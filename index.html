@@ -7,6 +7,8 @@
 <meta name="theme-color" content="#141412">
 <link rel="stylesheet" href="/app.css">
 <script src="https://unpkg.com/@phosphor-icons/web"></script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer></script>
 </head>
 <body>
 
@@ -54,6 +56,7 @@
         </svg>
         <span class="ctx-gauge-label" id="ctx-gauge-label">0%</span>
       </div>
+      <span class="tok-total" id="tok-total" title="Total generated tokens this session">0 tok</span>
       <button class="btn ghost sm" id="btn-faq" title="About Accuretta"><i class="ph ph-question"></i>FAQ</button>
       <button class="btn ghost sm" id="btn-settings"><i class="ph ph-gear-six"></i>Settings</button>
     </div>
@@ -72,6 +75,8 @@
         <span id="chat-meta">local</span>
       </div>
       <div class="actions">
+        <button class="iconbtn" id="btn-session-desktop" title="Desktop automation for this chat only" hidden><i class="ph ph-desktop"></i></button>
+        <button class="iconbtn" id="btn-palette" title="Switch session (⌘K / Ctrl+K)"><i class="ph ph-magnifying-glass"></i></button>
         <button class="iconbtn" id="btn-theme" title="Theme"><i class="ph ph-moon"></i></button>
         <button class="iconbtn" id="btn-toggle-preview" title="Toggle preview"><i class="ph ph-browser"></i></button>
         <button class="iconbtn mobile-only" id="btn-mobile-menu" title="Menu"><i class="ph ph-dots-three-vertical"></i></button>
@@ -111,6 +116,8 @@
             <button class="chip on" id="mode-auto" data-mode="auto"><i class="ph ph-lightning"></i>Auto</button>
             <button class="chip" id="btn-attach-image" title="Attach image — the vision model reads it and hands a description to the main model"><i class="ph ph-image"></i>Image</button>
             <input type="file" id="file-image" accept="image/*" multiple hidden>
+            <button class="chip" id="toggle-tailwind" title="Inject the Tailwind Play CDN into generated HTML and ask the model to use Tailwind classes"><i class="ph ph-wind"></i>Tailwind CDN</button>
+            <button class="chip" id="toggle-multifile" title="Have the model emit a small folder structure (index.html, style.css, script.js, assets/) — preview inlines it, Export Project zips the files separately"><i class="ph ph-folder-simple"></i>Multi-file</button>
             <span class="composer-spacer"></span>
             <button class="model-pill" id="model-pill">select model</button>
           </div>
@@ -141,7 +148,19 @@
         <button class="active" id="btn-view-preview">Preview</button>
         <button id="btn-view-code">Code</button>
       </div>
+      <div class="viewport-presets" id="viewport-presets" title="Preview viewport width">
+        <button class="vp-btn active" data-vp="full" title="Full width"><i class="ph ph-frame-corners"></i></button>
+        <button class="vp-btn" data-vp="desktop" title="Desktop 1280px"><i class="ph ph-monitor"></i></button>
+        <button class="vp-btn" data-vp="tablet" title="Tablet 820px"><i class="ph ph-device-tablet"></i></button>
+        <button class="vp-btn" data-vp="mobile" title="Mobile 390px"><i class="ph ph-device-mobile"></i></button>
+      </div>
       <button class="iconbtn" id="btn-refresh" title="Refresh"><i class="ph ph-arrow-clockwise"></i></button>
+      <button class="iconbtn" id="btn-screenshot" title="Screenshot the preview as PNG"><i class="ph ph-camera"></i></button>
+      <button class="iconbtn" id="btn-export-project" title="Export as .zip (index.html + any companion files)"><i class="ph ph-package"></i></button>
+      <button class="iconbtn" id="btn-save-snapshot" title="Save preview to data/snapshots/"><i class="ph ph-floppy-disk"></i></button>
+      <button class="iconbtn" id="btn-copy-dataurl" title="Copy as data: URL (portable, no server needed)"><i class="ph ph-link-simple"></i></button>
+      <button class="iconbtn" id="btn-toggle-console" title="Toggle console pane"><i class="ph ph-terminal"></i></button>
+      <button class="iconbtn" id="btn-review-ui" title="Screenshot the preview and attach it to the composer so you can ask the model to review it"><i class="ph ph-magnifying-glass"></i></button>
       <button class="iconbtn" id="btn-open-new" title="Open in new tab"><i class="ph ph-arrow-square-out"></i></button>
       <button class="iconbtn" id="btn-close-preview" title="Minimize"><i class="ph ph-x"></i></button>
     </div>
@@ -157,8 +176,19 @@
         <div class="h">nothing to render.</div>
         <div class="s">ask the agent to build a page.<br>e.g. "build a pricing page with three tiers."</div>
       </div>
-      <iframe class="preview-frame hidden" id="preview-frame" sandbox="allow-scripts allow-forms allow-modals allow-popups"></iframe>
+      <div class="preview-stage" id="preview-stage">
+        <iframe class="preview-frame hidden" id="preview-frame" sandbox="allow-scripts allow-forms allow-modals allow-popups"></iframe>
+      </div>
       <pre class="code-view hidden" id="code-view"></pre>
+      <div class="console-pane hidden" id="console-pane">
+        <div class="console-head">
+          <i class="ph ph-terminal"></i><span>Preview console</span>
+          <span class="grow"></span>
+          <button class="iconbtn sm" id="btn-console-clear" title="Clear"><i class="ph ph-trash"></i></button>
+          <button class="iconbtn sm" id="btn-console-close" title="Hide"><i class="ph ph-x"></i></button>
+        </div>
+        <div class="console-body" id="console-body"></div>
+      </div>
     </div>
 
     <div class="preview-foot">
@@ -219,6 +249,20 @@
 <div class="approval-stack" id="approval-stack"></div>
 
 <!-- ====== SETTINGS DRAWER ====== -->
+<!-- ====== COMMAND PALETTE (⌘K) ====== -->
+<div class="palette-scrim hidden" id="palette-scrim"></div>
+<div class="palette hidden" id="palette" role="dialog" aria-label="Session switcher">
+  <div class="palette-head">
+    <i class="ph ph-magnifying-glass"></i>
+    <input type="text" id="palette-input" placeholder="Switch session or type a command…" autocomplete="off" spellcheck="false">
+    <span class="kbd">Esc</span>
+  </div>
+  <div class="palette-list" id="palette-list"></div>
+  <div class="palette-foot">
+    <span class="kbd">↑↓</span> navigate · <span class="kbd">Enter</span> open · <span class="kbd">⌘N</span> new session
+  </div>
+</div>
+
 <div class="drawer-scrim" id="drawer-scrim"></div>
 <aside class="drawer" id="settings-drawer" aria-hidden="true">
   <div class="drawer-head">
@@ -345,6 +389,24 @@
       <button class="btn danger sm" id="btn-desktop-panic" type="button" title="Stop all desktop automation instantly — denies every pending approval"><i class="ph ph-warning-octagon"></i>Panic / stop all</button>
       <button class="btn sm" id="btn-desktop-resume" type="button" title="Clear the panic flag"><i class="ph ph-play"></i>Resume</button>
       <span id="desktop-panic-state" class="hint" style="align-self:center;"></span>
+    </div>
+
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+      <span>Memories</span>
+      <span class="grow" style="flex:1;"></span>
+      <span id="mem-count" class="hint" style="font-size:10px;"></span>
+      <button class="btn sm" id="btn-mem-refresh" type="button" title="Reload"><i class="ph ph-arrow-clockwise"></i></button>
+      <button class="btn danger sm" id="btn-mem-clear" type="button" title="Forget all memories"><i class="ph ph-trash"></i>Clear</button>
+    </div>
+    <div class="form-row">
+      <span class="hint">durable facts the model learned about you across sessions. delete anything stale or wrong — the model can always re-learn.</span>
+    </div>
+    <div class="form-row">
+      <div class="mem-list" id="mem-list"></div>
+    </div>
+    <div class="form-row inline" style="gap:6px;">
+      <input type="text" id="mem-add-text" placeholder="add a memory…" style="flex:1;">
+      <button class="btn sm" id="btn-mem-add"><i class="ph ph-plus"></i>Add</button>
     </div>
 
     <div class="form-row" style="margin-top: 20px;">

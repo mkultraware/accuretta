@@ -20,11 +20,18 @@
     versions: [],
     activeVersion: null,   // vid
     currentHtml: "",
+    currentFiles: {},      // { "style.css": "...", "script.js": "...", ... } parsed from the current assistant turn
     streaming: false,
     abortCtl: null,
     approvals: new Map(),
     mobileTab: "chat",
     pendingImages: [],  // [{ dataUrl, name }]
+    viewport: "full",        // full | desktop | tablet | mobile
+    consoleOpen: false,
+    consoleLogs: [],         // [{level, text, t}]
+    tokTotal: 0,             // cumulative generated tokens for this session (client-side)
+    sessionDesktopDisabled: false,
+    palette: { open: false, items: [], idx: 0 },
   };
 
   const app = $("#app");
@@ -184,9 +191,17 @@
     renderModelPill();
     renderChatList();
     renderWorkspace();
+    reflectIdeToggles();
 
     wireEvents();
     subscribeSSE();
+  }
+
+  function reflectIdeToggles() {
+    const tw = $("#toggle-tailwind");
+    if (tw) tw.classList.toggle("on", !!state.settings.use_tailwind_cdn);
+    const mf = $("#toggle-multifile");
+    if (mf) mf.classList.toggle("on", !!state.settings.ide_multifile);
   }
 
   // ---------- data loading ----------
@@ -240,12 +255,61 @@
     const chat = state.chats.chats[id];
     state.messages = chat ? (chat.messages || []).slice() : [];
     $("#chat-title").textContent = chat ? chat.title : "new session";
+    // restore the last-used mode for this chat so the toolbar feels sticky
+    if (chat && chat.last_mode && ["auto", "ide", "agent"].includes(chat.last_mode)) {
+      state.mode = chat.last_mode;
+      $$('[data-mode]').forEach(x => x.classList.toggle("on", x.dataset.mode === state.mode));
+    }
+    // reset cumulative token counter when switching chats — it tracks the live
+    // session, not historical usage
+    state.tokTotal = 0;
+    renderTokTotal();
+    refreshSessionDesktopState();
     renderMessages();
     loadVersions();
     renderChatList();
     if (isMobile()) {
       state.mobileTab = "chat";
       applyMobileTab();
+    }
+  }
+
+  // ---------- session-scoped desktop kill switch ----------
+  async function refreshSessionDesktopState() {
+    const btn = $("#btn-session-desktop");
+    if (!btn) return;
+    if (!state.chatId || !state.settings.desktop_enabled) {
+      btn.hidden = true;
+      return;
+    }
+    btn.hidden = false;
+    try {
+      const r = await fetch(`/api/desktop/chat-state/${state.chatId}`).then(x => x.json());
+      state.sessionDesktopDisabled = !!r.disabled;
+    } catch { state.sessionDesktopDisabled = false; }
+    btn.classList.toggle("off", state.sessionDesktopDisabled);
+    btn.title = state.sessionDesktopDisabled
+      ? "Desktop automation OFF for this chat — click to re-enable"
+      : "Desktop automation ON for this chat — click to disable";
+    btn.innerHTML = state.sessionDesktopDisabled
+      ? '<i class="ph ph-monitor-x"></i>'
+      : '<i class="ph ph-desktop"></i>';
+  }
+
+  async function toggleSessionDesktop() {
+    if (!state.chatId) return;
+    const next = !state.sessionDesktopDisabled;
+    try {
+      await fetch("/api/desktop/chat-toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: state.chatId, disabled: next }),
+      });
+      state.sessionDesktopDisabled = next;
+      refreshSessionDesktopState();
+      toast(next ? "Desktop off for this chat" : "Desktop on for this chat", "info", 2200, "sess-desk");
+    } catch (e) {
+      toast("Toggle failed: " + e.message, "err", 2800);
     }
   }
 
@@ -259,6 +323,105 @@
     } else {
       renderChatList();
     }
+  }
+
+  // ---------- command palette (⌘K) ----------
+  function openPalette() {
+    state.palette.open = true;
+    state.palette.idx = 0;
+    $("#palette-scrim").classList.remove("hidden");
+    $("#palette").classList.remove("hidden");
+    const inp = $("#palette-input");
+    inp.value = "";
+    refreshPaletteList("");
+    setTimeout(() => inp.focus(), 0);
+  }
+  function closePalette() {
+    state.palette.open = false;
+    $("#palette-scrim").classList.add("hidden");
+    $("#palette").classList.add("hidden");
+  }
+  function _fuzzyScore(query, text) {
+    if (!query) return 0;
+    const q = query.toLowerCase();
+    const t = (text || "").toLowerCase();
+    if (t.includes(q)) return 100 - t.indexOf(q);
+    // cheap subsequence scoring: every char of q must appear in order
+    let i = 0, score = 0, last = -1;
+    for (let j = 0; j < t.length && i < q.length; j++) {
+      if (t[j] === q[i]) { score += 5 - Math.min(4, j - last - 1); last = j; i++; }
+    }
+    return i === q.length ? score : -1;
+  }
+  function refreshPaletteList(query) {
+    const list = $("#palette-list");
+    list.innerHTML = "";
+    const items = [];
+    // built-in commands always appear first
+    const commands = [
+      { kind: "cmd", icon: "ph-plus", label: "New session", action: () => { closePalette(); newChat(); } },
+      { kind: "cmd", icon: "ph-gear-six", label: "Open Settings", action: () => { closePalette(); openSettings(); } },
+      { kind: "cmd", icon: "ph-brain", label: "Open Memories", action: () => { closePalette(); openSettings(); setTimeout(() => $("#btn-mem-refresh")?.scrollIntoView({ behavior: "smooth" }), 80); } },
+      { kind: "cmd", icon: "ph-arrow-counter-clockwise", label: "Regenerate last reply", action: () => { closePalette(); regenerateLast(); } },
+      { kind: "cmd", icon: "ph-moon", label: "Toggle theme", action: async () => { closePalette(); const d = state.settings.theme !== "dark"; await saveSettings({ theme: d ? "dark" : "light" }); applyTheme(d); } },
+      { kind: "cmd", icon: "ph-browser", label: "Toggle preview pane", action: () => { closePalette(); app.classList.toggle("preview-collapsed"); } },
+      { kind: "cmd", icon: "ph-camera", label: "Screenshot preview", action: () => { closePalette(); screenshotPreview(); } },
+      { kind: "cmd", icon: "ph-package", label: "Export project", action: () => { closePalette(); exportProjectZip(); } },
+      { kind: "cmd", icon: "ph-floppy-disk", label: "Save snapshot", action: () => { closePalette(); saveSnapshot(); } },
+    ];
+    for (const c of commands) {
+      const s = query ? _fuzzyScore(query, c.label) : 0;
+      if (query && s < 0) continue;
+      items.push({ ...c, score: s + 50 });
+    }
+    // then sessions
+    for (const id of state.chats.order) {
+      const c = state.chats.chats[id];
+      if (!c) continue;
+      const label = c.title || "(untitled)";
+      const s = query ? _fuzzyScore(query, label) : 0;
+      if (query && s < 0) continue;
+      items.push({
+        kind: "session",
+        icon: "ph-chat-circle",
+        label,
+        sub: id === state.chatId ? "current" : relTime(c.updated || c.created),
+        action: () => { closePalette(); selectChat(id); },
+        score: s,
+      });
+    }
+    items.sort((a, b) => b.score - a.score);
+    state.palette.items = items;
+    state.palette.idx = 0;
+    items.forEach((it, i) => {
+      const el = document.createElement("div");
+      el.className = "palette-item" + (i === 0 ? " sel" : "");
+      el.innerHTML = `
+        <i class="ph ${it.icon}"></i>
+        <div class="pi-main">
+          <div class="pi-label">${esc(it.label)}</div>
+          ${it.sub ? `<div class="pi-sub">${esc(it.sub)}</div>` : ""}
+        </div>
+        <span class="pi-kind">${esc(it.kind)}</span>`;
+      el.addEventListener("click", it.action);
+      list.appendChild(el);
+    });
+    if (!items.length) {
+      list.innerHTML = `<div class="palette-empty">no matches.</div>`;
+    }
+  }
+  function paletteMove(delta) {
+    const items = state.palette.items;
+    if (!items.length) return;
+    state.palette.idx = (state.palette.idx + delta + items.length) % items.length;
+    const rows = document.querySelectorAll("#palette-list .palette-item");
+    rows.forEach((r, i) => r.classList.toggle("sel", i === state.palette.idx));
+    const r = rows[state.palette.idx];
+    if (r) r.scrollIntoView({ block: "nearest" });
+  }
+  function paletteCommit() {
+    const it = state.palette.items[state.palette.idx];
+    if (it) it.action();
   }
 
   function renderChatList() {
@@ -303,6 +466,7 @@
     for (const m of state.messages) {
       inner.appendChild(renderBubble(m));
     }
+    renderRegenerateChip();
     scrollToBottom();
   }
 
@@ -330,7 +494,98 @@
         <div class="bubble ${m.role === "user" ? "user" : "agent"}">${renderMarkdown(visible)}</div>
         <div class="bubble-meta">${m.role === "user" ? "you" : (state.settings.model || "agent")} · ${relTime(m.t)}</div>
       </div>`;
+    enhanceCodeBlocks(row);
     return row;
+  }
+
+  // wrap each <pre><code> in the bubble with a copy button. idempotent —
+  // bails out if the pre already carries data-enhanced.
+  function enhanceCodeBlocks(root) {
+    const pres = root.querySelectorAll("pre");
+    pres.forEach(pre => {
+      if (pre.dataset.enhanced === "1") return;
+      pre.dataset.enhanced = "1";
+      pre.classList.add("code-block");
+      const btn = document.createElement("button");
+      btn.className = "copy-code";
+      btn.type = "button";
+      btn.innerHTML = '<i class="ph ph-copy"></i>';
+      btn.title = "Copy";
+      btn.addEventListener("click", async () => {
+        const codeEl = pre.querySelector("code");
+        const text = codeEl ? codeEl.textContent : pre.textContent;
+        try {
+          await navigator.clipboard.writeText(text || "");
+          btn.innerHTML = '<i class="ph ph-check"></i>';
+          setTimeout(() => (btn.innerHTML = '<i class="ph ph-copy"></i>'), 1200);
+        } catch {
+          toast("Clipboard blocked", "warn", 2000);
+        }
+      });
+      pre.appendChild(btn);
+    });
+  }
+
+  // regenerate the most recent assistant reply by re-sending the turn with
+  // regenerate:true.  the backend pops trailing assistant messages and
+  // replays the last user message through the same pipeline.
+  async function regenerateLast() {
+    if (state.streaming) return;
+    if (!state.messages.some(m => m.role === "assistant")) {
+      toast("Nothing to regenerate yet.", "warn", 2200);
+      return;
+    }
+    // drop the last assistant bubble visually before re-streaming
+    while (state.messages.length && state.messages[state.messages.length - 1].role === "assistant") {
+      state.messages.pop();
+    }
+    renderMessages();
+
+    const agentRow = document.createElement("div");
+    agentRow.className = "bubble-row";
+    agentRow.innerHTML = `
+      <div class="avatar"><i class="ph-bold ph-sparkle" style="font-size:12px"></i></div>
+      <div class="bubble-col">
+        <div class="think-line" data-label="Thinking"><i class="ph ph-brain"></i><span class="shimmer">Regenerating…</span></div>
+        <div class="tool-stack" id="tool-stack"></div>
+        <div class="bubble agent hidden" id="stream-bubble"></div>
+        <div class="bubble-meta">${esc(state.settings.model)} · streaming</div>
+      </div>`;
+    $("#chat-inner").appendChild(agentRow);
+    scrollToBottom();
+
+    state.streaming = true;
+    state.abortCtl = new AbortController();
+    setStreamingUI(true);
+    try {
+      await streamChat("", agentRow, state.abortCtl.signal, [], { regenerate: true });
+    } catch (e) {
+      if (e.name !== "AbortError") toast("regenerate failed: " + e.message, "err");
+    } finally {
+      state.streaming = false;
+      state.abortCtl = null;
+      setStreamingUI(false);
+      renderRegenerateChip();
+    }
+  }
+
+  // show a regenerate chip on the last assistant bubble (post-stream only).
+  function renderRegenerateChip() {
+    const existing = document.querySelector(".regen-chip");
+    if (existing) existing.remove();
+    const rows = [...document.querySelectorAll("#chat-inner .bubble-row")];
+    const lastAssistant = rows.reverse().find(r => r.querySelector(".bubble.agent"));
+    if (!lastAssistant) return;
+    const col = lastAssistant.querySelector(".bubble-col");
+    if (!col) return;
+    const meta = col.querySelector(".bubble-meta");
+    if (!meta) return;
+    const chip = document.createElement("button");
+    chip.className = "regen-chip";
+    chip.type = "button";
+    chip.innerHTML = '<i class="ph ph-arrow-counter-clockwise"></i>Regenerate';
+    chip.addEventListener("click", regenerateLast);
+    meta.after(chip);
   }
 
   // ---------- image attachments ----------
@@ -374,7 +629,20 @@
   async function send() {
     if (state.streaming) return;
     const ta = $("#composer-input");
-    const text = ta.value.trim();
+    let text = ta.value.trim();
+
+    // "review this UI" → auto-capture the preview iframe and attach as an image
+    // so the vision model actually sees it. Skip if the user already attached
+    // something or the phrase is trivially present in an unrelated way.
+    if (text && /\breview this ui\b/i.test(text) && !state.pendingImages.length && state.currentHtml) {
+      const canvas = await captureIframePng();
+      if (canvas) {
+        const dataUrl = canvas.toDataURL("image/png");
+        state.pendingImages.push({ dataUrl, name: `ui-${Date.now()}.png` });
+        renderImageTray();
+      }
+    }
+
     const images = state.pendingImages.slice();
     if (!text && !images.length) return;
     if (!state.settings.model) {
@@ -444,7 +712,8 @@
     }
   }
 
-  async function streamChat(text, agentRow, signal, images) {
+  async function streamChat(text, agentRow, signal, images, opts) {
+    const regenerate = !!(opts && opts.regenerate);
     const bubble = agentRow.querySelector("#stream-bubble");
     const toolStack = agentRow.querySelector("#tool-stack");
     let buf = "";
@@ -493,6 +762,7 @@
         message: text,
         mode: state.mode,
         images: (images || []).map(x => x.dataUrl),
+        regenerate,
       }),
       signal,
     });
@@ -624,6 +894,7 @@
       if (content.trim()) {
         bubble.classList.remove("hidden");
         bubble.innerHTML = renderMarkdown(content);
+        enhanceCodeBlocks(bubble);
         if (ctx.row) updateThinkLine(ctx.row, false);
       }
       scrollToBottom();
@@ -655,13 +926,26 @@
       const tps = dur > 0 ? (tok / dur).toFixed(1) : "—";
       const meta = bubble.parentElement.querySelector(".bubble-meta");
       if (meta) meta.textContent = `${state.settings.model} · ${tok} tok · ${tps} tok/s`;
+      if (Number.isFinite(tok)) {
+        state.tokTotal += tok;
+        renderTokTotal();
+      }
     } else if (evt.type === "final") {
+      const full = evt.message.content || "";
       state.messages.push({
         role: "assistant",
-        content: evt.message.content || "",
+        content: full,
         t: Math.floor(Date.now() / 1000),
       });
+      // parse companion files emitted alongside the primary html block
+      // (```css path=style.css ..., ```js path=script.js ..., etc.)
+      const files = parseMultiFileBlocks(full);
+      if (Object.keys(files).length) {
+        state.currentFiles = files;
+        if (state.currentHtml) renderPreview();
+      }
       renderCtxGauge();
+      renderRegenerateChip();
     } else if (evt.type === "error") {
       bubble.innerHTML = `<span style="color: var(--danger)">error: ${esc(evt.error)}</span>`;
     }
@@ -690,12 +974,26 @@
       return;
     }
     for (const v of state.versions) {
+      const wrap = document.createElement("span");
+      wrap.className = "version-wrap" + (v.id === state.activeVersion ? " active" : "");
       const chip = document.createElement("button");
       chip.className = "version-chip" + (v.id === state.activeVersion ? " active" : "");
       chip.innerHTML = `<span class="n">v${String(v.n).padStart(2, "0")}</span>${v.label ? `<span style="opacity:.6">· ${esc(v.label).slice(0, 32)}</span>` : ""}`;
       chip.title = `${v.id} · ${humanBytes(v.bytes)} · ${relTime(v.t)}`;
       chip.addEventListener("click", () => setActiveVersion(v.id));
-      bar.appendChild(chip);
+      wrap.appendChild(chip);
+      const rerun = document.createElement("button");
+      rerun.className = "version-rerun";
+      rerun.type = "button";
+      rerun.title = "Re-run: reload this version into the preview";
+      rerun.innerHTML = `<i class="ph ph-arrow-counter-clockwise"></i>`;
+      rerun.addEventListener("click", (e) => {
+        e.stopPropagation();
+        setActiveVersion(v.id);
+        toast(`v${String(v.n).padStart(2, "0")} re-loaded`, "info", 1600, "vrerun");
+      });
+      wrap.appendChild(rerun);
+      bar.appendChild(wrap);
     }
     const spacer = document.createElement("span");
     spacer.className = "spacer";
@@ -707,6 +1005,8 @@
     const resp = await fetch(`/api/versions/${state.chatId}/${vid}`);
     const html = await resp.text();
     state.currentHtml = html;
+    // companion-file map is per-turn; switching to a persisted version clears it
+    state.currentFiles = {};
     const v = state.versions.find(x => x.id === vid);
     $("#preview-url").textContent = vid;
     $("#preview-meta").textContent = v ? `v${String(v.n).padStart(2, "0")} · ${relTime(v.t)}` : "—";
@@ -721,6 +1021,7 @@
 
   function clearPreview() {
     state.currentHtml = "";
+    state.currentFiles = {};
     state.activeVersion = null;
     $("#preview-url").textContent = "—";
     $("#preview-meta").textContent = "—";
@@ -733,10 +1034,175 @@
 
   function injectCspIfNeeded(html) {
     if (state.settings.allow_web_preview !== false) return html;
-    const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'self' data: blob:; style-src 'unsafe-inline' 'self' data:; script-src 'unsafe-inline' 'self' data:; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self';">`;
+    // when Tailwind CDN is on we must relax CSP enough to load it, otherwise the script is blocked.
+    const scriptSrc = state.settings.use_tailwind_cdn
+      ? "'unsafe-inline' 'self' data: https://cdn.tailwindcss.com"
+      : "'unsafe-inline' 'self' data:";
+    const styleSrc = state.settings.use_tailwind_cdn
+      ? "'unsafe-inline' 'self' data: https://cdn.tailwindcss.com"
+      : "'unsafe-inline' 'self' data:";
+    const connectSrc = state.settings.use_tailwind_cdn
+      ? "'self' https://cdn.tailwindcss.com"
+      : "'self'";
+    const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'self' data: blob:; style-src ${styleSrc}; script-src ${scriptSrc}; img-src 'self' data: blob: https:; font-src 'self' data: https:; connect-src ${connectSrc};">`;
     if (/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i, m => m + csp);
     if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, m => m + "<head>" + csp + "</head>");
     return csp + html;
+  }
+
+  function injectTailwindIfNeeded(html) {
+    if (!state.settings.use_tailwind_cdn) return html;
+    // idempotent — bail out if the doc already pulls in Tailwind
+    if (/cdn\.tailwindcss\.com/i.test(html)) return html;
+    const tag = `<script src="https://cdn.tailwindcss.com"></script>`;
+    if (/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i, m => m + tag);
+    if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, m => m + "<head>" + tag + "</head>");
+    return tag + html;
+  }
+
+  // ---------- multi-file parsing ----------
+  // the model may emit companion files via fenced blocks with an info string
+  // like ```css path=style.css.  we collect them keyed by path so the preview
+  // can inline them and Export Project can zip them unchanged.
+  function parseMultiFileBlocks(text) {
+    if (!text) return {};
+    const out = {};
+    // match fenced blocks with info strings containing path=<path>
+    const re = /```([a-zA-Z0-9]+)?\s+([^\n`]*?path=([^\s`]+)[^\n`]*)\n([\s\S]*?)```/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const rawPath = (m[3] || "").trim().replace(/^["']|["']$/g, "");
+      const body = m[4] || "";
+      if (!rawPath) continue;
+      // normalise + safety: strip leading slashes, no .. traversal, posix slashes only
+      const safe = rawPath.replace(/\\/g, "/").replace(/^\/+/, "");
+      if (safe.includes("..")) continue;
+      out[safe] = body.replace(/\s+$/, "");
+    }
+    return out;
+  }
+
+  // Given the primary html and a map of extra files, return a single HTML
+  // string suitable for the preview iframe with any linked local css/js
+  // inlined.  Non-local hrefs are left alone.
+  function inlineLocalAssets(html, files) {
+    if (!html || !files || !Object.keys(files).length) return html;
+    const keyOf = (href) => (href || "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\/+/, "");
+    // inline <link rel="stylesheet" href="..."> for local files
+    html = html.replace(/<link\b([^>]*?)href=(["'])([^"']+)\2([^>]*)>/gi, (full, pre, _q, href, post) => {
+      if (/rel\s*=\s*["']stylesheet/i.test(pre + post) || /rel\s*=\s*["']stylesheet/i.test(full)) {
+        const key = keyOf(href);
+        if (files[key] != null) return `<style data-inlined-from="${esc(key)}">\n${files[key]}\n</style>`;
+      }
+      return full;
+    });
+    // inline <script src="..."> for local files
+    html = html.replace(/<script\b([^>]*?)src=(["'])([^"']+)\2([^>]*)><\/script>/gi, (full, pre, _q, src, post) => {
+      const key = keyOf(src);
+      if (files[key] != null) {
+        const typeMatch = (pre + post).match(/type\s*=\s*(["'])([^"']+)\1/i);
+        const typeAttr = typeMatch ? ` type="${esc(typeMatch[2])}"` : "";
+        return `<script data-inlined-from="${esc(key)}"${typeAttr}>\n${files[key]}\n<\/script>`;
+      }
+      return full;
+    });
+    return html;
+  }
+
+  // ---------- console forwarder ----------
+  // this script is injected into every preview so console.log / warn / error /
+  // info and uncaught errors get posted back to the parent via postMessage.
+  // the parent pushes them into the console-pane under the preview.
+  const CONSOLE_FORWARDER = `<script>
+(function(){
+  if (window.__accConsoleWired) return;
+  window.__accConsoleWired = true;
+  var levels = ["log","info","warn","error","debug"];
+  levels.forEach(function(lvl){
+    var orig = console[lvl] && console[lvl].bind(console);
+    console[lvl] = function(){
+      try {
+        var parts = [];
+        for (var i = 0; i < arguments.length; i++) {
+          var a = arguments[i];
+          if (a instanceof Error) parts.push(a.stack || a.message);
+          else if (typeof a === "object") { try { parts.push(JSON.stringify(a)); } catch(_){ parts.push(String(a)); } }
+          else parts.push(String(a));
+        }
+        parent.postMessage({ __acc: "console", level: lvl, text: parts.join(" ") }, "*");
+      } catch(_){}
+      if (orig) orig.apply(console, arguments);
+    };
+  });
+  window.addEventListener("error", function(e){
+    try { parent.postMessage({ __acc: "console", level: "error", text: (e.message||"error") + (e.filename?(" ("+e.filename+":"+e.lineno+")"):"") }, "*"); } catch(_){}
+  });
+  window.addEventListener("unhandledrejection", function(e){
+    try { parent.postMessage({ __acc: "console", level: "error", text: "unhandled rejection: " + ((e.reason && (e.reason.stack||e.reason.message))||String(e.reason)) }, "*"); } catch(_){}
+  });
+})();
+<\/script>`;
+
+  function injectConsoleForwarder(html) {
+    if (!html) return html;
+    if (/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i, m => m + CONSOLE_FORWARDER);
+    if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, m => m + "<head>" + CONSOLE_FORWARDER + "</head>");
+    return CONSOLE_FORWARDER + html;
+  }
+
+  function pushConsoleLog(level, text) {
+    const entry = { level, text: String(text || ""), t: Date.now() };
+    state.consoleLogs.push(entry);
+    if (state.consoleLogs.length > 400) state.consoleLogs.splice(0, state.consoleLogs.length - 400);
+    const body = document.getElementById("console-body");
+    if (!body) return;
+    const row = document.createElement("div");
+    row.className = `c-row c-${level}`;
+    row.textContent = entry.text;
+    body.appendChild(row);
+    body.scrollTop = body.scrollHeight;
+  }
+
+  function clearConsole() {
+    state.consoleLogs = [];
+    const body = document.getElementById("console-body");
+    if (body) body.innerHTML = "";
+  }
+
+  // single global listener — receives postMessage from *any* preview iframe
+  window.addEventListener("message", (e) => {
+    const d = e && e.data;
+    if (!d || d.__acc !== "console") return;
+    pushConsoleLog(d.level || "log", d.text || "");
+  });
+
+  // ---------- viewport presets ----------
+  const VIEWPORT_WIDTHS = { full: null, desktop: 1280, tablet: 820, mobile: 390 };
+
+  function applyViewport(vp) {
+    state.viewport = vp;
+    const stage = $("#preview-stage");
+    const frame = $("#preview-frame");
+    if (!stage || !frame) return;
+    const w = VIEWPORT_WIDTHS[vp];
+    if (w) {
+      stage.classList.add("vp-constrained");
+      frame.style.maxWidth = w + "px";
+      frame.style.marginInline = "auto";
+    } else {
+      stage.classList.remove("vp-constrained");
+      frame.style.maxWidth = "";
+      frame.style.marginInline = "";
+    }
+    $$(".vp-btn").forEach(b => b.classList.toggle("active", b.dataset.vp === vp));
+  }
+
+  function buildPreviewHtml() {
+    let html = inlineLocalAssets(state.currentHtml, state.currentFiles);
+    html = injectTailwindIfNeeded(html);
+    html = injectConsoleForwarder(html);
+    html = injectCspIfNeeded(html);
+    return html;
   }
 
   function renderPreview() {
@@ -751,7 +1217,7 @@
       fresh.id = "preview-frame";
       fresh.className = "preview-frame";
       fresh.setAttribute("sandbox", "allow-scripts allow-forms allow-modals allow-popups");
-      fresh.srcdoc = injectCspIfNeeded(state.currentHtml);
+      fresh.srcdoc = buildPreviewHtml();
       old.replaceWith(fresh);
     } else {
       $("#preview-frame").classList.add("hidden");
@@ -759,6 +1225,175 @@
       c.classList.remove("hidden");
       c.innerHTML = highlightHTML(state.currentHtml);
     }
+  }
+
+  // ---------- preview: screenshot / export / review-UI ----------
+  function safeSlug(s, fallback) {
+    const t = (s || "").toString().toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
+    return t || fallback;
+  }
+
+  function currentProjectBase() {
+    const v = state.versions.find(x => x.id === state.activeVersion);
+    const title = (state.chats?.find?.(x => x.id === state.chatId)?.title) || "";
+    return safeSlug(title || (v ? `version-${v.n}` : "preview"), "preview");
+  }
+
+  async function captureIframePng({ scale = 1 } = {}) {
+    if (!state.currentHtml) {
+      toast("Nothing in the preview yet.", "warn", 2200);
+      return null;
+    }
+    if (typeof window.html2canvas !== "function") {
+      toast("Screenshot library hasn't loaded yet — try again in a second.", "warn", 2500);
+      return null;
+    }
+    // srcdoc iframes inherit the parent origin, so contentDocument is accessible
+    const frame = $("#preview-frame");
+    const doc = frame && frame.contentDocument;
+    const body = doc && doc.body;
+    if (!body) {
+      toast("Preview frame isn't ready.", "warn", 2500);
+      return null;
+    }
+    try {
+      const canvas = await window.html2canvas(body, {
+        backgroundColor: getComputedStyle(body).backgroundColor || "#ffffff",
+        useCORS: true,
+        allowTaint: true,
+        scale,
+        logging: false,
+        windowWidth: doc.documentElement.scrollWidth,
+        windowHeight: doc.documentElement.scrollHeight,
+      });
+      return canvas;
+    } catch (e) {
+      toast(`Screenshot failed: ${e.message || e}`, "err", 3500);
+      return null;
+    }
+  }
+
+  async function screenshotPreview() {
+    const canvas = await captureIframePng();
+    if (!canvas) return;
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${currentProjectBase()}-${Date.now()}.png`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast("Screenshot saved", "ok", 2000, "ss");
+    }, "image/png");
+  }
+
+  async function reviewUiAttach() {
+    const canvas = await captureIframePng();
+    if (!canvas) return;
+    const dataUrl = canvas.toDataURL("image/png");
+    state.pendingImages.push({ dataUrl, name: `ui-${Date.now()}.png` });
+    renderImageTray();
+    const ta = $("#composer-input");
+    if (ta) {
+      const existing = ta.value.trim();
+      if (!/review this ui/i.test(existing)) {
+        ta.value = existing ? `${existing}\n\nReview this UI — note what feels off and suggest concrete fixes.`
+                            : "Review this UI — note what feels off and suggest concrete fixes.";
+      }
+      autoResize(ta);
+      ta.focus();
+    }
+    toast("Preview attached — press Send to have the model review it.", "ok", 3000, "review");
+  }
+
+  async function saveSnapshot() {
+    if (!state.currentHtml) {
+      toast("Nothing in the preview yet.", "warn", 2200);
+      return;
+    }
+    const base = currentProjectBase();
+    const html = buildPreviewHtml();  // persist what the user actually sees
+    const resp = await fetch("/api/snapshots", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: base, html }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || data.error) {
+      toast(`Snapshot failed: ${data.error || resp.status}`, "err", 3500);
+      return;
+    }
+    toast(`Saved: ${data.name}`, "ok", 2600, "snap");
+  }
+
+  async function copyPreviewAsDataUrl() {
+    if (!state.currentHtml) {
+      toast("Nothing in the preview yet.", "warn", 2200);
+      return;
+    }
+    const html = buildPreviewHtml();
+    const b64 = btoa(unescape(encodeURIComponent(html)));
+    const url = `data:text/html;charset=utf-8;base64,${b64}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast(`Copied data URL (${Math.round(url.length / 1024)}KB)`, "ok", 2400, "dataurl");
+    } catch {
+      // clipboard may be blocked — fall back to a throwaway prompt
+      try { window.prompt("Copy this data URL:", url); } catch {}
+    }
+  }
+
+  function toggleConsolePane(force) {
+    const want = typeof force === "boolean" ? force : !state.consoleOpen;
+    state.consoleOpen = want;
+    const pane = $("#console-pane");
+    if (!pane) return;
+    pane.classList.toggle("hidden", !want);
+    $("#btn-toggle-console")?.classList.toggle("active", want);
+  }
+
+  async function exportProjectZip() {
+    if (!state.currentHtml) {
+      toast("Nothing in the preview yet.", "warn", 2200);
+      return;
+    }
+    const base = currentProjectBase();
+    const files = state.currentFiles || {};
+    const hasCompanions = Object.keys(files).length > 0;
+
+    // single-file path: just download the html
+    if (!hasCompanions) {
+      const blob = new Blob([state.currentHtml], { type: "text/html" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${base}.html`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast("Downloaded HTML", "ok", 2000, "exp");
+      return;
+    }
+
+    if (typeof window.JSZip !== "function") {
+      toast("Zip library hasn't loaded yet — try again in a second.", "warn", 2500);
+      return;
+    }
+
+    const zip = new window.JSZip();
+    // if the model also emitted its own index.html path, prefer that verbatim;
+    // otherwise write state.currentHtml as index.html
+    if (!files["index.html"]) zip.file("index.html", state.currentHtml);
+    for (const [path, body] of Object.entries(files)) zip.file(path, body);
+    const blob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${base}.zip`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast(`Exported ${Object.keys(files).length + (files["index.html"] ? 0 : 1)} files`, "ok", 2400, "exp");
   }
 
   // ---------- workspace ----------
@@ -940,6 +1575,45 @@
   }
 
   // ---------- approvals ----------
+  // compose a pre-flight summary of what a tool call will actually do.
+  // purely cosmetic — the approval itself still lives on `a.command`.
+  function approvalPreview(a) {
+    const d = a.details || {};
+    const kind = d.kind || "";
+    const rows = [];
+    const pair = (k, v) => rows.push(`<div class="pv-row"><span class="pv-k">${esc(k)}</span><span class="pv-v">${esc(v)}</span></div>`);
+    if (kind === "write_file") {
+      pair("path", d.path || "?");
+      pair("size", (d.bytes || 0).toLocaleString() + " bytes");
+      pair("overwrites", "yes, if exists");
+    } else if (kind === "delete") {
+      pair("path", d.path || "?");
+      pair("target", d.dir ? "directory" : "file");
+      pair("reversible", "NO — permanent");
+    } else if (kind === "desktop.launch") {
+      pair("launches", d.target || "?");
+      pair("allowlist check", "passed");
+    } else if (kind === "desktop.focus") {
+      pair("focus window", d.title || "?");
+    } else if (kind === "desktop.click") {
+      pair("click at", `${d.x ?? "?"}, ${d.y ?? "?"}`);
+      pair("button", d.button || "left");
+      if (d.clicks) pair("count", String(d.clicks));
+    } else if (kind === "desktop.type") {
+      pair("types", `${d.length ?? (d.text || "").length} chars`);
+      if (d.text) pair("preview", d.text.slice(0, 80) + ((d.text || "").length > 80 ? "…" : ""));
+    } else if (kind === "desktop.keys") {
+      pair("presses", d.combo || "?");
+    } else if (kind === "desktop.close") {
+      pair("closes window", d.title || "?");
+    } else if (kind === "launch") {
+      pair("launches", d.path || "?");
+    } else if (kind === "powershell") {
+      pair("runs PowerShell", "check the command below");
+    }
+    return rows.length ? `<div class="pv">${rows.join("")}</div>` : "";
+  }
+
   function renderApprovals() {
     const stack = $("#approval-stack");
     stack.innerHTML = "";
@@ -948,13 +1622,21 @@
       card.className = "approval";
       const details = a.details || {};
       const tag = details.kind || "command";
+      const isDesktop = String(tag).startsWith("desktop.");
+      const isDestructive = ["delete", "write_file"].includes(tag);
+      if (isDesktop) card.classList.add("kind-desktop");
+      if (isDestructive) card.classList.add("kind-destructive");
       card.innerHTML = `
         <div class="head">
           <i class="ph-bold ph-shield-warning"></i>
           <span class="t">${esc(a.title)}</span>
           <span class="tag">${esc(tag)}</span>
         </div>
-        <div class="cmd">${esc(a.command)}</div>
+        ${approvalPreview(a)}
+        <details class="cmd-details">
+          <summary>Command</summary>
+          <div class="cmd">${esc(a.command)}</div>
+        </details>
         <div class="actions">
           <button class="btn danger" data-act="deny">Deny</button>
           <button class="btn accent" data-act="approve">Approve</button>
@@ -1008,6 +1690,8 @@
         if (evt.on) toast("desktop automation PANICKED — all actions blocked", "warn", 6000, "desktop-panic");
         else toast("desktop automation resumed", "ok", 2000, "desktop-panic");
         refreshDesktopStatus();
+      } else if (evt.type === "memories:update") {
+        if ($("#settings-drawer")?.classList.contains("open")) loadMemories();
       }
     };
     es.onerror = () => {
@@ -1053,6 +1737,70 @@
       if (btn) btn.disabled = false;
     }
   }
+  // ---------- memories panel ----------
+  function renderMemoriesList(items) {
+    const host = $("#mem-list");
+    if (!host) return;
+    host.innerHTML = "";
+    if (!items || !items.length) {
+      host.innerHTML = `<div class="mem-empty">no memories yet — add one below, or let the model call <code>remember</code>.</div>`;
+      return;
+    }
+    for (const m of items) {
+      const row = document.createElement("div");
+      row.className = "mem-item";
+      const tags = Array.isArray(m.tags) && m.tags.length
+        ? `<span class="mem-tags">${m.tags.map(t => `<span class="mem-tag">${esc(t)}</span>`).join("")}</span>`
+        : "";
+      row.innerHTML = `
+        <div class="mem-text">${esc(m.text || "")}</div>
+        <div class="mem-foot">
+          ${tags}
+          <span class="mem-ts">${m.t ? relTime(m.t) : ""}</span>
+          <button class="btn ghost sm mem-del" type="button" title="Forget"><i class="ph ph-trash"></i></button>
+        </div>`;
+      row.querySelector(".mem-del").addEventListener("click", async () => {
+        try {
+          await api("/api/memories/forget", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id: m.id }),
+          });
+        } catch (e) { toast("forget failed: " + e.message, "error"); }
+      });
+      host.appendChild(row);
+    }
+  }
+  async function loadMemories() {
+    try {
+      const r = await api("/api/memories");
+      renderMemoriesList(r.memories || []);
+    } catch (e) {
+      const host = $("#mem-list");
+      if (host) host.innerHTML = `<div class="mem-empty">(failed: ${esc(e.message || String(e))})</div>`;
+    }
+  }
+  async function addMemoryFromInput() {
+    const input = $("#mem-add-text");
+    if (!input) return;
+    const text = (input.value || "").trim();
+    if (!text) return;
+    const btn = $("#btn-mem-add");
+    if (btn) btn.disabled = true;
+    try {
+      await api("/api/memories", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      input.value = "";
+    } catch (e) {
+      toast("add failed: " + e.message, "error");
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
   async function rescanSystemContext() {
     const btn = $("#btn-sysctx-rescan");
     const ta = $("#set-sysctx");
@@ -1109,12 +1857,17 @@
     $("#sw-dark").classList.toggle("on", s.theme === "dark");
     $("#sw-web").classList.toggle("on", s.allow_web_preview !== false);
 
+    // IDE toggles mirror back into the composer chips
+    reflectIdeToggles();
+
     // desktop automation
     $("#sw-desktop-enabled")?.classList.toggle("on", !!s.desktop_enabled);
     const al = $("#set-desktop-allowlist");
     if (al) al.value = (s.desktop_app_allowlist || []).join("\n");
     fill("#set-desktop-rate", s.desktop_max_actions_per_minute || 30);
     refreshDesktopStatus();
+    // memories panel
+    loadMemories();
   }
 
   async function refreshDesktopStatus() {
@@ -1157,6 +1910,8 @@
       desktop_app_allowlist: ($("#set-desktop-allowlist")?.value || "")
         .split("\n").map(x => x.trim()).filter(Boolean),
       desktop_max_actions_per_minute: Math.max(1, Math.min(300, n("#set-desktop-rate") || 30)),
+      use_tailwind_cdn: !!state.settings.use_tailwind_cdn,
+      ide_multifile: !!state.settings.ide_multifile,
     };
     await saveSettings(payload);
     applyTheme(payload.theme === "dark");
@@ -1258,6 +2013,11 @@
     gauge.classList.toggle("warn", pct >= 0.7 && pct < 0.9);
     gauge.classList.toggle("crit", pct >= 0.9);
     gauge.title = `${used.toLocaleString()} / ${capacity.toLocaleString()} tokens (~${Math.round(pct * 100)}%)`;
+  }
+  function renderTokTotal() {
+    const el = $("#tok-total");
+    if (!el) return;
+    el.textContent = `${state.tokTotal.toLocaleString()} tok`;
   }
   function renderModelPill() {
     const pill = $("#model-pill");
@@ -1385,6 +2145,32 @@
       });
     });
 
+    // IDE toolbar: Tailwind CDN toggle
+    $("#toggle-tailwind")?.addEventListener("click", async () => {
+      const next = !state.settings.use_tailwind_cdn;
+      await saveSettings({ use_tailwind_cdn: next });
+      reflectIdeToggles();
+      if (state.currentHtml) renderPreview();
+      toast(next ? "Tailwind CDN will be injected into the preview" : "Tailwind CDN off", "info", 2200, "ide-tw");
+    });
+
+    // IDE toolbar: multi-file output toggle
+    $("#toggle-multifile")?.addEventListener("click", async () => {
+      const next = !state.settings.ide_multifile;
+      await saveSettings({ ide_multifile: next });
+      reflectIdeToggles();
+      toast(next ? "Model will emit multi-file folder structure" : "Single-file mode", "info", 2200, "ide-mf");
+    });
+
+    // preview: screenshot the iframe to PNG
+    $("#btn-screenshot")?.addEventListener("click", screenshotPreview);
+
+    // preview: export the current preview as a zip (or single .html if no companions)
+    $("#btn-export-project")?.addEventListener("click", exportProjectZip);
+
+    // preview: review this UI — capture and attach to composer
+    $("#btn-review-ui")?.addEventListener("click", reviewUiAttach);
+
     // preview toggle
     $("#btn-view-preview").addEventListener("click", () => {
       state.view = "preview";
@@ -1511,6 +2297,58 @@
     // responsive
     window.addEventListener("resize", () => {
       document.body.classList.toggle("is-mobile", isMobile());
+    });
+
+    // ----- command palette -----
+    $("#btn-palette")?.addEventListener("click", openPalette);
+    const palInput = $("#palette-input");
+    if (palInput) {
+      palInput.addEventListener("input", (e) => refreshPaletteList(e.target.value));
+      palInput.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") { e.preventDefault(); closePalette(); }
+        else if (e.key === "ArrowDown") { e.preventDefault(); paletteMove(1); }
+        else if (e.key === "ArrowUp") { e.preventDefault(); paletteMove(-1); }
+        else if (e.key === "Enter") { e.preventDefault(); paletteCommit(); }
+      });
+    }
+    $("#palette-scrim")?.addEventListener("click", closePalette);
+
+    // ⌘K / Ctrl+K anywhere
+    window.addEventListener("keydown", (e) => {
+      const isCmd = e.metaKey || e.ctrlKey;
+      if (isCmd && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        if (state.palette && state.palette.open) closePalette();
+        else openPalette();
+      }
+    });
+
+    // ----- per-session desktop kill switch -----
+    $("#btn-session-desktop")?.addEventListener("click", toggleSessionDesktop);
+
+    // ----- preview extras -----
+    $("#btn-save-snapshot")?.addEventListener("click", saveSnapshot);
+    $("#btn-copy-dataurl")?.addEventListener("click", copyPreviewAsDataUrl);
+
+    // ----- console pane -----
+    $("#btn-toggle-console")?.addEventListener("click", () => toggleConsolePane());
+    $("#btn-console-clear")?.addEventListener("click", clearConsole);
+    $("#btn-console-close")?.addEventListener("click", () => toggleConsolePane(false));
+
+    // ----- viewport presets -----
+    $$(".vp-btn").forEach(b => b.addEventListener("click", () => applyViewport(b.dataset.vp)));
+
+    // ----- memories panel -----
+    $("#btn-mem-refresh")?.addEventListener("click", loadMemories);
+    $("#btn-mem-clear")?.addEventListener("click", async () => {
+      if (!confirm("Forget all memories? This cannot be undone.")) return;
+      try {
+        await api("/api/memories/clear", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      } catch (e) { toast("clear failed: " + e.message, "error"); }
+    });
+    $("#btn-mem-add")?.addEventListener("click", addMemoryFromInput);
+    $("#mem-add-text")?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); addMemoryFromInput(); }
     });
   }
 

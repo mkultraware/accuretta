@@ -71,6 +71,7 @@ ROOT = Path(__file__).parent.resolve()
 DATA = ROOT / "data"
 VERSIONS_DIR = DATA / "versions"
 PENDING_DIR = DATA / "pending"
+SNAPSHOTS_DIR = DATA / "snapshots"
 CHATS_FILE = DATA / "chats.json"
 SETTINGS_FILE = DATA / "settings.json"
 WORKSPACE_FILE = DATA / "workspace.json"
@@ -78,8 +79,20 @@ SYSTEM_CONTEXT_FILE = DATA / "ACCURETTA.md"
 MEMORIES_FILE = DATA / "memories.jsonl"
 MEMORIES_MAX_INJECT = 15          # how many to load into every system prompt
 MEMORIES_TEXT_CAP = 220           # per-entry char cap — token-efficient
+IGNORE_FILE_NAME = ".accurettaignore"
 
-for d in (DATA, VERSIONS_DIR, PENDING_DIR):
+# per-chat ephemeral desktop kill switch.  lives in memory only — restarting
+# the bridge resets every chat to its global setting.
+_chat_desktop_disabled: set[str] = set()
+
+# tracks which chat a tool is being invoked inside, so the per-chat kill
+# switch can short-circuit desktop tools without plumbing chat_id through
+# every function. it's a plain module variable set on the worker thread
+# before run_chat_turn and cleared after.
+import contextvars
+_current_chat_id: contextvars.ContextVar[str] = contextvars.ContextVar("_current_chat_id", default="")
+
+for d in (DATA, VERSIONS_DIR, PENDING_DIR, SNAPSHOTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 def _resolve_ollama_url() -> str:
@@ -147,6 +160,9 @@ DEFAULT_SETTINGS = {
     "theme": "light",
     "auto_approve_read": True,
     "allow_web_preview": True,
+    # IDE preview extras (composer toolbar toggles)
+    "use_tailwind_cdn": False,      # inject Tailwind Play CDN into preview + ask model to use tailwind classes
+    "ide_multifile": False,         # tell the model to emit a small folder structure (index.html / style.css / script.js / assets/)
 }
 
 
@@ -354,6 +370,91 @@ def is_in_workspace(p: str) -> bool:
     return False
 
 
+# ---- .accurettaignore -----------------------------------------------------
+# gitignore-lite. each workspace folder may ship a `.accurettaignore` with one
+# glob per line. blank lines and `#` comments are skipped. matching is done
+# with fnmatch against (a) the path's basename and (b) the POSIX path relative
+# to the workspace root — so `node_modules` catches any subtree of that name
+# and `build/*.map` targets nested files. lines starting with `!` negate.
+import fnmatch
+
+
+_IGNORE_CACHE: dict[str, tuple[float, list[tuple[bool, str]]]] = {}
+
+
+def _read_ignore_rules(ws_root: str) -> list[tuple[bool, str]]:
+    ip = Path(ws_root) / IGNORE_FILE_NAME
+    try:
+        mtime = ip.stat().st_mtime if ip.exists() else 0.0
+    except Exception:
+        mtime = 0.0
+    cached = _IGNORE_CACHE.get(ws_root)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    rules: list[tuple[bool, str]] = []
+    if ip.exists():
+        try:
+            for raw in ip.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                neg = line.startswith("!")
+                if neg:
+                    line = line[1:].strip()
+                if not line:
+                    continue
+                # strip trailing slashes; a trailing `/` in gitignore-speak means
+                # "directory only" but we match by glob regardless
+                line = line.rstrip("/")
+                rules.append((neg, line))
+        except Exception:
+            rules = []
+    _IGNORE_CACHE[ws_root] = (mtime, rules)
+    return rules
+
+
+def _workspace_root_for(path: str) -> str | None:
+    n = normalize_path(path).lower()
+    for folder in get_workspace().get("folders", []):
+        f = normalize_path(folder)
+        fl = f.lower()
+        if n == fl or n.startswith(fl + os.sep):
+            return f
+    return None
+
+
+def is_ignored(path: str) -> bool:
+    """True if `path` matches a rule in the enclosing workspace's .accurettaignore."""
+    root = _workspace_root_for(path)
+    if not root:
+        return False
+    rules = _read_ignore_rules(root)
+    if not rules:
+        return False
+    rel = os.path.relpath(normalize_path(path), root).replace("\\", "/")
+    if rel == "." or rel.startswith(".."):
+        return False
+    base = os.path.basename(rel)
+    ignored = False
+    for neg, pat in rules:
+        # match against basename for patterns without a slash; match full rel path
+        # for patterns that contain a slash (so `build/*.map` works).
+        hit = False
+        if "/" in pat:
+            if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(rel, pat.rstrip("/") + "/*") or any(
+                fnmatch.fnmatch(rel, pat + "/" + "*") for _ in [0]
+            ):
+                hit = True
+        else:
+            # bare pattern: match any basename along the path
+            parts = rel.split("/")
+            if any(fnmatch.fnmatch(p, pat) for p in parts) or fnmatch.fnmatch(base, pat):
+                hit = True
+        if hit:
+            ignored = not neg
+    return ignored
+
+
 # ---- command classification -----------------------------------------------
 
 WRITE_PATTERNS = [
@@ -491,9 +592,13 @@ def tool_list_directory(args: dict) -> dict:
     if not os.path.isdir(path):
         return {"error": f"not a directory: {path}"}
     out = []
+    skipped = 0
     try:
         for entry in sorted(os.listdir(path)):
             full = os.path.join(path, entry)
+            if is_ignored(full):
+                skipped += 1
+                continue
             try:
                 st = os.stat(full)
                 out.append({
@@ -507,7 +612,10 @@ def tool_list_directory(args: dict) -> dict:
                 continue
     except PermissionError as e:
         return {"error": f"permission denied: {e}"}
-    return {"path": path, "entries": out[:2000]}
+    resp = {"path": path, "entries": out[:2000]}
+    if skipped:
+        resp["ignored"] = skipped
+    return resp
 
 
 def tool_read_file(args: dict) -> dict:
@@ -518,6 +626,8 @@ def tool_read_file(args: dict) -> dict:
         return {"error": "path blocked (Windows/System32)"}
     if not is_in_workspace(path):
         return {"error": "path outside workspace. Add folder in Workspace panel."}
+    if is_ignored(path):
+        return {"error": f"path ignored by .accurettaignore: {path}"}
     try:
         raw = Path(path).read_bytes()
         if len(raw) > 512 * 1024:
@@ -543,6 +653,8 @@ def tool_write_file(args: dict) -> dict:
         return {"error": "path blocked (Windows/System32)"}
     if not is_in_workspace(path):
         return {"error": "path outside workspace. Add folder in Workspace panel."}
+    if is_ignored(path):
+        return {"error": f"path ignored by .accurettaignore: {path}"}
     approval = request_approval(
         title="Write file",
         command=f'Set-Content -Path "{path}" -Value <{len(content)} chars>',
@@ -802,6 +914,9 @@ def _desktop_preflight(require_libs: bool = True) -> dict | None:
         return {"error": "desktop automation is disabled. Enable it in Settings -> Desktop automation."}
     if _desktop_panic.is_set():
         return {"error": "desktop automation is paused (panic/kill switch active). User must resume in Settings."}
+    cid = _current_chat_id.get()
+    if cid and cid in _chat_desktop_disabled:
+        return {"error": "desktop automation is off for this chat. User must re-enable it on the session header."}
     if require_libs and not (_HAVE_PYAUTOGUI and _HAVE_PIL):
         missing = []
         if not _HAVE_PYAUTOGUI:
@@ -1689,8 +1804,53 @@ keep responses tight. when reporting results, use the voice above.
 """
 
 
+IDE_TAILWIND_ADDENDUM = """IDE addendum — Tailwind is ENABLED:
+- the renderer will inject the Tailwind Play CDN (`https://cdn.tailwindcss.com`)
+  into the preview automatically. do NOT add a <script> for it yourself.
+- style the page with Tailwind utility classes (flex, grid, rounded-2xl,
+  shadow-sm, text-slate-700, etc.). prefer Tailwind over hand-written CSS.
+- you may include a tiny `tailwind.config = { ... }` inline script before the
+  closing </head> when you need theme extensions or the `darkMode: 'class'`
+  hook — that is the Play-CDN config pattern.
+- avoid dumping raw <style> rules for things Tailwind already covers.
+  keep the result looking polished and modern by default.
+"""
+
+IDE_MULTIFILE_ADDENDUM = """IDE addendum — multi-file output is ENABLED:
+- when the task warrants separating concerns (more than a trivial page),
+  emit a small folder structure instead of a single HTML file. use fenced
+  code blocks with a `path=` info string, one per file:
+
+    ```html path=index.html
+    <!doctype html><html>... link style.css / script.js here ...</html>
+    ```
+
+    ```css path=style.css
+    /* stylesheet */
+    ```
+
+    ```js path=script.js
+    // client script
+    ```
+
+- ALWAYS include `path=index.html` as the entry point. other common paths:
+  `style.css`, `script.js`, `assets/...`. keep paths relative and
+  POSIX-style (forward slashes). no absolute paths, no `..`.
+- the renderer will inline linked css/js into the preview iframe so
+  `<link rel="stylesheet" href="style.css">` and `<script src="script.js">`
+  both work in the live preview. Export Project will zip the files
+  separately, preserving the stated paths.
+- for trivial single-page work, a single ```html ...``` block is still fine.
+"""
+
+
 def build_system_prompt(include_tools: bool) -> str:
     parts = [SYSTEM_PROMPT_BASE.strip()]
+    settings = get_settings()
+    if settings.get("use_tailwind_cdn"):
+        parts.append(IDE_TAILWIND_ADDENDUM.strip())
+    if settings.get("ide_multifile"):
+        parts.append(IDE_MULTIFILE_ADDENDUM.strip())
     if include_tools:
         parts.append(tools_for_prompt())
     # learned memories — kept terse to stay token-cheap
@@ -2069,6 +2229,38 @@ class Handler(BaseHTTPRequestHandler):
             })
         if p == "/api/memories":
             return self._send_json(200, {"memories": _load_memories(), "path": str(MEMORIES_FILE)})
+        if p.startswith("/api/desktop/chat-state/"):
+            # GET the per-chat desktop-disabled flag
+            cid = p.split("/", 4)[4]
+            return self._send_json(200, {
+                "chat_id": cid,
+                "disabled": cid in _chat_desktop_disabled,
+            })
+        if p.startswith("/api/chats/") and p.count("/") == 3:
+            # GET a single chat's metadata (for restoring last_mode on switch)
+            cid = p.split("/")[3]
+            chats = get_chats()
+            if cid in chats["chats"]:
+                return self._send_json(200, chats["chats"][cid])
+            return self._send_json(404, {"error": "not found"})
+        if p == "/api/snapshots":
+            out = []
+            for f in sorted(SNAPSHOTS_DIR.glob("*.html")):
+                try:
+                    st = f.stat()
+                    out.append({"name": f.name, "size": st.st_size, "mtime": int(st.st_mtime)})
+                except Exception:
+                    continue
+            return self._send_json(200, {"snapshots": out, "path": str(SNAPSHOTS_DIR)})
+        if p.startswith("/api/snapshots/"):
+            # serve a single saved snapshot by filename (no path traversal)
+            fname = p.split("/", 3)[3]
+            if "/" in fname or "\\" in fname or ".." in fname:
+                return self._send_json(400, {"error": "bad name"})
+            fp = SNAPSHOTS_DIR / fname
+            if not fp.exists() or not fp.is_file():
+                return self._send_json(404, {"error": "not found"})
+            return self._send_bytes(200, fp.read_bytes(), "text/html; charset=utf-8")
         if p == "/api/desktop/status":
             s = get_settings()
             return self._send_json(200, {
@@ -2229,6 +2421,45 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(200, {"ok": True})
             except Exception as e:
                 return self._send_json(500, {"error": str(e)})
+        if p == "/api/memories":
+            # manual add from the memories panel in Settings
+            text = (body.get("text") or "").strip()
+            tags = body.get("tags") or []
+            if not text:
+                return self._send_json(400, {"error": "text required"})
+            r = tool_remember({"text": text, "tags": tags if isinstance(tags, list) else []})
+            broadcast_event({"type": "memories:update"})
+            return self._send_json(200, r)
+        if p == "/api/snapshots":
+            # save the currently-rendered preview html (or any html blob the
+            # client wants to keep) to data/snapshots/ with a safe filename.
+            raw_name = (body.get("name") or "snapshot").strip()
+            html = body.get("html") or ""
+            if not html:
+                return self._send_json(400, {"error": "html required"})
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_name)[:60] or "snapshot"
+            if not safe.lower().endswith(".html"):
+                safe = safe + ".html"
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            final_name = f"{ts}-{safe}"
+            out_path = SNAPSHOTS_DIR / final_name
+            out_path.write_text(html, encoding="utf-8")
+            return self._send_json(200, {
+                "ok": True,
+                "name": final_name,
+                "path": str(out_path),
+                "url": f"/api/snapshots/{final_name}",
+            })
+        if p == "/api/desktop/chat-toggle":
+            cid = (body.get("chat_id") or "").strip()
+            if not cid:
+                return self._send_json(400, {"error": "chat_id required"})
+            disabled = bool(body.get("disabled"))
+            if disabled:
+                _chat_desktop_disabled.add(cid)
+            else:
+                _chat_desktop_disabled.discard(cid)
+            return self._send_json(200, {"chat_id": cid, "disabled": disabled})
         if p == "/api/system-context/refresh":
             try:
                 md = rescan_system_context()
@@ -2299,7 +2530,8 @@ class Handler(BaseHTTPRequestHandler):
         user_text = (body.get("message") or "").strip()
         mode = body.get("mode") or "auto"  # auto | ide | agent
         images = body.get("images") or []  # list of base64 data URLs
-        if not user_text and not images:
+        regenerate = bool(body.get("regenerate"))
+        if not user_text and not images and not regenerate:
             return self._send_json(400, {"error": "empty message"})
 
         # describe any attached images with the small vision model first; the main
@@ -2323,13 +2555,27 @@ class Handler(BaseHTTPRequestHandler):
             }
             chats["order"].insert(0, chat_id)
         chat = chats["chats"][chat_id]
-        # auto-name any chat still using the default placeholder when its first
-        # user message comes in
-        is_first_user_msg = not any(m.get("role") == "user" for m in chat.get("messages", []))
-        if is_first_user_msg and chat.get("title", "").strip().lower() in ("", "new session", "new conversation"):
-            chat["title"] = _title_from_prompt(user_text)
-            broadcast_event({"type": "chat:rename", "chat_id": chat_id, "title": chat["title"]})
-        chat["messages"].append({"role": "user", "content": user_text, "t": int(time.time())})
+        # remember the mode this chat was last used in so the client can
+        # restore it on session switch
+        chat["last_mode"] = mode
+        # regenerate: drop the last assistant turn so we re-run on the same
+        # prior user message.  only valid if the most recent message is
+        # actually an assistant reply.
+        if regenerate:
+            while chat["messages"] and chat["messages"][-1].get("role") == "assistant":
+                chat["messages"].pop()
+            if not chat["messages"] or chat["messages"][-1].get("role") != "user":
+                save_json(CHATS_FILE, chats)
+                return self._send_json(400, {"error": "nothing to regenerate"})
+            user_text = chat["messages"][-1].get("content", "")
+        else:
+            # auto-name any chat still using the default placeholder when its first
+            # user message comes in
+            is_first_user_msg = not any(m.get("role") == "user" for m in chat.get("messages", []))
+            if is_first_user_msg and chat.get("title", "").strip().lower() in ("", "new session", "new conversation"):
+                chat["title"] = _title_from_prompt(user_text)
+                broadcast_event({"type": "chat:rename", "chat_id": chat_id, "title": chat["title"]})
+            chat["messages"].append({"role": "user", "content": user_text, "t": int(time.time())})
         chat["updated"] = int(time.time())
         save_json(CHATS_FILE, chats)
 
@@ -2360,6 +2606,7 @@ class Handler(BaseHTTPRequestHandler):
             broadcast_event(evt)
 
         emit({"type": "chat_start", "chat_id": chat_id})
+        tok = _current_chat_id.set(chat_id)
         try:
             final = run_chat_turn(chat_id, msgs, use_tools=use_tools, emit=emit)
         except Exception as e:
@@ -2369,6 +2616,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 return
             final = None
+        finally:
+            _current_chat_id.reset(tok)
 
         if final:
             chats = get_chats()
