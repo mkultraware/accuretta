@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Accuretta</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#141412">
+<link rel="stylesheet" href="/app.css">
+<script src="https://unpkg.com/@phosphor-icons/web"></script>
+</head>
+<body>
+
+<div class="app preview-collapsed" id="app">
+
+  <!-- ====== LEFT SIDEBAR (desktop) / MOBILE SESSIONS SCREEN ====== -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <img src="/design/assets/logo-mark.png" alt="">
+      <span>accuretta</span>
+      <span class="v" id="brand-v">v0.1.0</span>
+    </div>
+    <div class="side-actions">
+      <button class="btn accent sm" id="btn-new-chat"><i class="ph ph-plus"></i>New session</button>
+      <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
+    </div>
+
+    <div class="section-head">
+      <span>Sessions</span>
+      <span class="grow"></span>
+    </div>
+    <div class="chatlist" id="chatlist"></div>
+
+    <div class="section-head">
+      <span>Workspace</span>
+      <span class="grow"></span>
+      <button class="iconbtn" id="btn-ws-add-toggle" title="Add folder"><i class="ph ph-plus"></i></button>
+    </div>
+    <div class="workspace" id="workspace">
+      <div id="ws-list"></div>
+      <div class="ws-add hidden" id="ws-add">
+        <input id="ws-input" placeholder="C:\path\to\folder" autocomplete="off">
+        <button class="btn sm" id="ws-browse-btn" title="Browse for folder"><i class="ph ph-folder-open"></i></button>
+        <button class="btn accent sm" id="ws-add-btn">Add</button>
+      </div>
+    </div>
+
+    <div class="side-foot">
+      <div class="ctx-gauge" id="ctx-gauge" title="context window usage">
+        <svg viewBox="0 0 32 32" width="24" height="24" aria-hidden="true">
+          <circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="2.5" opacity="0.15"></circle>
+          <circle id="ctx-gauge-arc" cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="2.5"
+                  stroke-linecap="round" stroke-dasharray="81.68" stroke-dashoffset="81.68"
+                  transform="rotate(-90 16 16)"></circle>
+        </svg>
+        <span class="ctx-gauge-label" id="ctx-gauge-label">0%</span>
+      </div>
+      <button class="btn ghost sm" id="btn-faq" title="About Accuretta"><i class="ph ph-question"></i>FAQ</button>
+      <button class="btn ghost sm" id="btn-settings"><i class="ph ph-gear-six"></i>Settings</button>
+    </div>
+  </aside>
+
+  <button class="pull-tab-left" id="pull-tab-left" title="Open sidebar"><i class="ph ph-caret-right"></i></button>
+
+  <!-- ====== CENTER ====== -->
+  <div class="center">
+    <div class="topbar">
+      <button class="iconbtn" id="btn-toggle-sidebar-m" title="Sidebar"><i class="ph ph-list"></i></button>
+      <div class="path">
+        <i class="ph ph-chat-circle-dots"></i>
+        <span class="em" id="chat-title">new session</span>
+        <span class="sep">·</span>
+        <span id="chat-meta">local</span>
+      </div>
+      <div class="actions">
+        <button class="iconbtn" id="btn-theme" title="Theme"><i class="ph ph-moon"></i></button>
+        <button class="iconbtn" id="btn-toggle-preview" title="Toggle preview"><i class="ph ph-browser"></i></button>
+        <button class="iconbtn mobile-only" id="btn-mobile-menu" title="Menu"><i class="ph ph-dots-three-vertical"></i></button>
+      </div>
+    </div>
+
+    <div class="mobile-menu-scrim" id="mobile-menu-scrim"></div>
+    <div class="mobile-menu" id="mobile-menu" role="menu">
+      <button class="mm-item" data-mm="theme"><i class="ph ph-moon"></i><span id="mm-theme-label">Dark mode</span></button>
+      <div class="mm-sep"></div>
+      <button class="mm-item" data-mm="chat"><i class="ph ph-chats-circle"></i>Chat</button>
+      <button class="mm-item" data-mm="sessions"><i class="ph ph-list-bullets"></i>Sessions</button>
+      <button class="mm-item" data-mm="approvals"><i class="ph ph-shield-check"></i>Approvals</button>
+      <div class="mm-sep"></div>
+      <button class="mm-item" data-mm="settings"><i class="ph ph-gear-six"></i>Settings</button>
+      <button class="mm-item" data-mm="faq"><i class="ph ph-question"></i>FAQ</button>
+    </div>
+
+    <div class="chat">
+      <div class="chat-scroll" id="chat-scroll">
+        <div class="chat-inner" id="chat-inner">
+          <div class="bubble-row">
+            <div class="avatar"><i class="ph-bold ph-sparkle" style="font-size:12px"></i></div>
+            <div class="bubble-col">
+              <div class="bubble agent">Welcome to Accuretta. What would you like to do today?</div>
+              <div class="bubble-meta">accuretta</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="composer-wrap">
+        <div class="composer">
+          <div class="composer-tools">
+            <button class="chip" id="mode-ide" data-mode="ide"><i class="ph ph-code"></i>IDE</button>
+            <button class="chip" id="mode-agent" data-mode="agent"><i class="ph ph-terminal-window"></i>Agent</button>
+            <button class="chip on" id="mode-auto" data-mode="auto"><i class="ph ph-lightning"></i>Auto</button>
+            <button class="chip" id="btn-attach-image" title="Attach image — the vision model reads it and hands a description to the main model"><i class="ph ph-image"></i>Image</button>
+            <input type="file" id="file-image" accept="image/*" multiple hidden>
+            <span class="composer-spacer"></span>
+            <button class="model-pill" id="model-pill">select model</button>
+          </div>
+          <div class="image-tray hidden" id="image-tray"></div>
+          <textarea class="composer-input" id="composer-input" rows="2" placeholder="ask, build, or instruct…"></textarea>
+          <div class="composer-foot">
+            <span class="composer-hint">⌘⏎ send · Shift⏎ newline</span>
+            <button class="btn danger hidden" id="btn-stop"><i class="ph ph-stop-circle"></i>Stop</button>
+            <button class="btn accent" id="btn-send"><i class="ph-bold ph-arrow-up"></i>Send</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="preview-resizer" id="preview-resizer" title="Drag to resize"></div>
+
+  <!-- ====== RIGHT: PREVIEW PANE ====== -->
+  <aside class="preview" id="preview">
+    <div class="preview-head">
+      <div class="title">
+        <i class="ph ph-browser"></i>
+        <span>Prerender</span>
+        <span class="url-pill" id="preview-url">—</span>
+      </div>
+      <span class="grow"></span>
+      <div class="preview-toggle">
+        <button class="active" id="btn-view-preview">Preview</button>
+        <button id="btn-view-code">Code</button>
+      </div>
+      <button class="iconbtn" id="btn-refresh" title="Refresh"><i class="ph ph-arrow-clockwise"></i></button>
+      <button class="iconbtn" id="btn-open-new" title="Open in new tab"><i class="ph ph-arrow-square-out"></i></button>
+      <button class="iconbtn" id="btn-close-preview" title="Minimize"><i class="ph ph-x"></i></button>
+    </div>
+
+    <div class="version-bar" id="version-bar">
+      <span id="versions-empty">no versions yet</span>
+      <span class="spacer"></span>
+    </div>
+
+    <div class="preview-body" id="preview-body">
+      <div class="preview-empty" id="preview-empty">
+        <i class="ph ph-layout"></i>
+        <div class="h">nothing to render.</div>
+        <div class="s">ask the agent to build a page.<br>e.g. "build a pricing page with three tiers."</div>
+      </div>
+      <iframe class="preview-frame hidden" id="preview-frame" sandbox="allow-scripts allow-forms allow-modals allow-popups"></iframe>
+      <pre class="code-view hidden" id="code-view"></pre>
+    </div>
+
+    <div class="preview-foot">
+      <span id="preview-meta">—</span>
+      <span id="preview-size">—</span>
+    </div>
+  </aside>
+
+  <button class="pull-tab" id="pull-tab" title="Open preview">
+    <i class="ph ph-browser"></i>
+    <span>preview</span>
+  </button>
+
+  <!-- ====== MOBILE TAB BAR ====== -->
+  <nav class="mobile-tabs" id="mobile-tabs">
+    <button class="mobile-tab active" data-mtab="chat"><i class="ph ph-chats-circle"></i><span>Chat</span></button>
+    <button class="mobile-tab" data-mtab="sessions"><i class="ph ph-list-bullets"></i><span>Sessions</span></button>
+    <button class="mobile-tab" data-mtab="approvals"><i class="ph ph-shield-check"></i><span>Approvals</span></button>
+    <button class="mobile-tab" data-mtab="settings"><i class="ph ph-gear-six"></i><span>Settings</span></button>
+  </nav>
+</div>
+
+<!-- ====== FAQ MODAL ====== -->
+<div class="modal-scrim" id="faq-scrim"></div>
+<aside class="modal" id="faq-modal" aria-hidden="true">
+  <div class="modal-head">
+    <i class="ph ph-sparkle"></i>
+    <h3>About Accuretta</h3>
+    <button class="iconbtn" id="btn-close-faq"><i class="ph ph-x"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="faq-q">what is accuretta?</div>
+    <p>a local-first LLM wrapper. it runs entirely on your machine — no cloud API, no telemetry, no account. the model lives in <code>ollama</code>, the bridge is a small python server, the UI is served on <code>localhost:8787</code>.</p>
+
+    <div class="faq-q">what are the modes?</div>
+    <p><b>IDE</b> — model replies with one HTML document and the right pane renders it live, saving every version. good for building landing pages, mocks, dashboards.<br>
+    <b>Agent</b> — model calls tools to list files, read, write, run powershell. every write/run asks for your approval first.<br>
+    <b>Auto</b> — bridge picks IDE vs. Agent based on what you asked.</p>
+
+    <div class="faq-q">what is ACCURETTA.md?</div>
+    <p>a scan of your machine (OS, known folders, drives) written to <code>data/ACCURETTA.md</code> on first boot. it's injected into every chat so the model knows where your Desktop, Documents, Screenshots live. edit it freely — it's re-read each turn. rescan from Settings.</p>
+
+    <div class="faq-q">why tokens and not streaming text?</div>
+    <p>the model itself decides when to speak. small local models often spend their whole reply budget inside <code>&lt;think&gt;</code> tags and never produce a visible answer. bump <b>Max reply tokens</b> in Settings if that happens, or switch to a different model.</p>
+
+    <div class="faq-q">how is my data stored?</div>
+    <p>everything lives in <code>./data</code>: chat history, workspace, settings, versions, system context. nothing leaves the machine unless you explicitly allow it.</p>
+
+    <div class="faq-q">what does the context gauge show?</div>
+    <p>how full the current session's prompt is relative to <code>num_ctx</code>. once it hits the outer ring, older messages get silently dropped. start a new session, or raise num_ctx in Settings.</p>
+
+    <div class="faq-q">keyboard shortcuts?</div>
+    <p><code>⌘⏎</code> / <code>Ctrl⏎</code> send · <code>Shift⏎</code> newline · click model name in the chat meta to open Settings.</p>
+  </div>
+</aside>
+
+<!-- ====== APPROVAL STACK ====== -->
+<div class="approval-stack" id="approval-stack"></div>
+
+<!-- ====== SETTINGS DRAWER ====== -->
+<div class="drawer-scrim" id="drawer-scrim"></div>
+<aside class="drawer" id="settings-drawer" aria-hidden="true">
+  <div class="drawer-head">
+    <i class="ph ph-gear-six"></i>
+    <h3>Settings</h3>
+    <button class="iconbtn" id="btn-close-settings"><i class="ph ph-x"></i></button>
+  </div>
+  <div class="drawer-body" id="settings-body">
+    <div class="form-group">Model</div>
+    <div class="form-row">
+      <label>Chat model</label>
+      <div style="display:flex;gap:6px;">
+        <select id="set-model" style="flex:1;"></select>
+        <button class="btn sm" id="btn-refresh-models" title="Re-scan ollama"><i class="ph ph-arrow-clockwise"></i></button>
+      </div>
+      <span class="hint">pulled from <code>ollama list</code>. If empty: open a new terminal and run <code>ollama pull qwen3:8b</code>, then click refresh.</span>
+    </div>
+    <div class="form-row">
+      <label>Vision model</label>
+      <select id="set-vision"></select>
+    </div>
+
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+      <span>Speed</span>
+      <span class="grow" style="flex:1;"></span>
+      <button class="btn sm" id="btn-apply-rec" type="button" title="Apply recommended settings for the chosen model"><i class="ph ph-sparkle"></i>Use recommended</button>
+    </div>
+    <div class="form-row" id="rec-hint" style="display:none;">
+      <span class="hint" id="rec-hint-text"></span>
+    </div>
+    <div class="form-row">
+      <label>Context window · num_ctx</label>
+      <input type="number" id="set-ctx" min="512" step="256">
+      <span class="hint">tokens the model sees. Bigger = more memory, slower. 8k is safe.</span>
+    </div>
+    <div class="form-row">
+      <label>GPU layers · num_gpu</label>
+      <input type="number" id="set-gpu" min="0" step="1">
+      <span class="hint">99 = all on GPU. Drop if VRAM-limited.</span>
+    </div>
+    <div class="form-row">
+      <label>Batch size · num_batch</label>
+      <input type="number" id="set-batch" min="32" step="32">
+    </div>
+    <div class="form-row">
+      <label>Threads · num_thread</label>
+      <input type="number" id="set-thread" min="0" step="1">
+      <span class="hint">0 = auto.</span>
+    </div>
+    <div class="form-row">
+      <label>Max reply tokens · num_predict</label>
+      <input type="number" id="set-predict" step="1">
+      <span class="hint">-1 = unlimited.</span>
+    </div>
+    <div class="form-row">
+      <label>Keep model in VRAM · keep_alive</label>
+      <input id="set-keep">
+      <span class="hint">e.g. <code>30m</code>, <code>1h</code>, <code>-1</code>.</span>
+    </div>
+
+    <div class="form-group">Sampling</div>
+    <div class="form-row">
+      <label>Temperature</label>
+      <input type="number" id="set-temp" step="0.05" min="0" max="2">
+    </div>
+    <div class="form-row">
+      <label>Top-p</label>
+      <input type="number" id="set-topp" step="0.05" min="0" max="1">
+    </div>
+
+    <div class="form-group">Preview</div>
+    <div class="form-row inline">
+      <label>Allow web resources (fonts, stock images)</label>
+      <div class="sw" id="sw-web"></div>
+    </div>
+    <div class="form-row">
+      <span class="hint">when on, the preview iframe can load fonts.googleapis.com, images, and other cross-origin resources. off = air-gapped preview.</span>
+    </div>
+
+    <div class="form-group">Appearance</div>
+    <div class="form-row inline">
+      <label>Dark mode</label>
+      <div class="sw" id="sw-dark"></div>
+    </div>
+
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+      <span>Machine context</span>
+      <span class="grow" style="flex:1;"></span>
+      <button class="btn sm" id="btn-sysctx-rescan" type="button" title="Re-scan this machine"><i class="ph ph-arrow-clockwise"></i>Rescan</button>
+    </div>
+    <div class="form-row">
+      <span class="hint">this markdown is injected into every chat as <code>ACCURETTA.md</code> so the model knows where your Desktop, Documents, Screenshots, drives etc. are. edit freely — it is re-read every turn.</span>
+    </div>
+    <div class="form-row">
+      <label>File <code id="sysctx-path" class="hint"></code></label>
+      <textarea id="set-sysctx" rows="10" style="font-family:ui-monospace,Consolas,monospace;font-size:12px;"></textarea>
+    </div>
+    <div class="form-row">
+      <button class="btn sm" id="btn-sysctx-save" type="button"><i class="ph ph-check"></i>Save context</button>
+    </div>
+
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+      <span>Desktop automation</span>
+      <span class="grow" style="flex:1;"></span>
+      <span id="desktop-deps-badge" class="hint" style="font-size:10px;"></span>
+    </div>
+    <div class="form-row">
+      <span class="hint">lets the agent see and drive your screen (screenshot, launch apps, click, type). every action needs your approval. only apps you list below can be launched. use the panic button to stop everything instantly.</span>
+    </div>
+    <div class="form-row inline">
+      <label>Enable desktop automation</label>
+      <div class="sw" id="sw-desktop-enabled"></div>
+    </div>
+    <div class="form-row">
+      <label>App allowlist — one per line (exe name or absolute path)</label>
+      <textarea id="set-desktop-allowlist" rows="5" placeholder="notepad&#10;chrome&#10;C:\Program Files\Electronic Arts\EA Desktop\EA Desktop\EADesktop.exe" style="font-family:ui-monospace,Consolas,monospace;font-size:12px;"></textarea>
+      <span class="hint">matches any exe/path that contains a line from this list (case-insensitive). leave empty to block all launches. restart not required.</span>
+    </div>
+    <div class="form-row inline">
+      <label>Max actions per minute</label>
+      <input type="number" id="set-desktop-rate" min="1" max="300" style="max-width:100px;">
+    </div>
+    <div class="form-row" style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn danger sm" id="btn-desktop-panic" type="button" title="Stop all desktop automation instantly — denies every pending approval"><i class="ph ph-warning-octagon"></i>Panic / stop all</button>
+      <button class="btn sm" id="btn-desktop-resume" type="button" title="Clear the panic flag"><i class="ph ph-play"></i>Resume</button>
+      <span id="desktop-panic-state" class="hint" style="align-self:center;"></span>
+    </div>
+
+    <div class="form-row" style="margin-top: 20px;">
+      <button class="btn accent" id="btn-save-settings"><i class="ph ph-check"></i>Save</button>
+    </div>
+  </div>
+</aside>
+
+<script src="/app.js"></script>
+</body>
+</html>

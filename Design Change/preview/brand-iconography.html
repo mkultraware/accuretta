@@ -1,0 +1,59 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<script src="https://unpkg.com/@phosphor-icons/web"></script>
+<style>
+  body { padding: 20px 24px;}
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px;}
+  .lbl { font-family:var(--font-mono); font-size:10px; letter-spacing:0.14em; text-transform:uppercase; color:var(--fg-muted); width:76px;}
+  .icon {
+    width: 36px; height: 36px;
+    border-radius: 6px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 1px solid var(--border);
+    background: #FBFAF6;
+    color: var(--fg);
+  }
+  .icon i { font-size: 20px;}
+  .icon.safety { background: var(--safety); color: #5A2E0A; border-color: var(--safety-2);}
+  .icon.mint   { background: var(--mint); color: #1D4732; border-color: var(--mint-2);}
+  .icon.dark   { background: var(--off-black); color: var(--off-white); border-color: #2A2A26;}
+</style>
+</head>
+<body>
+  <div class="row">
+    <span class="lbl">Regular</span>
+    <div class="icon"><i class="ph ph-cpu"></i></div>
+    <div class="icon"><i class="ph ph-terminal-window"></i></div>
+    <div class="icon"><i class="ph ph-code-block"></i></div>
+    <div class="icon"><i class="ph ph-folder-open"></i></div>
+    <div class="icon"><i class="ph ph-play"></i></div>
+    <div class="icon"><i class="ph ph-pause"></i></div>
+    <div class="icon"><i class="ph ph-robot"></i></div>
+    <div class="icon"><i class="ph ph-sparkle"></i></div>
+  </div>
+  <div class="row">
+    <span class="lbl">Duotone</span>
+    <div class="icon"><i class="ph-duotone ph-cpu"></i></div>
+    <div class="icon"><i class="ph-duotone ph-terminal-window"></i></div>
+    <div class="icon"><i class="ph-duotone ph-code-block"></i></div>
+    <div class="icon"><i class="ph-duotone ph-folder-open"></i></div>
+    <div class="icon"><i class="ph-duotone ph-play"></i></div>
+    <div class="icon"><i class="ph-duotone ph-pause"></i></div>
+    <div class="icon"><i class="ph-duotone ph-robot"></i></div>
+    <div class="icon"><i class="ph-duotone ph-sparkle"></i></div>
+  </div>
+  <div class="row">
+    <span class="lbl">On color</span>
+    <div class="icon safety"><i class="ph-bold ph-lightning"></i></div>
+    <div class="icon mint"><i class="ph-bold ph-check"></i></div>
+    <div class="icon dark"><i class="ph-bold ph-terminal"></i></div>
+    <div class="icon"><i class="ph-fill ph-circle"></i></div>
+    <div class="icon"><i class="ph-thin ph-gear-six"></i></div>
+    <div class="icon"><i class="ph-light ph-flask"></i></div>
+  </div>
+</body>
+</html>

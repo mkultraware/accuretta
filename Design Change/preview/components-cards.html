@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<style>
+  body { padding: 18px 24px;}
+  .grid { display:grid; grid-template-columns: repeat(3, 1fr); gap:14px;}
+  .card {
+    background: #FBFAF6;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    display:flex; flex-direction:column; gap:8px;
+    box-shadow: var(--shadow-xs);
+  }
+  .card .head { display:flex; justify-content:space-between; align-items:center;}
+  .eyebrow { font-family:var(--font-mono); font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:var(--fg-muted);}
+  .title { font-family:var(--font-mono); font-size:14px; font-weight:600; color:var(--fg); letter-spacing:-0.01em;}
+  .body { font-family:var(--font-mono); font-size:11px; color:var(--fg-muted); line-height:1.5;}
+  .foot { display:flex; justify-content:space-between; align-items:center; margin-top:auto;}
+  .stat { font-family:var(--font-display); font-size:28px; font-weight:700; letter-spacing:-0.03em; color: var(--fg);}
+  .tiny { font-family:var(--font-mono); font-size:10px; color:var(--fg-faint);}
+  .accent-bar { height: 3px; width: 28px; background: var(--ember-2); border-radius: 2px;}
+  .sep { height: 1px; background: var(--border); margin: 4px -16px;}
+</style>
+</head>
+<body>
+  <div class="grid">
+    <div class="card">
+      <div class="eyebrow">Session</div>
+      <div class="title">accuretta · local</div>
+      <div class="body">Prerendering HTML for three files in parallel. 2,340 tokens / sec.</div>
+      <div class="sep"></div>
+      <div class="foot"><span class="tiny">00:12:44</span><span class="tiny" style="color:var(--mint-3)">● live</span></div>
+    </div>
+    <div class="card" style="background:var(--mint); border-color:var(--mint-2);">
+      <div class="eyebrow" style="color:#1D4732">Completed</div>
+      <div class="title" style="color:#1D4732">Plan approved</div>
+      <div class="stat" style="color:#1D4732">14 steps</div>
+      <div class="foot"><span class="tiny" style="color:#1D4732; opacity:0.7;">Ready to execute</span></div>
+    </div>
+    <div class="card" style="background:var(--off-black); color:var(--off-white); border-color:#2A2A26;">
+      <div class="eyebrow" style="color:var(--gray-30)">Model</div>
+      <div class="title" style="color:var(--off-white)">claude-3-7</div>
+      <div class="body" style="color:var(--gray-30)">Sonnet · 200k ctx · thinking on</div>
+      <div class="accent-bar"></div>
+      <div class="foot"><span class="tiny" style="color:var(--gray-40)">$3.00 / MTok</span><span class="tiny" style="color:var(--ember)">Default →</span></div>
+    </div>
+  </div>
+</body>
+</html>

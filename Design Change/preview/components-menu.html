@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<script src="https://unpkg.com/@phosphor-icons/web"></script>
+<style>
+  body { padding: 18px 24px; display:flex; gap: 18px; align-items:flex-start;}
+  .menu {
+    width: 240px;
+    background: #FBFAF6;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: var(--shadow-lg);
+    padding: 4px;
+    font-family: var(--font-mono);
+  }
+  .mi {
+    display:flex; align-items:center; justify-content:space-between;
+    padding: 6px 10px; border-radius: 4px; font-size: 12px; color: var(--fg);
+    gap: 10px;
+  }
+  .mi .l { display:flex; align-items:center; gap: 8px;}
+  .mi .l i { font-size: 14px; color: var(--fg-muted);}
+  .mi .k { font-size: 10px; color: var(--fg-faint);}
+  .mi.active { background: var(--bg-inset);}
+  .mi.accent { background: var(--safety); color: #5A2E0A;}
+  .mi.accent i { color: #5A2E0A;}
+  .sep { height: 1px; background: var(--border); margin: 4px 6px;}
+  .gp { font-size: 9px; text-transform: uppercase; letter-spacing: 0.14em; color: var(--fg-faint); padding: 6px 10px 2px;}
+  .cmd {
+    width: 280px;
+    background: var(--off-black);
+    color: var(--off-white);
+    border-radius: 10px;
+    box-shadow: var(--shadow-pop);
+    padding: 4px;
+    font-family: var(--font-mono);
+    border: 1px solid #2A2A26;
+  }
+  .cmd .inp { display:flex; align-items:center; padding: 8px 12px; gap: 8px; border-bottom: 1px solid #2A2A26;}
+  .cmd .inp i { color: var(--gray-30);}
+  .cmd .inp input { background:none; border:none; outline:none; color: var(--off-white); font-family: var(--font-mono); font-size: 12px; flex:1;}
+  .cmd .mi { color: var(--off-white);}
+  .cmd .mi .l i { color: var(--gray-30);}
+  .cmd .mi.active { background: #2A2A26;}
+  .cmd .gp { color: var(--gray-40);}
+</style>
+</head>
+<body>
+  <div class="menu">
+    <div class="gp">Session</div>
+    <div class="mi"><div class="l"><i class="ph ph-arrow-clockwise"></i>New chat</div><span class="k">⌘N</span></div>
+    <div class="mi active"><div class="l"><i class="ph ph-floppy-disk"></i>Save snapshot</div><span class="k">⌘S</span></div>
+    <div class="mi"><div class="l"><i class="ph ph-export"></i>Export HTML</div><span class="k">⌘E</span></div>
+    <div class="sep"></div>
+    <div class="gp">Agent</div>
+    <div class="mi"><div class="l"><i class="ph ph-sliders"></i>Model settings</div><span class="k">⌘,</span></div>
+    <div class="mi accent"><div class="l"><i class="ph ph-lightning"></i>Prerender now</div><span class="k">⌘⏎</span></div>
+  </div>
+  <div class="cmd">
+    <div class="inp"><i class="ph ph-magnifying-glass"></i><input value="prer" /></div>
+    <div style="padding: 4px;">
+      <div class="gp">Commands</div>
+      <div class="mi active"><div class="l"><i class="ph ph-lightning"></i>Prerender HTML</div><span class="k">⌘⏎</span></div>
+      <div class="mi"><div class="l"><i class="ph ph-play"></i>Preview in browser</div><span class="k">⌘P</span></div>
+      <div class="mi"><div class="l"><i class="ph ph-git-branch"></i>Preview → branch</div></div>
+    </div>
+  </div>
+</body>
+</html>

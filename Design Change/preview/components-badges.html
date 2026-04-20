@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<style>
+  body { padding: 20px 24px;}
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px;}
+  .lbl { font-family:var(--font-mono); font-size:10px; letter-spacing:0.14em; text-transform:uppercase; color:var(--fg-muted); width:70px;}
+  .badge {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .badge.mint { background: var(--mint); color: #1D4732;}
+  .badge.lilac { background: var(--lilac); color: #3A2E5A;}
+  .badge.pink { background: var(--pink); color: #6B2544;}
+  .badge.lemon { background: var(--lemon); color: #6B571A;}
+  .badge.ember { background: var(--accent-subtle); color: #5A3A1E;}
+  .badge.slate { background: var(--bg-inset); color: var(--fg-muted);}
+  .dot { width:5px; height:5px; border-radius:999px;}
+  .pill {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 4px 10px 4px 8px;
+    border-radius: 999px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    display:inline-flex; align-items:center; gap:6px;
+    color: var(--fg);
+  }
+</style>
+</head>
+<body>
+  <div class="row">
+    <span class="lbl">Status</span>
+    <span class="badge mint"><span class="dot" style="background:var(--mint-3)"></span>Running</span>
+    <span class="badge lemon"><span class="dot" style="background:var(--lemon-3)"></span>Paused</span>
+    <span class="badge pink"><span class="dot" style="background:var(--pink-3)"></span>Failed</span>
+    <span class="badge lilac"><span class="dot" style="background:var(--lilac-3)"></span>Queued</span>
+    <span class="badge slate"><span class="dot" style="background:var(--gray-30)"></span>Idle</span>
+  </div>
+  <div class="row">
+    <span class="lbl">Labels</span>
+    <span class="badge ember">v0.8.2</span>
+    <span class="badge slate">local</span>
+    <span class="badge lilac">beta</span>
+    <span class="badge mint">synced</span>
+    <span class="badge pink">experimental</span>
+  </div>
+  <div class="row">
+    <span class="lbl">Pills</span>
+    <span class="pill">claude-3-7-sonnet</span>
+    <span class="pill">gpt-5</span>
+    <span class="pill">deepseek-r1</span>
+    <span class="pill" style="background:var(--accent-subtle); border-color:var(--ember)">+ Add model</span>
+  </div>
+</body>
+</html>

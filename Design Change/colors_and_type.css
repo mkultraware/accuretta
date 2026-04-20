@@ -1,0 +1,314 @@
+/* ============================================================
+   ACCURETTA — Colors & Type
+   Pastel candy palette · Mono-forward · Off-white / Off-black
+   ============================================================ */
+
+/* ---- FONTS ---------------------------------------------------
+   Primary mono: JetBrains Mono (technical, multi-weight, broad glyph set)
+   Display mono: Space Mono (slightly more character for H1/display)
+   Sans fallback: Inter Tight (when mono is too dense for body copy)
+   ⚠ SUBSTITUTION FLAG: no proprietary fonts were provided — these
+   are the closest Google Font matches for "mono-forward technical".
+   Please provide licensed fonts if a specific family is desired.
+-------------------------------------------------------------- */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&family=Space+Mono:wght@400;700&family=Inter+Tight:wght@400;500;600;700&display=swap');
+
+:root {
+  /* ---- TYPE FAMILIES ---- */
+  --font-mono:    'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-display: 'Space Mono', 'JetBrains Mono', ui-monospace, monospace;
+  --font-sans:    'Inter Tight', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+
+  /* ---- TYPE SCALE (fluid-ish, desktop-first) ---- */
+  --fs-xs:   11px;
+  --fs-sm:   12px;
+  --fs-base: 14px;
+  --fs-md:   16px;
+  --fs-lg:   18px;
+  --fs-xl:   22px;
+  --fs-2xl:  28px;
+  --fs-3xl:  36px;
+  --fs-4xl:  48px;
+  --fs-5xl:  64px;
+  --fs-6xl:  88px;
+
+  --lh-tight:  1.08;
+  --lh-snug:   1.25;
+  --lh-normal: 1.5;
+  --lh-loose:  1.7;
+
+  --ls-tightest: -0.04em;
+  --ls-tight:    -0.02em;
+  --ls-normal:   0;
+  --ls-wide:     0.04em;
+  --ls-widest:   0.12em;
+
+  /* ---- CANDY PASTEL PALETTE (brand) ---- */
+  --mint:   #B8EDD4;
+  --mint-2: #8FDBB8;
+  --mint-3: #6AC49A;
+
+  --lilac:   #D6C7F4;
+  --lilac-2: #B69EE8;
+  --lilac-3: #8E72D1;
+
+  /* "Safety orange" — true hi-vis traffic-cone orange */
+  --safety:   #FF8C1A;
+  --safety-2: #FF6A00;
+  --safety-3: #E04E00;
+  /* Legacy aliases — keep --pink-* pointing at safety so existing refs don't break */
+  --pink:   var(--safety);
+  --pink-2: var(--safety-2);
+  --pink-3: var(--safety-3);
+
+  --lemon:   #F5EAAE;
+  --lemon-2: #E8D370;
+  --lemon-3: #C9AE3A;
+
+  /* Accent orange — lifted from the logo gradient */
+  --ember:   #F4A261;
+  --ember-2: #E8813A;
+  --ember-3: #C5611C;
+
+  /* ---- OFF-WHITE / OFF-BLACK NEUTRALS ---- */
+  --off-white:   #F6F4EF;  /* warm paper */
+  --off-white-2: #EDEAE2;
+  --off-white-3: #E2DED4;
+
+  --off-black:   #141412;  /* warm graphite */
+  --off-black-2: #1E1E1B;
+  --off-black-3: #2A2A26;
+
+  --gray-05: #F0EEE8;
+  --gray-10: #E2DED4;
+  --gray-20: #CAC6BC;
+  --gray-30: #A8A49A;
+  --gray-40: #7F7C73;
+  --gray-50: #5A5852;
+  --gray-60: #3D3C38;
+  --gray-70: #2A2A26;
+  --gray-80: #1E1E1B;
+  --gray-90: #141412;
+
+  /* ---- SEMANTIC (LIGHT MODE DEFAULT) ---- */
+  --bg:        var(--off-white);
+  --bg-raised: #FBFAF6;
+  --bg-sunken: var(--off-white-2);
+  --bg-inset:  var(--off-white-3);
+
+  --fg:        var(--off-black);
+  --fg-muted:  var(--gray-50);
+  --fg-subtle: var(--gray-40);
+  --fg-faint:  var(--gray-30);
+  --fg-invert: var(--off-white);
+
+  --border:         var(--gray-10);
+  --border-strong:  var(--gray-20);
+  --border-subtle:  var(--gray-05);
+
+  --accent:         var(--ember-2);
+  --accent-hover:   var(--ember-3);
+  --accent-subtle:  #F9E3CC;
+  --accent-fg:      #FFFFFF;
+
+  --success:  var(--mint-3);
+  --warning:  var(--lemon-3);
+  --danger:   var(--pink-3);
+  --info:     var(--lilac-3);
+
+  --success-subtle: var(--mint);
+  --warning-subtle: var(--lemon);
+  --danger-subtle:  var(--pink);
+  --info-subtle:    var(--lilac);
+
+  /* ---- RADII ---- */
+  --r-xs: 2px;
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 10px;
+  --r-xl: 14px;
+  --r-2xl: 20px;
+  --r-full: 999px;
+
+  /* ---- SPACING (4px base) ---- */
+  --s-0: 0;
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-8: 32px;
+  --s-10: 40px;
+  --s-12: 48px;
+  --s-16: 64px;
+  --s-20: 80px;
+  --s-24: 96px;
+
+  /* ---- SHADOWS (low, quiet — technical aesthetic) ---- */
+  --shadow-xs: 0 1px 0 rgba(20,20,18,0.04);
+  --shadow-sm: 0 1px 2px rgba(20,20,18,0.06), 0 0 0 1px rgba(20,20,18,0.04);
+  --shadow-md: 0 4px 12px rgba(20,20,18,0.06), 0 0 0 1px rgba(20,20,18,0.04);
+  --shadow-lg: 0 12px 32px rgba(20,20,18,0.10), 0 0 0 1px rgba(20,20,18,0.04);
+  --shadow-pop: 0 20px 60px rgba(20,20,18,0.18), 0 0 0 1px rgba(20,20,18,0.06);
+
+  /* ---- INNER SHADOWS (inset wells, code blocks) ---- */
+  --shadow-inset: inset 0 1px 0 rgba(20,20,18,0.04), inset 0 0 0 1px rgba(20,20,18,0.04);
+
+  /* ---- MOTION ---- */
+  --ease-out:    cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-in-out: cubic-bezier(0.6, 0, 0.4, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --dur-fast:   120ms;
+  --dur-base:   200ms;
+  --dur-slow:   360ms;
+
+  /* ---- Z LAYERS ---- */
+  --z-base: 1;
+  --z-raised: 10;
+  --z-sticky: 100;
+  --z-overlay: 1000;
+  --z-modal: 2000;
+  --z-toast: 3000;
+}
+
+/* ============================================================
+   DARK MODE (off-black)
+   ============================================================ */
+[data-theme="dark"],
+.dark {
+  --bg:        var(--off-black);
+  --bg-raised: var(--off-black-2);
+  --bg-sunken: #0E0E0C;
+  --bg-inset:  var(--off-black-3);
+
+  --fg:        var(--off-white);
+  --fg-muted:  var(--gray-30);
+  --fg-subtle: var(--gray-40);
+  --fg-faint:  var(--gray-50);
+  --fg-invert: var(--off-black);
+
+  --border:        #2A2A26;
+  --border-strong: #3D3C38;
+  --border-subtle: #1E1E1B;
+
+  --accent:        var(--ember);
+  --accent-hover:  #F7B884;
+  --accent-subtle: #3A2818;
+  --accent-fg:     var(--off-black);
+
+  --success-subtle: #1D3328;
+  --warning-subtle: #33301D;
+  --danger-subtle:  #33202A;
+  --info-subtle:    #2A2438;
+
+  --shadow-xs: 0 1px 0 rgba(0,0,0,0.3);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.04);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04);
+  --shadow-lg: 0 12px 32px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.04);
+  --shadow-pop: 0 20px 60px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.06);
+
+  --shadow-inset: inset 0 1px 0 rgba(0,0,0,0.3), inset 0 0 0 1px rgba(255,255,255,0.04);
+}
+
+/* ============================================================
+   BASE ELEMENTS
+   ============================================================ */
+html, body {
+  font-family: var(--font-mono);
+  font-size: var(--fs-base);
+  line-height: var(--lh-normal);
+  color: var(--fg);
+  background: var(--bg);
+  font-feature-settings: 'ss01', 'ss02', 'cv01', 'cv02';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1, .h1 {
+  font-family: var(--font-display);
+  font-size: var(--fs-5xl);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--ls-tightest);
+  font-weight: 700;
+  margin: 0;
+}
+h2, .h2 {
+  font-family: var(--font-display);
+  font-size: var(--fs-3xl);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--ls-tight);
+  font-weight: 700;
+  margin: 0;
+}
+h3, .h3 {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xl);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--ls-tight);
+  font-weight: 600;
+  margin: 0;
+}
+h4, .h4 {
+  font-family: var(--font-mono);
+  font-size: var(--fs-lg);
+  line-height: var(--lh-snug);
+  font-weight: 600;
+  margin: 0;
+}
+h5, .h5 {
+  font-family: var(--font-mono);
+  font-size: var(--fs-base);
+  line-height: var(--lh-snug);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-widest);
+  margin: 0;
+}
+
+p, .p {
+  font-family: var(--font-mono);
+  font-size: var(--fs-base);
+  line-height: var(--lh-loose);
+  color: var(--fg);
+  margin: 0;
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-widest);
+  color: var(--fg-muted);
+  font-weight: 500;
+}
+
+.caption {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  line-height: var(--lh-normal);
+}
+
+code, pre, .code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  font-feature-settings: 'ss01', 'ss02', 'calt' 0;
+}
+
+kbd {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  padding: 2px 6px;
+  border-radius: var(--r-sm);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-xs);
+  color: var(--fg-muted);
+}
+
+/* Selection uses the brand ember */
+::selection {
+  background: var(--accent-subtle);
+  color: var(--fg);
+}

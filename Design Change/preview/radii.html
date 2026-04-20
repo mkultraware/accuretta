@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<style>
+  body { padding: 20px 24px;}
+  .row { display:flex; gap:14px; align-items:flex-end;}
+  .item { display:flex; flex-direction:column; gap:6px; align-items:center;}
+  .box { width:72px; height:72px; background: var(--ember-2); border: 1px solid var(--ember-3);}
+  .tok { font-family:var(--font-mono); font-size:10px; letter-spacing:0.08em; text-transform:uppercase; color:var(--fg-muted);}
+  .px { font-family:var(--font-mono); font-size:10px; color:var(--fg-faint);}
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="item"><div class="box" style="border-radius:var(--r-xs)"></div><div class="tok">r-xs</div><div class="px">2px</div></div>
+    <div class="item"><div class="box" style="border-radius:var(--r-sm)"></div><div class="tok">r-sm</div><div class="px">4px</div></div>
+    <div class="item"><div class="box" style="border-radius:var(--r-md)"></div><div class="tok">r-md</div><div class="px">6px</div></div>
+    <div class="item"><div class="box" style="border-radius:var(--r-lg)"></div><div class="tok">r-lg</div><div class="px">10px</div></div>
+    <div class="item"><div class="box" style="border-radius:var(--r-xl)"></div><div class="tok">r-xl</div><div class="px">14px</div></div>
+    <div class="item"><div class="box" style="border-radius:var(--r-2xl)"></div><div class="tok">r-2xl</div><div class="px">20px</div></div>
+    <div class="item"><div class="box" style="border-radius:var(--r-full)"></div><div class="tok">r-full</div><div class="px">999px</div></div>
+  </div>
+</body>
+</html>

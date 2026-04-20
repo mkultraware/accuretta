@@ -1,0 +1,55 @@
+# ============================================================
+# accuretta — production-safe gitignore
+# anything in ./data is user-local (chats, keys, workspace paths,
+# machine scan, model choice). never commit it.
+# ============================================================
+
+# runtime user data — all of it is per-machine and often sensitive
+data/
+!data/.gitkeep
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# node / editor / ai tools cruft (in case we add any tooling later)
+node_modules/
+.vscode/
+.idea/
+.claude/
+.cursor/
+.cline/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# build / logs
+*.log
+*.tmp
+dist/
+build/
+coverage/
+
+# local design drafts that aren't part of the shipped app
+"Design Change/"
+
+# accuretta-specific safety net — if any of these sneak outside ./data
+ACCURETTA.md
+chats.json
+settings.json
+workspace.json
+approvals.json
+versions/
