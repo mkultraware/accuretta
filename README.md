@@ -23,6 +23,7 @@ Accuretta is a fully local AI bridge and Integrated Development Environment desi
 * **Coding and Prototyping:** Describe a pricing page or a dashboard layout, and Accuretta will generate it while rendering the result natively in the application browser.
 * **System Management:** Ask the agent to clean up your download folder or look for specific logs. It will write the necessary PowerShell commands and wait for your permission to execute them.
 * **Mobile Companion:** Access the interface from your phone on the local network to control your desktop remotely or chat with your local models while away from your keyboard.
+* **Workspace Analysis:** You can grant the application access to a specific workspace folder and ask the agent to act as a localized coding assistant. For example, simply ask, "I am having issues with the Python script in the workspace, can you help?" The agent will read the relevant files and propose fixes. Naturally, the execution quality will vary depending on your chosen model, but the foundational capability is completely supported.
 
 ### Alternative Perspectives
 
