@@ -118,6 +118,11 @@
             <input type="file" id="file-image" accept="image/*" multiple hidden>
             <button class="chip" id="toggle-tailwind" title="Inject the Tailwind Play CDN into generated HTML and ask the model to use Tailwind classes"><i class="ph ph-wind"></i>Tailwind CDN</button>
             <button class="chip" id="toggle-multifile" title="Have the model emit a small folder structure (index.html, style.css, script.js, assets/) — preview inlines it, Export Project zips the files separately"><i class="ph ph-folder-simple"></i>Multi-file</button>
+            <button class="toolbar-overflow mobile-only" id="btn-toolbar-overflow" title="More tools"><i class="ph ph-dots-three"></i></button>
+            <div class="toolbar-overflow-menu" id="toolbar-overflow-menu">
+              <button class="chip" id="toggle-tailwind-mobile"><i class="ph ph-wind"></i>Tailwind CDN</button>
+              <button class="chip" id="toggle-multifile-mobile"><i class="ph ph-folder-simple"></i>Multi-file</button>
+            </div>
             <span class="composer-spacer"></span>
             <button class="model-pill" id="model-pill">select model</button>
           </div>
@@ -286,6 +291,31 @@
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+      <span>Auto-Tune</span>
+      <span class="grow" style="flex:1;"></span>
+      <span id="hw-detect-badge" class="hint" style="font-size:10px;"></span>
+    </div>
+    <div class="form-row" id="hw-detect-row">
+      <div style="display:flex;gap:8px;align-items:flex-start;flex-direction:column;">
+        <div id="hw-detected-info" style="font-size:12px;color:var(--fg-muted);font-family:var(--font-mono);">
+          <!-- Populated by JS -->
+        </div>
+        <div style="display:flex;gap:6px;">
+          <button class="btn accent sm" id="btn-hw-detect" type="button">
+            <i class="ph ph-cpu"></i>Detect Hardware
+          </button>
+          <button class="btn sm" id="btn-hw-apply" type="button" disabled>
+            <i class="ph ph-lightning"></i>Apply Optimal
+          </button>
+        </div>
+      </div>
+      <span class="hint">
+        Automatically detects your GPU, CPU, and RAM to configure the best Ollama settings for 
+        your specific hardware. Targets 30+ tokens/second while maximizing context window.
+      </span>
+    </div>
+
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
       <span>Speed</span>
       <span class="grow" style="flex:1;"></span>
       <button class="btn sm" id="btn-apply-rec" type="button" title="Apply recommended settings for the chosen model"><i class="ph ph-sparkle"></i>Use recommended</button>
@@ -294,18 +324,19 @@
       <span class="hint" id="rec-hint-text"></span>
     </div>
     <div class="form-row">
-      <label>Context window · num_ctx</label>
+      <label>Context window · num_ctx <i class="ph ph-info" title="How many tokens the model can 'remember' at once. Each token ≈ 0.75 words. Larger = longer conversations but more VRAM usage. Auto-tune sets this based on your GPU VRAM."></i></label>
       <input type="number" id="set-ctx" min="512" step="256">
-      <span class="hint">tokens the model sees. Bigger = more memory, slower. 8k is safe.</span>
+      <span class="hint" id="ctx-hint">tokens the model sees. Bigger = more memory, slower. Auto-tuned for your hardware.</span>
     </div>
     <div class="form-row">
-      <label>GPU layers · num_gpu</label>
+      <label>GPU layers · num_gpu <i class="ph ph-info" title="How many model layers run on GPU vs CPU. 99 = all GPU (fastest). 0 = all CPU. Auto-tune detects your VRAM and sets this automatically."></i></label>
       <input type="number" id="set-gpu" min="0" step="1">
-      <span class="hint">99 = all on GPU. Drop if VRAM-limited.</span>
+      <span class="hint" id="gpu-hint">99 = all on GPU. Auto-detected from your graphics card.</span>
     </div>
     <div class="form-row">
-      <label>Batch size · num_batch</label>
+      <label>Batch size · num_batch <i class="ph ph-info" title="How many tokens processed in parallel. Larger = faster throughput but more VRAM. X3D CPUs benefit from larger batches."></i></label>
       <input type="number" id="set-batch" min="32" step="32">
+      <span class="hint" id="batch-hint">parallel token processing. Auto-tuned for your setup.</span>
     </div>
     <div class="form-row">
       <label>Threads · num_thread</label>

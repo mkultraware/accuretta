@@ -832,6 +832,117 @@ body.is-mobile { font-family: 'Geist', -apple-system, system-ui, sans-serif; }
 .mm-item i { font-size: 16px; color: var(--fg-muted); flex-shrink: 0; }
 .mm-sep { height: 1px; background: var(--border); margin: 4px 2px; }
 
+/* ============================================================
+   MOBILE TOOLBAR OVERFLOW FIX — Priority+ Pattern
+   ============================================================ */
+
+@media (max-width: 600px) {
+  .composer-tools {
+    position: relative;
+    flex-wrap: nowrap !important;
+    overflow: hidden;
+  }
+
+  /* Primary buttons — always visible */
+  .composer-tools .chip[data-mode="ide"],
+  .composer-tools .chip[data-mode="agent"],
+  .composer-tools .chip[data-mode="auto"],
+  .composer-tools #btn-attach-image {
+    display: inline-flex !important;
+    flex-shrink: 0;
+  }
+
+  /* Secondary buttons — hidden on mobile, moved to overflow */
+  .composer-tools #toggle-tailwind,
+  .composer-tools #toggle-multifile {
+    display: none !important;
+  }
+
+  /* Overflow toggle button */
+  .composer-tools .toolbar-overflow {
+    display: inline-flex !important;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 24px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--bg-raised);
+    color: var(--fg-muted);
+    cursor: pointer;
+    flex-shrink: 0;
+    margin-left: 2px;
+  }
+  .composer-tools .toolbar-overflow:hover {
+    color: var(--fg);
+    border-color: var(--border-strong);
+  }
+
+  /* Overflow dropdown */
+  .toolbar-overflow-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 50;
+    min-width: 180px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    box-shadow: var(--shadow-lg, 0 10px 30px rgba(0,0,0,0.35));
+    padding: 6px;
+    display: none;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .toolbar-overflow-menu.open {
+    display: flex;
+  }
+  .toolbar-overflow-menu .chip {
+    width: 100%;
+    justify-content: flex-start;
+    border-radius: 6px;
+    padding: 6px 10px;
+  }
+
+  /* Model pill — compress */
+  .composer-tools .model-pill {
+    max-width: 100px !important;
+    font-size: 9px;
+    padding: 2px 6px;
+  }
+
+  /* Spacer shrinks */
+  .composer-tools .composer-spacer {
+    min-width: 4px;
+  }
+}
+
+/* ============================================================
+   Auto-Tune UI Styles
+   ============================================================ */
+
+#hw-detected-info {
+  font-family: var(--font-mono);
+  line-height: 1.5;
+}
+
+#hw-detected-info strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+/* Info tooltip icons in settings */
+.form-row label .ph-info {
+  color: var(--fg-faint);
+  font-size: 14px;
+  margin-left: 4px;
+  cursor: help;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+.form-row label .ph-info:hover {
+  color: var(--accent);
+}
+
 @media (max-width: 600px) {
   .mobile-only { display: inline-flex !important; }
   .app {

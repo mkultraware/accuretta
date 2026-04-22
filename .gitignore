@@ -28,6 +28,7 @@ node_modules/
 .claude/
 .cursor/
 .cline/
+modelfiles/
 *.swp
 *.swo
 

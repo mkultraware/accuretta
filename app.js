@@ -63,7 +63,7 @@
     return el;
   }
 
-  const esc = (s) => (s || "").replace(/[&<>"']/g, c => ({
+  const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[c]));
 
@@ -133,9 +133,24 @@
   // Preserves code fences, ignores tool_call tags (rendered as tool cards separately).
   function renderMarkdown(text) {
     if (!text) return "";
-    // strip tool_call blocks from visible markdown (shown as cards)
+
+    // === STRIP ALL TOOL CALL FORMATS ===
     text = text.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "");
     text = text.replace(/```tool_call[\s\S]*?```/gi, "");
+    text = text.replace(/```json\s*\{[\s\S]*?"name"[\s\S]*?\}\s*```/gi, "");
+    text = text.replace(/```json\s*\{[\s\S]*?"function"[\s\S]*?\}\s*```/gi, "");
+    text = text.replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, "");
+    text = text.replace(/<functions>[\s\S]*?<\/functions>/gi, "");
+    text = text.replace(/<invoke>[\s\S]*?<\/invoke>/gi, "");
+    text = text.replace(/<tool>[\s\S]*?<\/tool>/gi, "");
+    text = text.replace(/\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/g, "");
+    text = text.replace(/\[[\s\S]*?\{[\s\S]*?"name"[\s\S]*?"arguments"[\s\S]*?\}[\s\S]*?\]/g, "");
+    text = text.replace(/\*\*Tool call:.*?\*\*/gi, "");
+    text = text.replace(/\*\*Function call:.*?\*\*/gi, "");
+    text = text.replace(/Calling\s+\w+\s*\(.*?\)\s*\.\.\./gi, "");
+    text = text.replace(/\[\s*\d+\s*tool\s*calls?\s*\]/gi, "");
+    text = text.replace(/\n{3,}/g, "\n\n");
+    text = text.trim();
 
     // extract code fences
     const fences = [];
@@ -885,6 +900,11 @@
     if (evt.type === "delta") {
       const newBuf = ctx.getBuf() + evt.content;
       ctx.setBuf(newBuf);
+      // Throttled gauge update during streaming
+      if (!state._lastGaugeUpdate || Date.now() - state._lastGaugeUpdate > 500) {
+        renderCtxGauge();
+        state._lastGaugeUpdate = Date.now();
+      }
       const { thinking, content } = splitThinking(newBuf);
       if (thinking && ctx.row) {
         // first few words of current thinking snippet, shimmering
@@ -2001,18 +2021,24 @@
     const label = $("#ctx-gauge-label");
     if (!arc || !label) return;
     const capacity = Math.max(1, Number(state.settings.num_ctx) || 8192);
-    // rough token estimate: chars/4 across all visible turns
-    const chars = (state.messages || []).reduce((a, m) => a + String(m.content || "").length, 0);
-    const used = Math.min(capacity, Math.round(chars / 4));
+    const systemPromptChars = 2500;
+    const msgChars = (state.messages || []).reduce((a, m) => {
+      const content = String(m.content || "");
+      const multiplier = m.role === "tool" ? 1.5 : 1.0;
+      return a + (content.length * multiplier);
+    }, 0);
+    const imageOverhead = (state.pendingImages || []).length * 500;
+    const totalChars = systemPromptChars + msgChars + imageOverhead;
+    const used = Math.min(capacity, Math.round(totalChars / 3.5));
     const pct = Math.min(1, used / capacity);
-    const circ = 2 * Math.PI * 13;            // r=13 → 81.68
+    const circ = 2 * Math.PI * 13;
     arc.setAttribute("stroke-dasharray", circ.toFixed(2));
     arc.setAttribute("stroke-dashoffset", (circ * (1 - pct)).toFixed(2));
     label.textContent = `${Math.round(pct * 100)}%`;
     const gauge = $("#ctx-gauge");
     gauge.classList.toggle("warn", pct >= 0.7 && pct < 0.9);
     gauge.classList.toggle("crit", pct >= 0.9);
-    gauge.title = `${used.toLocaleString()} / ${capacity.toLocaleString()} tokens (~${Math.round(pct * 100)}%)`;
+    gauge.title = `${used.toLocaleString()} / ${capacity.toLocaleString()} tokens (~${Math.round(pct * 100)}%)\nSystem: ~${Math.round(systemPromptChars/3.5)} tok | Msgs: ~${Math.round(msgChars/3.5)} tok`;
   }
   function renderTokTotal() {
     const el = $("#tok-total");
@@ -2051,6 +2077,91 @@
   function autoResize(ta) {
     ta.style.height = "auto";
     ta.style.height = Math.min(200, ta.scrollHeight) + "px";
+  }
+
+  
+  // ===== HARDWARE AUTO-TUNE =====
+  let _detectedHardware = null;
+
+  async function detectHardware() {
+    const btn = $("#btn-hw-detect");
+    const info = $("#hw-detected-info");
+    const applyBtn = $("#btn-hw-apply");
+    if (!btn || !info) return;
+    btn.disabled = true;
+    info.textContent = "Scanning...";
+    try {
+      const r = await api("/api/hardware");
+      _detectedHardware = r;
+      const hw = r.hardware;
+      const rec = r.recommended;
+      const gpuText = hw.gpus.length 
+        ? hw.gpus.map(g => `${g.name} (${g.vram_gb}GB)`).join(", ")
+        : "No GPU detected (CPU-only)";
+      info.innerHTML = `<div style="margin-bottom:6px;"><strong>Detected:</strong></div>
+        <div>GPU: ${esc(gpuText)}</div>
+        <div>CPU: ${esc(hw.cpu.cores)} cores / ${esc(hw.cpu.threads)} threads ${hw.cpu.is_x3d ? "(X3D)" : ""}</div>
+        <div>RAM: ${esc(hw.ram_gb)}GB</div>
+        <div style="margin-top:6px;"><strong>Recommended:</strong></div>
+        <div>ctx: ${rec.num_ctx.toLocaleString()} | gpu: ${rec.num_gpu} | batch: ${rec.num_batch} | threads: ${rec.num_thread}</div>`;
+      if (applyBtn) {
+        applyBtn.disabled = false;
+        applyBtn.onclick = () => applyHardwareSettings(r);
+      }
+      toast(`Detected: ${hw.gpus[0]?.name || "CPU"}`, "ok", 2500);
+    } catch (e) {
+      info.textContent = `Detection failed: ${e.message}`;
+      toast("Hardware detection failed", "err", 3000);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function applyHardwareSettings(hwData) {
+    const btn = $("#btn-hw-apply");
+    if (btn) btn.disabled = true;
+    try {
+      const r = await api("/api/hardware/apply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (r.ok) {
+        await loadSettings();
+        populateSettingsForm();
+        toast(r.message || "Optimal settings applied!", "ok", 3000);
+      }
+    } catch (e) {
+      toast("Apply failed: " + e.message, "err", 3000);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // ===== MOBILE TOOLBAR OVERFLOW =====
+  function initMobileToolbarOverflow() {
+    const overflowBtn = $("#btn-toolbar-overflow");
+    const overflowMenu = $("#toolbar-overflow-menu");
+    if (!overflowBtn || !overflowMenu) return;
+    overflowBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      overflowMenu.classList.toggle("open");
+    });
+    document.addEventListener("click", (e) => {
+      if (!overflowMenu.contains(e.target) && e.target !== overflowBtn) {
+        overflowMenu.classList.remove("open");
+      }
+    });
+    const twDesktop = $("#toggle-tailwind");
+    const twMobile = $("#toggle-tailwind-mobile");
+    const mfDesktop = $("#toggle-multifile");
+    const mfMobile = $("#toggle-multifile-mobile");
+    if (twDesktop && twMobile) {
+      twMobile.addEventListener("click", () => twDesktop.click());
+    }
+    if (mfDesktop && mfMobile) {
+      mfMobile.addEventListener("click", () => mfDesktop.click());
+    }
   }
 
   function wireEvents() {
@@ -2350,7 +2461,20 @@
     $("#mem-add-text")?.addEventListener("keydown", (e) => {
       if (e.key === "Enter") { e.preventDefault(); addMemoryFromInput(); }
     });
+
+    // ----- hardware auto-tune -----
+    $("#btn-hw-detect")?.addEventListener("click", detectHardware);
+
+    // ----- mobile toolbar overflow -----
+    initMobileToolbarOverflow();
   }
+
+  // Periodic refresh for real-time updates
+  setInterval(() => {
+    if (document.visibilityState === "visible") {
+      renderCtxGauge();
+    }
+  }, 3000);
 
   // kick off
   loadApprovals();

@@ -1844,39 +1844,86 @@ IDE_MULTIFILE_ADDENDUM = """IDE addendum — multi-file output is ENABLED:
 """
 
 
-def build_system_prompt(include_tools: bool) -> str:
-    parts = [SYSTEM_PROMPT_BASE.strip()]
+def build_system_prompt(include_tools: bool, chat_mode: str = "auto") -> str:
+    """Build a token-efficient system prompt. Target: < 1500 tokens total."""
     settings = get_settings()
-    if settings.get("use_tailwind_cdn"):
-        parts.append(IDE_TAILWIND_ADDENDUM.strip())
-    if settings.get("ide_multifile"):
-        parts.append(IDE_MULTIFILE_ADDENDUM.strip())
-    if include_tools:
-        parts.append(tools_for_prompt())
-    # learned memories — kept terse to stay token-cheap
+    parts = []
+
+    # === CORE PROMPT (compact, always present) ===
+    core = f"""you are accuretta, a local agent on the user's machine.
+
+voice: precise, lowercase, no hype.
+
+modes:
+- IDE: reply with complete HTML in ```html ... ``` block. include inline CSS/JS.
+- AGENT: call tools. windows/system32 blocked. all writes need approval.
+- AUTO: bridge picks based on request.
+
+tool format: <tool_call>{{"name":"...","arguments":{{...}}}}</tool_call>
+
+rules:
+1. status/thinking goes in <think>...</think> tags (UI shows as status line)
+2. final answer goes OUTSIDE think tags — never end a turn with only tools or thinking
+3. workspace folders are listed below — use them, don't ask
+4. only say "saved"/"wrote" if write_file returned success THIS turn
+5. call remember(text,tags?) for durable facts (≤220 chars)
+6. desktop: enabled={settings.get("desktop_enabled", False)}. if disabled, tell user to enable in Settings. observe before act (describe_screen → decide → act → verify). only allowlisted apps. every action needs approval.
+
+keep responses tight."""
+    parts.append(core)
+
+    # === MODE-SPECIFIC ADDENDUM (only when relevant) ===
+    if chat_mode == "ide" or (chat_mode == "auto" and include_tools is False):
+        ide_add = []
+        if settings.get("use_tailwind_cdn"):
+            ide_add.append("Tailwind CDN is injected automatically. Use utility classes (flex, grid, rounded-2xl, etc.).")
+        if settings.get("ide_multifile"):
+            ide_add.append("Multi-file: emit ```html path=index.html```, ```css path=style.css```, etc.")
+        if ide_add:
+            parts.append("IDE mode:\n" + "\n".join(ide_add))
+
+    # === TOOLS (compressed format) ===
+    if include_tools and chat_mode != "ide":
+        tool_lines = ["tools:"]
+        for name, t in _active_tools().items():
+            params = t["parameters"].get("properties", {})
+            sig = ",".join(f"{k}:{v.get('type','any')[:3]}" for k, v in params.items())
+            tool_lines.append(f"- {name}({sig})")
+        parts.append("\n".join(tool_lines))
+
+    # === MEMORIES (most useful only, not all) ===
     mems = _select_memories_for_prompt()
     if mems:
-        lines = ["learned memories (from prior sessions — lean on these):"]
-        for m in mems:
-            tag = f" [{', '.join(m.get('tags', []))}]" if m.get("tags") else ""
-            lines.append(f"- ({m.get('id','?')}) {m.get('text','').strip()}{tag}")
-        parts.append("\n".join(lines))
-    # system context (ACCURETTA.md) — known folders, OS, etc.
+        mem_lines = ["memories:"]
+        for m in mems[:5]:
+            tag = f"[{m.get('tags',[None])[0]}]" if m.get('tags') else ""
+            mem_lines.append(f"- {m.get('text','')[:120]}{tag}")
+        parts.append("\n".join(mem_lines))
+
+    # === SYSTEM CONTEXT (summarized) ===
     try:
-        md = SYSTEM_CONTEXT_FILE.read_text(encoding="utf-8").strip()
-        if md:
-            parts.append("machine context (from ACCURETTA.md):\n" + md)
+        if SYSTEM_CONTEXT_FILE.exists():
+            facts = _scan_system_context()
+            ctx_lines = ["context:"]
+            ctx_lines.append(f"os={facts.get('os','')}")
+            ctx_lines.append(f"user={facts.get('user','')}")
+            folders = facts.get("folders", [])[:3]
+            for f in folders:
+                ctx_lines.append(f"{f['label']}={f['path']}")
+            parts.append("\n".join(ctx_lines))
     except Exception:
         pass
+
+    # === WORKSPACE (compact) ===
     ws = get_workspace().get("folders", [])
     if ws:
-        parts.append("workspace folders:\n" + "\n".join(f"- {f}" for f in ws))
+        parts.append("workspace:\n" + "\n".join(f"- {f}" for f in ws))
     else:
-        parts.append("workspace: none configured (file tools will refuse until user adds a folder)")
-    return "\n\n".join(parts)
+        parts.append("workspace: none (file tools will refuse)")
+
+    return "\n".join(parts)
 
 
-# ---- chat streaming orchestrator ------------------------------------------
 
 def ollama_options(settings: dict) -> dict:
     opt = {
@@ -1894,6 +1941,225 @@ def ollama_options(settings: dict) -> dict:
     if int(settings.get("num_predict") or -1) != -1:
         opt["num_predict"] = int(settings["num_predict"])
     return opt
+
+
+# ---- hardware auto-detection for optimal settings -------------------------
+
+def _detect_gpu_info() -> list[dict]:
+    """Detect NVIDIA/AMD GPUs."""
+    gpus = []
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            name = pynvml.nvmlDeviceGetName(handle)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            total_mb = mem.total // (1024 * 1024)
+            gpus.append({
+                "vendor": "nvidia",
+                "name": name,
+                "vram_mb": total_mb,
+                "vram_gb": round(total_mb / 1024, 1),
+                "cuda_cores": _estimate_cuda_cores(name),
+            })
+        pynvml.nvmlShutdown()
+        return gpus
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split("\n"):
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    name = parts[0].strip()
+                    mem_str = parts[1].strip().replace(" MiB", "").replace(" MB", "")
+                    try:
+                        total_mb = int(mem_str)
+                        gpus.append({
+                            "vendor": "nvidia",
+                            "name": name,
+                            "vram_mb": total_mb,
+                            "vram_gb": round(total_mb / 1024, 1),
+                            "cuda_cores": _estimate_cuda_cores(name),
+                        })
+                    except ValueError:
+                        continue
+            if gpus:
+                return gpus
+    except Exception:
+        pass
+    return gpus
+
+
+def _estimate_cuda_cores(gpu_name: str) -> int:
+    name_lower = gpu_name.lower()
+    if "4090" in name_lower: return 16384
+    if "4080 super" in name_lower: return 10240
+    if "4080" in name_lower: return 9728
+    if "4070 ti super" in name_lower: return 8448
+    if "4070 ti" in name_lower: return 7680
+    if "4070 super" in name_lower: return 7168
+    if "4070" in name_lower: return 5888
+    if "4060 ti" in name_lower: return 4352
+    if "4060" in name_lower: return 3072
+    if "3090" in name_lower: return 10496
+    if "3080 ti" in name_lower: return 10240
+    if "3080" in name_lower: return 8704
+    if "3070 ti" in name_lower: return 6144
+    if "3070" in name_lower: return 5888
+    if "3060 ti" in name_lower: return 4864
+    if "3060" in name_lower: return 3584
+    return 0
+
+
+def _detect_cpu_info() -> dict:
+    info = {"cores": 0, "threads": 0, "arch": "unknown", "is_x3d": False}
+    try:
+        import os
+        info["cores"] = os.cpu_count() or 0
+        if os.name == "nt":
+            try:
+                result = subprocess.run(
+                    ["wmic", "cpu", "get", "NumberOfCores,NumberOfLogicalProcessors,Name"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split("\n")
+                    for line in lines[1:]:
+                        parts = line.strip().split()
+                        if len(parts) >= 3:
+                            info["cores"] = int(parts[0])
+                            info["threads"] = int(parts[1])
+                            name = " ".join(parts[2:])
+                            info["is_x3d"] = "x3d" in name.lower() or "3d" in name.lower()
+                            info["arch"] = "amd" if "amd" in name.lower() else "intel"
+                            break
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if info["threads"] == 0:
+        info["threads"] = info["cores"] or 4
+    return info
+
+
+def _detect_system_ram() -> int:
+    try:
+        import psutil
+        return psutil.virtual_memory().total // (1024 * 1024)
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            mem = MEMORYSTATUSEX()
+            mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem))
+            return mem.ullTotalPhys // (1024 * 1024)
+        except Exception:
+            pass
+    return 32768
+
+
+def _calculate_optimal_settings(gpus: list, cpu: dict, ram_mb: int) -> dict:
+    settings = {}
+    primary_gpu = gpus[0] if gpus else None
+    total_vram_mb = sum(g["vram_mb"] for g in gpus) if gpus else 0
+
+    if primary_gpu:
+        vram_gb = primary_gpu["vram_gb"]
+        if vram_gb >= 24:
+            settings["num_gpu"] = 99
+            settings["num_ctx"] = 16384
+            settings["num_batch"] = 1024
+        elif vram_gb >= 16:
+            settings["num_gpu"] = 99
+            settings["num_ctx"] = 12288
+            settings["num_batch"] = 768
+        elif vram_gb >= 12:
+            settings["num_gpu"] = 99
+            settings["num_ctx"] = 8192
+            settings["num_batch"] = 512
+        elif vram_gb >= 8:
+            settings["num_gpu"] = 99
+            settings["num_ctx"] = 6144
+            settings["num_batch"] = 384
+        elif vram_gb >= 6:
+            settings["num_gpu"] = 50
+            settings["num_ctx"] = 4096
+            settings["num_batch"] = 256
+        else:
+            settings["num_gpu"] = 20
+            settings["num_ctx"] = 2048
+            settings["num_batch"] = 128
+    else:
+        settings["num_gpu"] = 0
+        settings["num_ctx"] = 4096
+        settings["num_batch"] = 256
+
+    if cpu["threads"] >= 32:
+        settings["num_thread"] = min(cpu["cores"], 16)
+    elif cpu["threads"] >= 16:
+        settings["num_thread"] = min(cpu["cores"], 12)
+    elif cpu["threads"] >= 8:
+        settings["num_thread"] = min(cpu["cores"], 8)
+    else:
+        settings["num_thread"] = max(2, cpu["cores"] - 1)
+
+    if cpu.get("is_x3d"):
+        settings["num_thread"] = max(6, cpu["cores"])
+        settings["num_batch"] = min(settings["num_batch"] * 2, 2048)
+
+    ram_gb = ram_mb / 1024
+    if ram_gb < 16 and settings["num_ctx"] > 4096:
+        settings["num_ctx"] = 4096
+    elif ram_gb < 32 and settings["num_ctx"] > 8192:
+        settings["num_ctx"] = 8192
+
+    if primary_gpu and primary_gpu.get("vram_gb", 0) >= 16:
+        settings["num_batch"] = max(settings["num_batch"], 512)
+
+    if total_vram_mb > 16000:
+        settings["keep_alive"] = "1h"
+    else:
+        settings["keep_alive"] = "30m"
+
+    settings["num_predict"] = -1
+    settings.setdefault("temperature", 0.7)
+    settings.setdefault("top_p", 0.9)
+
+    return settings
+
+
+def get_optimal_settings() -> dict:
+    gpus = _detect_gpu_info()
+    cpu = _detect_cpu_info()
+    ram_mb = _detect_system_ram()
+    optimal = _calculate_optimal_settings(gpus, cpu, ram_mb)
+    optimal["_hardware"] = {
+        "gpus": gpus,
+        "cpu": cpu,
+        "ram_gb": round(ram_mb / 1024, 1),
+        "detected_at": int(time.time()),
+    }
+    return optimal
 
 
 def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
@@ -2187,6 +2453,13 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_api_get(self, p: str, parsed):
         if p == "/api/health":
             return self._send_json(200, {"ok": True, "ollama": OLLAMA})
+        if p == "/api/hardware":
+            optimal = get_optimal_settings()
+            return self._send_json(200, {
+                "hardware": optimal.pop("_hardware", {}),
+                "recommended": optimal,
+                "current": get_settings(),
+            })
         if p == "/api/models":
             try:
                 data = ollama_get("/api/tags")
@@ -2326,6 +2599,21 @@ class Handler(BaseHTTPRequestHandler):
             save_json(SETTINGS_FILE, cur)
             broadcast_event({"type": "settings:update"})
             return self._send_json(200, cur)
+        if p == "/api/hardware/apply":
+            optimal = get_optimal_settings()
+            hw_info = optimal.pop("_hardware", {})
+            cur = get_settings()
+            for key in ["num_ctx", "num_gpu", "num_batch", "num_thread", "num_predict", "keep_alive", "temperature", "top_p"]:
+                if key in optimal:
+                    cur[key] = optimal[key]
+            save_json(SETTINGS_FILE, cur)
+            broadcast_event({"type": "settings:update"})
+            return self._send_json(200, {
+                "ok": True,
+                "applied": optimal,
+                "hardware": hw_info,
+                "message": f"Tuned for {hw_info['gpus'][0]['name'] if hw_info['gpus'] else 'CPU'} ({hw_info['ram_gb']}GB RAM)",
+            })
         if p == "/api/workspace":
             folders = body.get("folders") or []
             folders = [normalize_path(f) for f in folders if isinstance(f, str) and f.strip()]
@@ -2704,6 +2992,16 @@ def main():
     print(f"  ollama:  {OLLAMA}")
     print(f"  port:    {PORT}")
     print(f"  bind:    0.0.0.0  (reachable over LAN / Tailscale)")
+
+    # Auto-enable Flash Attention for high-end GPUs
+    try:
+        gpus = _detect_gpu_info()
+        if any(g.get("vram_gb", 0) >= 16 for g in gpus):
+            os.environ.setdefault("OLLAMA_FLASH_ATTENTION", "1")
+            os.environ.setdefault("OLLAMA_KV_CACHE_TYPE", "q8_0")
+            print("  flash attention: enabled (16GB+ GPU detected)")
+    except Exception:
+        pass
 
     # first-run system context scan (creates data/ACCURETTA.md if missing)
     if not SYSTEM_CONTEXT_FILE.exists():
