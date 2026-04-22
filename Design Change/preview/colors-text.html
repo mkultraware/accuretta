@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<style>
+  body { padding: 20px 28px;}
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 24px;}
+  .block { display: flex; flex-direction: column; gap: 6px;}
+  .block.dark { background: var(--off-black); padding: 16px 18px; border-radius: 10px;}
+  .lbl { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; opacity: 0.5;}
+  .sample { font-family: var(--font-mono); font-size: 14px;}
+  .token { font-family: var(--font-mono); font-size: 10px; opacity: 0.55;}
+  .line { display:flex; justify-content:space-between; align-items:baseline;}
+</style>
+</head>
+<body>
+  <div class="cols">
+    <div class="block" style="background:var(--off-white); padding:16px 18px; border-radius:10px; border:1px solid var(--border);">
+      <div class="lbl" style="color:var(--off-black)">Light</div>
+      <div class="line"><span class="sample" style="color:var(--off-black)">Primary foreground</span><span class="token" style="color:var(--off-black)">--fg</span></div>
+      <div class="line"><span class="sample" style="color:var(--gray-50)">Muted foreground</span><span class="token" style="color:var(--gray-50)">--fg-muted</span></div>
+      <div class="line"><span class="sample" style="color:var(--gray-40)">Subtle foreground</span><span class="token" style="color:var(--gray-40)">--fg-subtle</span></div>
+      <div class="line"><span class="sample" style="color:var(--gray-30)">Faint / placeholder</span><span class="token" style="color:var(--gray-30)">--fg-faint</span></div>
+    </div>
+    <div class="block dark">
+      <div class="lbl" style="color:var(--off-white)">Dark</div>
+      <div class="line"><span class="sample" style="color:var(--off-white)">Primary foreground</span><span class="token" style="color:var(--off-white)">--fg</span></div>
+      <div class="line"><span class="sample" style="color:var(--gray-30)">Muted foreground</span><span class="token" style="color:var(--gray-30)">--fg-muted</span></div>
+      <div class="line"><span class="sample" style="color:var(--gray-40)">Subtle foreground</span><span class="token" style="color:var(--gray-40)">--fg-subtle</span></div>
+      <div class="line"><span class="sample" style="color:var(--gray-50)">Faint / placeholder</span><span class="token" style="color:var(--gray-50)">--fg-faint</span></div>
+    </div>
+  </div>
+</body>
+</html>

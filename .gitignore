@@ -45,7 +45,7 @@ build/
 coverage/
 
 # local design drafts that aren't part of the shipped app
-"Design Change/"
+
 
 # accuretta-specific safety net — if any of these sneak outside ./data
 ACCURETTA.md

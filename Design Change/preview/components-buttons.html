@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<style>
+  body { padding: 20px 24px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px;}
+  .lbl { font-family:var(--font-mono); font-size:10px; letter-spacing:0.14em; text-transform:uppercase; color:var(--fg-muted); width:76px;}
+  .btn {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    padding: 8px 14px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 120ms var(--ease-out);
+  }
+  .btn.primary { background: var(--off-black); color: var(--off-white); }
+  .btn.accent  { background: var(--ember-2); color: #fff;}
+  .btn.ghost   { background: transparent; color: var(--fg); border-color: var(--border-strong);}
+  .btn.mint    { background: var(--mint); color: #1D4732;}
+  .btn.lilac   { background: var(--lilac); color: #3A2E5A;}
+  .btn.pink    { background: var(--pink); color: #6B2544;}
+  .btn.lemon   { background: var(--lemon); color: #6B571A;}
+  .btn.link    { background: none; color: var(--accent); text-decoration: underline; text-underline-offset: 3px; padding:8px 4px;}
+  .btn.sm { font-size: 11px; padding: 6px 10px;}
+  .btn.lg { font-size: 14px; padding: 10px 18px;}
+  .kbd {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    padding: 1px 5px;
+    background: rgba(255,255,255,0.15);
+    border-radius: 3px;
+    margin-left: 4px;
+  }
+</style>
+</head>
+<body>
+  <div class="row">
+    <span class="lbl">Primary</span>
+    <button class="btn primary">Run agent <span class="kbd">⏎</span></button>
+    <button class="btn accent">Prerender</button>
+    <button class="btn ghost">Cancel</button>
+    <button class="btn link">View logs →</button>
+  </div>
+  <div class="row">
+    <span class="lbl">Pastel</span>
+    <button class="btn mint">Approve</button>
+    <button class="btn lilac">Plan</button>
+    <button class="btn pink">Stop</button>
+    <button class="btn lemon">Review</button>
+  </div>
+  <div class="row">
+    <span class="lbl">Sizes</span>
+    <button class="btn primary sm">Small</button>
+    <button class="btn primary">Default</button>
+    <button class="btn primary lg">Large</button>
+  </div>
+</body>
+</html>

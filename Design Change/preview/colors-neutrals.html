@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<style>
+  body { padding: 20px 24px;}
+  .row { display:flex; gap:8px; align-items:stretch;}
+  .swatch {
+    flex: 1;
+    height: 78px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    font-family: var(--font-mono);
+  }
+  .swatch .name { font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;}
+  .swatch .hex { font-size: 10px; opacity: 0.7;}
+  .group-label { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg-muted); margin-bottom: 8px; margin-top: 4px;}
+</style>
+</head>
+<body>
+  <div class="group-label">Off-white · Paper warmth</div>
+  <div class="row">
+    <div class="swatch" style="background:#FBFAF6; color:var(--off-black)"><div class="name">bg-raised</div><div class="hex">FBFAF6</div></div>
+    <div class="swatch" style="background:var(--off-white); color:var(--off-black)"><div class="name">bg</div><div class="hex">F6F4EF</div></div>
+    <div class="swatch" style="background:var(--off-white-2); color:var(--off-black)"><div class="name">bg-sunken</div><div class="hex">EDEAE2</div></div>
+    <div class="swatch" style="background:var(--off-white-3); color:var(--off-black)"><div class="name">bg-inset</div><div class="hex">E2DED4</div></div>
+  </div>
+  <div style="height:10px"></div>
+  <div class="group-label">Off-black · Graphite warmth</div>
+  <div class="row">
+    <div class="swatch" style="background:#0E0E0C; color:var(--off-white); border-color:#2A2A26"><div class="name">bg-sunken</div><div class="hex">0E0E0C</div></div>
+    <div class="swatch" style="background:var(--off-black); color:var(--off-white); border-color:#2A2A26"><div class="name">bg</div><div class="hex">141412</div></div>
+    <div class="swatch" style="background:var(--off-black-2); color:var(--off-white); border-color:#2A2A26"><div class="name">bg-raised</div><div class="hex">1E1E1B</div></div>
+    <div class="swatch" style="background:var(--off-black-3); color:var(--off-white); border-color:#3D3C38"><div class="name">bg-inset</div><div class="hex">2A2A26</div></div>
+  </div>
+</body>
+</html>

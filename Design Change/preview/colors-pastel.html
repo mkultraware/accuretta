@@ -1,0 +1,74 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../colors_and_type.css">
+<link rel="stylesheet" href="_card.css">
+<style>
+  body { padding: 20px 24px; }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .family { display:flex; flex-direction:column; gap:6px;}
+  .ramp { display:flex; height:68px; border-radius: 8px; overflow:hidden; border: 1px solid var(--border);}
+  .chip { flex:1; display:flex; align-items:flex-end; padding:6px 8px;}
+  .chip .hex {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    color: rgba(20,20,18,0.7);
+  }
+  .name {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg);
+  }
+  .tokens {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--fg-muted);
+  }
+</style>
+</head>
+<body>
+  <div class="grid">
+    <div class="family">
+      <div class="name">Mint</div>
+      <div class="ramp">
+        <div class="chip" style="background:var(--mint)"><span class="hex">B8EDD4</span></div>
+        <div class="chip" style="background:var(--mint-2)"><span class="hex">8FDBB8</span></div>
+        <div class="chip" style="background:var(--mint-3)"><span class="hex" style="color:#fff">6AC49A</span></div>
+      </div>
+      <div class="tokens">--mint · -2 · -3</div>
+    </div>
+    <div class="family">
+      <div class="name">Lilac</div>
+      <div class="ramp">
+        <div class="chip" style="background:var(--lilac)"><span class="hex">D6C7F4</span></div>
+        <div class="chip" style="background:var(--lilac-2)"><span class="hex">B69EE8</span></div>
+        <div class="chip" style="background:var(--lilac-3)"><span class="hex" style="color:#fff">8E72D1</span></div>
+      </div>
+      <div class="tokens">--lilac · -2 · -3</div>
+    </div>
+    <div class="family">
+      <div class="name">Safety</div>
+      <div class="ramp">
+        <div class="chip" style="background:var(--safety)"><span class="hex" style="color:#fff">FF8C1A</span></div>
+        <div class="chip" style="background:var(--safety-2)"><span class="hex" style="color:#fff">FF6A00</span></div>
+        <div class="chip" style="background:var(--safety-3)"><span class="hex" style="color:#fff">E04E00</span></div>
+      </div>
+      <div class="tokens">--safety · -2 · -3 · hi-vis</div>
+    </div>
+    <div class="family">
+      <div class="name">Lemon</div>
+      <div class="ramp">
+        <div class="chip" style="background:var(--lemon)"><span class="hex">F5EAAE</span></div>
+        <div class="chip" style="background:var(--lemon-2)"><span class="hex">E8D370</span></div>
+        <div class="chip" style="background:var(--lemon-3)"><span class="hex" style="color:#fff">C9AE3A</span></div>
+      </div>
+      <div class="tokens">--lemon · -2 · -3</div>
+    </div>
+  </div>
+</body>
+</html>
