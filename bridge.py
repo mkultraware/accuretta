@@ -29,6 +29,7 @@ from typing import Any
 import webbrowser
 import base64 as _b64
 import io as _io
+from concurrent.futures import ThreadPoolExecutor
 
 # ---- desktop automation (optional) ---------------------------------------
 # Graceful imports — desktop tools will clearly report when these are missing
@@ -91,6 +92,16 @@ _chat_desktop_disabled: set[str] = set()
 # before run_chat_turn and cleared after.
 import contextvars
 _current_chat_id: contextvars.ContextVar[str] = contextvars.ContextVar("_current_chat_id", default="")
+
+# per-chat SSE emitter so tools can stream progress without plumbing emit through every call
+_chat_emitters: dict[str, callable] = {}
+
+# thread pool for long-running tools so the HTTP worker stays responsive
+_tool_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tool-")
+
+# async tool jobs (for POST /api/tools/call returning job-id)
+_tool_jobs: dict[str, dict] = {}
+_tool_jobs_lock = threading.Lock()
 
 for d in (DATA, VERSIONS_DIR, PENDING_DIR, SNAPSHOTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
@@ -160,6 +171,8 @@ DEFAULT_SETTINGS = {
     "theme": "light",
     "auto_approve_read": True,
     "allow_web_preview": True,
+    # memory / performance
+    "kv_cache_type": "q8_0",        # q4_0 | q8_0 | f16 — lower = less VRAM, slightly lower quality
     # IDE preview extras (composer toolbar toggles)
     "use_tailwind_cdn": False,      # inject Tailwind Play CDN into preview + ask model to use tailwind classes
     "ide_multifile": False,         # tell the model to emit a small folder structure (index.html / style.css / script.js / assets/)
@@ -189,12 +202,75 @@ def get_chats() -> dict:
     return c
 
 
+# ---- token counting (approximation) ----------------------------------------
+# We don't bundle tiktoken — this is a fast, conservative heuristic that
+# works across languages. It errs on the side of over-counting so we don't
+# accidentally overflow the context window.
+# English text ~4 chars/tok, code ~3 chars/tok, CJK ~1.5 chars/tok.
+# We use a blended 3.0 to stay safe.
+CHARS_PER_TOKEN = 3.0
+
+
+def _approx_tokens(text: str) -> int:
+    if not text:
+        return 0
+    # byte-length penalises non-ASCII (CJK, emoji) which are multi-byte
+    return max(len(text), len(text.encode("utf-8"))) // CHARS_PER_TOKEN
+
+
+def _count_msg_tokens(msg: dict) -> int:
+    content = msg.get("content") or ""
+    # tool_call JSON is also text the model sees
+    tcs = msg.get("tool_calls") or []
+    extra = json.dumps(tcs, ensure_ascii=False) if tcs else ""
+    return _approx_tokens(content) + _approx_tokens(extra) + 4  # role overhead
+
+
+def truncate_messages(msgs: list[dict], max_tokens: int, reserve: int = 256) -> list[dict]:
+    """Drop oldest non-system messages until the total fits under max_tokens.
+    Always keeps the system prompt (index 0) and the most recent user message.
+    """
+    if not msgs:
+        return msgs
+    budget = max_tokens - reserve
+    system = [msgs[0]] if msgs[0].get("role") == "system" else []
+    tail = msgs[len(system):]
+
+    # Count from the end backwards until we hit budget
+    total = sum(_count_msg_tokens(m) for m in system)
+    keep = []
+    for m in reversed(tail):
+        t = _count_msg_tokens(m)
+        if total + t > budget and keep:
+            # We've kept at least one message; drop the rest
+            break
+        keep.insert(0, m)
+        total += t
+
+    if not keep:
+        # Emergency: keep only the very last user message
+        last_user = [m for m in tail if m.get("role") == "user"][-1:] or tail[-1:]
+        keep = last_user
+
+    return system + keep
+
+
 # ---- system context (ACCURETTA.md) ----------------------------------------
 # First-run scan of the user's machine so models know where things are.
 # Not automatically readable by tools — it's injected into the system prompt.
 
+# Cache system context scans for 5 minutes so we don't re-scan dirs every turn.
+_SYSTEM_CONTEXT_CACHE: tuple[float, dict] | None = None
+_SYSTEM_CONTEXT_TTL = 300
+
+
 def _scan_system_context() -> dict:
     """Return a dict of facts about the machine, cheap to compute."""
+    global _SYSTEM_CONTEXT_CACHE
+    if _SYSTEM_CONTEXT_CACHE is not None:
+        ts, cached = _SYSTEM_CONTEXT_CACHE
+        if time.time() - ts < _SYSTEM_CONTEXT_TTL:
+            return cached
     facts: dict = {}
     # OS / platform
     try:
@@ -268,6 +344,7 @@ def _scan_system_context() -> dict:
             break
 
     facts["scanned_at"] = int(time.time())
+    _SYSTEM_CONTEXT_CACHE = (time.time(), facts)
     return facts
 
 
@@ -612,9 +689,11 @@ def tool_list_directory(args: dict) -> dict:
                 continue
     except PermissionError as e:
         return {"error": f"permission denied: {e}"}
-    resp = {"path": path, "entries": out[:2000]}
+    resp = {"path": path, "entries": out[:200]}
     if skipped:
         resp["ignored"] = skipped
+    if len(out) > 200:
+        resp["truncated"] = True
     return resp
 
 
@@ -630,8 +709,8 @@ def tool_read_file(args: dict) -> dict:
         return {"error": f"path ignored by .accurettaignore: {path}"}
     try:
         raw = Path(path).read_bytes()
-        if len(raw) > 512 * 1024:
-            raw = raw[: 512 * 1024]
+        if len(raw) > 64 * 1024:
+            raw = raw[: 64 * 1024]
             truncated = True
         else:
             truncated = False
@@ -670,6 +749,98 @@ def tool_write_file(args: dict) -> dict:
         return {"error": str(e)}
 
 
+def tool_edit_file(args: dict) -> dict:
+    """Apply surgical search-and-replace edits to an existing file.
+    Each edit finds old_text and replaces it with new_text.
+    old_text must be unique or an exact single match — ambiguous matches are rejected.
+    """
+    path = normalize_path(args.get("path") or "")
+    edits = args.get("edits") or []
+    if not path:
+        return {"error": "missing path"}
+    if not isinstance(edits, list) or not edits:
+        return {"error": "edits must be a non-empty list of {old_text, new_text}"}
+    if is_blocked_path(path):
+        return {"error": "path blocked (Windows/System32)"}
+    if not is_in_workspace(path):
+        return {"error": "path outside workspace. Add folder in Workspace panel."}
+    if is_ignored(path):
+        return {"error": f"path ignored by .accurettaignore: {path}"}
+    if not os.path.isfile(path):
+        return {"error": f"not a file: {path}"}
+
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except Exception as e:
+        return {"error": f"read failed: {e}"}
+
+    applied = []
+    errors = []
+    modified = text
+
+    for i, edit in enumerate(edits):
+        old = edit.get("old_text", "")
+        new = edit.get("new_text", "")
+        if not old:
+            errors.append(f"edit {i}: old_text is empty")
+            continue
+
+        count = modified.count(old)
+        if count == 0:
+            # try stripping common surrounding whitespace for a fuzzy match
+            old_stripped = old.strip()
+            if old_stripped and old_stripped != old:
+                count = modified.count(old_stripped)
+                if count == 1:
+                    modified = modified.replace(old_stripped, new, 1)
+                    applied.append({"edit": i, "match": "fuzzy", "old": old[:60], "new": new[:60]})
+                    continue
+                elif count > 1:
+                    errors.append(f"edit {i}: fuzzy match '{old[:40]}' appears {count} times — ambiguous")
+                    continue
+            errors.append(f"edit {i}: '{old[:40]}' not found in file")
+            continue
+        elif count > 1:
+            errors.append(f"edit {i}: '{old[:40]}' appears {count} times — must be unique")
+            continue
+        else:
+            modified = modified.replace(old, new, 1)
+            applied.append({"edit": i, "match": "exact", "old": old[:60], "new": new[:60]})
+
+    if errors:
+        return {
+            "error": "; ".join(errors),
+            "applied": len(applied),
+            "failed": len(errors),
+            "path": path,
+        }
+
+    # approval: show a diff-like summary
+    diff_lines = []
+    for a in applied:
+        diff_lines.append(f"- {a['old'][:50]}")
+        diff_lines.append(f"+ {a['new'][:50]}")
+    preview = "\n".join(diff_lines) if diff_lines else "(no preview)"
+    approval = request_approval(
+        title="Edit file",
+        command=f'edit {len(applied)} location(s) in "{path}"',
+        details={"kind": "edit_file", "path": path, "edits": len(applied), "preview": preview},
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied edit ({approval.get('status')})"}
+
+    try:
+        Path(path).write_text(modified, encoding="utf-8")
+        return {
+            "ok": True,
+            "path": path,
+            "edits_applied": len(applied),
+            "bytes": len(modified.encode("utf-8")),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def tool_delete_file(args: dict) -> dict:
     path = normalize_path(args.get("path") or "")
     if not path or not os.path.exists(path):
@@ -695,22 +866,61 @@ def tool_delete_file(args: dict) -> dict:
         return {"error": str(e)}
 
 
+def _emit_tool_stream(name: str, text: str) -> None:
+    """If a chat turn is active, emit a tool_stream SSE event."""
+    cid = _current_chat_id.get()
+    emit = _chat_emitters.get(cid) if cid else None
+    if emit:
+        try:
+            emit({"type": "tool_stream", "name": name, "text": text[:240]})
+        except Exception:
+            pass
+
+
 def _run_powershell(cmd: str, timeout: int = 120) -> dict:
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-            capture_output=True, text=True, timeout=timeout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
-        return {
-            "ok": proc.returncode == 0,
-            "exit": proc.returncode,
-            "stdout": (proc.stdout or "")[-16000:],
-            "stderr": (proc.stderr or "")[-4000:],
-        }
-    except subprocess.TimeoutExpired:
-        return {"error": f"timeout after {timeout}s"}
     except Exception as e:
         return {"error": str(e)}
+
+    out_lines: list[str] = []
+    err_lines: list[str] = []
+
+    def reader(pipe, sink, name):
+        try:
+            for line in iter(pipe.readline, ""):
+                sink.append(line)
+                _emit_tool_stream(name, line.rstrip("\n\r"))
+            pipe.close()
+        except Exception:
+            pass
+
+    t_out = threading.Thread(target=reader, args=(proc.stdout, out_lines, "run_powershell"), daemon=True)
+    t_err = threading.Thread(target=reader, args=(proc.stderr, err_lines, "run_powershell"), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return {"error": f"timeout after {timeout}s"}
+
+    t_out.join(timeout=5)
+    t_err.join(timeout=5)
+
+    stdout = "".join(out_lines)[-16000:]
+    stderr = "".join(err_lines)[-4000:]
+    return {
+        "ok": proc.returncode == 0,
+        "exit": proc.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
 
 
 def tool_run_powershell(args: dict) -> dict:
@@ -1267,7 +1477,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_list_directory,
     },
     "read_file": {
-        "description": "Read a text file from the workspace.",
+        "description": "Read a file from the workspace. Works on text, code, markdown, and binary files (returns best-effort decoded text).",
         "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string"}},
@@ -1276,7 +1486,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_read_file,
     },
     "write_file": {
-        "description": "Write or overwrite a file. Requires user approval.",
+        "description": "Write or overwrite a file. Requires user approval. ONLY for new files or complete rewrites (>30 lines changed).",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1286,6 +1496,33 @@ TOOLS: dict[str, dict] = {
             "required": ["path", "content"],
         },
         "fn": tool_write_file,
+    },
+    "edit_file": {
+        "description": (
+            "Surgical search-and-replace edits on an existing file. "
+            "PREFERRED for changes affecting ≤30 lines. Each edit finds old_text and replaces with new_text. "
+            "old_text must appear exactly once in the file (unique). "
+            "NEVER use this to rewrite an entire file — use write_file for that."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_text": {"type": "string", "description": "exact text to find (must be unique in file)"},
+                            "new_text": {"type": "string", "description": "replacement text"},
+                        },
+                        "required": ["old_text", "new_text"],
+                    },
+                },
+            },
+            "required": ["path", "edits"],
+        },
+        "fn": tool_edit_file,
     },
     "delete_file": {
         "description": "Delete a file or folder. Requires user approval.",
@@ -1723,6 +1960,11 @@ feedback discipline — this is a chat UI, silence looks like a hang:
   script.py…", "drafting fixes…").
 - if a path isn't found, close thinking and tell the user in the
   bubble what you tried and ask for the correct path.
+- CHAIN TOOLS AGGRESSIVELY: when the user asks you to read a file,
+  read it immediately after finding it. do not stop after list_directory.
+  when asked to write, write immediately after confirming the path.
+  complete tasks in the fewest tool calls possible. never ask the user
+  "shall i read it?" or "would you like me to proceed?" — just do it.
 - the final bubble must contain only the answer/summary (1–3
   sentences when wrapping up a task), never status narration.
 - MANDATORY: every turn MUST end with visible text OUTSIDE of <think>
@@ -1762,6 +2004,14 @@ write honesty — never lie about persistence:
   "here's the proposed fix — confirm and I'll write it to <path>." do
   not imply the change is on disk.
 - if write_file returned an error, surface it verbatim and stop.
+
+file editing discipline — use the right tool for the job:
+- edit_file is for surgical changes: changing a color, renaming a variable, adding one function, fixing a typo. old_text must be UNIQUE in the file. include 2-3 lines of surrounding context in old_text so the match is unambiguous.
+- write_file is ONLY for: creating a new file, or rewriting >30 lines at once.
+- examples:
+  GOOD edit_file: old_text="  background: blue;\\n  color: white;" new_text="  background: red;\\n  color: black;"
+  BAD edit_file: old_text="(entire 400-line file)" new_text="(entire 400-line file with one word changed)"
+  BAD: rewriting a file in chat text then also calling write_file — confirm "saved" and stop.
 
 memories — you have a persistent `remember(text, tags?)` tool:
 - at the end of a task, if you learned something durable (a working
@@ -1868,6 +2118,8 @@ rules:
 4. only say "saved"/"wrote" if write_file returned success THIS turn
 5. call remember(text,tags?) for durable facts (≤220 chars)
 6. desktop: enabled={settings.get("desktop_enabled", False)}. if disabled, tell user to enable in Settings. observe before act (describe_screen → decide → act → verify). only allowlisted apps. every action needs approval.
+7. CHAIN TOOLS AGGRESSIVELY: when the user asks you to read a file, read it immediately after finding it. do not stop after list_directory. when asked to write, write immediately after confirming the path. complete tasks in the fewest tool calls possible. never ask the user "shall i read it?" or "would you like me to proceed?" — just do it.
+8. NEVER re-emit full file content you already generated in a previous turn. if the user asks you to save something you already built, call write_file with the content but do NOT dump the full code in the visible chat text — just confirm "saved to <path>".
 
 keep responses tight."""
     parts.append(core)
@@ -1894,10 +2146,10 @@ keep responses tight."""
     # === MEMORIES (most useful only, not all) ===
     mems = _select_memories_for_prompt()
     if mems:
-        mem_lines = ["memories:"]
-        for m in mems[:5]:
+        mem_lines = ["mem:"]
+        for m in mems[:3]:
             tag = f"[{m.get('tags',[None])[0]}]" if m.get('tags') else ""
-            mem_lines.append(f"- {m.get('text','')[:120]}{tag}")
+            mem_lines.append(f"- {m.get('text','')[:100]}{tag}")
         parts.append("\n".join(mem_lines))
 
     # === SYSTEM CONTEXT (summarized) ===
@@ -1940,6 +2192,9 @@ def ollama_options(settings: dict) -> dict:
         opt["num_thread"] = int(settings["num_thread"])
     if int(settings.get("num_predict") or -1) != -1:
         opt["num_predict"] = int(settings["num_predict"])
+    kv = (settings.get("kv_cache_type") or "q8_0").strip()
+    if kv in ("q4_0", "q8_0", "f16"):
+        opt["kv_cache_type"] = kv
     return opt
 
 
@@ -2145,13 +2400,21 @@ def _calculate_optimal_settings(gpus: list, cpu: dict, ram_mb: int) -> dict:
     settings.setdefault("temperature", 0.7)
     settings.setdefault("top_p", 0.9)
 
+    # VRAM-poor GPUs benefit from q4_0 KV cache (halves cache size vs q8_0)
+    if primary_gpu and primary_gpu.get("vram_gb", 0) <= 16:
+        settings["kv_cache_type"] = "q4_0"
+    else:
+        settings["kv_cache_type"] = "q8_0"
+
     return settings
 
 
 def get_optimal_settings() -> dict:
+    global _HW_CACHE
     gpus = _detect_gpu_info()
     cpu = _detect_cpu_info()
     ram_mb = _detect_system_ram()
+    _HW_CACHE = (time.time(), gpus, cpu, ram_mb)
     optimal = _calculate_optimal_settings(gpus, cpu, ram_mb)
     optimal["_hardware"] = {
         "gpus": gpus,
@@ -2160,6 +2423,91 @@ def get_optimal_settings() -> dict:
         "detected_at": int(time.time()),
     }
     return optimal
+
+
+# Cache hardware scans for 5 minutes so Apply Optimal doesn't re-scan every click.
+_HW_CACHE: tuple[float, list, dict, int] | None = None
+_HW_CACHE_TTL = 300
+
+
+def get_combined_optimal_settings(model: str | None = None) -> dict:
+    """Merge hardware detection with model-specific constraints.
+
+    Hardware sets the ceiling (VRAM, CPU threads).
+    Model sets safety limits (big models need smaller ctx/batch to fit).
+    The most conservative value wins for each parameter.
+    """
+    global _HW_CACHE
+    # ---- hardware baseline (cached) ----
+    if _HW_CACHE is not None:
+        ts, gpus, cpu, ram_mb = _HW_CACHE
+        if time.time() - ts < _HW_CACHE_TTL:
+            pass  # use cached
+        else:
+            _HW_CACHE = None
+    if _HW_CACHE is None:
+        gpus = _detect_gpu_info()
+        cpu = _detect_cpu_info()
+        ram_mb = _detect_system_ram()
+        _HW_CACHE = (time.time(), gpus, cpu, ram_mb)
+    else:
+        _, gpus, cpu, ram_mb = _HW_CACHE
+    hw = _calculate_optimal_settings(gpus, cpu, ram_mb)
+    hw_meta = {
+        "gpus": gpus,
+        "cpu": cpu,
+        "ram_gb": round(ram_mb / 1024, 1),
+        "detected_at": int(time.time()),
+    }
+
+    if not model:
+        hw["_hardware"] = hw_meta
+        return hw
+
+    # ---- model-specific constraints ----
+    model_rec = recommended_settings(model)
+    if "error" in model_rec or not model_rec.get("recommended"):
+        hw["_hardware"] = hw_meta
+        hw["_model"] = {"name": model, "error": model_rec.get("error", "unknown")}
+        return hw
+
+    mrec = model_rec["recommended"]
+    combined = dict(hw)
+
+    # Context window: most constrained wins
+    hw_ctx = hw.get("num_ctx", 8192)
+    model_ctx = mrec.get("num_ctx", hw_ctx)
+    native_ctx = model_rec.get("native_ctx", 0)
+    combined["num_ctx"] = min(hw_ctx, model_ctx)
+    if native_ctx > 0:
+        combined["num_ctx"] = min(combined["num_ctx"], native_ctx)
+
+    # Batch size: model may suggest smaller for huge models
+    hw_batch = hw.get("num_batch", 512)
+    model_batch = mrec.get("num_batch", hw_batch)
+    combined["num_batch"] = min(hw_batch, model_batch)
+
+    # GPU layers & threading: hardware is more specific than model defaults
+    combined["num_gpu"] = hw.get("num_gpu", 0)
+    combined["num_thread"] = hw.get("num_thread", 0)
+
+    # KV cache: hardware decides (q4_0 for <=16GB, q8_0 for bigger)
+    combined["kv_cache_type"] = hw.get("kv_cache_type", "q8_0")
+
+    # Other params: model rec is fine for these (same values usually)
+    for key in ["temperature", "top_p", "keep_alive", "num_predict"]:
+        if key in mrec:
+            combined[key] = mrec[key]
+
+    combined["_hardware"] = hw_meta
+    combined["_model"] = {
+        "name": model,
+        "size_b": model_rec.get("size_b"),
+        "quant": model_rec.get("quant"),
+        "est_weights_gb": model_rec.get("est_weights_gb"),
+        "native_ctx": native_ctx,
+    }
+    return combined
 
 
 def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
@@ -2174,97 +2522,134 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
         emit({"type": "error", "error": "no model selected. Pick one in Settings."})
         return None
 
-    max_tool_rounds = 6
-    rounds = 0
-    conversation = list(messages)
+    _chat_emitters[chat_id] = emit
+    try:
+        max_tool_rounds = 6
+        rounds = 0
+        empty_retry_done = False
+        conversation = list(messages)
 
-    while True:
-        payload = {
-            "model": model,
-            "messages": conversation,
-            "stream": True,
-            "keep_alive": settings.get("keep_alive", "30m"),
-            "options": ollama_options(settings),
-        }
-        if use_tools:
-            payload["tools"] = tools_for_ollama()
+        while True:
+            # keep context window under control — drop oldest non-system messages
+            ctx_limit = int(settings.get("num_ctx") or 8192)
+            trimmed = truncate_messages(conversation, ctx_limit, reserve=512)
+            if len(trimmed) < len(conversation):
+                dropped = len(conversation) - len(trimmed)
+                emit({"type": "notice", "note": f"dropped {dropped} old messages to fit context window"})
 
-        try:
-            resp = ollama_post_stream("/api/chat", payload)
-        except Exception as e:
-            emit({"type": "error", "error": f"ollama unreachable: {e}"})
-            return None
+            payload = {
+                "model": model,
+                "messages": trimmed,
+                "stream": True,
+                "keep_alive": settings.get("keep_alive", "30m"),
+                "options": ollama_options(settings),
+            }
+            if use_tools:
+                payload["tools"] = tools_for_ollama()
 
-        content_buf = []
-        tool_calls_native: list[dict] = []
-        done = False
-        for raw in resp:
-            if not raw:
-                continue
             try:
-                obj = json.loads(raw.decode("utf-8"))
-            except Exception:
-                continue
-            msg = obj.get("message") or {}
-            piece = msg.get("content") or ""
-            if piece:
-                content_buf.append(piece)
-                emit({"type": "delta", "content": piece})
-            for tc in (msg.get("tool_calls") or []):
-                tool_calls_native.append(tc)
-            if obj.get("done"):
-                done = True
-                if obj.get("eval_count") is not None:
-                    emit({
-                        "type": "stats",
+                resp = ollama_post_stream("/api/chat", payload)
+            except Exception as e:
+                emit({"type": "error", "error": f"ollama unreachable: {e}"})
+                return None
+
+            content_buf = []
+            tool_calls_native: list[dict] = []
+            done = False
+            last_stats = {}
+            for raw in resp:
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    continue
+                msg = obj.get("message") or {}
+                piece = msg.get("content") or ""
+                if piece:
+                    content_buf.append(piece)
+                    emit({"type": "delta", "content": piece})
+                for tc in (msg.get("tool_calls") or []):
+                    tool_calls_native.append(tc)
+                if obj.get("done"):
+                    done = True
+                    last_stats = {
                         "eval_count": obj.get("eval_count"),
                         "eval_duration": obj.get("eval_duration"),
                         "prompt_eval_count": obj.get("prompt_eval_count"),
+                    }
+                    if last_stats.get("eval_count") is not None:
+                        emit({"type": "stats", **last_stats})
+                    break
+            resp.close()
+
+            full_text = "".join(content_buf)
+            parsed_calls = []
+            for tc in tool_calls_native:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                parsed_calls.append({"name": fn.get("name"), "arguments": args or {}})
+            if not parsed_calls and use_tools:
+                for c in extract_tool_calls(full_text):
+                    parsed_calls.append({
+                        "name": c.get("name") or c.get("tool"),
+                        "arguments": c.get("arguments") or c.get("args") or {},
                     })
-                break
-        resp.close()
 
-        full_text = "".join(content_buf)
-        parsed_calls = []
-        for tc in tool_calls_native:
-            fn = tc.get("function") or {}
-            args = fn.get("arguments")
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    args = {}
-            parsed_calls.append({"name": fn.get("name"), "arguments": args or {}})
-        if not parsed_calls and use_tools:
-            for c in extract_tool_calls(full_text):
-                parsed_calls.append({
-                    "name": c.get("name") or c.get("tool"),
-                    "arguments": c.get("arguments") or c.get("args") or {},
+            assistant_msg = {"role": "assistant", "content": full_text}
+            if parsed_calls:
+                assistant_msg["tool_calls"] = [
+                    {"function": {"name": c["name"], "arguments": c["arguments"]}} for c in parsed_calls
+                ]
+
+            if not parsed_calls or rounds >= max_tool_rounds:
+                # If the model returned empty content after tool results, nudge once.
+                if not (assistant_msg.get("content") or "").strip() and rounds > 0 and not empty_retry_done:
+                    empty_retry_done = True
+                    conversation.append({
+                        "role": "system",
+                        "content": "Continue. Complete the user's request using the tool results you just received. Do not ask for permission.",
+                    })
+                    continue
+                # attach stats to the final message so the client can show per-msg token count
+                assistant_msg["_stats"] = last_stats
+                emit({"type": "final", "message": assistant_msg})
+                return assistant_msg
+
+            conversation.append(assistant_msg)
+            for call in parsed_calls:
+                name = call.get("name") or ""
+                args = call.get("arguments") or {}
+                emit({"type": "tool_start", "name": name, "arguments": args})
+                # run tool in thread pool so we can heartbeat while it blocks.
+                # copy context vars so _current_chat_id and _chat_emitters work inside the worker.
+                _ctx = contextvars.copy_context()
+                future = _tool_executor.submit(_ctx.run, invoke_tool, name, args if isinstance(args, dict) else {})
+                while not future.done():
+                    try:
+                        future.result(timeout=1.0)
+                    except Exception:
+                        pass
+                    if not future.done():
+                        try:
+                            emit({"type": "heartbeat", "note": f"waiting for {name}…"})
+                        except Exception:
+                            pass
+                result = future.result()
+                emit({"type": "tool_result", "name": name, "result": result})
+                conversation.append({
+                    "role": "tool",
+                    "name": name,
+                    "content": json.dumps(result, ensure_ascii=False)[:4000],
                 })
-
-        assistant_msg = {"role": "assistant", "content": full_text}
-        if parsed_calls:
-            assistant_msg["tool_calls"] = [
-                {"function": {"name": c["name"], "arguments": c["arguments"]}} for c in parsed_calls
-            ]
-
-        if not parsed_calls or rounds >= max_tool_rounds:
-            emit({"type": "final", "message": assistant_msg})
-            return assistant_msg
-
-        conversation.append(assistant_msg)
-        for call in parsed_calls:
-            name = call.get("name") or ""
-            args = call.get("arguments") or {}
-            emit({"type": "tool_start", "name": name, "arguments": args})
-            result = invoke_tool(name, args if isinstance(args, dict) else {})
-            emit({"type": "tool_result", "name": name, "result": result})
-            conversation.append({
-                "role": "tool",
-                "name": name,
-                "content": json.dumps(result, ensure_ascii=False)[:12000],
-            })
-        rounds += 1
+            rounds += 1
+    finally:
+        _chat_emitters.pop(chat_id, None)
 
 
 # ---- versioning ------------------------------------------------------------
@@ -2454,9 +2839,12 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/health":
             return self._send_json(200, {"ok": True, "ollama": OLLAMA})
         if p == "/api/hardware":
-            optimal = get_optimal_settings()
+            qs = urllib.parse.parse_qs(parsed.query)
+            model = (qs.get("model") or [""])[0].strip()
+            optimal = get_combined_optimal_settings(model or None)
             return self._send_json(200, {
                 "hardware": optimal.pop("_hardware", {}),
+                "model": optimal.pop("_model", None),
                 "recommended": optimal,
                 "current": get_settings(),
             })
@@ -2534,6 +2922,19 @@ class Handler(BaseHTTPRequestHandler):
             if not fp.exists() or not fp.is_file():
                 return self._send_json(404, {"error": "not found"})
             return self._send_bytes(200, fp.read_bytes(), "text/html; charset=utf-8")
+        if p.startswith("/api/jobs/"):
+            job_id = p.split("/")[3]
+            with _tool_jobs_lock:
+                job = _tool_jobs.get(job_id)
+            if not job:
+                return self._send_json(404, {"error": "not found"})
+            return self._send_json(200, {
+                "id": job_id,
+                "status": job.get("status"),
+                "result": job.get("result"),
+                "started": job.get("started"),
+                "finished": job.get("finished"),
+            })
         if p == "/api/desktop/status":
             s = get_settings()
             return self._send_json(200, {
@@ -2600,19 +3001,26 @@ class Handler(BaseHTTPRequestHandler):
             broadcast_event({"type": "settings:update"})
             return self._send_json(200, cur)
         if p == "/api/hardware/apply":
-            optimal = get_optimal_settings()
+            model = (body.get("model") or "").strip()
+            optimal = get_combined_optimal_settings(model or None)
             hw_info = optimal.pop("_hardware", {})
+            model_info = optimal.pop("_model", None)
             cur = get_settings()
-            for key in ["num_ctx", "num_gpu", "num_batch", "num_thread", "num_predict", "keep_alive", "temperature", "top_p"]:
+            for key in ["num_ctx", "num_gpu", "num_batch", "num_thread", "num_predict", "keep_alive", "temperature", "top_p", "kv_cache_type"]:
                 if key in optimal:
                     cur[key] = optimal[key]
             save_json(SETTINGS_FILE, cur)
             broadcast_event({"type": "settings:update"})
+            if model_info and not model_info.get("error"):
+                msg = f"Tuned for {hw_info['gpus'][0]['name'] if hw_info['gpus'] else 'CPU'} + {model_info['name']} ({model_info['est_weights_gb']}GB weights)"
+            else:
+                msg = f"Tuned for {hw_info['gpus'][0]['name'] if hw_info['gpus'] else 'CPU'} ({hw_info['ram_gb']}GB RAM)"
             return self._send_json(200, {
                 "ok": True,
                 "applied": optimal,
                 "hardware": hw_info,
-                "message": f"Tuned for {hw_info['gpus'][0]['name'] if hw_info['gpus'] else 'CPU'} ({hw_info['ram_gb']}GB RAM)",
+                "model": model_info,
+                "message": msg,
             })
         if p == "/api/workspace":
             folders = body.get("folders") or []
@@ -2659,8 +3067,37 @@ class Handler(BaseHTTPRequestHandler):
             ok = decide_approval(body.get("id") or "", body.get("decision") or "deny")
             return self._send_json(200 if ok else 404, {"ok": ok})
         if p == "/api/tools/call":
-            result = invoke_tool(body.get("name") or "", body.get("arguments") or {})
-            return self._send_json(200, {"result": result})
+            job_id = uuid.uuid4().hex[:12]
+            name = body.get("name") or ""
+            args = body.get("arguments") or {}
+
+            def _do_job():
+                with _tool_jobs_lock:
+                    _tool_jobs[job_id]["status"] = "running"
+                try:
+                    result = invoke_tool(name, args)
+                    with _tool_jobs_lock:
+                        _tool_jobs[job_id]["status"] = "done"
+                        _tool_jobs[job_id]["result"] = result
+                except Exception as e:
+                    with _tool_jobs_lock:
+                        _tool_jobs[job_id]["status"] = "error"
+                        _tool_jobs[job_id]["result"] = {"error": str(e)}
+                finally:
+                    with _tool_jobs_lock:
+                        _tool_jobs[job_id]["finished"] = int(time.time())
+
+            with _tool_jobs_lock:
+                _tool_jobs[job_id] = {
+                    "id": job_id,
+                    "status": "queued",
+                    "name": name,
+                    "started": int(time.time()),
+                    "finished": None,
+                    "result": None,
+                }
+            _tool_executor.submit(_do_job)
+            return self._send_json(202, {"job_id": job_id, "status": "queued"})
         if p == "/api/chat":
             return self._handle_chat(body)
         if p == "/api/prewarm":
@@ -2911,11 +3348,17 @@ class Handler(BaseHTTPRequestHandler):
             chats = get_chats()
             if chat_id in chats["chats"]:
                 chat = chats["chats"][chat_id]
-                chat["messages"].append({
+                msg = {
                     "role": "assistant",
                     "content": final.get("content", ""),
                     "t": int(time.time()),
-                })
+                }
+                stats = final.get("_stats") or {}
+                if stats.get("eval_count") is not None:
+                    msg["tokens"] = stats["eval_count"]
+                if stats.get("prompt_eval_count") is not None:
+                    msg["prompt_tokens"] = stats["prompt_eval_count"]
+                chat["messages"].append(msg)
                 chat["updated"] = int(time.time())
                 html = extract_html(final.get("content", ""))
                 if html:

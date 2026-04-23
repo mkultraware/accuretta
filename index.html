@@ -243,10 +243,19 @@
     <p>everything lives in <code>./data</code>: chat history, workspace, settings, versions, system context. nothing leaves the machine unless you explicitly allow it.</p>
 
     <div class="faq-q">what does the context gauge show?</div>
-    <p>how full the current session's prompt is relative to <code>num_ctx</code>. once it hits the outer ring, older messages get silently dropped. start a new session, or raise num_ctx in Settings.</p>
+    <p>how full the current session's prompt is relative to <code>num_ctx</code>. the count is conservative (≈3 chars per token) so it errs on the safe side. once it hits the outer ring, the bridge silently drops the oldest non-system messages to stay under budget — you don't need to start a new session. hover any assistant bubble's meta line to see how many tokens that reply used.</p>
+
+    <div class="faq-q">how do hardware auto-tune and model recommendations work?</div>
+    <p><b>Detect Hardware</b> scans your GPU, CPU, and RAM. the values shown are a <b>combined</b> result: your hardware sets the ceiling, and the chosen model sets safety limits. the smaller value always wins. if you switch models, click <b>Recalculate</b> to re-run the combined scan. settings are only applied when you press <b>Apply Optimal</b> — nothing changes automatically.</p>
+
+    <div class="faq-q">what is kv cache quant?</div>
+    <p>controls the precision of the model's memory cache. <code>q4_0</code> uses half the VRAM of <code>q8_0</code> with barely noticeable quality loss — ideal for 16GB cards. <code>f16</code> is best quality but uses full VRAM. the auto-tuner picks <code>q4_0</code> automatically for GPUs with 16GB or less.</p>
+
+    <div class="faq-q">does the composer save drafts?</div>
+    <p>yes — whatever you type is saved to browser storage per chat. if you refresh the page or switch chats, your draft is restored when you come back. it is cleared when you hit send.</p>
 
     <div class="faq-q">keyboard shortcuts?</div>
-    <p><code>⌘⏎</code> / <code>Ctrl⏎</code> send · <code>Shift⏎</code> newline · click model name in the chat meta to open Settings.</p>
+    <p><code>⌘⏎</code> / <code>Ctrl⏎</code> send · <code>Shift⏎</code> newline · <code>Ctrl+K</code> / <code>⌘K</code> session switcher · click model name in the chat meta to open Settings.</p>
   </div>
 </aside>
 
@@ -315,14 +324,7 @@
       </span>
     </div>
 
-    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
-      <span>Speed</span>
-      <span class="grow" style="flex:1;"></span>
-      <button class="btn sm" id="btn-apply-rec" type="button" title="Apply recommended settings for the chosen model"><i class="ph ph-sparkle"></i>Use recommended</button>
-    </div>
-    <div class="form-row" id="rec-hint" style="display:none;">
-      <span class="hint" id="rec-hint-text"></span>
-    </div>
+
     <div class="form-row">
       <label>Context window · num_ctx <i class="ph ph-info" title="How many tokens the model can 'remember' at once. Each token ≈ 0.75 words. Larger = longer conversations but more VRAM usage. Auto-tune sets this based on your GPU VRAM."></i></label>
       <input type="number" id="set-ctx" min="512" step="256">
@@ -352,6 +354,15 @@
       <label>Keep model in VRAM · keep_alive</label>
       <input id="set-keep">
       <span class="hint">e.g. <code>30m</code>, <code>1h</code>, <code>-1</code>.</span>
+    </div>
+    <div class="form-row">
+      <label>KV cache quant · kv_cache_type <i class="ph ph-info" title="q4_0 saves ~50% VRAM vs q8_0 with tiny quality loss. f16 is best quality but uses full VRAM."></i></label>
+      <select id="set-kv">
+        <option value="q4_0">q4_0 — smallest VRAM</option>
+        <option value="q8_0">q8_0 — balanced</option>
+        <option value="f16">f16 — best quality</option>
+      </select>
+      <span class="hint">lower = more context window fits in VRAM. restart not required.</span>
     </div>
 
     <div class="form-group">Sampling</div>

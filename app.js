@@ -32,6 +32,9 @@
     tokTotal: 0,             // cumulative generated tokens for this session (client-side)
     sessionDesktopDisabled: false,
     palette: { open: false, items: [], idx: 0 },
+    _versionsExpanded: false,
+    _lastMsgTokens: 0,
+    _lastMsgPromptTokens: 0,
   };
 
   const app = $("#app");
@@ -67,9 +70,15 @@
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[c]));
 
-  function scrollToBottom() {
+  function isNearBottom() {
     const s = $("#chat-scroll");
-    s.scrollTop = s.scrollHeight;
+    return s.scrollHeight - s.scrollTop - s.clientHeight < 120;
+  }
+  function scrollToBottom(force = false) {
+    const s = $("#chat-scroll");
+    if (force || isNearBottom()) {
+      s.scrollTop = s.scrollHeight;
+    }
   }
 
   function relTime(t) {
@@ -100,6 +109,7 @@
       case "list_directory": return `Looking in ${shortPath(args.path) || "folder"}…`;
       case "read_file":      return `Reading ${shortPath(args.path)}…`;
       case "write_file":     return `Writing ${shortPath(args.path)}…`;
+      case "edit_file":      return `Editing ${shortPath(args.path)}…`;
       case "delete_file":    return `Deleting ${shortPath(args.path)}…`;
       case "run_powershell": return `Running command…`;
       case "open_program":   return `Opening ${args.name || args.path || "program"}…`;
@@ -117,6 +127,7 @@
       }
       case "read_file":      return `Read ${shortPath(res.path)}${res.bytes != null ? ` (${res.bytes} bytes)` : ""}`;
       case "write_file":     return `Wrote ${shortPath(res.path)}`;
+      case "edit_file":      return `Edited ${shortPath(res.path)} · ${res.edits_applied || 0} change${(res.edits_applied || 0) === 1 ? "" : "s"}`;
       case "delete_file":    return `Deleted ${shortPath(res.path)}`;
       case "run_powershell": {
         const out = (res.stdout || "").trim();
@@ -263,6 +274,9 @@
     });
     await loadChats();
     selectChat(c.id);
+    const ta = $("#composer-input");
+    ta.value = "";
+    autoResize(ta);
   }
 
   function selectChat(id) {
@@ -281,8 +295,13 @@
     renderTokTotal();
     refreshSessionDesktopState();
     renderMessages();
+    state._versionsExpanded = false;
     loadVersions();
     renderChatList();
+    // restore composer draft
+    const ta = $("#composer-input");
+    ta.value = localStorage.getItem("accuretta:draft:" + id) || "";
+    autoResize(ta);
     if (isMobile()) {
       state.mobileTab = "chat";
       applyMobileTab();
@@ -331,6 +350,7 @@
   async function deleteChat(id) {
     if (!confirm("Delete this session and its versions?")) return;
     await fetch(`/api/chats/${id}`, { method: "DELETE" });
+    localStorage.removeItem("accuretta:draft:" + id);
     await loadChats();
     if (state.chatId === id) {
       if (state.chats.order.length) selectChat(state.chats.order[0]);
@@ -475,14 +495,14 @@
             <div class="bubble agent">Welcome to Accuretta. What would you like to do today?</div>
           </div>
         </div>`;
-      scrollToBottom();
+      scrollToBottom(true);
       return;
     }
     for (const m of state.messages) {
       inner.appendChild(renderBubble(m));
     }
     renderRegenerateChip();
-    scrollToBottom();
+    scrollToBottom(true);
   }
 
   function renderBubble(m) {
@@ -502,13 +522,30 @@
       }
     }
 
+    const tokTip = m.tokens ? ` title="${m.tokens.toLocaleString()} tokens"` : "";
     row.innerHTML = `
       ${avatar}
       <div class="bubble-col">
         ${thoughtChip}
         <div class="bubble ${m.role === "user" ? "user" : "agent"}">${renderMarkdown(visible)}</div>
-        <div class="bubble-meta">${m.role === "user" ? "you" : (state.settings.model || "agent")} · ${relTime(m.t)}</div>
+        <div class="bubble-meta"${tokTip}>${m.role === "user" ? "you" : (state.settings.model || "agent")} · ${relTime(m.t)}</div>
       </div>`;
+    // copy button for every bubble
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "copy-msg";
+    copyBtn.type = "button";
+    copyBtn.innerHTML = '<i class="ph ph-copy"></i>';
+    copyBtn.title = "Copy message";
+    copyBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(m.content || "");
+        copyBtn.innerHTML = '<i class="ph ph-check"></i>';
+        setTimeout(() => (copyBtn.innerHTML = '<i class="ph ph-copy"></i>'), 1200);
+      } catch {
+        toast("Clipboard blocked", "warn", 2000);
+      }
+    });
+    row.querySelector(".bubble-col").appendChild(copyBtn);
     enhanceCodeBlocks(row);
     return row;
   }
@@ -567,7 +604,7 @@
         <div class="bubble-meta">${esc(state.settings.model)} · streaming</div>
       </div>`;
     $("#chat-inner").appendChild(agentRow);
-    scrollToBottom();
+    scrollToBottom(true);
 
     state.streaming = true;
     state.abortCtl = new AbortController();
@@ -667,6 +704,7 @@
     }
     ta.value = "";
     autoResize(ta);
+    if (state.chatId) localStorage.removeItem("accuretta:draft:" + state.chatId);
     state.pendingImages = [];
     renderImageTray();
 
@@ -677,7 +715,7 @@
     const userMsg = { role: "user", content: bubbleText, t: Math.floor(Date.now() / 1000) };
     state.messages.push(userMsg);
     $("#chat-inner").appendChild(renderBubble(userMsg));
-    scrollToBottom();
+    scrollToBottom(true);
     renderCtxGauge();
 
     // placeholder agent bubble
@@ -692,7 +730,7 @@
         <div class="bubble-meta">${esc(state.settings.model)} · streaming</div>
       </div>`;
     $("#chat-inner").appendChild(agentRow);
-    scrollToBottom();
+    scrollToBottom(true);
 
     state.streaming = true;
     state.abortCtl = new AbortController();
@@ -925,6 +963,22 @@
       card.dataset.name = evt.name || "";
       toolStack.appendChild(card);
       scrollToBottom();
+    } else if (evt.type === "tool_stream") {
+      const cards = Array.from(toolStack.querySelectorAll(".tool-line.running"));
+      const card = cards.reverse().find(c => c.dataset.name === evt.name);
+      if (card) {
+        const span = card.querySelector("span");
+        if (span) span.textContent = (evt.text || "").slice(-120);
+      }
+    } else if (evt.type === "heartbeat") {
+      // while a long tool runs, the backend sends heartbeats — keep the shimmer alive
+      const line = row && row.querySelector(".think-line");
+      if (line && !line.classList.contains("done")) {
+        const span = line.querySelector("span");
+        if (span && span.classList.contains("shimmer")) {
+          span.textContent = (evt.note || "working…").slice(0, 80);
+        }
+      }
     } else if (evt.type === "tool_result") {
       const cards = Array.from(toolStack.querySelectorAll(".tool-line.running"));
       const card = cards.reverse().find(c => c.dataset.name === evt.name);
@@ -950,13 +1004,30 @@
         state.tokTotal += tok;
         renderTokTotal();
       }
+      // stash for the final message object
+      state._lastMsgTokens = tok;
+      state._lastMsgPromptTokens = evt.prompt_eval_count;
     } else if (evt.type === "final") {
       const full = evt.message.content || "";
-      state.messages.push({
+      const msg = {
         role: "assistant",
         content: full,
         t: Math.floor(Date.now() / 1000),
-      });
+        tokens: state._lastMsgTokens || 0,
+        prompt_tokens: state._lastMsgPromptTokens || 0,
+      };
+      state.messages.push(msg);
+      state._lastMsgTokens = 0;
+      state._lastMsgPromptTokens = 0;
+      // update the meta tooltip on the bubble we just rendered
+      const rows = [...document.querySelectorAll("#chat-inner .bubble-row")];
+      const lastRow = rows.reverse().find(r => r.querySelector(".bubble.agent"));
+      if (lastRow) {
+        const meta = lastRow.querySelector(".bubble-meta");
+        if (meta && msg.tokens) {
+          meta.title = `${msg.tokens.toLocaleString()} tokens${msg.prompt_tokens ? ` (prompt: ${msg.prompt_tokens.toLocaleString()})` : ""}`;
+        }
+      }
       // parse companion files emitted alongside the primary html block
       // (```css path=style.css ..., ```js path=script.js ..., etc.)
       const files = parseMultiFileBlocks(full);
@@ -966,6 +1037,8 @@
       }
       renderCtxGauge();
       renderRegenerateChip();
+    } else if (evt.type === "notice") {
+      toast(evt.note || "", "info", 3000, "ctx-notice");
     } else if (evt.type === "error") {
       bubble.innerHTML = `<span style="color: var(--danger)">error: ${esc(evt.error)}</span>`;
     }
@@ -993,7 +1066,21 @@
       bar.innerHTML = `<span id="versions-empty" style="color:var(--fg-faint)">no versions yet</span><span class="spacer"></span>`;
       return;
     }
-    for (const v of state.versions) {
+    const maxVisible = state._versionsExpanded ? Infinity : 8;
+    const hiddenCount = Math.max(0, state.versions.length - maxVisible);
+    const visible = state._versionsExpanded ? state.versions : state.versions.slice(-maxVisible);
+    if (hiddenCount > 0) {
+      const expand = document.createElement("button");
+      expand.className = "version-chip";
+      expand.innerHTML = `<span class="n">…</span><span style="opacity:.6">+${hiddenCount} more</span>`;
+      expand.title = `Show all ${state.versions.length} versions`;
+      expand.addEventListener("click", () => {
+        state._versionsExpanded = true;
+        renderVersions();
+      });
+      bar.appendChild(expand);
+    }
+    for (const v of visible) {
       const wrap = document.createElement("span");
       wrap.className = "version-wrap" + (v.id === state.activeVersion ? " active" : "");
       const chip = document.createElement("button");
@@ -1606,6 +1693,10 @@
       pair("path", d.path || "?");
       pair("size", (d.bytes || 0).toLocaleString() + " bytes");
       pair("overwrites", "yes, if exists");
+    } else if (kind === "edit_file") {
+      pair("path", d.path || "?");
+      pair("edits", String(d.edits || "?"));
+      if (d.preview) pair("preview", d.preview.slice(0, 120).replace(/\n/g, " "));
     } else if (kind === "delete") {
       pair("path", d.path || "?");
       pair("target", d.dir ? "directory" : "file");
@@ -1726,8 +1817,6 @@
     $("#settings-drawer").classList.add("open");
     await loadModels();
     populateSettingsForm();
-    const current = $("#set-model").value;
-    if (current) loadRecommended(current);
     loadSystemContext();
   }
 
@@ -1872,6 +1961,8 @@
     fill("#set-thread", s.num_thread);
     fill("#set-predict", s.num_predict);
     fill("#set-keep", s.keep_alive);
+    const kvSel = $("#set-kv");
+    if (kvSel) kvSel.value = s.kv_cache_type || "q8_0";
     fill("#set-temp", s.temperature);
     fill("#set-topp", s.top_p);
     $("#sw-dark").classList.toggle("on", s.theme === "dark");
@@ -1922,6 +2013,7 @@
       num_thread: n("#set-thread"),
       num_predict: n("#set-predict"),
       keep_alive: $("#set-keep").value || "30m",
+      kv_cache_type: $("#set-kv")?.value || "q8_0",
       temperature: n("#set-temp"),
       top_p: n("#set-topp"),
       theme: $("#sw-dark").classList.contains("on") ? "dark" : "light",
@@ -1938,63 +2030,6 @@
     closeSettings();
   }
 
-  let _lastRec = null;
-  async function loadRecommended(model) {
-    const hint = $("#rec-hint");
-    const text = $("#rec-hint-text");
-    if (!model) { hint.style.display = "none"; _lastRec = null; return; }
-    try {
-      const r = await api(`/api/model-info/${encodeURIComponent(model)}`);
-      if (r.error) { hint.style.display = "none"; _lastRec = null; return; }
-      _lastRec = r;
-      const rec = r.recommended || {};
-      const gpuLbl = rec.num_gpu === 0 ? "auto" : rec.num_gpu;
-      text.innerHTML = `detected: <code>${r.size_b || "?"}B</code> · <code>${r.quant || "?"}</code> · ~<code>${r.est_weights_gb || "?"}GB</code> weights · native ctx <code>${r.native_ctx}</code>. recommended → ctx <code>${rec.num_ctx}</code>, gpu <code>${gpuLbl}</code>, batch <code>${rec.num_batch}</code>.`;
-      hint.style.display = "";
-    } catch {
-      hint.style.display = "none"; _lastRec = null;
-    }
-  }
-  function applyRecommended() {
-    if (!_lastRec) return;
-    const rec = _lastRec.recommended;
-    $("#set-ctx").value = rec.num_ctx;
-    $("#set-gpu").value = rec.num_gpu;
-    $("#set-batch").value = rec.num_batch;
-    $("#set-thread").value = rec.num_thread;
-    $("#set-predict").value = rec.num_predict;
-    $("#set-keep").value = rec.keep_alive;
-    $("#set-temp").value = rec.temperature;
-    $("#set-topp").value = rec.top_p;
-  }
-  // auto-apply: whenever the model changes (settings dropdown or model pill),
-  // pull recommended, merge into settings, save. Aim is plug-and-play.
-  async function autoTuneForModel(model, opts = {}) {
-    if (!model) return;
-    try {
-      const r = await api(`/api/model-info/${encodeURIComponent(model)}`);
-      if (!r || r.error || !r.recommended) return;
-      const rec = r.recommended;
-      _lastRec = r;
-      const payload = {
-        model,
-        num_ctx: rec.num_ctx,
-        num_gpu: rec.num_gpu,
-        num_batch: rec.num_batch,
-        num_thread: rec.num_thread,
-        num_predict: rec.num_predict,
-        keep_alive: rec.keep_alive,
-        temperature: rec.temperature,
-        top_p: rec.top_p,
-      };
-      await saveSettings(payload);
-      if (opts.silent !== true) {
-        toast(`tuned for ${model} — ctx ${rec.num_ctx}, batch ${rec.num_batch}`, "ok");
-      }
-      // warm up ollama so the first reply doesn't freeze
-      prewarmModel(model);
-    } catch {}
-  }
   async function prewarmModel(model) {
     if (!model) return;
     toast(`loading ${model.split("/").pop()}…`, "info", 30000, "prewarm");
@@ -2029,7 +2064,7 @@
     }, 0);
     const imageOverhead = (state.pendingImages || []).length * 500;
     const totalChars = systemPromptChars + msgChars + imageOverhead;
-    const used = Math.min(capacity, Math.round(totalChars / 3.5));
+    const used = Math.min(capacity, Math.round(totalChars / 3.0));
     const pct = Math.min(1, used / capacity);
     const circ = 2 * Math.PI * 13;
     arc.setAttribute("stroke-dasharray", circ.toFixed(2));
@@ -2038,7 +2073,7 @@
     const gauge = $("#ctx-gauge");
     gauge.classList.toggle("warn", pct >= 0.7 && pct < 0.9);
     gauge.classList.toggle("crit", pct >= 0.9);
-    gauge.title = `${used.toLocaleString()} / ${capacity.toLocaleString()} tokens (~${Math.round(pct * 100)}%)\nSystem: ~${Math.round(systemPromptChars/3.5)} tok | Msgs: ~${Math.round(msgChars/3.5)} tok`;
+    gauge.title = `${used.toLocaleString()} / ${capacity.toLocaleString()} tokens (~${Math.round(pct * 100)}%)\nSystem: ~${Math.round(systemPromptChars/3.0)} tok | Msgs: ~${Math.round(msgChars/3.0)} tok`;
   }
   function renderTokTotal() {
     const el = $("#tok-total");
@@ -2091,24 +2126,45 @@
     btn.disabled = true;
     info.textContent = "Scanning...";
     try {
-      const r = await api("/api/hardware");
+      const model = state.settings.model || "";
+      const r = await api(`/api/hardware${model ? "?model=" + encodeURIComponent(model) : ""}`);
       _detectedHardware = r;
       const hw = r.hardware;
       const rec = r.recommended;
-      const gpuText = hw.gpus.length 
+      const m = r.model;
+      const gpuText = hw.gpus.length
         ? hw.gpus.map(g => `${g.name} (${g.vram_gb}GB)`).join(", ")
         : "No GPU detected (CPU-only)";
-      info.innerHTML = `<div style="margin-bottom:6px;"><strong>Detected:</strong></div>
+      let html = `<div style="margin-bottom:6px;"><strong>Detected:</strong></div>
         <div>GPU: ${esc(gpuText)}</div>
         <div>CPU: ${esc(hw.cpu.cores)} cores / ${esc(hw.cpu.threads)} threads ${hw.cpu.is_x3d ? "(X3D)" : ""}</div>
-        <div>RAM: ${esc(hw.ram_gb)}GB</div>
-        <div style="margin-top:6px;"><strong>Recommended:</strong></div>
-        <div>ctx: ${rec.num_ctx.toLocaleString()} | gpu: ${rec.num_gpu} | batch: ${rec.num_batch} | threads: ${rec.num_thread}</div>`;
+        <div>RAM: ${esc(hw.ram_gb)}GB</div>`;
+      if (m && !m.error) {
+        html += `<div style="margin-top:6px;"><strong>Model:</strong> ${esc(m.name)} · ${esc(m.size_b || "?")}B · ${esc(m.quant || "?")} · ~${esc(m.est_weights_gb || "?")}GB weights · native ctx <code>${(m.native_ctx || "?").toLocaleString()}</code></div>`;
+      }
+      // Show combined recommendations with clear constraint labels
+      html += `<div style="margin-top:6px;"><strong>Combined (hardware + model):</strong></div>`;
+      const ctxWhy = rec.num_ctx < (m?.native_ctx || Infinity) ? "capped by hardware" : "native model limit";
+      const batchWhy = rec.num_batch < 512 ? "capped by hardware" : "hardware supports more";
+      html += `<div style="font-size:11px;line-height:1.5;">
+        <div>ctx <code>${rec.num_ctx.toLocaleString()}</code> <span style="opacity:.6">(${ctxWhy})</span></div>
+        <div>gpu layers <code>${rec.num_gpu === 0 ? "auto" : rec.num_gpu}</code></div>
+        <div>batch <code>${rec.num_batch}</code> <span style="opacity:.6">(${batchWhy})</span></div>
+        <div>threads <code>${rec.num_thread}</code></div>
+        <div>kv cache <code>${rec.kv_cache_type || "q8_0"}</code></div>
+      </div>`;
+      if (m && !m.error && m.est_weights_gb) {
+        const vram = hw.gpus[0]?.vram_gb || 0;
+        if (m.est_weights_gb > vram * 0.8) {
+          html += `<div style="margin-top:4px;color:var(--danger);font-size:11px;"><i class="ph ph-warning-circle"></i> Model may not fit in VRAM — consider a smaller quant or model.</div>`;
+        }
+      }
+      info.innerHTML = html;
       if (applyBtn) {
         applyBtn.disabled = false;
         applyBtn.onclick = () => applyHardwareSettings(r);
       }
-      toast(`Detected: ${hw.gpus[0]?.name || "CPU"}`, "ok", 2500);
+      toast(`Detected: ${hw.gpus[0]?.name || "CPU"}${m ? " + " + m.name.split("/").pop() : ""}`, "ok", 2500);
     } catch (e) {
       info.textContent = `Detection failed: ${e.message}`;
       toast("Hardware detection failed", "err", 3000);
@@ -2124,7 +2180,7 @@
       const r = await api("/api/hardware/apply", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ model: state.settings.model || "" }),
       });
       if (r.ok) {
         await loadSettings();
@@ -2203,10 +2259,23 @@
     $("#model-pill").addEventListener("click", openSettings);
     $("#set-model").addEventListener("change", () => {
       const m = $("#set-model").value;
-      loadRecommended(m);
-      autoTuneForModel(m);           // plug-and-play: apply best settings
+      prewarmModel(m);
+      // Show recalculate prompt if hardware was already scanned
+      if (_detectedHardware) {
+        const info = $("#hw-detected-info");
+        const existing = info.querySelector(".recalc-prompt");
+        if (!existing) {
+          const prompt = document.createElement("div");
+          prompt.className = "recalc-prompt";
+          prompt.style.cssText = "margin-top:8px;";
+          prompt.innerHTML = `<button class="btn accent sm" id="btn-hw-recalc"><i class="ph ph-arrows-clockwise"></i>Recalculate for ${esc(m)}</button>`;
+          info.appendChild(prompt);
+          $("#btn-hw-recalc")?.addEventListener("click", () => {
+            detectHardware();
+          });
+        }
+      }
     });
-    $("#btn-apply-rec").addEventListener("click", applyRecommended);
     $("#btn-sysctx-rescan").addEventListener("click", rescanSystemContext);
     $("#btn-sysctx-save").addEventListener("click", saveSystemContext);
     $("#btn-theme").addEventListener("click", async () => {
@@ -2246,6 +2315,14 @@
         if (files.length) addImageFiles(files);
       });
     }
+
+    // composer draft auto-save
+    $("#composer-input").addEventListener("input", (e) => {
+      autoResize(e.target);
+      if (state.chatId) {
+        localStorage.setItem("accuretta:draft:" + state.chatId, e.target.value);
+      }
+    });
 
     // mode chips
     $$('[data-mode]').forEach(b => {

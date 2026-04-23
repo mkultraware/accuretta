@@ -312,7 +312,7 @@ button { font-family: inherit; }
   margin-top: 2px;
 }
 .avatar.user { background: var(--lilac); color: #3A2E5A; font-size: 10px; font-weight: 600; }
-.bubble-col { display: flex; flex-direction: column; gap: 4px; max-width: 82%; min-width: 0; }
+.bubble-col { display: flex; flex-direction: column; gap: 4px; max-width: 82%; min-width: 0; position: relative; }
 .bubble-row.user .bubble-col { align-items: flex-end; }
 
 .bubble {
@@ -369,6 +369,22 @@ button { font-family: inherit; }
   color: var(--fg-faint);
   padding: 0 6px;
 }
+.copy-msg {
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-out);
+  position: absolute;
+  top: 6px; right: 6px;
+  width: 24px; height: 24px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+.bubble-row:hover .copy-msg { opacity: 1; }
+.copy-msg:hover { color: var(--fg); background: var(--bg-inset); }
 .typing { display: inline-flex; gap: 3px; margin-left: 6px; vertical-align: middle; }
 .typing span { width: 4px; height: 4px; border-radius: 999px; background: var(--fg-muted); animation: typing 1.2s infinite; }
 .typing span:nth-child(2) { animation-delay: 0.2s; }
@@ -702,7 +718,7 @@ button { font-family: inherit; }
   border-bottom: 1px solid var(--border);
 }
 .drawer-head h3 { font-family: var(--font-display); font-size: 18px; letter-spacing: -0.02em; flex: 1; margin: 0; }
-.drawer-body { padding: 16px 20px 24px; overflow-y: auto; flex: 1; }
+.drawer-body { padding: 16px 20px 24px; overflow-y: auto; overflow-x: hidden; flex: 1; }
 .form-row { display: flex; flex-direction: column; gap: 4px; margin-bottom: 14px; }
 .form-row label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--fg-muted); font-weight: 500; }
 .form-row .hint { font-size: 10px; color: var(--fg-faint); line-height: 1.5; }
