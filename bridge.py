@@ -2715,7 +2715,7 @@ MIME = {
     ".ico": "image/x-icon",
 }
 
-STATIC_WHITELIST = {"index.html", "app.js", "app.css"}
+STATIC_WHITELIST = {"index.html", "app.js", "app.css", "colors_and_type.css", "logo-mark.png"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2781,12 +2781,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._serve_static("index.html")
             if p.startswith("/api/"):
                 return self._handle_api_get(p, parsed)
-            if p.startswith("/design/"):
-                rel = p[len("/design/"):]
-                full = (ROOT / "Design Change" / rel).resolve()
-                if str(full).startswith(str((ROOT / "Design Change").resolve())) and full.is_file():
-                    return self._send_bytes(200, full.read_bytes(), MIME.get(full.suffix, "application/octet-stream"))
-                return self._send_json(404, {"error": "not found"})
             name = p.lstrip("/")
             if name in STATIC_WHITELIST:
                 return self._serve_static(name)
