@@ -1,5 +1,5 @@
 """
-Accuretta bridge — local Ollama proxy + tools + approvals + static server.
+Accuretta bridge — local llama.cpp proxy + tools + approvals + static server.
 
 One process. Serves the frontend (index.html / app.js / app.css / Design Change)
 and exposes JSON/SSE endpoints for chat streaming, tool invocation, workspace,
