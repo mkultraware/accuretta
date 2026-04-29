@@ -245,11 +245,8 @@
     <div class="faq-q">what does the context gauge show?</div>
     <p>how full the current session's prompt is relative to <code>num_ctx</code>. the count is conservative (≈3 chars per token) so it errs on the safe side. once it hits the outer ring, the bridge silently drops the oldest non-system messages to stay under budget — you don't need to start a new session. hover any assistant bubble's meta line to see how many tokens that reply used.</p>
 
-    <div class="faq-q">how do hardware auto-tune and model recommendations work?</div>
-    <p><b>Detect Hardware</b> scans your GPU, CPU, and RAM. the values shown are a <b>combined</b> result: your hardware sets the ceiling, and the chosen model sets safety limits. the smaller value always wins. if you switch models, click <b>Recalculate</b> to re-run the combined scan. settings are only applied when you press <b>Apply Optimal</b> — nothing changes automatically.</p>
-
     <div class="faq-q">what is kv cache quant?</div>
-    <p>controls the precision of the model's memory cache. <code>q4_0</code> uses half the VRAM of <code>q8_0</code> with barely noticeable quality loss — ideal for 16GB cards. <code>f16</code> is best quality but uses full VRAM. the auto-tuner picks <code>q4_0</code> automatically for GPUs with 16GB or less.</p>
+    <p>controls the precision of the model's memory cache. <code>q4_0</code> uses half the VRAM of <code>q8_0</code> with barely noticeable quality loss — ideal for 16GB cards. <code>f16</code> is best quality but uses full VRAM.</p>
 
     <div class="faq-q">does the composer save drafts?</div>
     <p>yes — whatever you type is saved to browser storage per chat. if you refresh the page or switch chats, your draft is restored when you come back. it is cleared when you hit send.</p>
@@ -287,58 +284,41 @@
   <div class="drawer-body" id="settings-body">
     <div class="form-group">Model</div>
     <div class="form-row">
+      <label>Models folder</label>
+      <div style="display:flex;gap:6px;">
+        <input type="text" id="set-models-dir" placeholder="C:\Users\you\MODELS" style="flex:1;" />
+        <button class="btn sm" id="btn-browse-models-dir" title="Pick folder"><i class="ph ph-folder-open"></i></button>
+        <button class="btn sm" id="btn-rescan-models-dir" title="Re-scan folder"><i class="ph ph-arrow-clockwise"></i></button>
+      </div>
+      <span class="hint">folder containing <code>.gguf</code> files. picked folder is scanned recursively.</span>
+    </div>
+    <div class="form-row">
       <label>Chat model</label>
       <div style="display:flex;gap:6px;">
         <select id="set-model" style="flex:1;"></select>
-        <button class="btn sm" id="btn-refresh-models" title="Re-scan ollama"><i class="ph ph-arrow-clockwise"></i></button>
+        <button class="btn sm" id="btn-refresh-models" title="Re-scan models folder"><i class="ph ph-arrow-clockwise"></i></button>
       </div>
-      <span class="hint">pulled from <code>ollama list</code>. If empty: open a new terminal and run <code>ollama pull qwen3:8b</code>, then click refresh.</span>
+      <span class="hint" id="set-model-hint">selecting a model loads it into llama-server.</span>
     </div>
     <div class="form-row">
       <label>Vision model</label>
       <select id="set-vision"></select>
     </div>
 
-    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
-      <span>Auto-Tune</span>
-      <span class="grow" style="flex:1;"></span>
-      <span id="hw-detect-badge" class="hint" style="font-size:10px;"></span>
-    </div>
-    <div class="form-row" id="hw-detect-row">
-      <div style="display:flex;gap:8px;align-items:flex-start;flex-direction:column;">
-        <div id="hw-detected-info" style="font-size:12px;color:var(--fg-muted);font-family:var(--font-mono);">
-          <!-- Populated by JS -->
-        </div>
-        <div style="display:flex;gap:6px;">
-          <button class="btn accent sm" id="btn-hw-detect" type="button">
-            <i class="ph ph-cpu"></i>Detect Hardware
-          </button>
-          <button class="btn sm" id="btn-hw-apply" type="button" disabled>
-            <i class="ph ph-lightning"></i>Apply Optimal
-          </button>
-        </div>
-      </div>
-      <span class="hint">
-        Automatically detects your GPU, CPU, and RAM to configure the best Ollama settings for 
-        your specific hardware. Targets 30+ tokens/second while maximizing context window.
-      </span>
-    </div>
-
-
     <div class="form-row">
-      <label>Context window · num_ctx <i class="ph ph-info" title="How many tokens the model can 'remember' at once. Each token ≈ 0.75 words. Larger = longer conversations but more VRAM usage. Auto-tune sets this based on your GPU VRAM."></i></label>
+      <label>Context window · num_ctx <i class="ph ph-info" title="How many tokens the model can 'remember' at once. Each token ≈ 0.75 words. Larger = longer conversations but more VRAM usage."></i></label>
       <input type="number" id="set-ctx" min="512" step="256">
-      <span class="hint" id="ctx-hint">tokens the model sees. Bigger = more memory, slower. Auto-tuned for your hardware.</span>
+      <span class="hint" id="ctx-hint">tokens the model sees. Bigger = more VRAM, slower.</span>
     </div>
     <div class="form-row">
-      <label>GPU layers · num_gpu <i class="ph ph-info" title="How many model layers run on GPU vs CPU. 99 = all GPU (fastest). 0 = all CPU. Auto-tune detects your VRAM and sets this automatically."></i></label>
-      <input type="number" id="set-gpu" min="0" step="1">
-      <span class="hint" id="gpu-hint">99 = all on GPU. Auto-detected from your graphics card.</span>
+      <label>GPU layers · num_gpu <i class="ph ph-info" title="How many model layers run on GPU vs CPU. -1 or 99 = all GPU (fastest). 0 = all CPU."></i></label>
+      <input type="number" id="set-gpu" min="-1" step="1">
+      <span class="hint" id="gpu-hint">-1 or 99 = all layers on GPU.</span>
     </div>
     <div class="form-row">
-      <label>Batch size · num_batch <i class="ph ph-info" title="How many tokens processed in parallel. Larger = faster throughput but more VRAM. X3D CPUs benefit from larger batches."></i></label>
+      <label>Batch size · num_batch <i class="ph ph-info" title="How many tokens processed in parallel. Larger = faster prompt processing but more VRAM."></i></label>
       <input type="number" id="set-batch" min="32" step="32">
-      <span class="hint" id="batch-hint">parallel token processing. Auto-tuned for your setup.</span>
+      <span class="hint" id="batch-hint">parallel token processing.</span>
     </div>
     <div class="form-row">
       <label>Threads · num_thread</label>
@@ -351,28 +331,54 @@
       <span class="hint">-1 = unlimited.</span>
     </div>
     <div class="form-row">
-      <label>Keep model in VRAM · keep_alive</label>
-      <input id="set-keep">
-      <span class="hint">e.g. <code>30m</code>, <code>1h</code>, <code>-1</code>.</span>
-    </div>
-    <div class="form-row">
-      <label>KV cache quant · kv_cache_type <i class="ph ph-info" title="q4_0 saves ~50% VRAM vs q8_0 with tiny quality loss. f16 is best quality but uses full VRAM."></i></label>
+      <label>KV cache quant · kv_cache_type <i class="ph ph-info" title="q4_0 saves ~50% VRAM vs q8_0 with tiny quality loss. f16 is best quality but uses full VRAM. Changing this restarts llama-server."></i></label>
       <select id="set-kv">
         <option value="q4_0">q4_0 — smallest VRAM</option>
         <option value="q8_0">q8_0 — balanced</option>
         <option value="f16">f16 — best quality</option>
       </select>
-      <span class="hint">lower = more context window fits in VRAM. restart not required.</span>
+      <span class="hint">lower = more context window fits in VRAM. saving reloads the model.</span>
     </div>
 
-    <div class="form-group">Sampling</div>
+    <div class="form-group">Sampling <span class="hint" style="font-size:10px;font-weight:normal;text-transform:none;letter-spacing:0;">— applied next message</span></div>
     <div class="form-row">
-      <label>Temperature</label>
+      <label>Temperature <i class="ph ph-info" title="Randomness of next-token pick. 0 = deterministic, 0.7 = balanced, 1.5+ = wild."></i></label>
       <input type="number" id="set-temp" step="0.05" min="0" max="2">
     </div>
     <div class="form-row">
-      <label>Top-p</label>
+      <label>Top-p <i class="ph ph-info" title="Nucleus sampling. Keep tokens until their cumulative probability reaches this. 0.9 is typical."></i></label>
       <input type="number" id="set-topp" step="0.05" min="0" max="1">
+    </div>
+    <div class="form-row">
+      <label>Top-k <i class="ph ph-info" title="Consider only the K most likely next tokens. 40 is the common default. 0 = disabled."></i></label>
+      <input type="number" id="set-topk" step="1" min="0" max="200">
+    </div>
+    <div class="form-row">
+      <label>Min-p <i class="ph ph-info" title="Cut off tokens with probability below min_p × (top token's probability). 0.05 keeps quality up at high temperatures."></i></label>
+      <input type="number" id="set-minp" step="0.01" min="0" max="1">
+    </div>
+    <div class="form-row">
+      <label>Repetition penalty <i class="ph ph-info" title="Discourages the model from repeating recent tokens. 1 = off (model loops). 1.05–1.15 is the safe range. >1.2 hurts coherence."></i></label>
+      <input type="number" id="set-repeat" step="0.01" min="1" max="2">
+      <span class="hint">if you see the model looping (\"I'll also include… I'll also include…\"), bump to 1.1.</span>
+    </div>
+    <div class="form-row">
+      <label>Presence penalty <i class="ph ph-info" title="Flat penalty for any token that has appeared. Encourages topic diversity. 0 = off."></i></label>
+      <input type="number" id="set-presence" step="0.05" min="-2" max="2">
+    </div>
+    <div class="form-row">
+      <label>Frequency penalty <i class="ph ph-info" title="Penalty proportional to how often a token has appeared. Stronger anti-repetition than presence_penalty. 0 = off."></i></label>
+      <input type="number" id="set-frequency" step="0.05" min="-2" max="2">
+    </div>
+
+    <div class="form-group">Reasoning <span class="hint" style="font-size:10px;font-weight:normal;text-transform:none;letter-spacing:0;">— applied next message</span></div>
+    <div class="form-row inline">
+      <label>Enable thinking</label>
+      <div class="sw" id="sw-thinking"></div>
+    </div>
+    <div class="form-row">
+      <label>Thinking budget (tokens) <i class="ph ph-info" title="Cap how many tokens the model can spend in its <think> phase before being forced to answer. 0 = no thinking. -1 = unlimited."></i></label>
+      <input type="number" id="set-think-budget" step="128" min="-1">
     </div>
 
     <div class="form-group">Preview</div>

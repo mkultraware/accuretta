@@ -57,6 +57,40 @@ except Exception:
     _pgw = None  # type: ignore
     _HAVE_PGW = False
 
+# ---- firmware analysis (optional) ----------------------------------------
+# Signature scanning is pure-Python (no binwalk dependency — the pip
+# "binwalk" package is a broken stub unrelated to the real tool).
+# PySquashfsImage handles squashfs extraction, pyelftools parses ELF
+# headers. Both are graceful — tools self-report the missing dep when
+# invoked so the agent can tell the user what to install.
+try:
+    from PySquashfsImage import SquashFsImage  # type: ignore
+    _HAVE_SQUASHFS = True
+except Exception:
+    SquashFsImage = None  # type: ignore
+    _HAVE_SQUASHFS = False
+
+try:
+    from elftools.elf.elffile import ELFFile  # type: ignore
+    _HAVE_ELFTOOLS = True
+except Exception:
+    ELFFile = None  # type: ignore
+    _HAVE_ELFTOOLS = False
+
+try:
+    import capstone as _capstone  # type: ignore
+    _HAVE_CAPSTONE = True
+except Exception:
+    _capstone = None  # type: ignore
+    _HAVE_CAPSTONE = False
+
+try:
+    import r2pipe as _r2pipe  # type: ignore
+    _HAVE_R2PIPE = True
+except Exception:
+    _r2pipe = None  # type: ignore
+    _HAVE_R2PIPE = False
+
 # Kill switch: when set, every desktop action tool refuses immediately.
 # The frontend panic button and the user deny-action both flip this via
 # `/api/desktop/panic`. Cleared by /api/desktop/resume or a new chat turn.
@@ -96,6 +130,65 @@ _current_chat_id: contextvars.ContextVar[str] = contextvars.ContextVar("_current
 # per-chat SSE emitter so tools can stream progress without plumbing emit through every call
 _chat_emitters: dict[str, callable] = {}
 
+# per-chat cancellation. `cancel` flips when user hits Stop (via /api/cancel or
+# client disconnect). `resp` is the live urllib response to llama-server, which
+# we close explicitly to abort generation server-side — closing the socket is
+# the only reliable way to make llama-server stop emitting tokens.
+_chat_cancels: dict[str, dict] = {}
+_chat_cancels_lock = threading.Lock()
+
+
+def _register_cancel(chat_id: str) -> threading.Event:
+    ev = threading.Event()
+    with _chat_cancels_lock:
+        _chat_cancels[chat_id] = {"cancel": ev, "resp": None}
+    return ev
+
+
+def _set_cancel_resp(chat_id: str, resp) -> None:
+    with _chat_cancels_lock:
+        if chat_id in _chat_cancels:
+            _chat_cancels[chat_id]["resp"] = resp
+
+
+def _unregister_cancel(chat_id: str) -> None:
+    with _chat_cancels_lock:
+        _chat_cancels.pop(chat_id, None)
+
+
+def cancel_chat(chat_id: str) -> bool:
+    """Flip the cancel flag and force-close the active llama-server response
+    for this chat. Returns True if something was cancelled."""
+    with _chat_cancels_lock:
+        entry = _chat_cancels.get(chat_id)
+        if not entry:
+            return False
+        entry["cancel"].set()
+        resp = entry.get("resp")
+    if resp is not None:
+        try:
+            resp.close()
+        except Exception:
+            pass
+        try:
+            # reach through urllib to the raw socket and hard-shut it so
+            # llama-server notices within one token's worth of time.
+            fp = getattr(resp, "fp", None)
+            sock = getattr(getattr(fp, "raw", None), "_sock", None)
+            if sock:
+                import socket as _sock
+                try:
+                    sock.shutdown(_sock.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return True
+
 # thread pool for long-running tools so the HTTP worker stays responsive
 _tool_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tool-")
 
@@ -106,29 +199,36 @@ _tool_jobs_lock = threading.Lock()
 for d in (DATA, VERSIONS_DIR, PENDING_DIR, SNAPSHOTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-def _resolve_ollama_url() -> str:
-    raw = (os.environ.get("OLLAMA_HOST") or "").strip()
+def _resolve_llama_url() -> str:
+    """Resolve llama-server URL. Default: http://127.0.0.1:8080.
+    Env LLAMA_HOST accepts 'host:port', bare host, or full URL."""
+    raw = (os.environ.get("LLAMA_HOST") or os.environ.get("LLAMA_URL") or "").strip()
     if not raw:
-        return "http://127.0.0.1:11434"
-    # accept forms: "http://x:port", "x:port", "x", "0.0.0.0", "0.0.0.0:11434"
+        return "http://127.0.0.1:8080"
     if not raw.startswith(("http://", "https://")):
         raw = "http://" + raw
-    # split into scheme://host[:port]
     try:
         scheme, rest = raw.split("://", 1)
         hostport = rest.split("/", 1)[0]
         if ":" in hostport:
             host, port = hostport.split(":", 1)
         else:
-            host, port = hostport, "11434"
+            host, port = hostport, "8080"
     except Exception:
-        return "http://127.0.0.1:11434"
-    # 0.0.0.0 / :: mean "bind all" server-side — meaningless as a client target
+        return "http://127.0.0.1:8080"
     if host in ("", "0.0.0.0", "::", "*"):
         host = "127.0.0.1"
     return f"{scheme}://{host}:{port}"
 
-OLLAMA = _resolve_ollama_url()
+LLAMA = _resolve_llama_url()
+# optional separate vision-capable llama-server. If unset, we assume the main
+# llama-server is vision-capable (started with --mmproj). If it isn't, image
+# messages just fail — caller should handle.
+VISION_LLAMA = (os.environ.get("VISION_LLAMA_HOST") or "").strip()
+if VISION_LLAMA and not VISION_LLAMA.startswith(("http://", "https://")):
+    VISION_LLAMA = "http://" + VISION_LLAMA
+if not VISION_LLAMA:
+    VISION_LLAMA = LLAMA
 PORT = int(os.environ.get("ACCURETTA_PORT", "8787"))
 
 # ---- persistence helpers ---------------------------------------------------
@@ -167,6 +267,11 @@ DEFAULT_SETTINGS = {
     "num_predict": -1,
     "temperature": 0.7,
     "top_p": 0.9,
+    "top_k": 40,
+    "min_p": 0.05,
+    "repeat_penalty": 1.1,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
     "keep_alive": "30m",
     "theme": "light",
     "auto_approve_read": True,
@@ -176,6 +281,15 @@ DEFAULT_SETTINGS = {
     # IDE preview extras (composer toolbar toggles)
     "use_tailwind_cdn": False,      # inject Tailwind Play CDN into preview + ask model to use tailwind classes
     "ide_multifile": False,         # tell the model to emit a small folder structure (index.html / style.css / script.js / assets/)
+    # reasoning / thinking (Qwen3-family and other reasoner models)
+    "enable_thinking": True,        # when False, suppress <think> blocks entirely via chat_template_kwargs
+    "thinking_budget": 2048,        # cap tokens the model spends thinking before it must answer. -1 = unlimited
+    "max_tool_rounds": 60,          # how many tool-call rounds the model may run per user turn before forced stop
+    "preserve_prior_thinking": True,# rewrite prior <think>…</think> as plain text so it survives chat-template stripping
+    # llama-server lifecycle (bridge spawns it for us)
+    "models_dir": "",               # folder containing .gguf files (set via Settings -> Models folder)
+    "model_path": "",               # full path to the currently loaded .gguf
+    "llama_bin": "",                # override path to llama-server.exe (auto-detected if blank)
 }
 
 
@@ -200,6 +314,36 @@ def get_chats() -> dict:
     c.setdefault("chats", {})
     c.setdefault("order", [])
     return c
+
+
+# Hard cap on how many messages we retain per chat in chats.json. Trimmer at
+# request time gives the *model* a tight context window; this cap is purely
+# disk hygiene so a long-running firmware investigation doesn't grow the JSON
+# file unbounded. Anchored on the first user message — it's the task statement
+# and the trimmer always keeps it as the second message after system.
+CHAT_HISTORY_MAX = 1000
+
+
+def _enforce_chat_retention(chat: dict) -> None:
+    msgs = chat.get("messages") or []
+    if len(msgs) <= CHAT_HISTORY_MAX:
+        return
+    # find the first user message — that's our anchor we never drop
+    first_user_idx = next(
+        (i for i, m in enumerate(msgs) if m.get("role") == "user"),
+        None,
+    )
+    overflow = len(msgs) - CHAT_HISTORY_MAX
+    # drop oldest messages AFTER the first user, walking forward
+    if first_user_idx is None:
+        # no user message? just trim from the front
+        chat["messages"] = msgs[overflow:]
+        return
+    keep_head = msgs[: first_user_idx + 1]
+    rest = msgs[first_user_idx + 1:]
+    # drop `overflow` oldest from rest
+    rest = rest[overflow:]
+    chat["messages"] = keep_head + rest
 
 
 # ---- token counting (approximation) ----------------------------------------
@@ -227,32 +371,72 @@ def _count_msg_tokens(msg: dict) -> int:
 
 
 def truncate_messages(msgs: list[dict], max_tokens: int, reserve: int = 256) -> list[dict]:
-    """Drop oldest non-system messages until the total fits under max_tokens.
-    Always keeps the system prompt (index 0) and the most recent user message.
+    """Conveyor belt: drop oldest middle messages while anchoring the system
+    prompt (current goals/memory) AND the first user message (the original ask
+    that frames the whole conversation). Most recent messages always keep.
+
+    Layout: [system] + [first_user] + ...dropped... + [recent...]
+    Reserve covers room for the next assistant reply + reasoning.
     """
     if not msgs:
         return msgs
     budget = max_tokens - reserve
-    system = [msgs[0]] if msgs[0].get("role") == "system" else []
-    tail = msgs[len(system):]
 
-    # Count from the end backwards until we hit budget
-    total = sum(_count_msg_tokens(m) for m in system)
-    keep = []
-    for m in reversed(tail):
+    # Anchor 1: system prompt at index 0 (if present).
+    system = [msgs[0]] if msgs and msgs[0].get("role") == "system" else []
+    rest = msgs[len(system):]
+
+    # Anchor 2: the first user message in `rest` (the original request). We
+    # also pull the assistant reply that immediately follows it, because tool
+    # call / tool result pairs must stay together to be valid OpenAI history.
+    anchor: list[dict] = []
+    anchor_end = 0
+    for i, m in enumerate(rest):
+        if m.get("role") == "user":
+            anchor = [m]
+            anchor_end = i + 1
+            # include directly-following assistant + tool messages that pair
+            # with this first user turn (avoid splitting a tool_call/result).
+            while anchor_end < len(rest) and rest[anchor_end].get("role") in ("assistant", "tool"):
+                anchor.append(rest[anchor_end])
+                anchor_end += 1
+            break
+
+    middle_and_tail = rest[anchor_end:]
+
+    # Count anchored cost first; if it already busts the budget, give up on
+    # the anchor (long first message in a tiny ctx) and fall back to plain
+    # tail-only behavior.
+    anchor_cost = sum(_count_msg_tokens(m) for m in system) + sum(_count_msg_tokens(m) for m in anchor)
+    if anchor_cost > budget * 0.6:
+        anchor = []
+        anchor_cost = sum(_count_msg_tokens(m) for m in system)
+
+    # Walk recent messages from the end backwards, keeping until budget hits.
+    keep: list[dict] = []
+    total = anchor_cost
+    for m in reversed(middle_and_tail):
         t = _count_msg_tokens(m)
         if total + t > budget and keep:
-            # We've kept at least one message; drop the rest
             break
         keep.insert(0, m)
         total += t
 
-    if not keep:
-        # Emergency: keep only the very last user message
-        last_user = [m for m in tail if m.get("role") == "user"][-1:] or tail[-1:]
-        keep = last_user
+    if not keep and not anchor:
+        # Emergency: keep only the very last message.
+        keep = middle_and_tail[-1:] or rest[-1:]
 
-    return system + keep
+    # Pair-protect the boundary: a `tool` message at the front of `keep` is
+    # an orphan if its parent assistant (with the matching tool_call_id) was
+    # dropped. llama-server rejects orphan tool messages, so drop them here.
+    while keep and keep[0].get("role") == "tool":
+        keep.pop(0)
+
+    # If the anchor is the same object as the first kept message (very short
+    # convo), don't duplicate it.
+    if anchor and keep and anchor[0] is keep[0]:
+        return system + keep
+    return system + anchor + keep
 
 
 # ---- system context (ACCURETTA.md) ----------------------------------------
@@ -337,11 +521,22 @@ def _scan_system_context() -> dict:
             program_roots.append(p)
     facts["program_roots"] = program_roots
 
-    # Ollama models dir
-    for candidate in [os.environ.get("OLLAMA_MODELS"), str(home / ".ollama" / "models")]:
-        if candidate and Path(candidate).exists():
-            facts["ollama_models_dir"] = candidate
-            break
+    # GGUF model directories — check common llama.cpp / unsloth / lm-studio spots
+    gguf_dirs = []
+    candidates = [
+        os.environ.get("LLAMA_MODELS"),
+        str(home / "models"),
+        str(home / ".cache" / "llama.cpp"),
+        str(home / ".cache" / "unsloth"),
+        str(home / ".cache" / "huggingface" / "hub"),
+        str(home / ".lmstudio" / "models"),
+        r"C:\llama.cpp\models",
+    ]
+    for c in candidates:
+        if c and Path(c).exists():
+            gguf_dirs.append(c)
+    if gguf_dirs:
+        facts["gguf_model_dirs"] = gguf_dirs
 
     facts["scanned_at"] = int(time.time())
     _SYSTEM_CONTEXT_CACHE = (time.time(), facts)
@@ -363,8 +558,10 @@ def _render_system_context_md(facts: dict) -> str:
     ]
     if facts.get("drives"):
         lines.append(f"- Drives: {', '.join(facts['drives'])}")
-    if facts.get("ollama_models_dir"):
-        lines.append(f"- Ollama models dir: {facts['ollama_models_dir']}")
+    if facts.get("gguf_model_dirs"):
+        lines.append("- GGUF model directories:")
+        for d in facts["gguf_model_dirs"]:
+            lines.append(f"  - {d}")
     if facts.get("program_roots"):
         lines.append("- Program roots:")
         for p in facts["program_roots"]:
@@ -1104,6 +1301,71 @@ def tool_web_fetch(args: dict) -> dict:
         return {"error": str(e)}
 
 
+_DDG_RESULT_RE = re.compile(
+    r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+_DDG_SNIPPET_RE = re.compile(
+    r'<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_tags(s: str) -> str:
+    s = re.sub(r"<[^>]+>", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def tool_web_search(args: dict) -> dict:
+    """Search the web via DuckDuckGo's no-JS HTML endpoint. No API key.
+    Returns a list of {title, url, snippet}. The model usually wants to
+    follow up with web_fetch on the top few URLs to read full content."""
+    q = (args.get("query") or args.get("q") or "").strip()
+    if not q:
+        return {"error": "query required"}
+    max_results = int(args.get("max_results") or 6)
+    max_results = max(1, min(max_results, 20))
+    try:
+        body = urllib.parse.urlencode({"q": q}).encode()
+        req = urllib.request.Request(
+            "https://html.duckduckgo.com/html/",
+            data=body,
+            method="POST",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) accuretta/1.0",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "text/html",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return {"error": f"search failed: {e}"}
+    snippets = [_strip_tags(s) for s in _DDG_SNIPPET_RE.findall(html)]
+    results = []
+    for i, m in enumerate(_DDG_RESULT_RE.finditer(html)):
+        url = m.group(1)
+        if url.startswith("//"):
+            url = "https:" + url
+        # ddg wraps outbound links as /l/?uddg=<encoded>
+        try:
+            pu = urllib.parse.urlparse(url)
+            if "duckduckgo.com" in pu.netloc and pu.path.startswith("/l/"):
+                qs = urllib.parse.parse_qs(pu.query)
+                real = qs.get("uddg", [""])[0]
+                if real:
+                    url = urllib.parse.unquote(real)
+        except Exception:
+            pass
+        title = _strip_tags(m.group(2))
+        snippet = snippets[i] if i < len(snippets) else ""
+        if title and url:
+            results.append({"title": title, "url": url, "snippet": snippet})
+        if len(results) >= max_results:
+            break
+    return {"query": q, "results": results, "count": len(results)}
+
+
 # ---- desktop automation ---------------------------------------------------
 # Layered defense:
 #   1. Feature flag (`desktop_enabled`) must be ON in settings.
@@ -1466,6 +1728,1332 @@ def tool_desktop_close_window(args: dict) -> dict:
         return {"error": str(e)}
 
 
+# ============================================================================
+# Firmware analysis tools — read-only triage on binaries dropped in the
+# workspace. Designed for first-pass router / IoT firmware audits. No system
+# tools, no shells. Pure Python where possible, optional pip libs elsewhere.
+# Extraction is the only destructive op and uses the standard approval card.
+# ============================================================================
+
+# Magic-byte signature table for tool_file_inspect. Only formats we expect
+# to see in consumer firmware. Order matters — longer signatures first.
+_FW_MAGIC_TABLE = [
+    (b"\x1f\x8b\x08", "gzip"),
+    (b"PK\x03\x04", "zip"),
+    (b"PK\x05\x06", "zip (empty)"),
+    (b"7z\xbc\xaf\x27\x1c", "7z"),
+    (b"\xfd7zXZ\x00", "xz"),
+    (b"BZh", "bzip2"),
+    (b"hsqs", "squashfs (le)"),
+    (b"sqsh", "squashfs (be)"),
+    (b"\x85\x19\x03\x20", "jffs2 (le)"),
+    (b"\x19\x85\x20\x03", "jffs2 (be)"),
+    (b"\x45\x3d\xcd\x28", "cramfs (le)"),
+    (b"\x28\xcd\x3d\x45", "cramfs (be)"),
+    (b"HDR0", "trx (router header)"),
+    (b"\x7fELF", "ELF"),
+    (b"MZ", "PE/DOS executable"),
+    (b"\xca\xfe\xba\xbe", "Java class / Mach-O fat"),
+    (b"070701", "cpio (newc ascii)"),
+    (b"070707", "cpio (binary)"),
+]
+
+
+def _fw_identify_magic(data: bytes) -> str | None:
+    for sig, name in _FW_MAGIC_TABLE:
+        if data.startswith(sig):
+            return name
+    # ustar lives at offset 257 in a tar header
+    if len(data) >= 263 and data[257:262] == b"ustar":
+        return "tar"
+    return None
+
+
+def _fw_check_path(path: str, must_exist: bool = True) -> tuple[str, dict | None]:
+    """Resolve + validate a workspace path. Returns (resolved, error_or_None)."""
+    p = normalize_path(path or "")
+    if not p:
+        return "", {"error": "missing path"}
+    if must_exist and not os.path.exists(p):
+        return p, {"error": f"not found: {p}"}
+    if is_blocked_path(p):
+        return p, {"error": "path blocked (Windows/System32)"}
+    if not is_in_workspace(p):
+        return p, {"error": "path outside workspace. Add folder in Workspace panel."}
+    return p, None
+
+
+# Signatures scanned for at any offset in tool_binwalk_scan. Kept short and
+# unambiguous to minimize false positives. This isn't binwalk's full database
+# — just the formats that actually show up in consumer router firmware.
+_FW_SCAN_SIGNATURES: list[tuple[bytes, str]] = [
+    (b"\x1f\x8b\x08", "gzip"),
+    (b"BZh9", "bzip2 (level 9)"),
+    (b"\xfd7zXZ\x00", "xz"),
+    (b"7z\xbc\xaf\x27\x1c", "7z"),
+    (b"PK\x03\x04", "zip (local file)"),
+    (b"PK\x05\x06", "zip (end of central dir)"),
+    (b"hsqs", "squashfs (le)"),
+    (b"sqsh", "squashfs (be)"),
+    (b"\x85\x19\x03\x20", "jffs2 (le)"),
+    (b"\x19\x85\x20\x03", "jffs2 (be)"),
+    (b"\x45\x3d\xcd\x28", "cramfs (le)"),
+    (b"\x28\xcd\x3d\x45", "cramfs (be)"),
+    (b"\x7fELF", "ELF executable"),
+    (b"HDR0", "trx router header"),
+    (b"-rom1fs-", "romfs"),
+    (b"070701", "cpio (newc ascii)"),
+    (b"070707", "cpio (binary)"),
+    (b"UBI#", "UBI image"),
+    (b"!<arch>", "ar archive"),
+]
+
+
+def tool_binwalk_scan(args: dict) -> dict:
+    """Scan a binary for known magic-byte signatures at any offset.
+    Pure-Python — covers gzip, bzip2, xz, 7z, zip, squashfs, jffs2,
+    cramfs, ELF, TRX, romfs, cpio, UBI, ar. Returns sorted offset table."""
+    path, err = _fw_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isfile(path):
+        return {"error": f"not a file: {path}"}
+    max_results = max(1, min(int(args.get("max_results") or 200), 1000))
+    max_bytes = max(1024, min(int(args.get("max_bytes") or 64 * 1024 * 1024),
+                              256 * 1024 * 1024))
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            data = f.read(max_bytes)
+        truncated = size > len(data)
+        results: list[dict] = []
+        for sig, name in _FW_SCAN_SIGNATURES:
+            start = 0
+            while True:
+                idx = data.find(sig, start)
+                if idx < 0:
+                    break
+                results.append({
+                    "offset": idx,
+                    "offset_hex": f"0x{idx:x}",
+                    "description": name,
+                })
+                if len(results) >= max_results:
+                    break
+                start = idx + 1
+            if len(results) >= max_results:
+                break
+        results.sort(key=lambda r: r["offset"])
+        return {
+            "path": path,
+            "size": size,
+            "scanned_bytes": len(data),
+            "truncated": truncated,
+            "count": len(results),
+            "matches": results,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_strings_dump(args: dict) -> dict:
+    """Extract printable ASCII string runs from a binary file. Optional
+    regex filter. Caps reads at max_bytes so large firmwares stay sane."""
+    path, err = _fw_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isfile(path):
+        return {"error": f"not a file: {path}"}
+    min_len = max(4, int(args.get("min_length") or 8))
+    pattern = args.get("pattern")
+    max_results = max(1, min(int(args.get("max_results") or 500), 5000))
+    max_bytes = max(1024, min(int(args.get("max_bytes") or 16 * 1024 * 1024),
+                              64 * 1024 * 1024))
+    try:
+        rx = re.compile(pattern) if pattern else None
+    except re.error as e:
+        return {"error": f"bad pattern: {e}"}
+    try:
+        with open(path, "rb") as f:
+            data = f.read(max_bytes)
+        run_re = re.compile(rb"[\x20-\x7e]{%d,}" % min_len)
+        found: list[dict] = []
+        for m in run_re.finditer(data):
+            s = m.group(0).decode("ascii", errors="replace")
+            if rx and not rx.search(s):
+                continue
+            found.append({"offset": m.start(), "string": s})
+            if len(found) >= max_results:
+                break
+        return {
+            "path": path,
+            "scanned_bytes": len(data),
+            "truncated": len(data) >= max_bytes,
+            "match_count": len(found),
+            "matches": found,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_file_inspect(args: dict) -> dict:
+    """Identify a file by magic bytes. For ELF binaries, also report
+    architecture, type, entry point, interpreter, and strip status."""
+    path, err = _fw_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isfile(path):
+        return {"error": f"not a file: {path}"}
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(512)
+        magic = _fw_identify_magic(head)
+        info: dict = {
+            "path": path,
+            "size": size,
+            "magic": magic or "unknown",
+            "header_hex": head[:32].hex(),
+        }
+        if magic == "ELF" and _HAVE_ELFTOOLS:
+            try:
+                with open(path, "rb") as f:
+                    elf = ELFFile(f)
+                    interp_section = elf.get_section_by_name(".interp")
+                    info["elf"] = {
+                        "class": elf.header["e_ident"]["EI_CLASS"],
+                        "data": elf.header["e_ident"]["EI_DATA"],
+                        "machine": elf.header["e_machine"],
+                        "type": elf.header["e_type"],
+                        "entry": hex(elf.header["e_entry"]),
+                        "stripped": elf.get_section_by_name(".symtab") is None,
+                        "interpreter": (
+                            interp_section.data().decode(errors="replace").rstrip("\x00")
+                            if interp_section else None
+                        ),
+                    }
+            except Exception as e:
+                info["elf_error"] = str(e)
+        return info
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_read_bytes(args: dict) -> dict:
+    """Read raw bytes at an offset. Returns hex + printable ASCII view.
+    Use to inspect a header or an offset surfaced by binwalk_scan."""
+    path, err = _fw_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isfile(path):
+        return {"error": f"not a file: {path}"}
+    offset = max(0, int(args.get("offset") or 0))
+    length = max(1, min(int(args.get("length") or 256), 4096))
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read(length)
+        ascii_view = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
+        return {
+            "path": path,
+            "offset": offset,
+            "length": len(data),
+            "hex": data.hex(),
+            "ascii": ascii_view,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_find_files(args: dict) -> dict:
+    """Recursive glob under a directory with optional size cap. Good for
+    triaging extracted firmware roots without reading everything."""
+    root, err = _fw_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isdir(root):
+        return {"error": f"not a directory: {root}"}
+    pattern = (args.get("pattern") or "*").strip() or "*"
+    max_size = int(args.get("max_size") or 0)  # 0 = no cap
+    max_results = max(1, min(int(args.get("max_results") or 500), 5000))
+    try:
+        matches: list[dict] = []
+        for p in Path(root).rglob(pattern):
+            if not p.is_file():
+                continue
+            try:
+                sz = p.stat().st_size
+            except OSError:
+                continue
+            if max_size and sz > max_size:
+                continue
+            matches.append({"path": str(p), "size": sz})
+            if len(matches) >= max_results:
+                break
+        return {"root": root, "count": len(matches), "matches": matches}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_extract_archive(args: dict) -> dict:
+    """Auto-detect format and extract gzip/tar/zip/xz/bzip2/squashfs into
+    a sandbox subdirectory next to the source. Destructive — gated by an
+    approval card. Refuses path-traversal in archive members."""
+    path, err = _fw_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isfile(path):
+        return {"error": f"not a file: {path}"}
+    src = Path(path)
+    dest_name = (args.get("dest_name") or f"{src.stem}_extracted").strip()
+    if "/" in dest_name or "\\" in dest_name or ".." in dest_name:
+        return {"error": "dest_name must be a single folder name (no slashes)"}
+    dest = src.parent / dest_name
+    if dest.exists() and not args.get("overwrite"):
+        return {"error": f"destination exists: {dest}. Pass overwrite:true or pick a new dest_name."}
+
+    approval = request_approval(
+        title="Extract archive",
+        command=f'extract: "{src.name}" -> "{dest.name}"',
+        details={"kind": "extract_archive", "source": str(src), "dest": str(dest)},
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied extraction ({approval.get('status')})"}
+
+    import gzip as _gz
+    import tarfile as _tar
+    import zipfile as _zip
+    import lzma as _xz
+    import bz2 as _bz
+
+    def _safe_member(name: str) -> str | None:
+        n = (name or "").replace("\\", "/").lstrip("/")
+        if not n or ".." in n.split("/"):
+            return None
+        return n
+
+    try:
+        with open(src, "rb") as f:
+            head = f.read(512)
+        magic = _fw_identify_magic(head) or ""
+
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True)
+
+        files_written = 0
+
+        if magic == "gzip":
+            # gzip usually wraps a tar in firmware contexts
+            with _gz.open(src, "rb") as gz:
+                inner_head = gz.read(512)
+            if len(inner_head) >= 263 and inner_head[257:262] == b"ustar":
+                with _gz.open(src, "rb") as gz, _tar.open(fileobj=gz, mode="r:") as tar:
+                    for m in tar.getmembers():
+                        n = _safe_member(m.name)
+                        if not n:
+                            continue
+                        m.name = n
+                        tar.extract(m, dest)
+                        files_written += 1
+            else:
+                out = dest / (src.stem + ".bin")
+                with _gz.open(src, "rb") as gz, open(out, "wb") as o:
+                    shutil.copyfileobj(gz, o)
+                files_written = 1
+        elif magic == "tar":
+            with _tar.open(src, "r:") as tar:
+                for m in tar.getmembers():
+                    n = _safe_member(m.name)
+                    if not n:
+                        continue
+                    m.name = n
+                    tar.extract(m, dest)
+                    files_written += 1
+        elif magic.startswith("zip"):
+            with _zip.ZipFile(src) as z:
+                for info in z.infolist():
+                    n = _safe_member(info.filename)
+                    if not n:
+                        continue
+                    info.filename = n
+                    z.extract(info, dest)
+                    files_written += 1
+        elif magic == "xz":
+            out = dest / (src.stem + ".bin")
+            with _xz.open(src, "rb") as xz, open(out, "wb") as o:
+                shutil.copyfileobj(xz, o)
+            files_written = 1
+        elif magic == "bzip2":
+            out = dest / (src.stem + ".bin")
+            with _bz.open(src, "rb") as bz, open(out, "wb") as o:
+                shutil.copyfileobj(bz, o)
+            files_written = 1
+        elif magic.startswith("squashfs"):
+            if not _HAVE_SQUASHFS:
+                return {"error": "squashfs detected but PySquashfsImage not installed."}
+            with SquashFsImage.from_file(str(src)) as img:
+                for entry in img:
+                    if getattr(entry, "is_dir", False):
+                        continue
+                    if not getattr(entry, "is_file", True):
+                        continue
+                    rel = (getattr(entry, "path", "") or "").lstrip("/")
+                    n = _safe_member(rel)
+                    if not n:
+                        continue
+                    out = dest / n
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        data = entry.read_bytes()
+                    except Exception:
+                        # API drift fallback
+                        with entry.open() as fp:  # type: ignore[attr-defined]
+                            data = fp.read()
+                    with open(out, "wb") as o:
+                        o.write(data)
+                    files_written += 1
+        else:
+            shutil.rmtree(dest, ignore_errors=True)
+            return {"error": f"unsupported or unrecognized format (magic={magic or 'unknown'})"}
+
+        return {
+            "ok": True,
+            "source": str(src),
+            "dest": str(dest),
+            "files_written": files_written,
+            "magic": magic,
+        }
+    except Exception as e:
+        try:
+            shutil.rmtree(dest, ignore_errors=True)
+        except Exception:
+            pass
+        return {"error": str(e)}
+
+
+def tool_carve_file(args: dict) -> dict:
+    """Carve a byte range [offset, offset+length] out of a source file into
+    a new file in the same directory. Use when binwalk_scan surfaces an
+    embedded gzip/squashfs/etc inside a custom container (e.g. the 0xd00dfe
+    TP-Link/ASUS .pkgtb wrapper) — carve the range, THEN run extract_archive
+    or extract_squashfs on the carved file. length=0 carves to EOF."""
+    path, err = _fw_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isfile(path):
+        return {"error": f"not a file: {path}"}
+    src = Path(path)
+    try:
+        size = os.path.getsize(src)
+    except OSError as e:
+        return {"error": str(e)}
+    offset = max(0, int(args.get("offset") or 0))
+    if offset >= size:
+        return {"error": f"offset 0x{offset:x} >= file size 0x{size:x}"}
+    length_raw = int(args.get("length") or 0)
+    if length_raw <= 0:
+        length = size - offset
+    else:
+        length = min(length_raw, size - offset)
+    # cap absurd carves so runaway tool calls can't fill the disk
+    max_carve = max(1024, min(int(args.get("max_bytes") or 512 * 1024 * 1024),
+                              2 * 1024 * 1024 * 1024))
+    if length > max_carve:
+        return {"error": f"carve length {length} exceeds max_bytes {max_carve}; pass max_bytes explicitly to override."}
+
+    dest_name = (args.get("dest_name") or f"{src.stem}_at_0x{offset:x}.bin").strip()
+    if "/" in dest_name or "\\" in dest_name or ".." in dest_name:
+        return {"error": "dest_name must be a single filename (no slashes)"}
+    dest = src.parent / dest_name
+    if dest.exists() and not args.get("overwrite"):
+        return {"error": f"destination exists: {dest}. Pass overwrite:true or pick a new dest_name."}
+
+    # carving creates a new file, so gate behind approval like other writes
+    approval = request_approval(
+        title="Carve file",
+        command=f'carve: "{src.name}" [0x{offset:x}..+0x{length:x}] -> "{dest.name}"',
+        details={"kind": "carve_file", "source": str(src), "dest": str(dest),
+                 "offset": offset, "length": length},
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied carve ({approval.get('status')})"}
+
+    try:
+        chunk = 1024 * 1024
+        written = 0
+        head_hex = ""
+        with open(src, "rb") as f, open(dest, "wb") as o:
+            f.seek(offset)
+            remaining = length
+            while remaining > 0:
+                buf = f.read(min(chunk, remaining))
+                if not buf:
+                    break
+                if written == 0:
+                    head_hex = buf[:16].hex()
+                o.write(buf)
+                written += len(buf)
+                remaining -= len(buf)
+        # identify carved magic so the model knows what tool to chain next
+        try:
+            with open(dest, "rb") as f:
+                head = f.read(512)
+            magic = _fw_identify_magic(head) or "unknown"
+        except Exception:
+            magic = "unknown"
+        return {
+            "ok": True,
+            "source": str(src),
+            "dest": str(dest),
+            "offset": offset,
+            "offset_hex": f"0x{offset:x}",
+            "length": written,
+            "head_hex": head_hex,
+            "magic": magic,
+        }
+    except Exception as e:
+        try:
+            if dest.exists():
+                dest.unlink()
+        except Exception:
+            pass
+        return {"error": str(e)}
+
+
+def tool_extract_squashfs(args: dict) -> dict:
+    """Extract a squashfs image into a sandbox subdirectory next to the source.
+    Pure-Python via PySquashfsImage — no system squashfs-tools needed. Refuses
+    path-traversal in archive members. Requires user approval (destructive)."""
+    if not _HAVE_SQUASHFS:
+        return {"error": "PySquashfsImage not installed. pip install PySquashfsImage"}
+    path, err = _fw_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isfile(path):
+        return {"error": f"not a file: {path}"}
+    src = Path(path)
+    dest_name = (args.get("dest_name") or f"{src.stem}_rootfs").strip()
+    if "/" in dest_name or "\\" in dest_name or ".." in dest_name:
+        return {"error": "dest_name must be a single folder name (no slashes)"}
+    dest = src.parent / dest_name
+    if dest.exists() and not args.get("overwrite"):
+        return {"error": f"destination exists: {dest}. Pass overwrite:true or pick a new dest_name."}
+
+    # quick magic sanity check
+    try:
+        with open(src, "rb") as f:
+            head = f.read(8)
+    except Exception as e:
+        return {"error": f"could not read source: {e}"}
+    if not (head.startswith(b"hsqs") or head.startswith(b"sqsh")):
+        return {"error": f"not a squashfs image (magic={head[:4].hex()}). Try binwalk_scan to find the offset and carve first."}
+
+    approval = request_approval(
+        title="Extract squashfs",
+        command=f'extract squashfs: "{src.name}" -> "{dest.name}"',
+        details={"kind": "extract_squashfs", "source": str(src), "dest": str(dest)},
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied extraction ({approval.get('status')})"}
+
+    def _safe_member(name: str) -> str | None:
+        n = (name or "").replace("\\", "/").lstrip("/")
+        if not n or ".." in n.split("/"):
+            return None
+        return n
+
+    try:
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True)
+
+        files_written = 0
+        symlinks = 0
+        skipped = 0
+        total_bytes = 0
+
+        with SquashFsImage.from_file(str(src)) as img:
+            for entry in img:
+                try:
+                    rel = (getattr(entry, "path", "") or "").lstrip("/")
+                    n = _safe_member(rel)
+                    if not n:
+                        skipped += 1
+                        continue
+                    out = dest / n
+                    if getattr(entry, "is_dir", False):
+                        out.mkdir(parents=True, exist_ok=True)
+                        continue
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    if getattr(entry, "is_symlink", False):
+                        # write symlink target as a tiny text file - Windows
+                        # can't always make real symlinks without admin
+                        target = getattr(entry, "readlink", lambda: "")()
+                        try:
+                            with open(out, "w", encoding="utf-8") as o:
+                                o.write(f"[symlink] -> {target}\n")
+                            symlinks += 1
+                        except Exception:
+                            skipped += 1
+                        continue
+                    if not getattr(entry, "is_file", True):
+                        skipped += 1
+                        continue
+                    try:
+                        data = entry.read_bytes()
+                    except Exception:
+                        # API drift fallback
+                        try:
+                            with entry.open() as fp:  # type: ignore[attr-defined]
+                                data = fp.read()
+                        except Exception:
+                            skipped += 1
+                            continue
+                    with open(out, "wb") as o:
+                        o.write(data)
+                    files_written += 1
+                    total_bytes += len(data)
+                except Exception:
+                    skipped += 1
+                    continue
+
+        return {
+            "ok": True,
+            "source": str(src),
+            "dest": str(dest),
+            "files_written": files_written,
+            "symlinks": symlinks,
+            "skipped": skipped,
+            "total_bytes": total_bytes,
+        }
+    except Exception as e:
+        try:
+            shutil.rmtree(dest, ignore_errors=True)
+        except Exception:
+            pass
+        return {"error": str(e)}
+
+
+# Skip these directories during recursive grep — they explode result counts
+# without surfacing useful matches in firmware-analysis contexts.
+_GREP_SKIP_DIRS = {
+    ".git", ".svn", ".hg", "__pycache__", "node_modules",
+    ".venv", "venv", ".tox", "dist", "build",
+}
+
+# Files larger than this (per file) are skipped. Avoids wasting cycles
+# grepping multi-MB binaries where strings_dump is the right tool.
+_GREP_MAX_FILE_BYTES = 4 * 1024 * 1024
+
+
+def tool_grep_files(args: dict) -> dict:
+    """Recursive regex search across a directory tree. Returns matches with
+    file path, line number, and the matched line (truncated). Skips binary
+    files (null-byte heuristic) and obvious noise dirs (.git, node_modules).
+    Best for searching extracted firmware roots for keywords like 'system(',
+    'sprintf', auth strings, hardcoded creds, CGI handler names."""
+    root, err = _fw_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isdir(root):
+        return {"error": f"not a directory: {root}"}
+    pattern = args.get("pattern") or ""
+    if not pattern:
+        return {"error": "missing pattern"}
+    glob_pat = (args.get("glob") or "").strip() or None
+    case_insensitive = bool(args.get("case_insensitive"))
+    max_matches = max(1, min(int(args.get("max_matches") or 200), 2000))
+    max_files = max(1, min(int(args.get("max_files") or 5000), 50000))
+    flags = re.IGNORECASE if case_insensitive else 0
+    try:
+        rx = re.compile(pattern, flags)
+    except re.error as e:
+        return {"error": f"bad regex: {e}"}
+
+    matches: list[dict] = []
+    files_scanned = 0
+    files_skipped_binary = 0
+    files_skipped_size = 0
+    truncated = False
+
+    try:
+        for cur_dir, dirnames, filenames in os.walk(root):
+            # prune noise dirs in-place
+            dirnames[:] = [d for d in dirnames if d not in _GREP_SKIP_DIRS]
+            for fn in filenames:
+                if files_scanned >= max_files:
+                    truncated = True
+                    break
+                fp = os.path.join(cur_dir, fn)
+                if glob_pat:
+                    try:
+                        if not Path(fp).match(glob_pat) and not fnmatch.fnmatch(fn, glob_pat):
+                            continue
+                    except Exception:
+                        if not fnmatch.fnmatch(fn, glob_pat):
+                            continue
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                if st.st_size > _GREP_MAX_FILE_BYTES:
+                    files_skipped_size += 1
+                    continue
+                # null-byte heuristic on first 4KB to skip binaries
+                try:
+                    with open(fp, "rb") as f:
+                        sniff = f.read(4096)
+                    if b"\x00" in sniff:
+                        files_skipped_binary += 1
+                        continue
+                    with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                        for lineno, line in enumerate(f, start=1):
+                            if rx.search(line):
+                                matches.append({
+                                    "path": fp,
+                                    "line": lineno,
+                                    "text": line.rstrip("\n")[:400],
+                                })
+                                if len(matches) >= max_matches:
+                                    truncated = True
+                                    break
+                    files_scanned += 1
+                    if truncated:
+                        break
+                except Exception:
+                    continue
+            if truncated:
+                break
+        return {
+            "root": root,
+            "pattern": pattern,
+            "match_count": len(matches),
+            "files_scanned": files_scanned,
+            "files_skipped_binary": files_skipped_binary,
+            "files_skipped_size": files_skipped_size,
+            "truncated": truncated,
+            "matches": matches,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# Capstone arch/mode mapping. Values resolved lazily so we don't fail
+# import on systems without capstone.
+def _capstone_md(arch: str, mode: str):
+    if not _HAVE_CAPSTONE:
+        return None, "capstone not installed"
+    arch = (arch or "").lower()
+    mode = (mode or "").lower()
+    cs = _capstone
+    arch_map = {
+        "x86": (cs.CS_ARCH_X86, cs.CS_MODE_32),
+        "x64": (cs.CS_ARCH_X86, cs.CS_MODE_64),
+        "x86_64": (cs.CS_ARCH_X86, cs.CS_MODE_64),
+        "amd64": (cs.CS_ARCH_X86, cs.CS_MODE_64),
+        "arm": (cs.CS_ARCH_ARM, cs.CS_MODE_ARM),
+        "thumb": (cs.CS_ARCH_ARM, cs.CS_MODE_THUMB),
+        "arm64": (cs.CS_ARCH_ARM64, cs.CS_MODE_ARM),
+        "aarch64": (cs.CS_ARCH_ARM64, cs.CS_MODE_ARM),
+        "mips": (cs.CS_ARCH_MIPS, cs.CS_MODE_MIPS32),
+        "mips32": (cs.CS_ARCH_MIPS, cs.CS_MODE_MIPS32),
+        "mips64": (cs.CS_ARCH_MIPS, cs.CS_MODE_MIPS64),
+        "ppc": (cs.CS_ARCH_PPC, cs.CS_MODE_32),
+        "ppc64": (cs.CS_ARCH_PPC, cs.CS_MODE_64),
+    }
+    if arch not in arch_map:
+        return None, f"unsupported arch: {arch}. Try: x86, x64, arm, thumb, arm64, mips, mips64, ppc, ppc64."
+    cs_arch, cs_mode = arch_map[arch]
+    # endianness override for MIPS/ARM/PPC
+    if mode in ("le", "little"):
+        cs_mode |= cs.CS_MODE_LITTLE_ENDIAN
+    elif mode in ("be", "big"):
+        cs_mode |= cs.CS_MODE_BIG_ENDIAN
+    try:
+        md = cs.Cs(cs_arch, cs_mode)
+        md.detail = False
+        return md, None
+    except Exception as e:
+        return None, f"capstone init failed: {e}"
+
+
+def tool_disasm_at(args: dict) -> dict:
+    """Disassemble N instructions at a file offset. Supports x86/x64/arm/
+    thumb/arm64/mips/mips32/mips64/ppc/ppc64. Auto-detects arch/endianness
+    when target is an ELF and arch arg is omitted. Use to inspect a function
+    near an offset surfaced by binwalk_scan or a string xref."""
+    if not _HAVE_CAPSTONE:
+        return {"error": "capstone not installed. pip install capstone"}
+    path, err = _fw_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isfile(path):
+        return {"error": f"not a file: {path}"}
+    offset = max(0, int(args.get("offset") or 0))
+    count = max(1, min(int(args.get("count") or 32), 256))
+    bytes_to_read = max(16, min(int(args.get("max_bytes") or 4096), 16 * 1024))
+    arch = (args.get("arch") or "").strip()
+    mode = (args.get("mode") or "").strip()
+    base_addr = int(args.get("address") or offset)
+
+    try:
+        # auto-detect from ELF if arch not provided
+        if not arch and _HAVE_ELFTOOLS:
+            try:
+                with open(path, "rb") as f:
+                    if f.read(4) == b"\x7fELF":
+                        f.seek(0)
+                        elf = ELFFile(f)
+                        em = elf.header["e_machine"]
+                        ei = elf.header["e_ident"]["EI_DATA"]
+                        cls = elf.header["e_ident"]["EI_CLASS"]
+                        endian = "le" if "LSB" in ei else "be"
+                        m = {
+                            "EM_X86_64": ("x64", endian),
+                            "EM_386": ("x86", endian),
+                            "EM_ARM": ("arm", endian),
+                            "EM_AARCH64": ("arm64", endian),
+                            "EM_MIPS": ("mips64" if "ELFCLASS64" in cls else "mips32", endian),
+                            "EM_PPC": ("ppc", endian),
+                            "EM_PPC64": ("ppc64", endian),
+                        }
+                        if em in m:
+                            arch = arch or m[em][0]
+                            mode = mode or m[em][1]
+            except Exception:
+                pass
+
+        if not arch:
+            return {"error": "could not detect architecture; pass arch (e.g. mips, arm, x64)."}
+
+        md, merr = _capstone_md(arch, mode)
+        if merr:
+            return {"error": merr}
+
+        with open(path, "rb") as f:
+            f.seek(offset)
+            blob = f.read(bytes_to_read)
+        if not blob:
+            return {"error": f"no bytes at offset 0x{offset:x}"}
+
+        instrs: list[dict] = []
+        for ins in md.disasm(blob, base_addr):
+            instrs.append({
+                "address": f"0x{ins.address:x}",
+                "bytes": ins.bytes.hex(),
+                "mnemonic": ins.mnemonic,
+                "op_str": ins.op_str,
+            })
+            if len(instrs) >= count:
+                break
+
+        return {
+            "path": path,
+            "arch": arch,
+            "mode": mode or "default",
+            "offset": offset,
+            "address": f"0x{base_addr:x}",
+            "instruction_count": len(instrs),
+            "bytes_read": len(blob),
+            "instructions": instrs,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ============================================================
+# SECURITY ANALYSIS TOOLS
+# All tools degrade gracefully — they report the missing
+# binary/package when invoked so the agent can tell the user.
+# None of these kill startup if not installed.
+# ============================================================
+
+def _sec_which(cmd: str) -> str | None:
+    """Return full path to a CLI tool or None if not found."""
+    return shutil.which(cmd)
+
+
+def _sec_run(cmd: list[str], timeout: int = 120) -> tuple[str, str, int]:
+    """Run a subprocess, return (stdout, stderr, returncode)."""
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return r.stdout, r.stderr, r.returncode
+    except FileNotFoundError:
+        return "", f"binary not found: {cmd[0]}", 127
+    except subprocess.TimeoutExpired:
+        return "", f"timed out after {timeout}s", 1
+    except Exception as e:
+        return "", str(e), 1
+
+
+def _sec_check_path(raw: str) -> tuple[str, dict | None]:
+    """Reuse firmware path checker for security tools."""
+    return _fw_check_path(raw)
+
+
+def tool_unblob_extract(args: dict) -> dict:
+    """Extract firmware using unblob. Handles nested containers (SquashFS
+    inside CPIO inside ZIP, etc). Requires 'unblob' on PATH.
+    pip install unblob — also needs system deps: e2tools, jefferson, etc."""
+    exe = _sec_which("unblob")
+    if not exe:
+        return {"error": "unblob not found. pip install unblob (also needs system deps — see unblob.io)"}
+
+    path, err = _sec_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isfile(path):
+        return {"error": f"not a file: {path}"}
+
+    dest_name = (args.get("dest_name") or "").strip()
+    if not dest_name:
+        dest_name = Path(path).stem + "_unblob"
+    dest = str(Path(path).parent / dest_name)
+
+    if os.path.exists(dest) and not args.get("overwrite"):
+        return {"error": f"destination exists: {dest}. Pass overwrite=true to replace."}
+
+    stdout, stderr, rc = _sec_run([exe, "-e", dest, path], timeout=300)
+
+    if rc != 0:
+        return {"error": f"unblob failed (rc={rc})", "stderr": stderr[:2000]}
+
+    # Inventory the extraction — bounded to 500 entries
+    entries: list[dict] = []
+    try:
+        for root, dirs, files in os.walk(dest):
+            dirs[:] = [d for d in dirs if d not in {".git", "__pycache__"}]
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    sz = os.path.getsize(fp)
+                except OSError:
+                    sz = -1
+                entries.append({
+                    "path": fp,
+                    "size": sz,
+                })
+                if len(entries) >= 500:
+                    break
+            if len(entries) >= 500:
+                break
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "dest": dest,
+        "files_found": len(entries),
+        "truncated": len(entries) >= 500,
+        "files": entries,
+    }
+
+
+def tool_checksec(args: dict) -> dict:
+    """Check ELF binary for exploit mitigations: NX, stack canary, RELRO,
+    PIE, ASLR, FORTIFY. Accepts a single binary or a directory (scans all ELFs).
+    Requires checksec: pip install checksec.py"""
+    exe = _sec_which("checksec")
+    if not exe:
+        return {"error": "checksec not found. pip install checksec.py"}
+
+    path, err = _sec_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.exists(path):
+        return {"error": f"path not found: {path}"}
+
+    is_dir = os.path.isdir(path)
+
+    if is_dir:
+        stdout, stderr, rc = _sec_run(
+            [exe, "--dir", path, "--output", "json"], timeout=120
+        )
+    else:
+        stdout, stderr, rc = _sec_run(
+            [exe, "--file", path, "--output", "json"], timeout=30
+        )
+
+    if not stdout.strip():
+        # Try alternate flag style (checksec.sh compatible)
+        if is_dir:
+            stdout, stderr, rc = _sec_run([exe, "--dir=" + path], timeout=120)
+        else:
+            stdout, stderr, rc = _sec_run([exe, "--file=" + path], timeout=30)
+
+    # Try to parse JSON, fall back to raw text
+    result: dict = {"path": path}
+    try:
+        result["data"] = json.loads(stdout)
+    except Exception:
+        # Return raw but bounded
+        lines = stdout.strip().splitlines()
+        result["raw"] = lines[:200]
+        result["truncated"] = len(lines) > 200
+
+    if stderr.strip():
+        result["stderr"] = stderr[:500]
+
+    return result
+
+
+def tool_flawfinder(args: dict) -> dict:
+    """Static analysis of C/C++ source for common vulnerabilities.
+    Returns findings ranked by severity (1-5). Saves full output to
+    workspace as flawfinder_output.txt if findings exceed threshold.
+    Requires: pip install flawfinder"""
+    exe = _sec_which("flawfinder")
+    if not exe:
+        return {"error": "flawfinder not found. pip install flawfinder"}
+
+    path, err = _sec_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.exists(path):
+        return {"error": f"path not found: {path}"}
+
+    min_level = max(1, min(int(args.get("min_level") or 1), 5))
+    max_findings = max(1, min(int(args.get("max_findings") or 50), 500))
+
+    stdout, stderr, rc = _sec_run(
+        [exe, "--minlevel", str(min_level), "--dataonly", "--quiet", path],
+        timeout=180,
+    )
+
+    if rc not in (0, 1):  # flawfinder returns 1 when findings exist
+        return {"error": f"flawfinder failed (rc={rc})", "stderr": stderr[:1000]}
+
+    # Parse findings — flawfinder text format
+    # Each finding starts with "filename:line:" pattern
+    finding_re = re.compile(
+        r'^(?P<file>[^\s:]+):(?P<line>\d+):\s+'
+        r'\[(?P<level>\d)\]\s+\((?P<type>[^)]+)\)\s+(?P<func>\S+):\s*(?P<desc>.+)$'
+    )
+    findings: list[dict] = []
+    for line in stdout.splitlines():
+        m = finding_re.match(line.strip())
+        if m:
+            findings.append({
+                "file": m.group("file"),
+                "line": int(m.group("line")),
+                "level": int(m.group("level")),
+                "type": m.group("type"),
+                "function": m.group("func"),
+                "description": m.group("desc").strip(),
+            })
+
+    # Sort by severity descending
+    findings.sort(key=lambda x: x["level"], reverse=True)
+
+    total = len(findings)
+    truncated = total > max_findings
+
+    # Save full output to workspace if large
+    save_path = None
+    if total > 20:
+        try:
+            ws = _get_workspace_dirs()
+            if ws:
+                save_path = os.path.join(ws[0], "flawfinder_output.txt")
+                with open(save_path, "w", encoding="utf-8") as fh:
+                    fh.write(stdout)
+        except Exception:
+            pass
+
+    return {
+        "path": path,
+        "total_findings": total,
+        "min_level": min_level,
+        "truncated": truncated,
+        "shown": min(total, max_findings),
+        "findings": findings[:max_findings],
+        "full_output_saved": save_path,
+    }
+
+
+def tool_firmwalker(args: dict) -> dict:
+    """Search an extracted firmware rootfs for sensitive files: passwords,
+    ssh keys, SSL certs, config files, hardcoded IPs, default creds.
+    Requires firmwalker.sh on PATH or provide explicit path via exe_path.
+    Download: https://github.com/craigz28/firmwalker"""
+    exe_path = (args.get("exe_path") or "").strip()
+    exe = exe_path or _sec_which("firmwalker.sh") or _sec_which("firmwalker")
+    if not exe:
+        return {
+            "error": (
+                "firmwalker not found on PATH. "
+                "Download from https://github.com/craigz28/firmwalker "
+                "and pass exe_path=/full/path/to/firmwalker.sh"
+            )
+        }
+
+    path, err = _sec_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isdir(path):
+        return {"error": f"not a directory: {path}. firmwalker needs the extracted rootfs."}
+
+    stdout, stderr, rc = _sec_run(["bash", exe, path], timeout=120)
+
+    if not stdout.strip():
+        return {"error": "firmwalker produced no output", "stderr": stderr[:500]}
+
+    # Parse into categories — firmwalker outputs section headers in ALL CAPS
+    # followed by file paths / matches
+    categories: dict[str, list[str]] = {}
+    current_cat = "general"
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Section headers are lines that are all-uppercase words + punctuation
+        if stripped.isupper() or (stripped.endswith(":") and stripped[:-1].isupper()):
+            current_cat = stripped.rstrip(":")
+            categories.setdefault(current_cat, [])
+        else:
+            categories.setdefault(current_cat, []).append(stripped)
+
+    # Build summary — cap each category at 20 items
+    summary: dict[str, dict] = {}
+    for cat, items in categories.items():
+        total = len(items)
+        summary[cat] = {
+            "total": total,
+            "items": items[:20],
+            "truncated": total > 20,
+        }
+
+    total_findings = sum(len(v) for v in categories.values())
+
+    # Save full output
+    save_path = None
+    if total_findings > 30:
+        try:
+            ws = _get_workspace_dirs()
+            if ws:
+                save_path = os.path.join(ws[0], "firmwalker_output.txt")
+                with open(save_path, "w", encoding="utf-8") as fh:
+                    fh.write(stdout)
+        except Exception:
+            pass
+
+    return {
+        "path": path,
+        "total_findings": total_findings,
+        "categories": summary,
+        "full_output_saved": save_path,
+    }
+
+
+def _r2_open(path: str) -> tuple[Any, str | None]:
+    """Open a file in radare2 via r2pipe. Returns (r2, error_or_None)."""
+    if not _HAVE_R2PIPE:
+        return None, "r2pipe not installed. pip install r2pipe (also needs radare2 system binary)"
+    if not _sec_which("radare2") and not _sec_which("r2"):
+        return None, "radare2 binary not found. Install from https://rada.re"
+    try:
+        r2 = _r2pipe.open(path, flags=["-2"])  # -2 silences stderr
+        return r2, None
+    except Exception as e:
+        return None, f"r2pipe open failed: {e}"
+
+
+def tool_r2_info(args: dict) -> dict:
+    """Get basic info about a binary via radare2: file type, architecture,
+    OS, compiler, entry point, linked libraries, security mitigations (from r2).
+    Does NOT run full analysis — fast, safe to call first."""
+    path, err = _sec_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isfile(path):
+        return {"error": f"not a file: {path}"}
+
+    r2, err = _r2_open(path)
+    if err:
+        return {"error": err}
+
+    try:
+        info = r2.cmdj("ij") or {}
+        # Pull out the useful bits
+        core = info.get("core", {})
+        bin_ = info.get("bin", {})
+        result = {
+            "path": path,
+            "file_type": core.get("type"),
+            "size": core.get("size"),
+            "arch": bin_.get("arch"),
+            "bits": bin_.get("bits"),
+            "os": bin_.get("os"),
+            "endian": bin_.get("endian"),
+            "entry_point": hex(bin_.get("baddr", 0) + bin_.get("entry", 0)) if bin_.get("entry") else None,
+            "compiler": bin_.get("compiler"),
+            "stripped": bin_.get("stripped"),
+            "static": bin_.get("static"),
+            "canary": bin_.get("canary"),
+            "nx": bin_.get("nx"),
+            "pic": bin_.get("pic"),
+            "relocs": bin_.get("relocs"),
+        }
+        # Linked libraries
+        libs = r2.cmdj("ilj") or []
+        result["libraries"] = libs[:50]
+        return result
+    except Exception as e:
+        return {"error": f"r2 info failed: {e}"}
+    finally:
+        try:
+            r2.quit()
+        except Exception:
+            pass
+
+
+def tool_r2_functions(args: dict) -> dict:
+    """List functions in a binary using radare2 analysis.
+    Runs 'aaa' (full analysis) then returns function list sorted by size.
+    Caps at 200 functions. Pass filter_pattern to regex-match function names.
+    WARNING: aaa on large binaries can take 30-120 seconds."""
+    path, err = _sec_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isfile(path):
+        return {"error": f"not a file: {path}"}
+
+    filter_pat = (args.get("filter_pattern") or "").strip()
+    max_funcs = max(1, min(int(args.get("max_functions") or 100), 200))
+
+    r2, err = _r2_open(path)
+    if err:
+        return {"error": err}
+
+    try:
+        r2.cmd("aaa")  # full analysis
+        funcs = r2.cmdj("aflj") or []
+    except Exception as e:
+        return {"error": f"r2 analysis failed: {e}"}
+    finally:
+        try:
+            r2.quit()
+        except Exception:
+            pass
+
+    # Filter
+    if filter_pat:
+        try:
+            rx = re.compile(filter_pat, re.IGNORECASE)
+            funcs = [f for f in funcs if rx.search(f.get("name", ""))]
+        except re.error as e:
+            return {"error": f"bad filter_pattern: {e}"}
+
+    # Sort by size descending — largest functions first
+    funcs.sort(key=lambda f: f.get("size", 0), reverse=True)
+
+    total = len(funcs)
+    truncated = total > max_funcs
+    funcs = funcs[:max_funcs]
+
+    # Return clean subset of fields
+    clean = []
+    for f in funcs:
+        clean.append({
+            "name": f.get("name"),
+            "offset": hex(f.get("offset", 0)),
+            "size": f.get("size"),
+            "nbbs": f.get("nbbs"),   # number of basic blocks
+            "nargs": f.get("nargs"),
+            "nlocals": f.get("nlocals"),
+        })
+
+    return {
+        "path": path,
+        "total_functions": total,
+        "shown": len(clean),
+        "truncated": truncated,
+        "functions": clean,
+    }
+
+
+def tool_r2_disasm_function(args: dict) -> dict:
+    """Disassemble a single named function using radare2.
+    Provide function name (from r2_functions) or hex address.
+    Hard-capped at 100 instructions to protect context window.
+    Run r2_functions first to find function names."""
+    path, err = _sec_check_path(args.get("path") or "")
+    if err:
+        return err
+    if not os.path.isfile(path):
+        return {"error": f"not a file: {path}"}
+
+    func_name = (args.get("function_name") or "").strip()
+    func_addr = (args.get("function_address") or "").strip()
+    max_instrs = max(1, min(int(args.get("max_instructions") or 64), 100))
+
+    if not func_name and not func_addr:
+        return {"error": "provide function_name or function_address"}
+
+    r2, err = _r2_open(path)
+    if err:
+        return {"error": err}
+
+    try:
+        r2.cmd("aaa")
+
+        # Seek to function
+        if func_addr:
+            r2.cmd(f"s {func_addr}")
+        else:
+            r2.cmd(f"s sym.{func_name}")
+            # Try without sym. prefix if that fails
+            info = r2.cmdj("afij") or []
+            if not info:
+                r2.cmd(f"s {func_name}")
+
+        # Disassemble the function (pdfj = print disasm function as json)
+        disasm = r2.cmdj("pdfj") or {}
+    except Exception as e:
+        return {"error": f"r2 disasm failed: {e}"}
+    finally:
+        try:
+            r2.quit()
+        except Exception:
+            pass
+
+    if not disasm:
+        return {"error": f"function not found: {func_name or func_addr}. Run r2_functions to list available functions."}
+
+    ops = disasm.get("ops", [])
+    total_ops = len(ops)
+    truncated = total_ops > max_instrs
+    ops = ops[:max_instrs]
+
+    # Clean fields
+    clean_ops = []
+    for op in ops:
+        clean_ops.append({
+            "offset": hex(op.get("offset", 0)),
+            "bytes": op.get("bytes"),
+            "type": op.get("type"),
+            "disasm": op.get("disasm"),
+            "comment": op.get("comment"),  # r2 inline comments (xrefs, strings)
+        })
+
+    return {
+        "path": path,
+        "function": disasm.get("name"),
+        "offset": hex(disasm.get("offset", 0)),
+        "size": disasm.get("size"),
+        "total_instructions": total_ops,
+        "shown": len(clean_ops),
+        "truncated": truncated,
+        "instructions": clean_ops,
+    }
+
+
 TOOLS: dict[str, dict] = {
     "list_directory": {
         "description": "List files and folders at a path. Use to explore.",
@@ -1557,8 +3145,24 @@ TOOLS: dict[str, dict] = {
         },
         "fn": tool_open_program,
     },
+    "web_search": {
+        "description": (
+            "Search the web for current information (news, weather, prices, docs, "
+            "anything time-sensitive). Returns a list of {title, url, snippet}. "
+            "Follow up with web_fetch on the most promising URLs to read full text."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "search query, plain english"},
+                "max_results": {"type": "integer", "description": "1-20, default 6"},
+            },
+            "required": ["query"],
+        },
+        "fn": tool_web_search,
+    },
     "web_fetch": {
-        "description": "Fetch a URL and return stripped text content.",
+        "description": "Fetch a URL and return stripped text content. Use after web_search to read a specific page.",
         "parameters": {
             "type": "object",
             "properties": {"url": {"type": "string"}},
@@ -1702,6 +3306,298 @@ TOOLS: dict[str, dict] = {
         },
         "fn": tool_desktop_close_window,
     },
+    # ---- firmware analysis -------------------------------------------------
+    "binwalk_scan": {
+        "description": "Scan a binary file for embedded archives, filesystems, and known signatures. Use first on unknown firmware blobs to find offsets.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+        "fn": tool_binwalk_scan,
+    },
+    "strings_dump": {
+        "description": "Extract printable ASCII strings from a binary, optional regex filter. Good for finding hardcoded creds, URLs, paths, default passwords.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "min_length": {"type": "integer", "description": "minimum run length, default 8"},
+                "pattern": {"type": "string", "description": "regex filter, optional"},
+                "max_results": {"type": "integer", "description": "default 500, max 5000"},
+                "max_bytes": {"type": "integer", "description": "default 16MB, max 64MB"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_strings_dump,
+    },
+    "file_inspect": {
+        "description": "Identify a file by magic bytes. For ELF binaries also reports architecture, type, entry point, interpreter, and strip status.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+        "fn": tool_file_inspect,
+    },
+    "read_bytes": {
+        "description": "Read raw bytes at an offset. Returns hex + printable ASCII view. Use to inspect a header or an offset surfaced by binwalk_scan.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "offset": {"type": "integer", "description": "byte offset, default 0"},
+                "length": {"type": "integer", "description": "bytes to read, default 256, max 4096"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_read_bytes,
+    },
+    "find_files": {
+        "description": "Recursive file search under a directory with optional glob and size cap. Triages extracted firmware roots without reading every file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "directory to search"},
+                "pattern": {"type": "string", "description": "glob like *.cgi, default *"},
+                "max_size": {"type": "integer", "description": "skip files larger than this (bytes), 0 = no cap"},
+                "max_results": {"type": "integer", "description": "default 500, max 5000"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_find_files,
+    },
+    "extract_archive": {
+        "description": "Auto-detect and extract gzip/tar/zip/xz/bzip2/squashfs into a sandbox folder next to the source. Requires user approval.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "dest_name": {"type": "string", "description": "subfolder name, default <stem>_extracted"},
+                "overwrite": {"type": "boolean", "description": "replace existing destination"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_extract_archive,
+    },
+    "carve_file": {
+        "description": (
+            "Carve a byte range out of a source file into a new file in the "
+            "same directory. Use when binwalk_scan surfaces an embedded "
+            "gzip/squashfs/etc inside a custom container (e.g. the 0xd00dfe "
+            "TP-Link/ASUS .pkgtb wrapper) — carve the range, then run "
+            "extract_archive or extract_squashfs on the carved file. "
+            "length=0 carves to EOF. Requires user approval."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "source file"},
+                "offset": {"type": "integer", "description": "start byte, default 0"},
+                "length": {"type": "integer", "description": "bytes to copy, 0 = to EOF"},
+                "dest_name": {"type": "string", "description": "output filename, default <stem>_at_0x<offset>.bin"},
+                "overwrite": {"type": "boolean", "description": "replace existing destination"},
+                "max_bytes": {"type": "integer", "description": "safety cap, default 512MB, max 2GB"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_carve_file,
+    },
+    "extract_squashfs": {
+        "description": (
+            "Extract a squashfs filesystem image (hsqs/sqsh magic) into a "
+            "sandbox folder next to the source. Pure-Python via PySquashfsImage "
+            "— no system squashfs-tools needed. Use AFTER you've located a "
+            "squashfs.img (e.g. via binwalk_scan + extract_archive on a tar). "
+            "Requires user approval."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "absolute path to a .img/.sqsh squashfs file"},
+                "dest_name": {"type": "string", "description": "subfolder name, default <stem>_rootfs"},
+                "overwrite": {"type": "boolean", "description": "replace existing destination"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_extract_squashfs,
+    },
+    "grep_files": {
+        "description": (
+            "Recursive regex search across a directory tree. Returns matches "
+            "with file path, line number, and the matched line. Skips binaries "
+            "(null-byte heuristic) and noise dirs (.git, node_modules, etc). "
+            "Best for searching extracted firmware roots — find CGI handlers, "
+            "system()/sprintf calls, hardcoded creds, auth strings, etc."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "directory to search"},
+                "pattern": {"type": "string", "description": "Python regex"},
+                "glob": {"type": "string", "description": "filename glob filter, e.g. *.cgi or *.sh"},
+                "case_insensitive": {"type": "boolean", "description": "default false"},
+                "max_matches": {"type": "integer", "description": "default 200, max 2000"},
+                "max_files": {"type": "integer", "description": "default 5000, max 50000"},
+            },
+            "required": ["path", "pattern"],
+        },
+        "fn": tool_grep_files,
+    },
+    "disasm_at": {
+        "description": (
+            "Disassemble N instructions at a file offset using capstone. "
+            "Auto-detects arch/endianness from ELF header; pass arch explicitly "
+            "for raw blobs. Supported: x86, x64, arm, thumb, arm64, mips, "
+            "mips64, ppc, ppc64. Use to inspect a function near an offset "
+            "surfaced by binwalk_scan or a string xref."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "offset": {"type": "integer", "description": "byte offset into file, default 0"},
+                "count": {"type": "integer", "description": "number of instructions, default 32, max 256"},
+                "arch": {"type": "string", "description": "x86|x64|arm|thumb|arm64|mips|mips64|ppc|ppc64 (auto for ELF)"},
+                "mode": {"type": "string", "description": "le|be (auto for ELF)"},
+                "address": {"type": "integer", "description": "virtual address for display, default = offset"},
+                "max_bytes": {"type": "integer", "description": "bytes to read, default 4096, max 16384"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_disasm_at,
+    },
+    # ---- security analysis tools -------------------------------------------
+    "unblob_extract": {
+        "description": (
+            "Extract firmware using unblob. Handles nested/unknown containers "
+            "(SquashFS inside CPIO inside ZIP etc) better than extract_archive. "
+            "Use when extract_archive fails or firmware has unusual packaging. "
+            "Requires: pip install unblob + system deps. Requires user approval."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "firmware file to extract"},
+                "dest_name": {"type": "string", "description": "output folder name, default <stem>_unblob"},
+                "overwrite": {"type": "boolean", "description": "replace existing destination"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_unblob_extract,
+    },
+    "checksec": {
+        "description": (
+            "Check ELF binaries for exploit mitigations: NX, stack canary, "
+            "RELRO (full/partial/none), PIE, ASLR, FORTIFY. "
+            "Pass a single binary path or a directory to scan all ELFs. "
+            "Run this on every network-facing binary before disassembling. "
+            "Requires: pip install checksec.py"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "ELF binary or directory containing ELFs"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_checksec,
+    },
+    "flawfinder": {
+        "description": (
+            "Static analysis of C/C++ source code for common vulnerabilities. "
+            "Finds: buffer overflows, format strings, race conditions, crypto misuse, shell injection. "
+            "Returns findings ranked 1-5 by severity. Saves full output to workspace. "
+            "Use on extracted firmware source or CGI scripts. "
+            "Requires: pip install flawfinder"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "source file or directory"},
+                "min_level": {"type": "integer", "description": "minimum severity 1-5, default 1"},
+                "max_findings": {"type": "integer", "description": "findings to return, default 50, max 500"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_flawfinder,
+    },
+    "firmwalker": {
+        "description": (
+            "Search an extracted firmware rootfs for sensitive material: "
+            "passwords, SSH keys, SSL certs, config files, hardcoded IPs, "
+            "default credentials, web server files, databases. "
+            "Run on the extracted rootfs directory AFTER extraction. "
+            "Saves full output to workspace. "
+            "Requires firmwalker.sh — download from https://github.com/craigz28/firmwalker. "
+            "Pass exe_path if not on PATH."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "extracted firmware rootfs directory"},
+                "exe_path": {"type": "string", "description": "full path to firmwalker.sh if not on PATH"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_firmwalker,
+    },
+    "r2_info": {
+        "description": (
+            "Get basic binary info via radare2: arch, bits, OS, entry point, "
+            "linked libraries, compiler, and security flags (canary, NX, PIC). "
+            "Fast — does not run full analysis. Always call this before r2_functions. "
+            "Requires: pip install r2pipe + radare2 system binary."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "ELF or PE binary"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_r2_info,
+    },
+    "r2_functions": {
+        "description": (
+            "List functions in a binary using radare2 full analysis (aaa). "
+            "Returns function names, offsets, sizes, basic block count. "
+            "Sorted by size — largest/most complex first. "
+            "Use filter_pattern to narrow to e.g. 'auth', 'login', 'parse'. "
+            "WARNING: aaa can take 30-120s on large binaries. "
+            "Requires: pip install r2pipe + radare2."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "filter_pattern": {"type": "string", "description": "regex to filter function names, e.g. auth|login|parse"},
+                "max_functions": {"type": "integer", "description": "default 100, max 200"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_r2_functions,
+    },
+    "r2_disasm_function": {
+        "description": (
+            "Disassemble ONE function by name or address using radare2. "
+            "Hard cap: 100 instructions. Always use r2_functions first to get "
+            "the correct function name. Do not call this more than 3 times per "
+            "checkpoint — save checkpoint.json after every 3 functions. "
+            "Requires: pip install r2pipe + radare2."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "function_name": {"type": "string", "description": "function name from r2_functions (e.g. sym.check_auth)"},
+                "function_address": {"type": "string", "description": "hex address (e.g. 0x00401234) if name unknown"},
+                "max_instructions": {"type": "integer", "description": "default 64, hard max 100"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_r2_disasm_function,
+    },
 }
 
 
@@ -1709,6 +3605,14 @@ _DESKTOP_TOOL_NAMES = {
     "screenshot", "describe_screen", "list_windows",
     "desktop_launch_app", "desktop_focus_window", "desktop_click",
     "desktop_type_text", "desktop_press_keys", "desktop_close_window",
+}
+
+# Tools whose results are bulky-by-design (string dumps, grep hits, disasm
+# listings, signature scans). Truncated looser so the model can actually
+# reason over the output instead of seeing the head + a cliff.
+_ANALYSIS_TOOL_NAMES = {
+    "strings_dump", "grep_files", "disasm_at",
+    "binwalk_scan", "find_files", "file_inspect", "read_bytes",
 }
 
 
@@ -1721,7 +3625,9 @@ def _active_tools() -> dict:
     return {k: v for k, v in TOOLS.items() if k not in _DESKTOP_TOOL_NAMES}
 
 
-def tools_for_ollama() -> list[dict]:
+def tools_for_llama() -> list[dict]:
+    """Tool spec for llama-server's OpenAI-compatible /v1/chat/completions.
+    Same shape as OpenAI function calling."""
     out = []
     for name, t in _active_tools().items():
         out.append({
@@ -1735,6 +3641,10 @@ def tools_for_ollama() -> list[dict]:
     return out
 
 
+# back-compat alias — some old call sites may still use the ollama name.
+tools_for_ollama = tools_for_llama
+
+
 def tools_for_prompt() -> str:
     lines = ["Available tools (call via <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>):"]
     for name, t in _active_tools().items():
@@ -1744,10 +3654,64 @@ def tools_for_prompt() -> str:
     return "\n".join(lines)
 
 
+# Common synonyms the model invents instead of the canonical tool names. Map
+# them so a single typo doesn't burn an entire tool round on "unknown tool".
+TOOL_ALIASES = {
+    "create_file": "write_file",
+    "save_file": "write_file",
+    "make_file": "write_file",
+    "new_file": "write_file",
+    "patch_file": "edit_file",
+    "modify_file": "edit_file",
+    "update_file": "edit_file",
+    "view_file": "read_file",
+    "open_file": "read_file",
+    "cat_file": "read_file",
+    "cat": "read_file",
+    "list_dir": "list_directory",
+    "ls": "list_directory",
+    "ls_dir": "list_directory",
+    "dir": "list_directory",
+    "rm": "delete_file",
+    "remove_file": "delete_file",
+    "rm_file": "delete_file",
+    "powershell": "run_powershell",
+    "shell": "run_powershell",
+    "bash": "run_powershell",
+    "cmd": "run_powershell",
+    "exec": "run_powershell",
+    "search_web": "web_search",
+    "google": "web_search",
+    "duckduckgo": "web_search",
+    "fetch": "web_fetch",
+    "http_get": "web_fetch",
+    "screenshot_screen": "screenshot",
+    "take_screenshot": "screenshot",
+    "windows": "list_windows",
+    "save_memory": "remember",
+    "delete_memory": "forget",
+}
+
+
+def _resolve_tool_name(name: str) -> str:
+    if not name:
+        return name
+    if name in TOOLS:
+        return name
+    lc = name.lower()
+    if lc in TOOLS:
+        return lc
+    if lc in TOOL_ALIASES:
+        return TOOL_ALIASES[lc]
+    return name
+
+
 def invoke_tool(name: str, args: dict) -> dict:
-    t = TOOLS.get(name)
+    canon = _resolve_tool_name(name)
+    t = TOOLS.get(canon)
     if not t:
-        return {"error": f"unknown tool: {name}"}
+        # Surface the available names so a repair-retry round can fix a typo.
+        return {"error": f"unknown tool: {name}", "available": sorted(TOOLS.keys())}
     try:
         return t["fn"](args or {})
     except Exception as e:
@@ -1756,41 +3720,312 @@ def invoke_tool(name: str, args: dict) -> dict:
 
 
 # ---- tool-call parsing (fallback for models w/o native tools) -------------
+# Self-healing — accepts lightly broken JSON from the model, since local
+# models routinely emit trailing prose, unbalanced braces, or code fences.
 
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>", re.IGNORECASE)
 TOOL_CALL_FENCE_RE = re.compile(r"```tool_call\s*\n([\s\S]*?)\n```", re.IGNORECASE)
+# Extra dialects from non-OpenAI fine-tunes. Tier-2 fallback only — native
+# tool_calls on the streamed delta still wins. Patterns are anchored on
+# dialect-specific markers so they cannot collide with each other.
+#   <call:NAME>{args}</call:NAME>      seen on BugTraceAI and similar tunes
+#   <|python_tag|>{...}<|eom_id|>      llama-3.1 / 3.2 native format
+#   [TOOL_CALLS][{...}, ...]           mistral native format
+TOOL_CALL_NAMED_RE = re.compile(
+    # Accept either </call> or </call:NAME> for the closer. BugTraceAI and
+    # other gemma-derived tunes drop the name in the close tag.
+    r"<call:([a-zA-Z0-9_\-]+)>\s*(\{[\s\S]*?\})\s*</call(?::\1)?>",
+    re.IGNORECASE)
+TOOL_CALL_PYTAG_RE = re.compile(
+    r"<\|python_tag\|>\s*(\{[\s\S]*?\})\s*(?:<\|eom_id\|>|<\|eot_id\|>|$)",
+    re.IGNORECASE)
+TOOL_CALL_MISTRAL_RE = re.compile(
+    r"\[TOOL_CALLS\]\s*(\[[\s\S]*?\])", re.IGNORECASE)
+# XML-tag dialect: Hermes-3 / GLM-4 / some Qwen3 finetunes emit
+#   <tool_call><function=NAME><parameter=KEY>VAL</parameter>...</function></tool_call>
+# Tolerant: closing </function> and/or </tool_call> may be missing if the
+# model truncates. We anchor on <tool_call> + <function=NAME> and then walk
+# parameters until we hit a closer or the next tool_call/end-of-string.
+TOOL_CALL_XMLTAG_RE = re.compile(
+    r"<tool_call>\s*<function=([a-zA-Z0-9_\-\.]+)>"
+    r"([\s\S]*?)"
+    r"(?:</function>\s*</tool_call>|</tool_call>|(?=<tool_call>)|$)",
+    re.IGNORECASE)
+TOOL_PARAM_XMLTAG_RE = re.compile(
+    r"<parameter=([a-zA-Z0-9_\-\.]+)>\s*([\s\S]*?)\s*</parameter>",
+    re.IGNORECASE)
+# Heuristic: model emitted tool-call syntax but no parser matched it.
+# When this fires with zero parsed calls, the reply is almost certainly
+# a hallucination from a chat-template mismatch.
+TOOL_SYNTAX_HINT_RE = re.compile(
+    r"<call:[a-zA-Z]|<\|python_tag\|>|\[TOOL_CALLS\]|<tool_call>|```tool_call",
+    re.IGNORECASE)
+
+
+def _js_to_json(s: str) -> str:
+    """Best-effort: turn a JavaScript-style object literal into valid JSON.
+    Handles two failure modes seen on local fine-tunes:
+      - unquoted identifier keys:  {path: "..."}      → {"path": "..."}
+      - invalid backslash escapes: "C:\\Users\\..."   → "C:\\\\Users\\\\..."
+        (Windows paths emitted as raw \\ in JSON strings)
+    Conservative: only touches obvious problems, leaves valid JSON alone."""
+    # quote unquoted identifier keys appearing after { or ,
+    s = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', s)
+    # double any backslash that isn't part of a valid JSON escape sequence.
+    # Valid: \" \\ \/ \b \f \n \r \t \uXXXX. Anything else gets escaped.
+    s = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', s)
+    return s
+
+
+def repair_tool_args(raw) -> dict:
+    """Coerce a tool-call arguments blob to a dict. Accepts dict, JSON string,
+    or broken JSON (trailing prose, missing close brace, code fences,
+    JavaScript-style unquoted keys, raw Windows backslashes). Returns {}
+    on total failure — the agentic loop then feeds that back as an error
+    and the model retries with a clean call."""
+    if isinstance(raw, dict):
+        return raw
+    if raw is None:
+        return {}
+    s = str(raw).strip()
+    if not s:
+        return {}
+    s = re.sub(r"^```(?:json)?\s*\n?", "", s)
+    s = re.sub(r"\n?\s*```\s*$", "", s)
+    try:
+        v = json.loads(s)
+        return v if isinstance(v, dict) else {"value": v}
+    except Exception:
+        pass
+    # try JS-style → JSON repair (unquoted keys + Windows-path backslashes)
+    try:
+        v = json.loads(_js_to_json(s))
+        return v if isinstance(v, dict) else {"value": v}
+    except Exception:
+        pass
+    # slice to outermost braces — catches leading/trailing prose
+    start = s.find("{")
+    end = s.rfind("}")
+    if start >= 0 and end > start:
+        sliced = s[start:end + 1]
+        try:
+            v = json.loads(sliced)
+            return v if isinstance(v, dict) else {"value": v}
+        except Exception:
+            pass
+        try:
+            v = json.loads(_js_to_json(sliced))
+            return v if isinstance(v, dict) else {"value": v}
+        except Exception:
+            pass
+    # balance missing closing braces
+    if start >= 0:
+        tail = s[start:]
+        opens = tail.count("{")
+        closes = tail.count("}")
+        if opens > closes:
+            patched = tail + ("}" * (opens - closes))
+            try:
+                v = json.loads(patched)
+                return v if isinstance(v, dict) else {"value": v}
+            except Exception:
+                pass
+            try:
+                v = json.loads(_js_to_json(patched))
+                return v if isinstance(v, dict) else {"value": v}
+            except Exception:
+                pass
+    return {}
 
 
 def extract_tool_calls(text: str) -> list[dict]:
-    calls = []
-    for m in TOOL_CALL_RE.finditer(text):
+    """Parse tool calls from free text. Tries multiple dialects so models
+    that weren't fine-tuned on the OpenAI/llama-server schema can still
+    drive the agent loop. All paths normalize to {name, arguments}.
+    Native tool_calls on the streamed delta still take precedence; this
+    only runs when that field came back empty."""
+    calls: list[dict] = []
+    seen = set()
+
+    def _add(parsed) -> None:
+        if not isinstance(parsed, dict):
+            return
+        if not (parsed.get("name") or parsed.get("tool")):
+            return
+        # de-dup identical consecutive calls (some models double-emit)
+        key = json.dumps(parsed, sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            return
+        seen.add(key)
+        calls.append(parsed)
+
+    # 1. <tool_call>{...}</tool_call> and ```tool_call fences  (hermes/qwen)
+    for m in list(TOOL_CALL_RE.finditer(text)) + list(TOOL_CALL_FENCE_RE.finditer(text)):
+        _add(repair_tool_args(m.group(1)))
+
+    # 2. <call:NAME>{args}</call:NAME>  (BugTraceAI dialect and similar)
+    for m in TOOL_CALL_NAMED_RE.finditer(text):
+        args = repair_tool_args(m.group(2))
+        _add({"name": m.group(1), "arguments": args})
+
+    # 3. <|python_tag|>{...}<|eom_id|>  (llama-3.1 / 3.2 native)
+    for m in TOOL_CALL_PYTAG_RE.finditer(text):
+        parsed = repair_tool_args(m.group(1))
+        # llama uses "parameters" instead of "arguments" — normalize
+        if isinstance(parsed, dict) and "parameters" in parsed and "arguments" not in parsed:
+            parsed["arguments"] = parsed.pop("parameters")
+        _add(parsed)
+
+    # 4. [TOOL_CALLS][{...}, ...]  (mistral native)
+    for m in TOOL_CALL_MISTRAL_RE.finditer(text):
         try:
-            calls.append(json.loads(m.group(1)))
+            arr = json.loads(m.group(1))
         except Exception:
-            pass
-    for m in TOOL_CALL_FENCE_RE.finditer(text):
-        try:
-            calls.append(json.loads(m.group(1)))
-        except Exception:
-            pass
+            continue
+        if isinstance(arr, list):
+            for item in arr:
+                if isinstance(item, dict):
+                    _add(item)
+
+    # 5. <tool_call><function=NAME><parameter=K>V</parameter>...</function></tool_call>
+    #    (Hermes-3 / GLM-4 / some Qwen3 finetunes — XML-tag dialect)
+    for m in TOOL_CALL_XMLTAG_RE.finditer(text):
+        name = m.group(1)
+        body = m.group(2) or ""
+        args: dict = {}
+        for pm in TOOL_PARAM_XMLTAG_RE.finditer(body):
+            k = pm.group(1)
+            v = (pm.group(2) or "").strip()
+            # try to coerce numeric / bool / json-ish values, fall back to str
+            if v.lower() in ("true", "false"):
+                args[k] = (v.lower() == "true")
+            else:
+                try:
+                    args[k] = int(v)
+                except Exception:
+                    try:
+                        args[k] = float(v)
+                    except Exception:
+                        if (v.startswith("{") and v.endswith("}")) or \
+                           (v.startswith("[") and v.endswith("]")):
+                            parsed_v = repair_tool_args(v)
+                            args[k] = parsed_v if parsed_v is not None else v
+                        else:
+                            args[k] = v
+        _add({"name": name, "arguments": args})
+
     return calls
 
 
-# ---- Ollama helpers --------------------------------------------------------
+# ---- llama-server helpers --------------------------------------------------
+# Everything below talks to llama.cpp's `llama-server` over its OpenAI-
+# compatible /v1 endpoints. No Ollama. If you want to use Ollama you're in
+# the wrong file.
 
-def ollama_get(path: str) -> dict:
-    with urllib.request.urlopen(f"{OLLAMA}{path}", timeout=30) as resp:
+def llama_get(path: str, base: str | None = None) -> dict:
+    with urllib.request.urlopen(f"{base or LLAMA}{path}", timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def ollama_post(path: str, payload: dict) -> dict:
+def llama_post(path: str, payload: dict, base: str | None = None, timeout: float = 30) -> dict:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        f"{OLLAMA}{path}", data=data,
+        f"{base or LLAMA}{path}", data=data,
         headers={"Content-Type": "application/json"}, method="POST",
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+# Cache /props readings — the value never changes for a running server,
+# and we'd rather not hit it every turn just to read n_ctx_slot.
+_LLAMA_PROPS_CTX_CACHE: tuple[str, int] | None = None  # (base, ctx)
+
+def _llama_props_ctx() -> int | None:
+    """Return the llama-server's actual slot context size, or None if we
+    can't reach /props. Cached per LLAMA base so we don't re-poll every turn."""
+    global _LLAMA_PROPS_CTX_CACHE
+    base = LLAMA
+    if _LLAMA_PROPS_CTX_CACHE and _LLAMA_PROPS_CTX_CACHE[0] == base:
+        return _LLAMA_PROPS_CTX_CACHE[1]
+    try:
+        with urllib.request.urlopen(f"{base}/props", timeout=2) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        # llama-server exposes the slot ctx under default_generation_settings
+        # as `n_ctx`, and at the top level as `n_ctx`. Try a few keys.
+        ctx = (
+            (data.get("default_generation_settings") or {}).get("n_ctx")
+            or data.get("n_ctx")
+            or (data.get("model_meta") or {}).get("n_ctx")
+        )
+        if isinstance(ctx, int) and ctx > 0:
+            _LLAMA_PROPS_CTX_CACHE = (base, ctx)
+            return ctx
+    except Exception:
+        pass
+    return None
+
+
+def _llama_props_ctx_invalidate() -> None:
+    """Call after stopping/restarting llama-server so the next turn re-polls."""
+    global _LLAMA_PROPS_CTX_CACHE, _TOOLS_OVERHEAD_CACHE
+    _LLAMA_PROPS_CTX_CACHE = None
+    _TOOLS_OVERHEAD_CACHE = ("", 0)
+
+
+# Cache for the tools-spec token count. Re-tokenized only when the rendered
+# tools JSON changes (e.g. user toggles desktop tools, we add a new tool, or
+# llama-server is restarted with a different tokenizer).
+_TOOLS_OVERHEAD_CACHE: tuple[str, int] = ("", 0)
+
+
+def _llama_tokenize(text: str) -> int | None:
+    """Ask llama-server to tokenize `text` and return the token count.
+    Returns None if the server is unreachable or the response is malformed."""
+    try:
+        req = urllib.request.Request(
+            f"{LLAMA}/tokenize",
+            data=json.dumps({"content": text}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        toks = data.get("tokens") or []
+        return len(toks) if isinstance(toks, list) else None
+    except Exception:
+        return None
+
+
+def _tools_spec_overhead_tokens(tools_json: str) -> int:
+    """Estimate the token overhead llama-server's Jinja chat template adds
+    when it inlines the tools array into the system message. Uses /tokenize
+    for an exact count; falls back to a JSON-density approximation if the
+    server is unreachable. +512 covers template boilerplate (the prose the
+    chat template wraps tool defs in — varies per model family)."""
+    global _TOOLS_OVERHEAD_CACHE
+    if _TOOLS_OVERHEAD_CACHE[0] == tools_json:
+        return _TOOLS_OVERHEAD_CACHE[1]
+    exact = _llama_tokenize(tools_json)
+    if exact is not None:
+        # +1024 covers Jinja boilerplate (tool-use prose, role tags, format
+        # instructions) which varies by template. Conservative on purpose —
+        # better to have a tiny bit of unused ctx than overflow the slot.
+        overhead = exact + 1024
+    else:
+        # JSON tokenizes denser than English (~2 chars/tok). Plus boilerplate.
+        overhead = int(len(tools_json) / 2.0) + 1024
+    _TOOLS_OVERHEAD_CACHE = (tools_json, overhead)
+    return overhead
+
+
+# back-compat shims — old call sites; rewritten to go through llama-server.
+def ollama_get(path: str) -> dict:  # type: ignore[no-redef]
+    return llama_get(path)
+
+
+def ollama_post(path: str, payload: dict) -> dict:  # type: ignore[no-redef]
+    return llama_post(path, payload)
 
 
 def _parse_size_to_b(s: str) -> float:
@@ -1805,62 +4040,29 @@ def _parse_size_to_b(s: str) -> float:
 
 
 def recommended_settings(model: str) -> dict:
-    """Query Ollama /api/show, derive speed-oriented defaults.
-    Heuristic — assumes consumer GPU (8-24GB VRAM). User can override.
-    """
-    info = {}
+    """Return heuristic defaults for the UI. llama-server's context window,
+    GPU layers, batch size and thread count are server-launch flags, not
+    per-request params — so these numbers are informational only; the user
+    tunes them on the llama-server command line."""
+    native_ctx = 8192
     try:
-        info = ollama_post("/api/show", {"name": model})
-    except Exception as e:
-        return {"error": f"ollama show failed: {e}"}
-
-    details = info.get("details") or {}
-    size_b = _parse_size_to_b(details.get("parameter_size") or "")
-    quant = (details.get("quantization_level") or "").upper()
-
-    # approximate bytes per param for common quant levels
-    bpp_map = {"Q2": 0.375, "Q3": 0.5, "Q4": 0.55, "Q5": 0.7, "Q6": 0.85, "Q8": 1.05, "F16": 2.0}
-    bpp = 0.6
-    for k, v in bpp_map.items():
-        if k in quant:
-            bpp = v
-            break
-    weight_gb = size_b * bpp if size_b > 0 else 0.0
-
-    # native context from model config (various field paths across ollama versions)
-    native_ctx = 0
-    mi = info.get("model_info") or {}
-    for k, v in mi.items():
-        if "context_length" in k and isinstance(v, (int, float)):
-            native_ctx = int(v); break
-    if not native_ctx:
-        native_ctx = 8192
-
-    # recommended num_ctx: cap at native and at 16k for sanity
-    rec_ctx = min(native_ctx, 16384)
-    # if model is big, drop ctx to preserve VRAM for KV cache
-    if weight_gb > 12:
-        rec_ctx = min(rec_ctx, 8192)
-    if weight_gb > 24:
-        rec_ctx = min(rec_ctx, 4096)
-
-    # num_gpu: 0 means auto (ollama picks layer split). Keep auto by default.
-    rec_gpu = 0
-
-    # num_batch: bigger is faster but more VRAM. Default 512; 256 for big models.
-    rec_batch = 512 if weight_gb <= 12 else 256
-
+        info = llama_get("/v1/models")
+        # llama-server exposes one model; no size/quant detail in /v1/models.
+        # If the user hit a custom /props endpoint we'd use it, but keep simple.
+        _ = info
+    except Exception:
+        pass
     return {
-        "model": model,
-        "size_b": size_b,
-        "quant": quant,
-        "est_weights_gb": round(weight_gb, 2),
+        "model": model or "local",
+        "size_b": 0.0,
+        "quant": "",
+        "est_weights_gb": 0.0,
         "native_ctx": native_ctx,
         "recommended": {
-            "num_ctx": rec_ctx,
-            "num_gpu": rec_gpu,          # 0 = auto
-            "num_batch": rec_batch,
-            "num_thread": 0,             # auto
+            "num_ctx": native_ctx,
+            "num_gpu": 99,
+            "num_batch": 512,
+            "num_thread": 0,
             "num_predict": -1,
             "temperature": 0.7,
             "top_p": 0.9,
@@ -1869,30 +4071,40 @@ def recommended_settings(model: str) -> dict:
     }
 
 
-def ollama_post_stream(path: str, payload: dict):
+def llama_post_stream(path: str, payload: dict, base: str | None = None):
+    """POST and return the raw response object — caller iterates over SSE lines."""
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        f"{OLLAMA}{path}",
+        f"{base or LLAMA}{path}",
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         method="POST",
     )
     return urllib.request.urlopen(req, timeout=None)
 
 
+# back-compat: old name some callers may still use
+ollama_post_stream = llama_post_stream
+
+
 def describe_image(b64: str, hint: str = "") -> str:
-    """one-shot: hand a base64 image to the vision model, get a text description.
-    the chat model then only sees text — no VRAM overhead for vision tokens in the big model.
-    ollama loads the vision model in a separate slot so the main model stays resident."""
-    settings = get_settings()
-    vmodel = (settings.get("vision_model") or "").strip()
-    if not vmodel:
-        return "[image attached — no vision model configured]"
-    # strip any data URL prefix the browser included
+    """Hand a base64 image to a vision-capable llama-server via
+    /v1/chat/completions with image_url content. llama-server must be started
+    with --mmproj pointing at the vision projector (or VISION_LLAMA env var
+    pointed at a separate vision server).
+    The main chat model then only sees the text description — so context
+    stays small even for multi-image turns."""
     if b64.startswith("data:"):
+        data_url = b64
         comma = b64.find(",")
         if comma >= 0:
-            b64 = b64[comma + 1 :]
+            b64_clean = b64[comma + 1:]
+        else:
+            b64_clean = b64
+    else:
+        b64_clean = b64
+        data_url = f"data:image/png;base64,{b64}"
+    _ = b64_clean  # kept for future (raw b64 endpoints)
     prompt = (
         "Describe this image precisely and completely. "
         "Transcribe ALL visible text verbatim. "
@@ -1903,26 +4115,29 @@ def describe_image(b64: str, hint: str = "") -> str:
     if hint:
         prompt += f"\n\nContext from user: {hint}"
     payload = {
-        "model": vmodel,
-        "prompt": prompt,
-        "images": [b64],
+        "model": "vision",
         "stream": False,
-        "keep_alive": "10m",
-        "options": {"temperature": 0.1, "num_predict": 768},
+        "temperature": 0.1,
+        "max_tokens": 768,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }],
     }
     try:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            f"{OLLAMA}/api/generate",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            out = json.loads(resp.read().decode("utf-8"))
-        return (out.get("response") or "").strip() or "[image attached — empty description]"
+        out = llama_post("/v1/chat/completions", payload, base=VISION_LLAMA, timeout=180)
+        choices = out.get("choices") or []
+        if choices:
+            msg = choices[0].get("message") or {}
+            text = (msg.get("content") or "").strip()
+            if text:
+                return text
+        return "[image attached — empty description]"
     except Exception as e:
-        return f"[image attached — vision model failed: {e}]"
+        return f"[image attached — vision llama-server at {VISION_LLAMA} failed: {e}]"
 
 
 # ---- system prompt ---------------------------------------------------------
@@ -1994,6 +4209,18 @@ workspace resolution — the user almost always refers to their workspace:
   user for the path.
 - only ask the user to clarify if there are zero matches or multiple
   plausible matches.
+
+workspace refusal — do not loop on denied writes:
+- if write_file, edit_file, or delete_file returns
+  `"path outside workspace. Add folder in Workspace panel."`, STOP immediately.
+  do not retry with a different path, do not fall back to PowerShell, do not
+  try to create the file under a plausible-looking root. the user has not
+  configured a workspace that covers that path — only they can fix it.
+- respond in the bubble: name the path you tried, and tell the user to add
+  the parent folder in Settings -> Workspace folders, then ask them to retry.
+- the same rule applies to any tool that returns a sandbox / allowlist refusal
+  (e.g. `desktop_launch_app` refusing an app, `run_powershell` refusing a
+  destructive command without approval). one clear explanation, then stop.
 
 write honesty — never lie about persistence:
 - do NOT say "saved", "applied", "written", "fixed the file", or
@@ -2177,337 +4404,37 @@ keep responses tight."""
 
 
 
-def ollama_options(settings: dict) -> dict:
-    opt = {
-        "num_ctx": int(settings.get("num_ctx") or 8192),
-        "num_batch": int(settings.get("num_batch") or 512),
+def llama_options(settings: dict) -> dict:
+    """Map our settings to llama-server /v1/chat/completions top-level params.
+    Unlike Ollama, llama-server treats ctx size / GPU layers / batch / threads
+    as server-launch flags — not per-request. We only ship per-request
+    sampling/predict params here."""
+    opt: dict = {
         "temperature": float(settings.get("temperature") or 0.7),
         "top_p": float(settings.get("top_p") or 0.9),
     }
-    # num_gpu: 0 means "let ollama auto-decide layer split" (best for mixed VRAM)
-    ngpu = int(settings.get("num_gpu") or 0)
-    if ngpu > 0:
-        opt["num_gpu"] = ngpu
-    if int(settings.get("num_thread") or 0) > 0:
-        opt["num_thread"] = int(settings["num_thread"])
-    if int(settings.get("num_predict") or -1) != -1:
-        opt["num_predict"] = int(settings["num_predict"])
-    kv = (settings.get("kv_cache_type") or "q8_0").strip()
-    if kv in ("q4_0", "q8_0", "f16"):
-        opt["kv_cache_type"] = kv
+    # Pass through additional sampler params if set. These prevent the model
+    # from looping or producing low-diversity output.
+    for key, default in (("top_k", 40), ("min_p", 0.05),
+                         ("repeat_penalty", 1.1),
+                         ("presence_penalty", 0.0),
+                         ("frequency_penalty", 0.0)):
+        v = settings.get(key)
+        if v is not None and v != "":
+            try:
+                opt[key] = float(v)
+            except (ValueError, TypeError):
+                pass
+    np = int(settings.get("num_predict") or -1)
+    if np > 0:
+        opt["max_tokens"] = np
     return opt
 
 
-# ---- hardware auto-detection for optimal settings -------------------------
-
-def _detect_gpu_info() -> list[dict]:
-    """Detect NVIDIA/AMD GPUs."""
-    gpus = []
-    try:
-        import pynvml
-        pynvml.nvmlInit()
-        for i in range(pynvml.nvmlDeviceGetCount()):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            name = pynvml.nvmlDeviceGetName(handle)
-            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            total_mb = mem.total // (1024 * 1024)
-            gpus.append({
-                "vendor": "nvidia",
-                "name": name,
-                "vram_mb": total_mb,
-                "vram_gb": round(total_mb / 1024, 1),
-                "cuda_cores": _estimate_cuda_cores(name),
-            })
-        pynvml.nvmlShutdown()
-        return gpus
-    except Exception:
-        pass
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            for line in result.stdout.strip().split("\n"):
-                parts = line.split(",")
-                if len(parts) >= 2:
-                    name = parts[0].strip()
-                    mem_str = parts[1].strip().replace(" MiB", "").replace(" MB", "")
-                    try:
-                        total_mb = int(mem_str)
-                        gpus.append({
-                            "vendor": "nvidia",
-                            "name": name,
-                            "vram_mb": total_mb,
-                            "vram_gb": round(total_mb / 1024, 1),
-                            "cuda_cores": _estimate_cuda_cores(name),
-                        })
-                    except ValueError:
-                        continue
-            if gpus:
-                return gpus
-    except Exception:
-        pass
-    return gpus
+# back-compat alias
+ollama_options = llama_options
 
 
-def _estimate_cuda_cores(gpu_name: str) -> int:
-    name_lower = gpu_name.lower()
-    if "4090" in name_lower: return 16384
-    if "4080 super" in name_lower: return 10240
-    if "4080" in name_lower: return 9728
-    if "4070 ti super" in name_lower: return 8448
-    if "4070 ti" in name_lower: return 7680
-    if "4070 super" in name_lower: return 7168
-    if "4070" in name_lower: return 5888
-    if "4060 ti" in name_lower: return 4352
-    if "4060" in name_lower: return 3072
-    if "3090" in name_lower: return 10496
-    if "3080 ti" in name_lower: return 10240
-    if "3080" in name_lower: return 8704
-    if "3070 ti" in name_lower: return 6144
-    if "3070" in name_lower: return 5888
-    if "3060 ti" in name_lower: return 4864
-    if "3060" in name_lower: return 3584
-    return 0
-
-
-def _detect_cpu_info() -> dict:
-    info = {"cores": 0, "threads": 0, "arch": "unknown", "is_x3d": False}
-    try:
-        import os
-        info["cores"] = os.cpu_count() or 0
-        if os.name == "nt":
-            try:
-                result = subprocess.run(
-                    ["wmic", "cpu", "get", "NumberOfCores,NumberOfLogicalProcessors,Name"],
-                    capture_output=True, text=True, timeout=5
-                )
-                if result.returncode == 0:
-                    lines = result.stdout.strip().split("\n")
-                    for line in lines[1:]:
-                        parts = line.strip().split()
-                        if len(parts) >= 3:
-                            info["cores"] = int(parts[0])
-                            info["threads"] = int(parts[1])
-                            name = " ".join(parts[2:])
-                            info["is_x3d"] = "x3d" in name.lower() or "3d" in name.lower()
-                            info["arch"] = "amd" if "amd" in name.lower() else "intel"
-                            break
-            except Exception:
-                pass
-    except Exception:
-        pass
-    if info["threads"] == 0:
-        info["threads"] = info["cores"] or 4
-    return info
-
-
-def _detect_system_ram() -> int:
-    try:
-        import psutil
-        return psutil.virtual_memory().total // (1024 * 1024)
-    except Exception:
-        pass
-    if os.name == "nt":
-        try:
-            import ctypes
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-            mem = MEMORYSTATUSEX()
-            mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem))
-            return mem.ullTotalPhys // (1024 * 1024)
-        except Exception:
-            pass
-    return 32768
-
-
-def _calculate_optimal_settings(gpus: list, cpu: dict, ram_mb: int) -> dict:
-    settings = {}
-    primary_gpu = gpus[0] if gpus else None
-    total_vram_mb = sum(g["vram_mb"] for g in gpus) if gpus else 0
-
-    if primary_gpu:
-        vram_gb = primary_gpu["vram_gb"]
-        if vram_gb >= 24:
-            settings["num_gpu"] = 99
-            settings["num_ctx"] = 16384
-            settings["num_batch"] = 1024
-        elif vram_gb >= 16:
-            settings["num_gpu"] = 99
-            settings["num_ctx"] = 12288
-            settings["num_batch"] = 768
-        elif vram_gb >= 12:
-            settings["num_gpu"] = 99
-            settings["num_ctx"] = 8192
-            settings["num_batch"] = 512
-        elif vram_gb >= 8:
-            settings["num_gpu"] = 99
-            settings["num_ctx"] = 6144
-            settings["num_batch"] = 384
-        elif vram_gb >= 6:
-            settings["num_gpu"] = 50
-            settings["num_ctx"] = 4096
-            settings["num_batch"] = 256
-        else:
-            settings["num_gpu"] = 20
-            settings["num_ctx"] = 2048
-            settings["num_batch"] = 128
-    else:
-        settings["num_gpu"] = 0
-        settings["num_ctx"] = 4096
-        settings["num_batch"] = 256
-
-    if cpu["threads"] >= 32:
-        settings["num_thread"] = min(cpu["cores"], 16)
-    elif cpu["threads"] >= 16:
-        settings["num_thread"] = min(cpu["cores"], 12)
-    elif cpu["threads"] >= 8:
-        settings["num_thread"] = min(cpu["cores"], 8)
-    else:
-        settings["num_thread"] = max(2, cpu["cores"] - 1)
-
-    if cpu.get("is_x3d"):
-        settings["num_thread"] = max(6, cpu["cores"])
-        settings["num_batch"] = min(settings["num_batch"] * 2, 2048)
-
-    ram_gb = ram_mb / 1024
-    if ram_gb < 16 and settings["num_ctx"] > 4096:
-        settings["num_ctx"] = 4096
-    elif ram_gb < 32 and settings["num_ctx"] > 8192:
-        settings["num_ctx"] = 8192
-
-    if primary_gpu and primary_gpu.get("vram_gb", 0) >= 16:
-        settings["num_batch"] = max(settings["num_batch"], 512)
-
-    if total_vram_mb > 16000:
-        settings["keep_alive"] = "1h"
-    else:
-        settings["keep_alive"] = "30m"
-
-    settings["num_predict"] = -1
-    settings.setdefault("temperature", 0.7)
-    settings.setdefault("top_p", 0.9)
-
-    # VRAM-poor GPUs benefit from q4_0 KV cache (halves cache size vs q8_0)
-    if primary_gpu and primary_gpu.get("vram_gb", 0) <= 16:
-        settings["kv_cache_type"] = "q4_0"
-    else:
-        settings["kv_cache_type"] = "q8_0"
-
-    return settings
-
-
-def get_optimal_settings() -> dict:
-    global _HW_CACHE
-    gpus = _detect_gpu_info()
-    cpu = _detect_cpu_info()
-    ram_mb = _detect_system_ram()
-    _HW_CACHE = (time.time(), gpus, cpu, ram_mb)
-    optimal = _calculate_optimal_settings(gpus, cpu, ram_mb)
-    optimal["_hardware"] = {
-        "gpus": gpus,
-        "cpu": cpu,
-        "ram_gb": round(ram_mb / 1024, 1),
-        "detected_at": int(time.time()),
-    }
-    return optimal
-
-
-# Cache hardware scans for 5 minutes so Apply Optimal doesn't re-scan every click.
-_HW_CACHE: tuple[float, list, dict, int] | None = None
-_HW_CACHE_TTL = 300
-
-
-def get_combined_optimal_settings(model: str | None = None) -> dict:
-    """Merge hardware detection with model-specific constraints.
-
-    Hardware sets the ceiling (VRAM, CPU threads).
-    Model sets safety limits (big models need smaller ctx/batch to fit).
-    The most conservative value wins for each parameter.
-    """
-    global _HW_CACHE
-    # ---- hardware baseline (cached) ----
-    if _HW_CACHE is not None:
-        ts, gpus, cpu, ram_mb = _HW_CACHE
-        if time.time() - ts < _HW_CACHE_TTL:
-            pass  # use cached
-        else:
-            _HW_CACHE = None
-    if _HW_CACHE is None:
-        gpus = _detect_gpu_info()
-        cpu = _detect_cpu_info()
-        ram_mb = _detect_system_ram()
-        _HW_CACHE = (time.time(), gpus, cpu, ram_mb)
-    else:
-        _, gpus, cpu, ram_mb = _HW_CACHE
-    hw = _calculate_optimal_settings(gpus, cpu, ram_mb)
-    hw_meta = {
-        "gpus": gpus,
-        "cpu": cpu,
-        "ram_gb": round(ram_mb / 1024, 1),
-        "detected_at": int(time.time()),
-    }
-
-    if not model:
-        hw["_hardware"] = hw_meta
-        return hw
-
-    # ---- model-specific constraints ----
-    model_rec = recommended_settings(model)
-    if "error" in model_rec or not model_rec.get("recommended"):
-        hw["_hardware"] = hw_meta
-        hw["_model"] = {"name": model, "error": model_rec.get("error", "unknown")}
-        return hw
-
-    mrec = model_rec["recommended"]
-    combined = dict(hw)
-
-    # Context window: most constrained wins
-    hw_ctx = hw.get("num_ctx", 8192)
-    model_ctx = mrec.get("num_ctx", hw_ctx)
-    native_ctx = model_rec.get("native_ctx", 0)
-    combined["num_ctx"] = min(hw_ctx, model_ctx)
-    if native_ctx > 0:
-        combined["num_ctx"] = min(combined["num_ctx"], native_ctx)
-
-    # Batch size: model may suggest smaller for huge models
-    hw_batch = hw.get("num_batch", 512)
-    model_batch = mrec.get("num_batch", hw_batch)
-    combined["num_batch"] = min(hw_batch, model_batch)
-
-    # GPU layers & threading: hardware is more specific than model defaults
-    combined["num_gpu"] = hw.get("num_gpu", 0)
-    combined["num_thread"] = hw.get("num_thread", 0)
-
-    # KV cache: hardware decides (q4_0 for <=16GB, q8_0 for bigger)
-    combined["kv_cache_type"] = hw.get("kv_cache_type", "q8_0")
-
-    # Other params: model rec is fine for these (same values usually)
-    for key in ["temperature", "top_p", "keep_alive", "num_predict"]:
-        if key in mrec:
-            combined[key] = mrec[key]
-
-    combined["_hardware"] = hw_meta
-    combined["_model"] = {
-        "name": model,
-        "size_b": model_rec.get("size_b"),
-        "quant": model_rec.get("quant"),
-        "est_weights_gb": model_rec.get("est_weights_gb"),
-        "native_ctx": native_ctx,
-    }
-    return combined
 
 
 def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
@@ -2523,92 +4450,257 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
         return None
 
     _chat_emitters[chat_id] = emit
+    cancel_ev = _register_cancel(chat_id)
     try:
-        max_tool_rounds = 6
+        try:
+            max_tool_rounds = int(settings.get("max_tool_rounds") or 60)
+        except Exception:
+            max_tool_rounds = 60
+        max_tool_rounds = max(1, min(max_tool_rounds, 500))
         rounds = 0
         empty_retry_done = False
         conversation = list(messages)
+        # Anything appended past this index is the model's working memory
+        # for THIS turn — intermediate assistant messages with tool_calls,
+        # tool results, the empty-retry nudge. We hand it back to the caller
+        # via `final["_appended_intermediate"]` so it can be persisted and
+        # the next turn replays it (instead of the model waking up amnesic).
+        _start_len = len(messages)
 
         while True:
-            # keep context window under control — drop oldest non-system messages
-            ctx_limit = int(settings.get("num_ctx") or 8192)
-            trimmed = truncate_messages(conversation, ctx_limit, reserve=512)
-            if len(trimmed) < len(conversation):
-                dropped = len(conversation) - len(trimmed)
-                emit({"type": "notice", "note": f"dropped {dropped} old messages to fit context window"})
+            if cancel_ev.is_set():
+                emit({"type": "notice", "note": "stopped by user"})
+                return None
+            # Use the llama-server's *actual* slot context if we can read it;
+            # falling back to settings only if /props isn't reachable. Without
+            # this, a settings default of 8K would make the trimmer chop a
+            # conversation the server happily holds at 32K — and tool results
+            # the model discovered earlier in the turn vanish from history.
+            ctx_limit = _llama_props_ctx() or int(settings.get("num_ctx") or 32768)
+            # Reserve ~25% of ctx for the response + thinking so the model
+            # always has headroom to answer. The frontend gets a single event
+            # with the elided count so it can render a pill — no spammy toast.
+            reserve = max(int(ctx_limit * 0.25), 1024)
+            # Tool spec overhead: llama-server's Jinja template inlines the
+            # FULL tools array into the system message server-side. That can
+            # be 6-10K tokens for our ~21 tools — invisible to us until the
+            # server rejects with "exceeds context size". Use /tokenize for
+            # an exact count (cached per spec) so the trimmer's budget reflects
+            # what actually gets sent.
+            tools_overhead = 0
+            if use_tools:
+                try:
+                    _tools_json = json.dumps(tools_for_llama(), ensure_ascii=False)
+                    tools_overhead = _tools_spec_overhead_tokens(_tools_json)
+                except Exception:
+                    tools_overhead = 4096  # conservative fallback
+            # Floor the messages budget at 2048 tokens — even if tools overhead
+            # is huge, we still need room for at least the system + last user.
+            effective_reserve = min(reserve + tools_overhead, ctx_limit - 2048)
+            trimmed = truncate_messages(conversation, ctx_limit, reserve=effective_reserve)
+            dropped = max(0, len(conversation) - len(trimmed))
+            if dropped > 0:
+                emit({"type": "context_trimmed", "dropped": dropped, "total": len(conversation)})
 
             payload = {
-                "model": model,
-                "messages": trimmed,
+                "model": model or "local",
+                "messages": _sanitize_messages_for_openai(trimmed),
                 "stream": True,
-                "keep_alive": settings.get("keep_alive", "30m"),
-                "options": ollama_options(settings),
+                **llama_options(settings),
             }
+            # Qwen3 / reasoner-family chat_template_kwargs. llama-server forwards
+            # these into the Jinja chat template: lets us toggle thinking mode
+            # per-request and cap thinking tokens so the model can't spin forever.
+            tpl_kwargs: dict = {}
+            enable_thinking = settings.get("enable_thinking")
+            if enable_thinking is not None:
+                tpl_kwargs["enable_thinking"] = bool(enable_thinking)
+            tb = settings.get("thinking_budget")
+            try:
+                tb_int = int(tb) if tb is not None else 2048
+            except Exception:
+                tb_int = 2048
+            if tb_int >= 0:
+                tpl_kwargs["thinking_budget"] = tb_int
+            if tpl_kwargs:
+                payload["chat_template_kwargs"] = tpl_kwargs
             if use_tools:
-                payload["tools"] = tools_for_ollama()
+                payload["tools"] = tools_for_llama()
+                payload["tool_choice"] = "auto"
 
             try:
-                resp = ollama_post_stream("/api/chat", payload)
+                resp = llama_post_stream("/v1/chat/completions", payload)
             except Exception as e:
-                emit({"type": "error", "error": f"ollama unreachable: {e}"})
+                emit({"type": "error",
+                      "error": f"llama-server unreachable at {LLAMA}: {e}. "
+                               f"Start it with: llama-server -m <model.gguf> --host 127.0.0.1 --port 8080 --jinja"})
+                return None
+            _set_cancel_resp(chat_id, resp)
+
+            content_buf: list[str] = []
+            tool_calls_by_index: dict[int, dict] = {}
+            last_stats: dict = {}
+            # llama-server with --reasoning-format deepseek splits thinking into
+            # its own `reasoning_content` delta. The frontend's splitThinking()
+            # only recognizes inline <think>…</think>, so we re-wrap here and
+            # forward as one continuous stream.
+            reasoning_open = False
+
+            try:
+                for raw in resp:
+                    if cancel_ev.is_set():
+                        break
+                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if not line:
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except Exception:
+                        continue
+                    # llama-server may emit a bare timings object after [DONE]
+                    if "timings" in obj and "choices" not in obj:
+                        t = obj["timings"]
+                        last_stats = {
+                            "eval_count": t.get("predicted_n"),
+                            "eval_duration": int((t.get("predicted_ms") or 0) * 1e6),
+                            "prompt_eval_count": t.get("prompt_n"),
+                        }
+                        continue
+                    if "usage" in obj and "choices" not in obj:
+                        u = obj["usage"]
+                        last_stats.setdefault("eval_count", u.get("completion_tokens"))
+                        last_stats.setdefault("prompt_eval_count", u.get("prompt_tokens"))
+                        continue
+                    choices = obj.get("choices") or []
+                    if not choices:
+                        continue
+                    ch = choices[0]
+                    delta = ch.get("delta") or ch.get("message") or {}
+                    # reasoning first — wrap as <think>…</think> for the UI
+                    rpiece = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                    if rpiece:
+                        if not reasoning_open:
+                            content_buf.append("<think>")
+                            emit({"type": "delta", "content": "<think>"})
+                            reasoning_open = True
+                        content_buf.append(rpiece)
+                        emit({"type": "delta", "content": rpiece})
+                    piece = delta.get("content") or ""
+                    if piece:
+                        if reasoning_open:
+                            content_buf.append("</think>")
+                            emit({"type": "delta", "content": "</think>"})
+                            reasoning_open = False
+                        content_buf.append(piece)
+                        emit({"type": "delta", "content": piece})
+                    # tool-call deltas come as partial fragments — `arguments`
+                    # is a string that concatenates into a JSON blob across
+                    # many chunks.
+                    for tc in (delta.get("tool_calls") or []):
+                        idx = tc.get("index", 0)
+                        slot = tool_calls_by_index.setdefault(idx, {
+                            "id": tc.get("id") or f"call_{idx}",
+                            "name": "",
+                            "arguments": "",
+                        })
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["name"] = fn["name"]
+                        args_chunk = fn.get("arguments")
+                        if args_chunk:
+                            if isinstance(args_chunk, dict):
+                                # non-streaming mode occasionally returns a dict directly
+                                slot["arguments"] = json.dumps(args_chunk, ensure_ascii=False)
+                            else:
+                                slot["arguments"] += args_chunk
+                    if obj.get("usage"):
+                        u = obj["usage"]
+                        last_stats.setdefault("eval_count", u.get("completion_tokens"))
+                        last_stats.setdefault("prompt_eval_count", u.get("prompt_tokens"))
+                # if the stream ended while still inside reasoning (no answer
+                # tokens came), close the tag so the UI can render it cleanly.
+                if reasoning_open:
+                    content_buf.append("</think>")
+                    emit({"type": "delta", "content": "</think>"})
+                    reasoning_open = False
+                if last_stats.get("eval_count") is not None:
+                    emit({"type": "stats", **last_stats})
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                _set_cancel_resp(chat_id, None)
+
+            if cancel_ev.is_set():
+                emit({"type": "notice", "note": "stopped by user"})
                 return None
 
-            content_buf = []
-            tool_calls_native: list[dict] = []
-            done = False
-            last_stats = {}
-            for raw in resp:
-                if not raw:
-                    continue
-                try:
-                    obj = json.loads(raw.decode("utf-8"))
-                except Exception:
-                    continue
-                msg = obj.get("message") or {}
-                piece = msg.get("content") or ""
-                if piece:
-                    content_buf.append(piece)
-                    emit({"type": "delta", "content": piece})
-                for tc in (msg.get("tool_calls") or []):
-                    tool_calls_native.append(tc)
-                if obj.get("done"):
-                    done = True
-                    last_stats = {
-                        "eval_count": obj.get("eval_count"),
-                        "eval_duration": obj.get("eval_duration"),
-                        "prompt_eval_count": obj.get("prompt_eval_count"),
-                    }
-                    if last_stats.get("eval_count") is not None:
-                        emit({"type": "stats", **last_stats})
-                    break
-            resp.close()
-
             full_text = "".join(content_buf)
-            parsed_calls = []
-            for tc in tool_calls_native:
-                fn = tc.get("function") or {}
-                args = fn.get("arguments")
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        args = {}
-                parsed_calls.append({"name": fn.get("name"), "arguments": args or {}})
+
+            # assemble native tool calls
+            parsed_calls: list[dict] = []
+            for idx in sorted(tool_calls_by_index.keys()):
+                slot = tool_calls_by_index[idx]
+                if not slot.get("name"):
+                    continue
+                args = repair_tool_args(slot.get("arguments", ""))
+                parsed_calls.append({"id": slot["id"], "name": slot["name"], "arguments": args})
+
+            # fallback: parse tool calls emitted in content (hermes/qwen/llama/mistral/named)
             if not parsed_calls and use_tools:
                 for c in extract_tool_calls(full_text):
-                    parsed_calls.append({
-                        "name": c.get("name") or c.get("tool"),
-                        "arguments": c.get("arguments") or c.get("args") or {},
+                    name = c.get("name") or c.get("tool")
+                    args = c.get("arguments") or c.get("args") or {}
+                    if not isinstance(args, dict):
+                        args = repair_tool_args(args)
+                    if name:
+                        parsed_calls.append({
+                            "id": f"call_{len(parsed_calls)}",
+                            "name": name,
+                            "arguments": args,
+                        })
+                # diagnostic — model emitted tool-call syntax but nothing
+                # parsed. Almost always a chat-template / dialect mismatch,
+                # which means the rest of the reply is hallucinated narration
+                # of a tool that never ran. Surface that to the UI.
+                if not parsed_calls and TOOL_SYNTAX_HINT_RE.search(full_text or ""):
+                    print(
+                        "[tool] WARNING: model emitted tool-call syntax but "
+                        "no dialect matched - likely chat-template mismatch",
+                        flush=True,
+                    )
+                    emit({
+                        "type": "tool_dialect_warning",
+                        "message": (
+                            "Model produced tool-call syntax that this build "
+                            "couldn't parse. The reply may be a hallucination "
+                            "- no tool actually ran."
+                        ),
                     })
 
             assistant_msg = {"role": "assistant", "content": full_text}
             if parsed_calls:
                 assistant_msg["tool_calls"] = [
-                    {"function": {"name": c["name"], "arguments": c["arguments"]}} for c in parsed_calls
+                    {
+                        "id": c["id"],
+                        "type": "function",
+                        "function": {
+                            "name": c["name"],
+                            "arguments": json.dumps(c["arguments"], ensure_ascii=False),
+                        },
+                    }
+                    for c in parsed_calls
                 ]
 
             if not parsed_calls or rounds >= max_tool_rounds:
-                # If the model returned empty content after tool results, nudge once.
                 if not (assistant_msg.get("content") or "").strip() and rounds > 0 and not empty_retry_done:
                     empty_retry_done = True
                     conversation.append({
@@ -2616,8 +4708,12 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
                         "content": "Continue. Complete the user's request using the tool results you just received. Do not ask for permission.",
                     })
                     continue
-                # attach stats to the final message so the client can show per-msg token count
                 assistant_msg["_stats"] = last_stats
+                # Intermediate working memory for this turn: every tool result
+                # and intermediate-assistant-with-tool-calls the loop appended.
+                # The caller persists these so the next user turn replays the
+                # full agentic context, not just the final bubble.
+                assistant_msg["_appended_intermediate"] = list(conversation[_start_len:])
                 emit({"type": "final", "message": assistant_msg})
                 return assistant_msg
 
@@ -2626,8 +4722,6 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
                 name = call.get("name") or ""
                 args = call.get("arguments") or {}
                 emit({"type": "tool_start", "name": name, "arguments": args})
-                # run tool in thread pool so we can heartbeat while it blocks.
-                # copy context vars so _current_chat_id and _chat_emitters work inside the worker.
                 _ctx = contextvars.copy_context()
                 future = _tool_executor.submit(_ctx.run, invoke_tool, name, args if isinstance(args, dict) else {})
                 while not future.done():
@@ -2642,14 +4736,90 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
                             pass
                 result = future.result()
                 emit({"type": "tool_result", "name": name, "result": result})
+                # analysis tools produce large structured output (string lists,
+                # grep hit lists, disasm listings). Cap looser so the model can
+                # actually reason over the output. Chatty tools stay tight.
+                _trunc = 16000 if name in _ANALYSIS_TOOL_NAMES else 4000
                 conversation.append({
                     "role": "tool",
+                    "tool_call_id": call.get("id") or name,
                     "name": name,
-                    "content": json.dumps(result, ensure_ascii=False)[:4000],
+                    "content": json.dumps(result, ensure_ascii=False)[:_trunc],
                 })
             rounds += 1
     finally:
         _chat_emitters.pop(chat_id, None)
+        _unregister_cancel(chat_id)
+
+
+# Rewrite prior assistant <think>…</think> blocks as plain-text scratchpad
+# notes so they survive chat-template stripping (Qwen3, DeepSeek, etc. all
+# discard prior reasoning by default — the model loses its own context).
+_PRIOR_THINK_RE = re.compile(r"<think>([\s\S]*?)</think>", re.IGNORECASE)
+
+def _preserve_prior_thinking(text: str) -> str:
+    if not text or "<think>" not in text.lower():
+        return text
+    def _rewrite(m: "re.Match[str]") -> str:
+        body = (m.group(1) or "").strip()
+        if not body:
+            return ""
+        # plain text the chat template can't recognize as reasoning, but the
+        # model can still read. compact-ish to keep ctx in check.
+        return f"[scratchpad-from-earlier-turn]\n{body}\n[/scratchpad-from-earlier-turn]"
+    return _PRIOR_THINK_RE.sub(_rewrite, text)
+
+
+def _sanitize_messages_for_openai(msgs: list[dict]) -> list[dict]:
+    """llama-server's OpenAI endpoint is stricter about message shape than
+    Ollama. Strip local-only fields (`t`, `_stats`), coerce tool messages to
+    the `{role:'tool', tool_call_id, content}` shape, and ensure assistant
+    tool_calls have a string `arguments` field."""
+    try:
+        preserve_thinking = bool(get_settings().get("preserve_prior_thinking", True))
+    except Exception:
+        preserve_thinking = True
+    out = []
+    # the LAST assistant message is "current" reasoning being authored — we
+    # only rewrite think blocks for messages strictly older than the latest.
+    last_assistant_idx = -1
+    for i, m in enumerate(msgs):
+        if m.get("role") == "assistant":
+            last_assistant_idx = i
+    for i, m in enumerate(msgs):
+        role = m.get("role")
+        if role not in ("system", "user", "assistant", "tool"):
+            continue
+        clean: dict = {"role": role}
+        content = m.get("content", "")
+        if isinstance(content, list):
+            clean["content"] = content
+        else:
+            text_content = content or ""
+            if (preserve_thinking and role == "assistant"
+                    and i < last_assistant_idx and isinstance(text_content, str)):
+                text_content = _preserve_prior_thinking(text_content)
+            clean["content"] = text_content
+        if role == "tool":
+            clean["tool_call_id"] = m.get("tool_call_id") or m.get("name") or "tool"
+            if m.get("name"):
+                clean["name"] = m["name"]
+        if role == "assistant" and m.get("tool_calls"):
+            tcs = []
+            for tc in m["tool_calls"]:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, dict):
+                    args = json.dumps(args, ensure_ascii=False)
+                tcs.append({
+                    "id": tc.get("id") or f"call_{len(tcs)}",
+                    "type": "function",
+                    "function": {"name": fn.get("name", ""), "arguments": args or "{}"},
+                })
+            if tcs:
+                clean["tool_calls"] = tcs
+        out.append(clean)
+    return out
 
 
 # ---- versioning ------------------------------------------------------------
@@ -2831,23 +5001,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_api_get(self, p: str, parsed):
         if p == "/api/health":
-            return self._send_json(200, {"ok": True, "ollama": OLLAMA})
-        if p == "/api/hardware":
-            qs = urllib.parse.parse_qs(parsed.query)
-            model = (qs.get("model") or [""])[0].strip()
-            optimal = get_combined_optimal_settings(model or None)
             return self._send_json(200, {
-                "hardware": optimal.pop("_hardware", {}),
-                "model": optimal.pop("_model", None),
-                "recommended": optimal,
-                "current": get_settings(),
+                "ok": True,
+                "llama": LLAMA,
+                "vision_llama": VISION_LLAMA,
+                "llama_up": llama_ping(timeout=1.0),
+                # legacy alias so older frontend builds don't break
+                "ollama": LLAMA,
             })
         if p == "/api/models":
-            try:
-                data = ollama_get("/api/tags")
-                return self._send_json(200, data)
-            except Exception as e:
-                return self._send_json(200, {"models": [], "error": str(e)})
+            # List .gguf files under settings.models_dir. Each entry includes a
+            # `loaded` flag so the UI can highlight the active model.
+            s = get_settings()
+            mdir = (s.get("models_dir") or "").strip()
+            files = scan_gguf_dir(mdir)
+            loaded = _llama.loaded_model() or s.get("model_path") or ""
+            for f in files:
+                f["loaded"] = (f["path"] == loaded)
+            return self._send_json(200, {
+                "models_dir": mdir,
+                "loaded_model": loaded,
+                "llama_running": _llama.is_running() or llama_ping(timeout=0.5),
+                "models": files,
+            })
         if p.startswith("/api/model-info/"):
             name = urllib.parse.unquote(p[len("/api/model-info/"):])
             return self._send_json(200, recommended_settings(name))
@@ -2994,28 +5170,6 @@ class Handler(BaseHTTPRequestHandler):
             save_json(SETTINGS_FILE, cur)
             broadcast_event({"type": "settings:update"})
             return self._send_json(200, cur)
-        if p == "/api/hardware/apply":
-            model = (body.get("model") or "").strip()
-            optimal = get_combined_optimal_settings(model or None)
-            hw_info = optimal.pop("_hardware", {})
-            model_info = optimal.pop("_model", None)
-            cur = get_settings()
-            for key in ["num_ctx", "num_gpu", "num_batch", "num_thread", "num_predict", "keep_alive", "temperature", "top_p", "kv_cache_type"]:
-                if key in optimal:
-                    cur[key] = optimal[key]
-            save_json(SETTINGS_FILE, cur)
-            broadcast_event({"type": "settings:update"})
-            if model_info and not model_info.get("error"):
-                msg = f"Tuned for {hw_info['gpus'][0]['name'] if hw_info['gpus'] else 'CPU'} + {model_info['name']} ({model_info['est_weights_gb']}GB weights)"
-            else:
-                msg = f"Tuned for {hw_info['gpus'][0]['name'] if hw_info['gpus'] else 'CPU'} ({hw_info['ram_gb']}GB RAM)"
-            return self._send_json(200, {
-                "ok": True,
-                "applied": optimal,
-                "hardware": hw_info,
-                "model": model_info,
-                "message": msg,
-            })
         if p == "/api/workspace":
             folders = body.get("folders") or []
             folders = [normalize_path(f) for f in folders if isinstance(f, str) and f.strip()]
@@ -3024,17 +5178,58 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, {"folders": folders})
         if p == "/api/browse-folder":
             # native OS folder picker, only on the machine running the bridge.
+            title = (body.get("title") or "Pick a folder").strip()
             try:
                 import tkinter as tk
                 from tkinter import filedialog
                 root = tk.Tk()
                 root.withdraw()
                 root.attributes("-topmost", True)
-                path = filedialog.askdirectory(title="Add workspace folder")
+                path = filedialog.askdirectory(title=title)
                 root.destroy()
                 return self._send_json(200, {"path": path or ""})
             except Exception as e:
                 return self._send_json(200, {"path": "", "error": str(e)})
+        if p == "/api/models/scan-dir":
+            # Save settings.models_dir and immediately return the scan.
+            new_dir = (body.get("path") or "").strip()
+            if new_dir and not Path(new_dir).is_dir():
+                return self._send_json(400, {"error": f"not a directory: {new_dir}"})
+            s = get_settings()
+            s["models_dir"] = new_dir
+            save_json(SETTINGS_FILE, s)
+            files = scan_gguf_dir(new_dir)
+            loaded = _llama.loaded_model() or s.get("model_path") or ""
+            for f in files:
+                f["loaded"] = (f["path"] == loaded)
+            broadcast_event({"type": "models:update"})
+            return self._send_json(200, {
+                "models_dir": new_dir,
+                "loaded_model": loaded,
+                "models": files,
+            })
+        if p == "/api/models/load":
+            # Switch the active model. Kills current llama-server, spawns new.
+            target = (body.get("path") or "").strip()
+            if not target:
+                return self._send_json(400, {"error": "path required"})
+            if not Path(target).exists():
+                return self._send_json(400, {"error": f"file not found: {target}"})
+            res = _llama.start(target)
+            if res.get("ok"):
+                s = get_settings()
+                s["model_path"] = target
+                # Use the basename without extension as the model id the chat
+                # API sends to llama-server. (llama-server accepts any id but
+                # logs/UI look nicer with a clean name.)
+                s["model"] = Path(target).stem
+                save_json(SETTINGS_FILE, s)
+                broadcast_event({"type": "models:update", "loaded_model": target})
+            return self._send_json(200 if res.get("ok") else 500, res)
+        if p == "/api/models/stop":
+            _llama.stop()
+            broadcast_event({"type": "models:update", "loaded_model": ""})
+            return self._send_json(200, {"ok": True})
         if p == "/api/chats":
             chat_id = body.get("id") or uuid.uuid4().hex[:12]
             chats = get_chats()
@@ -3094,22 +5289,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(202, {"job_id": job_id, "status": "queued"})
         if p == "/api/chat":
             return self._handle_chat(body)
+        if p == "/api/cancel":
+            cid = (body.get("chat_id") or "").strip()
+            if not cid:
+                return self._send_json(400, {"error": "chat_id required"})
+            ok = cancel_chat(cid)
+            return self._send_json(200, {"ok": ok, "chat_id": cid})
         if p == "/api/prewarm":
-            # load the model into VRAM so the first chat isn't a 30s cold start.
-            # ollama's /api/generate with empty prompt + keep_alive does this.
-            model = (body.get("model") or "").strip()
-            if not model:
-                return self._send_json(400, {"error": "model required"})
+            # llama-server keeps the model resident after startup, so "prewarm"
+            # is just a 1-token ping that forces any lazy mmap to fault in.
+            model = (body.get("model") or "local").strip() or "local"
             try:
-                payload = {"model": model, "prompt": "", "keep_alive": get_settings().get("keep_alive", "30m"), "stream": False}
-                req = urllib.request.Request(
-                    f"{OLLAMA}/api/generate",
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=120) as resp:
-                    resp.read()
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": "ok"}],
+                    "max_tokens": 1,
+                    "stream": False,
+                }
+                llama_post("/v1/chat/completions", payload, timeout=120)
                 return self._send_json(200, {"ok": True, "model": model})
             except Exception as e:
                 return self._send_json(200, {"ok": False, "error": str(e)})
@@ -3281,7 +5478,11 @@ class Handler(BaseHTTPRequestHandler):
         # prior user message.  only valid if the most recent message is
         # actually an assistant reply.
         if regenerate:
-            while chat["messages"] and chat["messages"][-1].get("role") == "assistant":
+            # Pop the whole prior agentic tail — final assistant + every
+            # intermediate assistant and tool message — back to the last user
+            # turn. With server-side history, "regenerate" means re-run from
+            # exactly that user message, so the loop's internal context resets.
+            while chat["messages"] and chat["messages"][-1].get("role") in ("assistant", "tool"):
                 chat["messages"].pop()
             if not chat["messages"] or chat["messages"][-1].get("role") != "user":
                 save_json(CHATS_FILE, chats)
@@ -3301,9 +5502,24 @@ class Handler(BaseHTTPRequestHandler):
         use_tools = mode != "ide"
         system_prompt = build_system_prompt(include_tools=use_tools)
         msgs: list[dict] = [{"role": "system", "content": system_prompt}]
+        # Replay the FULL stored history including intermediate-assistant
+        # turns (with tool_calls) and tool-result messages from prior agentic
+        # loops. This is the anti-amnesia change — the model picks up its
+        # working memory from where the last turn left off, not from a sanitised
+        # bubble-only transcript.
         for m in chat["messages"]:
-            if m.get("role") in ("user", "assistant"):
-                msgs.append({"role": m["role"], "content": m.get("content", "")})
+            role = m.get("role")
+            if role not in ("user", "assistant", "tool"):
+                continue
+            out: dict = {"role": role, "content": m.get("content", "") or ""}
+            if role == "assistant" and m.get("tool_calls"):
+                out["tool_calls"] = m["tool_calls"]
+            if role == "tool":
+                if m.get("tool_call_id"):
+                    out["tool_call_id"] = m["tool_call_id"]
+                if m.get("name"):
+                    out["name"] = m["name"]
+            msgs.append(out)
 
         # set up SSE response — Connection: close so the browser reader resolves done
         self.send_response(200)
@@ -3342,10 +5558,38 @@ class Handler(BaseHTTPRequestHandler):
             chats = get_chats()
             if chat_id in chats["chats"]:
                 chat = chats["chats"][chat_id]
+                # Persist the agentic loop's working memory (tool calls + tool
+                # results + intermediate assistant messages) BEFORE the final
+                # bubble. Marked _internal=true on assistants so the renderer
+                # skips them — they stay in the JSON purely so the model can
+                # replay them on the next user turn.
+                appended = final.pop("_appended_intermediate", None) or []
+                now_t = int(time.time())
+                for im in appended:
+                    role = im.get("role")
+                    if role not in ("assistant", "tool"):
+                        # the empty-retry "system" nudge isn't worth persisting
+                        continue
+                    persisted = {
+                        "role": role,
+                        "content": im.get("content", "") or "",
+                        "t": now_t,
+                    }
+                    if role == "assistant":
+                        persisted["_internal"] = True
+                        if im.get("tool_calls"):
+                            persisted["tool_calls"] = im["tool_calls"]
+                    elif role == "tool":
+                        if im.get("tool_call_id"):
+                            persisted["tool_call_id"] = im["tool_call_id"]
+                        if im.get("name"):
+                            persisted["name"] = im["name"]
+                    chat["messages"].append(persisted)
+
                 msg = {
                     "role": "assistant",
                     "content": final.get("content", ""),
-                    "t": int(time.time()),
+                    "t": now_t,
                 }
                 stats = final.get("_stats") or {}
                 if stats.get("eval_count") is not None:
@@ -3353,7 +5597,12 @@ class Handler(BaseHTTPRequestHandler):
                 if stats.get("prompt_eval_count") is not None:
                     msg["prompt_tokens"] = stats["prompt_eval_count"]
                 chat["messages"].append(msg)
-                chat["updated"] = int(time.time())
+                chat["updated"] = now_t
+                # Retention cap: keep the chat under CHAT_HISTORY_MAX messages.
+                # Anchors (system + first user) are always kept; oldest beyond
+                # that get dropped. Trimmer at request time gives the model a
+                # tight tail; this cap keeps the JSON file from ballooning.
+                _enforce_chat_retention(chat)
                 html = extract_html(final.get("content", ""))
                 if html:
                     entry = save_version(chat_id, html, label=user_text[:80])
@@ -3370,54 +5619,218 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
 
-# ---- ollama management -----------------------------------------------------
+# ---- llama-server management -----------------------------------------------
+# Bridge owns the llama-server subprocess so the user can swap models from the
+# UI without restarting anything. Set settings.model_path to the .gguf and we
+# (re)spawn llama-server with the unsloth-tuned flag set.
 
-def ollama_ping(timeout: float = 2.0) -> bool:
+def find_llama_bin() -> str:
+    """Locate llama-server.exe — settings override > env > PATH > known dirs."""
+    s = get_settings()
+    explicit = (s.get("llama_bin") or "").strip()
+    if explicit and Path(explicit).exists():
+        return explicit
+    env = (os.environ.get("ACCURETTA_LLAMA_BIN") or "").strip()
+    if env and Path(env).exists():
+        return env
+    found = shutil.which("llama-server.exe") or shutil.which("llama-server")
+    if found:
+        return found
+    home = Path.home()
+    candidates = [
+        home / ".unsloth/llama.cpp/build/bin/Release/llama-server.exe",
+        home / ".unsloth/llama.cpp/build/bin/llama-server.exe",
+        home / ".docker/bin/inference/llama-server.exe",
+        home / "llama.cpp/build/bin/Release/llama-server.exe",
+        home / "llama.cpp/llama-server.exe",
+        Path("C:/llama.cpp/build/bin/Release/llama-server.exe"),
+        Path("C:/llama.cpp/llama-server.exe"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return ""
+
+
+def _parse_llama_port() -> int:
+    m = re.search(r":(\d+)", LLAMA)
+    return int(m.group(1)) if m else 8080
+
+
+def scan_gguf_dir(root: str) -> list[dict]:
+    """List .gguf files under root (recursive). Returns [{name,path,size,modified_at}]."""
+    if not root:
+        return []
+    rp = Path(root)
+    if not rp.exists() or not rp.is_dir():
+        return []
+    out = []
+    for p in rp.rglob("*.gguf"):
+        try:
+            st = p.stat()
+        except Exception:
+            continue
+        out.append({
+            "name": p.name,
+            "path": str(p.resolve()),
+            "size": st.st_size,
+            "modified_at": int(st.st_mtime),
+        })
+    out.sort(key=lambda m: m["name"].lower())
+    return out
+
+
+class LlamaProcess:
+    """Single llama-server subprocess; thread-safe start / stop / swap-model."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._proc: Optional[subprocess.Popen] = None
+        self._loaded_model: str = ""
+
+    def loaded_model(self) -> str:
+        with self._lock:
+            return self._loaded_model
+
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._proc is not None and self._proc.poll() is None
+
+    def stop(self, timeout: float = 5.0) -> bool:
+        with self._lock:
+            p = self._proc
+            self._proc = None
+            self._loaded_model = ""
+        _llama_props_ctx_invalidate()
+        if not p:
+            return True
+        try:
+            p.terminate()
+            try:
+                p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait(timeout=2.0)
+        except Exception:
+            pass
+        return True
+
+    def start(self, model_path: str, wait: bool = True, wait_seconds: int = 120) -> dict:
+        bin_path = find_llama_bin()
+        if not bin_path:
+            return {"ok": False, "error": "llama-server.exe not found. Set llama_bin in Settings or install llama.cpp."}
+        if not model_path or not Path(model_path).exists():
+            return {"ok": False, "error": f"model not found: {model_path}"}
+
+        s = get_settings()
+        port = _parse_llama_port()
+        # Cap ctx to keep KV cache from blowing past VRAM. A 256k ctx with f16
+        # KV on a 16-attn-head model burns ~16 GiB by itself, leaving nothing
+        # for the weights and forcing layer offload to system RAM. 32k is a
+        # sane chat default; users who want more can raise it knowing the cost.
+        ctx_raw = int(s.get("num_ctx") or 32768)
+        # 65k is the max we trust for a 16 GB GPU with q8_0 KV cache. Above
+        # that, even a mid-size model starts spilling layers to host RAM.
+        ctx = min(ctx_raw, 65536) if ctx_raw > 0 else 32768
+        n_batch = max(int(s.get("num_batch") or 2048), 512)
+        n_ubatch = min(max(n_batch // 2, 512), 1024)
+        ngl_setting = int(s.get("num_gpu") or 99)
+        ngl = -1 if ngl_setting >= 99 else ngl_setting
+        kv_type = (s.get("kv_cache_type") or "q8_0").strip().lower()
+        if kv_type not in ("f16", "f32", "q8_0", "q4_0", "q5_0", "q5_1", "q4_1"):
+            kv_type = "q8_0"
+
+        # Stop any existing instance first.
+        with self._lock:
+            running = self._proc is not None and self._proc.poll() is None
+        if running:
+            self.stop()
+
+        # If something *else* is squatting on the port (e.g. user launched
+        # llama-server manually before bridge), refuse rather than fight it.
+        if llama_ping(timeout=0.8):
+            return {"ok": False, "error": f"port {port} already in use by another llama-server. Stop it first."}
+
+        cmd = [
+            bin_path,
+            "-m", model_path,
+            "--host", "127.0.0.1",
+            "--port", str(port),
+            "--jinja",
+            "--flash-attn", "on",
+            "--no-context-shift",
+            "-ngl", str(ngl),
+            "-c", str(ctx),
+            "-b", str(n_batch),
+            "-ub", str(n_ubatch),
+            "--cache-type-k", kv_type,
+            "--cache-type-v", kv_type,
+            "--parallel", "1",
+            "--spec-type", "ngram-mod",
+            "--spec-ngram-size-n", "24",
+            "--draft-min", "48",
+            "--draft-max", "64",
+            "--reasoning-format", "deepseek",
+        ]
+        try:
+            creationflags = 0
+            if sys.platform == "win32":
+                creationflags = subprocess.CREATE_NEW_CONSOLE
+            p = subprocess.Popen(
+                cmd,
+                cwd=str(Path(bin_path).parent),
+                creationflags=creationflags,
+            )
+        except Exception as e:
+            return {"ok": False, "error": f"spawn failed: {e}"}
+
+        with self._lock:
+            self._proc = p
+            self._loaded_model = model_path
+
+        if not wait:
+            return {"ok": True, "pid": p.pid, "model": model_path, "ready": False}
+        if wait_for_llama(wait_seconds):
+            return {"ok": True, "pid": p.pid, "model": model_path, "ready": True}
+        # if we waited but nothing came up, the child likely died
+        if p.poll() is not None:
+            with self._lock:
+                self._proc = None
+                self._loaded_model = ""
+            return {"ok": False, "error": f"llama-server exited (code {p.returncode}) — check the model file or VRAM."}
+        return {"ok": False, "error": "llama-server didn't answer in time. Still loading; check the spawned window."}
+
+
+_llama = LlamaProcess()
+
+
+def llama_ping(timeout: float = 2.0) -> bool:
     try:
-        with urllib.request.urlopen(f"{OLLAMA}/api/tags", timeout=timeout) as r:
+        with urllib.request.urlopen(f"{LLAMA}/v1/models", timeout=timeout) as r:
             r.read(1)
         return True
     except Exception:
         return False
 
 
-def ensure_ollama(wait_seconds: int = 30) -> bool:
-    """Return True if Ollama is reachable. Start it if not, wait for readiness."""
-    if ollama_ping():
+# back-compat alias for any stray callers
+ollama_ping = llama_ping
+
+
+def wait_for_llama(wait_seconds: int = 30) -> bool:
+    """Poll llama-server up to wait_seconds. Returns True once it's up."""
+    if llama_ping():
         return True
-    exe = shutil.which("ollama")
-    if not exe:
-        print("  [warn] ollama not on PATH. install from https://ollama.com/download")
-        return False
-    print("  starting ollama serve with perf env ...")
-    try:
-        env = os.environ.copy()
-        # perf tuning applied to the spawned ollama process only
-        env.setdefault("OLLAMA_FLASH_ATTENTION", "1")
-        env.setdefault("OLLAMA_KV_CACHE_TYPE", "q8_0")
-        env.setdefault("OLLAMA_KEEP_ALIVE", "30m")
-        creationflags = 0
-        if os.name == "nt":
-            creationflags = 0x00000008 | 0x00000200  # DETACHED | NEW_PROCESS_GROUP
-        subprocess.Popen(
-            [exe, "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            env=env,
-            creationflags=creationflags,
-            close_fds=True,
-        )
-    except Exception as e:
-        print(f"  [warn] could not spawn ollama: {e}")
-        return False
     t0 = time.time()
+    printed = False
     while time.time() - t0 < wait_seconds:
         time.sleep(0.6)
-        if ollama_ping(timeout=1.5):
-            print(f"  ollama up in {time.time() - t0:.1f}s")
+        if llama_ping(timeout=1.5):
+            print(f"  llama-server up in {time.time() - t0:.1f}s")
             return True
-    print(f"  [warn] ollama not responding after {wait_seconds}s")
+        if not printed and time.time() - t0 > 2:
+            print(f"  waiting for llama-server at {LLAMA} ...")
+            printed = True
     return False
 
 
@@ -3426,19 +5839,11 @@ def ensure_ollama(wait_seconds: int = 30) -> bool:
 def main():
     print(f"accuretta bridge")
     print(f"  root:    {ROOT}")
-    print(f"  ollama:  {OLLAMA}")
+    print(f"  llama:   {LLAMA}")
+    if VISION_LLAMA and VISION_LLAMA != LLAMA:
+        print(f"  vision:  {VISION_LLAMA}")
     print(f"  port:    {PORT}")
     print(f"  bind:    0.0.0.0  (reachable over LAN / Tailscale)")
-
-    # Auto-enable Flash Attention for high-end GPUs
-    try:
-        gpus = _detect_gpu_info()
-        if any(g.get("vram_gb", 0) >= 16 for g in gpus):
-            os.environ.setdefault("OLLAMA_FLASH_ATTENTION", "1")
-            os.environ.setdefault("OLLAMA_KV_CACHE_TYPE", "q8_0")
-            print("  flash attention: enabled (16GB+ GPU detected)")
-    except Exception:
-        pass
 
     # first-run system context scan (creates data/ACCURETTA.md if missing)
     if not SYSTEM_CONTEXT_FILE.exists():
@@ -3448,32 +5853,43 @@ def main():
     else:
         print(f"  context: {SYSTEM_CONTEXT_FILE} (edit or delete to rescan)")
 
-    ensure_ollama(wait_seconds=30)
-
-    try:
-        tags = ollama_get("/api/tags")
-        models = [m.get("name") for m in tags.get("models", [])]
-        print(f"  models:  {', '.join(models) if models else '(none — run: ollama pull qwen3:8b)'}")
-    except Exception as e:
-        print(f"  models:  (ollama unreachable: {e})")
-
-    s = get_settings()
-    if not s.get("model"):
+    # auto-spawn llama-server with the user's last-loaded model, if any.
+    # Skip if something is already answering on LLAMA_HOST (user launched
+    # their own — we don't fight them).
+    s_initial = get_settings()
+    last_model = (s_initial.get("model_path") or "").strip()
+    if llama_ping(timeout=1.0):
+        print(f"  llama-server: already running at {LLAMA} (using existing instance)")
         try:
-            tags = ollama_get("/api/tags")
-            for pref in ["qwen3:8b", "qwen2.5:7b", "qwen2.5-coder:7b", "llama3.1:8b"]:
-                if any(m.get("name", "").startswith(pref) for m in tags.get("models", [])):
-                    s["model"] = pref
-                    save_json(SETTINGS_FILE, s)
-                    print(f"  chose default model: {pref}")
-                    break
-            else:
-                if tags.get("models"):
-                    s["model"] = tags["models"][0].get("name")
-                    save_json(SETTINGS_FILE, s)
-                    print(f"  chose default model: {s['model']}")
+            info = llama_get("/v1/models")
+            names = [m.get("id") for m in (info.get("data") or []) if m.get("id")]
+            if names and not s_initial.get("model"):
+                s_initial["model"] = names[0]
+                save_json(SETTINGS_FILE, s_initial)
         except Exception:
             pass
+    elif last_model and Path(last_model).exists():
+        print(f"  spawning llama-server with {Path(last_model).name} ...")
+        res = _llama.start(last_model, wait=True, wait_seconds=120)
+        if res.get("ok"):
+            print(f"  llama-server: ready (pid {res.get('pid')})")
+        else:
+            print(f"  [warn] llama-server didn't start: {res.get('error')}")
+            print(f"         pick a different model or update settings via the UI.")
+    else:
+        bin_path = find_llama_bin()
+        if not bin_path:
+            print(f"  [warn] llama-server.exe not found.")
+            print(f"         install llama.cpp or set llama_bin in Settings.")
+        elif not s_initial.get("models_dir"):
+            print(f"  [info] no models folder set yet.")
+            print(f"         open Settings -> Models folder, pick where your .gguf files live.")
+        else:
+            print(f"  [info] no model loaded yet. Pick one in Settings -> Models.")
+
+    # ensure the spawned llama-server dies with us
+    import atexit
+    atexit.register(_llama.stop)
 
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     httpd.daemon_threads = True
@@ -3493,6 +5909,11 @@ def main():
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopping.")
+    finally:
+        try:
+            _llama.stop()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

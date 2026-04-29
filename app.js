@@ -103,6 +103,63 @@
     const parts = s.split("/").filter(Boolean);
     return parts.length <= 2 ? s : "…/" + parts.slice(-2).join("/");
   }
+  // Tools whose action the user almost always wants to see in full (paths,
+  // commands). Everything else (reads, searches, listings, memory ops) gets
+  // collapsed into a single chevron group to keep the chat readable.
+  const COMMAND_TOOLS = new Set([
+    "write_file", "delete_file", "edit_file", "patch_file",
+    "run_powershell", "open_program",
+    "desktop_launch_app", "desktop_focus_window", "desktop_click",
+    "desktop_type_text", "desktop_press_keys", "desktop_close_window",
+  ]);
+  function isCommandTool(name) { return COMMAND_TOOLS.has(name); }
+
+  function getOrCreateToolGroup(stack) {
+    let group = stack.querySelector(".tool-group:last-of-type");
+    // start a new group if the previous one already finished (no .running cards)
+    if (group && !group.querySelector(".tool-line.running") && group.dataset.sealed === "1") {
+      group = null;
+    }
+    if (group) return { group, body: group.querySelector(".tool-group-body") };
+    group = document.createElement("div");
+    group.className = "tool-group collapsed";
+    group.innerHTML = `
+      <div class="tool-group-head">
+        <i class="ph ph-wrench tool-icon spinning"></i>
+        <span class="tool-group-label">working…</span>
+        <i class="ph ph-caret-down chevron"></i>
+      </div>
+      <div class="tool-group-body"></div>`;
+    const head = group.querySelector(".tool-group-head");
+    head.addEventListener("click", () => group.classList.toggle("collapsed"));
+    stack.appendChild(group);
+    return { group, body: group.querySelector(".tool-group-body") };
+  }
+
+  function updateToolGroupHead(stack) {
+    const groups = stack.querySelectorAll(".tool-group");
+    for (const g of groups) {
+      const cards = g.querySelectorAll(".tool-line");
+      const running = g.querySelectorAll(".tool-line.running").length;
+      const done = g.querySelectorAll(".tool-line.done").length;
+      const err = g.querySelectorAll(".tool-line.err").length;
+      const total = cards.length;
+      const icon = g.querySelector(".tool-icon");
+      const label = g.querySelector(".tool-group-label");
+      if (running > 0) {
+        icon?.classList.add("spinning");
+        if (label) label.textContent = `working…`;
+      } else {
+        icon?.classList.remove("spinning");
+        g.dataset.sealed = "1";
+        const summary = err > 0
+          ? `${done} step${done === 1 ? "" : "s"} · ${err} failed`
+          : `${done} step${done === 1 ? "" : "s"}`;
+        if (label) label.textContent = summary;
+      }
+    }
+  }
+
   function toolLabel(name, args) {
     args = args || {};
     switch (name) {
@@ -146,8 +203,23 @@
     if (!text) return "";
 
     // === STRIP ALL TOOL CALL FORMATS ===
+    // Closed forms — the parser already executed these; just clean the bubble.
     text = text.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "");
     text = text.replace(/```tool_call[\s\S]*?```/gi, "");
+    // BugTraceAI / gemma-tunes:  <call:NAME>{...}</call(:NAME)?>
+    text = text.replace(/<call:[a-zA-Z0-9_\-]+>[\s\S]*?<\/call(?::[a-zA-Z0-9_\-]+)?>/gi, "");
+    // Llama 3.x native:  <|python_tag|>{...}(<|eom_id|>|<|eot_id|>)
+    text = text.replace(/<\|python_tag\|>[\s\S]*?(<\|eom_id\|>|<\|eot_id\|>)/gi, "");
+    // Mistral native:  [TOOL_CALLS][{...}]
+    text = text.replace(/\[TOOL_CALLS\]\s*\[[\s\S]*?\]/gi, "");
+    // Partial / streaming open-only forms — the closer hasn't arrived yet,
+    // so the regex above can't catch them and the user sees raw tag spam
+    // flicker mid-stream. Strip from the open tag to end-of-text.
+    text = text.replace(/<tool_call>[\s\S]*$/gi, "");
+    text = text.replace(/<call:[a-zA-Z0-9_\-]+>[\s\S]*$/gi, "");
+    text = text.replace(/<\|python_tag\|>[\s\S]*$/gi, "");
+    text = text.replace(/\[TOOL_CALLS\][\s\S]*$/gi, "");
+    text = text.replace(/```tool_call[\s\S]*$/gi, "");
     text = text.replace(/```json\s*\{[\s\S]*?"name"[\s\S]*?\}\s*```/gi, "");
     text = text.replace(/```json\s*\{[\s\S]*?"function"[\s\S]*?\}\s*```/gi, "");
     text = text.replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, "");
@@ -257,10 +329,18 @@
   async function loadModels() {
     try {
       const r = await api("/api/models");
-      state.models = (r.models || []).map(m => m.name || m.model).filter(Boolean);
-      state.modelsError = r.error || (state.models.length ? "" : "ollama returned no models — run: ollama pull qwen3:8b");
+      state.modelsDir = r.models_dir || "";
+      state.loadedModel = r.loaded_model || "";
+      state.llamaRunning = !!r.llama_running;
+      state.modelsList = Array.isArray(r.models) ? r.models : [];
+      state.models = state.modelsList.map(m => m.name).filter(Boolean);
+      if (r.error) state.modelsError = r.error;
+      else if (!state.modelsDir) state.modelsError = "no models folder set — pick one above.";
+      else if (!state.models.length) state.modelsError = "no .gguf files found in " + state.modelsDir;
+      else state.modelsError = "";
     } catch (e) {
       state.models = [];
+      state.modelsList = [];
       state.modelsError = "bridge unreachable: " + (e.message || e);
     }
   }
@@ -282,7 +362,15 @@
   function selectChat(id) {
     state.chatId = id;
     const chat = state.chats.chats[id];
-    state.messages = chat ? (chat.messages || []).slice() : [];
+    // Only render visible bubbles. The chat record now also stores
+    // intermediate assistant turns (with tool_calls) and tool-result messages
+    // so the bridge can replay the full agentic working memory on the next
+    // turn — but those aren't bubbles, the renderer skips them.
+    state.messages = chat
+      ? (chat.messages || []).filter(
+          m => (m.role === "user" || m.role === "assistant") && !m._internal
+        )
+      : [];
     $("#chat-title").textContent = chat ? chat.title : "new session";
     // restore the last-used mode for this chat so the toolbar feels sticky
     if (chat && chat.last_mode && ["auto", "ide", "agent"].includes(chat.last_mode)) {
@@ -601,7 +689,7 @@
         <div class="think-line" data-label="Thinking"><i class="ph ph-brain"></i><span class="shimmer">Regenerating…</span></div>
         <div class="tool-stack" id="tool-stack"></div>
         <div class="bubble agent hidden" id="stream-bubble"></div>
-        <div class="bubble-meta">${esc(state.settings.model)} · streaming</div>
+        <div class="bubble-meta streaming">${esc(state.settings.model)} · streaming<span class="typing"><span></span><span></span><span></span></span></div>
       </div>`;
     $("#chat-inner").appendChild(agentRow);
     scrollToBottom(true);
@@ -621,9 +709,9 @@
     }
   }
 
-  // show a regenerate chip on the last assistant bubble (post-stream only).
+  // show an action row (regenerate + copy) under the last assistant bubble.
   function renderRegenerateChip() {
-    const existing = document.querySelector(".regen-chip");
+    const existing = document.querySelector(".bubble-actions");
     if (existing) existing.remove();
     const rows = [...document.querySelectorAll("#chat-inner .bubble-row")];
     const lastAssistant = rows.reverse().find(r => r.querySelector(".bubble.agent"));
@@ -632,12 +720,35 @@
     if (!col) return;
     const meta = col.querySelector(".bubble-meta");
     if (!meta) return;
-    const chip = document.createElement("button");
-    chip.className = "regen-chip";
-    chip.type = "button";
-    chip.innerHTML = '<i class="ph ph-arrow-counter-clockwise"></i>Regenerate';
-    chip.addEventListener("click", regenerateLast);
-    meta.after(chip);
+    const bubble = col.querySelector(".bubble.agent");
+    const actions = document.createElement("div");
+    actions.className = "bubble-actions";
+    actions.innerHTML = `
+      <button type="button" class="bubble-action" data-act="regen" title="Regenerate"><i class="ph ph-arrow-counter-clockwise"></i></button>
+      <button type="button" class="bubble-action" data-act="copy" title="Copy"><i class="ph ph-copy"></i></button>
+    `;
+    actions.querySelector('[data-act="regen"]').addEventListener("click", regenerateLast);
+    actions.querySelector('[data-act="copy"]').addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      const text = bubble?.innerText || "";
+      try {
+        await navigator.clipboard.writeText(text);
+        const icon = btn.querySelector("i");
+        if (icon) {
+          icon.classList.remove("ph-copy");
+          icon.classList.add("ph-check");
+          btn.classList.add("copied");
+          setTimeout(() => {
+            icon.classList.remove("ph-check");
+            icon.classList.add("ph-copy");
+            btn.classList.remove("copied");
+          }, 1400);
+        }
+      } catch {
+        toast("copy failed", "err", 2000);
+      }
+    });
+    meta.after(actions);
   }
 
   // ---------- image attachments ----------
@@ -727,7 +838,7 @@
         <div class="think-line" data-label="Thinking"><i class="ph ph-brain"></i><span class="shimmer">Thinking…</span></div>
         <div class="tool-stack" id="tool-stack"></div>
         <div class="bubble agent hidden" id="stream-bubble"></div>
-        <div class="bubble-meta">${esc(state.settings.model)} · streaming</div>
+        <div class="bubble-meta streaming">${esc(state.settings.model)} · streaming<span class="typing"><span></span><span></span><span></span></span></div>
       </div>`;
     $("#chat-inner").appendChild(agentRow);
     scrollToBottom(true);
@@ -760,6 +871,19 @@
   }
 
   function stopStreaming() {
+    // tell the bridge to force-close the llama-server socket first — otherwise
+    // generation keeps running server-side until it hits its own limit.
+    const cid = state.chatId;
+    if (cid) {
+      try {
+        fetch("/api/cancel", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: cid }),
+          keepalive: true,
+        }).catch(() => {});
+      } catch {}
+    }
     if (state.abortCtl) {
       try { state.abortCtl.abort(); } catch {}
     }
@@ -846,7 +970,14 @@
     } finally {
       try { await reader.cancel(); } catch {}
       clearInterval(heartbeat);
-      if (agentRow) updateThinkLine(agentRow, false);
+      if (agentRow) {
+        updateThinkLine(agentRow, false);
+        const meta = agentRow.querySelector(".bubble-meta");
+        if (meta) {
+          meta.classList.remove("streaming");
+          meta.querySelectorAll(".typing").forEach(d => d.remove());
+        }
+      }
       // safety net: if the model ran tools or thought for a while but ended
       // without a visible answer, surface what we have so the user isn't
       // staring at nothing. Promote the tail of thinking if it's substantive.
@@ -961,7 +1092,15 @@
       card.className = "tool-line running";
       card.innerHTML = `<i class="ph ph-circle-notch"></i><span class="shimmer">${esc(toolLabel(evt.name, evt.arguments))}</span>`;
       card.dataset.name = evt.name || "";
-      toolStack.appendChild(card);
+      // command-like tools always show inline (user wants to see paths/cmds);
+      // everything else folds into a collapsible group so reads/searches don't
+      // wall-of-text the chat.
+      if (isCommandTool(evt.name)) {
+        toolStack.appendChild(card);
+      } else {
+        getOrCreateToolGroup(toolStack).body.appendChild(card);
+        updateToolGroupHead(toolStack);
+      }
       scrollToBottom();
     } else if (evt.type === "tool_stream") {
       const cards = Array.from(toolStack.querySelectorAll(".tool-line.running"));
@@ -989,6 +1128,29 @@
         const icon = isErr ? "ph-x-circle" : "ph-check";
         const label = toolResultLabel(evt.name, evt.result);
         card.innerHTML = `<i class="ph ${icon}"></i><span>${esc(label)}</span>`;
+        updateToolGroupHead(toolStack);
+      }
+    } else if (evt.type === "context_trimmed") {
+      // Conveyor belt elision notice — show a single pill above the agent
+      // row's tool stack. Replaces any prior pill from this turn so re-rounds
+      // don't stack pills.
+      if (row) {
+        let pill = row.querySelector(".ctx-trim-pill");
+        if (!pill) {
+          pill = document.createElement("div");
+          pill.className = "ctx-trim-pill";
+          const tip = "Conversation exceeds context window. Older middle messages aren't sent to the model to save space. Your system prompt and first message are always preserved.";
+          pill.innerHTML = `
+            <i class="ph ph-arrows-in-line-horizontal"></i>
+            <span class="ctx-trim-text"></span>
+            <i class="ph ph-info ctx-trim-info" title="${esc(tip)}"></i>`;
+          // Insert above tool-stack so it sits at the top of the agent column.
+          const stack = row.querySelector(".tool-stack");
+          if (stack && stack.parentNode) stack.parentNode.insertBefore(pill, stack);
+          else row.appendChild(pill);
+        }
+        const text = pill.querySelector(".ctx-trim-text");
+        if (text) text.textContent = `${evt.dropped} message${evt.dropped === 1 ? "" : "s"} summarized`;
       }
     } else if (evt.type === "version_saved") {
       state.versions.push(evt.version);
@@ -999,7 +1161,15 @@
       const dur = (evt.eval_duration || 0) / 1e9;
       const tps = dur > 0 ? (tok / dur).toFixed(1) : "—";
       const meta = bubble.parentElement.querySelector(".bubble-meta");
-      if (meta) meta.textContent = `${state.settings.model} · ${tok} tok · ${tps} tok/s`;
+      if (meta) {
+        meta.textContent = `${state.settings.model} · ${tok} tok · ${tps} tok/s`;
+        if (state.streaming && meta.classList.contains("streaming")) {
+          const dots = document.createElement("span");
+          dots.className = "typing";
+          dots.innerHTML = "<span></span><span></span><span></span>";
+          meta.appendChild(dots);
+        }
+      }
       if (Number.isFinite(tok)) {
         state.tokTotal += tok;
         renderTokTotal();
@@ -1007,6 +1177,9 @@
       // stash for the final message object
       state._lastMsgTokens = tok;
       state._lastMsgPromptTokens = evt.prompt_eval_count;
+      // refresh gauge live — prompt_eval_count is the truth from llama-server,
+      // and tool-heavy turns can blow past where the char-count estimate sits.
+      renderCtxGauge();
     } else if (evt.type === "final") {
       const full = evt.message.content || "";
       const msg = {
@@ -1803,6 +1976,11 @@
         refreshDesktopStatus();
       } else if (evt.type === "memories:update") {
         if ($("#settings-drawer")?.classList.contains("open")) loadMemories();
+      } else if (evt.type === "models:update") {
+        loadModels().then(() => {
+          if ($("#settings-drawer")?.classList.contains("open")) populateSettingsForm();
+          renderModelPill();
+        });
       }
     };
     es.onerror = () => {
@@ -1931,28 +2109,50 @@
   function populateSettingsForm() {
     const s = state.settings;
     const fill = (id, v) => { const el = $(id); if (el) el.value = v ?? ""; };
-    // model selects
-    const modelSel = $("#set-model"); modelSel.innerHTML = "";
-    for (const name of state.models) {
-      const o = document.createElement("option");
-      o.value = name; o.textContent = name;
-      if (name === s.model) o.selected = true;
-      modelSel.appendChild(o);
-    }
-    if (!state.models.length) {
-      const msg = state.modelsError || "no models — run: ollama pull qwen3:8b";
-      modelSel.innerHTML = `<option value="">(${msg})</option>`;
-    }
 
-    const visionSel = $("#set-vision"); visionSel.innerHTML = "";
-    const emptyOpt = document.createElement("option");
-    emptyOpt.value = ""; emptyOpt.textContent = "(none)";
-    visionSel.appendChild(emptyOpt);
-    for (const name of state.models) {
-      const o = document.createElement("option");
-      o.value = name; o.textContent = name;
-      if (name === s.vision_model) o.selected = true;
-      visionSel.appendChild(o);
+    // models folder + dropdown
+    const dirInput = $("#set-models-dir");
+    if (dirInput) dirInput.value = state.modelsDir || s.models_dir || "";
+    const modelSel = $("#set-model");
+    if (modelSel) {
+      modelSel.innerHTML = "";
+      const list = state.modelsList || [];
+      const loaded = state.loadedModel || s.model_path || "";
+      if (!list.length) {
+        const msg = state.modelsError || "pick a models folder above";
+        modelSel.innerHTML = `<option value="">(${msg})</option>`;
+      } else {
+        for (const m of list) {
+          const o = document.createElement("option");
+          o.value = m.path; o.textContent = m.name + (m.size_gb ? `  (${m.size_gb} GB)` : "");
+          if (m.path === loaded || m.loaded) o.selected = true;
+          modelSel.appendChild(o);
+        }
+      }
+    }
+    const hint = $("#set-model-hint");
+    if (hint) {
+      if (state.llamaRunning && state.loadedModel) {
+        const name = state.loadedModel.split(/[\\/]/).pop();
+        hint.textContent = `loaded: ${name}`;
+      } else if (state.modelsDir) {
+        hint.textContent = `${(state.modelsList || []).length} model(s) in ${state.modelsDir}`;
+      } else {
+        hint.textContent = "selecting a model loads it into llama-server.";
+      }
+    }
+    const visionSel = $("#set-vision");
+    if (visionSel) {
+      visionSel.innerHTML = "";
+      const emptyOpt = document.createElement("option");
+      emptyOpt.value = ""; emptyOpt.textContent = "(none)";
+      visionSel.appendChild(emptyOpt);
+      for (const m of (state.modelsList || [])) {
+        const o = document.createElement("option");
+        o.value = m.path; o.textContent = m.name;
+        if (m.path === s.vision_model) o.selected = true;
+        visionSel.appendChild(o);
+      }
     }
 
     fill("#set-ctx", s.num_ctx);
@@ -1960,11 +2160,17 @@
     fill("#set-batch", s.num_batch);
     fill("#set-thread", s.num_thread);
     fill("#set-predict", s.num_predict);
-    fill("#set-keep", s.keep_alive);
     const kvSel = $("#set-kv");
     if (kvSel) kvSel.value = s.kv_cache_type || "q8_0";
     fill("#set-temp", s.temperature);
     fill("#set-topp", s.top_p);
+    fill("#set-topk", s.top_k ?? 40);
+    fill("#set-minp", s.min_p ?? 0.05);
+    fill("#set-repeat", s.repeat_penalty ?? 1.1);
+    fill("#set-presence", s.presence_penalty ?? 0);
+    fill("#set-frequency", s.frequency_penalty ?? 0);
+    $("#sw-thinking")?.classList.toggle("on", s.enable_thinking !== false);
+    fill("#set-think-budget", s.thinking_budget ?? 2048);
     $("#sw-dark").classList.toggle("on", s.theme === "dark");
     $("#sw-web").classList.toggle("on", s.allow_web_preview !== false);
 
@@ -2002,20 +2208,32 @@
       }
     } catch {}
   }
+  // settings whose changes require relaunching llama-server (load-time flags)
+  const LOAD_TIME_KEYS = ["num_ctx", "num_gpu", "num_batch", "num_thread", "kv_cache_type", "model_path"];
+
   async function collectAndSaveSettings() {
     const n = (id) => Number($(id).value);
+    const modelPath = $("#set-model").value || "";
     const payload = {
-      model: $("#set-model").value,
+      model_path: modelPath,
+      model: modelPath ? modelPath.split(/[\\/]/).pop().replace(/\.gguf$/i, "") : "",
+      models_dir: ($("#set-models-dir")?.value || "").trim(),
       vision_model: $("#set-vision").value,
       num_ctx: n("#set-ctx") || 8192,
       num_gpu: n("#set-gpu"),
       num_batch: n("#set-batch") || 512,
       num_thread: n("#set-thread"),
       num_predict: n("#set-predict"),
-      keep_alive: $("#set-keep").value || "30m",
       kv_cache_type: $("#set-kv")?.value || "q8_0",
       temperature: n("#set-temp"),
       top_p: n("#set-topp"),
+      top_k: n("#set-topk"),
+      min_p: n("#set-minp"),
+      repeat_penalty: n("#set-repeat"),
+      presence_penalty: n("#set-presence"),
+      frequency_penalty: n("#set-frequency"),
+      enable_thinking: $("#sw-thinking")?.classList.contains("on") !== false,
+      thinking_budget: n("#set-think-budget"),
       theme: $("#sw-dark").classList.contains("on") ? "dark" : "light",
       allow_web_preview: $("#sw-web").classList.contains("on"),
       desktop_enabled: $("#sw-desktop-enabled")?.classList.contains("on") || false,
@@ -2025,8 +2243,28 @@
       use_tailwind_cdn: !!state.settings.use_tailwind_cdn,
       ide_multifile: !!state.settings.ide_multifile,
     };
+
+    // Detect which load-time keys actually changed → triggers a llama-server
+    // restart so the new flags take effect without the user having to know.
+    const prev = state.settings || {};
+    const changedLoadKeys = LOAD_TIME_KEYS.filter(k => String(prev[k] ?? "") !== String(payload[k] ?? ""));
+
     await saveSettings(payload);
     applyTheme(payload.theme === "dark");
+
+    if (changedLoadKeys.length && payload.model_path) {
+      const tid = "reload-llama";
+      toast(`reloading model (${changedLoadKeys.join(", ")})…`, "info", 60000, tid);
+      try {
+        await api("/api/models/load", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ path: payload.model_path }),
+        });
+        toast("model reloaded with new settings", "ok", 2500, tid);
+      } catch (e) {
+        toast("reload failed: " + (e.message || e), "error", 6000, tid);
+      }
+    }
     closeSettings();
   }
 
@@ -2055,16 +2293,28 @@
     const arc = $("#ctx-gauge-arc");
     const label = $("#ctx-gauge-label");
     if (!arc || !label) return;
-    const capacity = Math.max(1, Number(state.settings.num_ctx) || 8192);
-    const systemPromptChars = 2500;
-    const msgChars = (state.messages || []).reduce((a, m) => {
-      const content = String(m.content || "");
-      const multiplier = m.role === "tool" ? 1.5 : 1.0;
-      return a + (content.length * multiplier);
-    }, 0);
-    const imageOverhead = (state.pendingImages || []).length * 500;
-    const totalChars = systemPromptChars + msgChars + imageOverhead;
-    const used = Math.min(capacity, Math.round(totalChars / 3.0));
+    const capacity = Math.max(1, Number(state.settings.num_ctx) || 32768);
+    // Prefer llama-server's actual reported prompt-token count from the most
+    // recent turn. The visible-bubble char count below is blind to tool calls,
+    // tool results, and intermediate assistant rounds — for tool-heavy work
+    // (firmware, multi-step research) it under-reports by 10x or more.
+    const livePromptTokens = Number(state._lastMsgPromptTokens || 0);
+    let used, source;
+    if (livePromptTokens > 0) {
+      used = Math.min(capacity, livePromptTokens);
+      source = "llama-server prompt_eval_count";
+    } else {
+      const systemPromptChars = 2500;
+      const msgChars = (state.messages || []).reduce((a, m) => {
+        const content = String(m.content || "");
+        const multiplier = m.role === "tool" ? 1.5 : 1.0;
+        return a + (content.length * multiplier);
+      }, 0);
+      const imageOverhead = (state.pendingImages || []).length * 500;
+      const totalChars = systemPromptChars + msgChars + imageOverhead;
+      used = Math.min(capacity, Math.round(totalChars / 3.0));
+      source = "char-count estimate (no live data yet)";
+    }
     const pct = Math.min(1, used / capacity);
     const circ = 2 * Math.PI * 13;
     arc.setAttribute("stroke-dasharray", circ.toFixed(2));
@@ -2073,7 +2323,7 @@
     const gauge = $("#ctx-gauge");
     gauge.classList.toggle("warn", pct >= 0.7 && pct < 0.9);
     gauge.classList.toggle("crit", pct >= 0.9);
-    gauge.title = `${used.toLocaleString()} / ${capacity.toLocaleString()} tokens (~${Math.round(pct * 100)}%)\nSystem: ~${Math.round(systemPromptChars/3.0)} tok | Msgs: ~${Math.round(msgChars/3.0)} tok`;
+    gauge.title = `${used.toLocaleString()} / ${capacity.toLocaleString()} tokens (~${Math.round(pct * 100)}%)\nsource: ${source}`;
   }
   function renderTokTotal() {
     const el = $("#tok-total");
@@ -2082,15 +2332,17 @@
   }
   function renderModelPill() {
     const pill = $("#model-pill");
-    if (state.settings.model) {
-      pill.textContent = state.settings.model;
+    const loadedPath = state.loadedModel || state.settings.model_path || state.settings.model || "";
+    if (loadedPath) {
+      const name = String(loadedPath).split(/[\\/]/).pop();
+      pill.textContent = name;
       pill.title = "Click to change model";
-    } else if (state.models.length) {
+    } else if (state.models && state.models.length) {
       pill.textContent = "select model";
       pill.title = "Click to pick a model";
     } else {
       pill.textContent = "no models";
-      pill.title = state.modelsError || "Install Ollama and pull a model";
+      pill.title = state.modelsError || "Pick a models folder in Settings";
     }
   }
 
@@ -2115,85 +2367,6 @@
   }
 
   
-  // ===== HARDWARE AUTO-TUNE =====
-  let _detectedHardware = null;
-
-  async function detectHardware() {
-    const btn = $("#btn-hw-detect");
-    const info = $("#hw-detected-info");
-    const applyBtn = $("#btn-hw-apply");
-    if (!btn || !info) return;
-    btn.disabled = true;
-    info.textContent = "Scanning...";
-    try {
-      const model = state.settings.model || "";
-      const r = await api(`/api/hardware${model ? "?model=" + encodeURIComponent(model) : ""}`);
-      _detectedHardware = r;
-      const hw = r.hardware;
-      const rec = r.recommended;
-      const m = r.model;
-      const gpuText = hw.gpus.length
-        ? hw.gpus.map(g => `${g.name} (${g.vram_gb}GB)`).join(", ")
-        : "No GPU detected (CPU-only)";
-      let html = `<div style="margin-bottom:6px;"><strong>Detected:</strong></div>
-        <div>GPU: ${esc(gpuText)}</div>
-        <div>CPU: ${esc(hw.cpu.cores)} cores / ${esc(hw.cpu.threads)} threads ${hw.cpu.is_x3d ? "(X3D)" : ""}</div>
-        <div>RAM: ${esc(hw.ram_gb)}GB</div>`;
-      if (m && !m.error) {
-        html += `<div style="margin-top:6px;"><strong>Model:</strong> ${esc(m.name)} · ${esc(m.size_b || "?")}B · ${esc(m.quant || "?")} · ~${esc(m.est_weights_gb || "?")}GB weights · native ctx <code>${(m.native_ctx || "?").toLocaleString()}</code></div>`;
-      }
-      // Show combined recommendations with clear constraint labels
-      html += `<div style="margin-top:6px;"><strong>Combined (hardware + model):</strong></div>`;
-      const ctxWhy = rec.num_ctx < (m?.native_ctx || Infinity) ? "capped by hardware" : "native model limit";
-      const batchWhy = rec.num_batch < 512 ? "capped by hardware" : "hardware supports more";
-      html += `<div style="font-size:11px;line-height:1.5;">
-        <div>ctx <code>${rec.num_ctx.toLocaleString()}</code> <span style="opacity:.6">(${ctxWhy})</span></div>
-        <div>gpu layers <code>${rec.num_gpu === 0 ? "auto" : rec.num_gpu}</code></div>
-        <div>batch <code>${rec.num_batch}</code> <span style="opacity:.6">(${batchWhy})</span></div>
-        <div>threads <code>${rec.num_thread}</code></div>
-        <div>kv cache <code>${rec.kv_cache_type || "q8_0"}</code></div>
-      </div>`;
-      if (m && !m.error && m.est_weights_gb) {
-        const vram = hw.gpus[0]?.vram_gb || 0;
-        if (m.est_weights_gb > vram * 0.8) {
-          html += `<div style="margin-top:4px;color:var(--danger);font-size:11px;"><i class="ph ph-warning-circle"></i> Model may not fit in VRAM — consider a smaller quant or model.</div>`;
-        }
-      }
-      info.innerHTML = html;
-      if (applyBtn) {
-        applyBtn.disabled = false;
-        applyBtn.onclick = () => applyHardwareSettings(r);
-      }
-      toast(`Detected: ${hw.gpus[0]?.name || "CPU"}${m ? " + " + m.name.split("/").pop() : ""}`, "ok", 2500);
-    } catch (e) {
-      info.textContent = `Detection failed: ${e.message}`;
-      toast("Hardware detection failed", "err", 3000);
-    } finally {
-      btn.disabled = false;
-    }
-  }
-
-  async function applyHardwareSettings(hwData) {
-    const btn = $("#btn-hw-apply");
-    if (btn) btn.disabled = true;
-    try {
-      const r = await api("/api/hardware/apply", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: state.settings.model || "" }),
-      });
-      if (r.ok) {
-        await loadSettings();
-        populateSettingsForm();
-        toast(r.message || "Optimal settings applied!", "ok", 3000);
-      }
-    } catch (e) {
-      toast("Apply failed: " + e.message, "err", 3000);
-    } finally {
-      if (btn) btn.disabled = false;
-    }
-  }
-
   // ===== MOBILE TOOLBAR OVERFLOW =====
   function initMobileToolbarOverflow() {
     const overflowBtn = $("#btn-toolbar-overflow");
@@ -2248,32 +2421,87 @@
       } catch (e) { toast("resume failed: " + e.message, "error"); }
     });
     $("#sw-web").addEventListener("click", e => e.currentTarget.classList.toggle("on"));
-    $("#btn-refresh-models").addEventListener("click", async () => {
-      const btn = $("#btn-refresh-models");
-      btn.disabled = true;
+    $("#sw-thinking")?.addEventListener("click", e => e.currentTarget.classList.toggle("on"));
+    const refreshModels = async () => {
       await loadModels();
       populateSettingsForm();
       renderModelPill();
-      btn.disabled = false;
+    };
+    $("#btn-refresh-models").addEventListener("click", async () => {
+      const btn = $("#btn-refresh-models");
+      btn.disabled = true;
+      try { await refreshModels(); } finally { btn.disabled = false; }
+    });
+    $("#btn-rescan-models-dir")?.addEventListener("click", async () => {
+      const btn = $("#btn-rescan-models-dir");
+      const path = ($("#set-models-dir")?.value || "").trim();
+      if (!path) { toast("pick a models folder first", "warn"); return; }
+      btn.disabled = true;
+      try {
+        await api("/api/models/scan-dir", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ path }),
+        });
+        await refreshModels();
+        toast("models folder scanned", "ok", 2000);
+      } catch (e) {
+        toast("scan failed: " + (e.message || e), "error");
+      } finally { btn.disabled = false; }
+    });
+    $("#btn-browse-models-dir")?.addEventListener("click", async () => {
+      const btn = $("#btn-browse-models-dir");
+      btn.disabled = true;
+      try {
+        const r = await api("/api/browse-folder", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ title: "Pick models folder" }),
+        });
+        if (!r.path) return;
+        $("#set-models-dir").value = r.path;
+        await api("/api/models/scan-dir", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ path: r.path }),
+        });
+        await refreshModels();
+        toast("models folder set", "ok", 2000);
+      } catch (e) {
+        toast("browse failed: " + (e.message || e), "error");
+      } finally { btn.disabled = false; }
+    });
+    $("#set-models-dir")?.addEventListener("change", async (e) => {
+      const path = (e.target.value || "").trim();
+      if (!path) return;
+      try {
+        await api("/api/models/scan-dir", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ path }),
+        });
+        await refreshModels();
+      } catch (err) {
+        toast("scan failed: " + (err.message || err), "error");
+      }
     });
     $("#model-pill").addEventListener("click", openSettings);
-    $("#set-model").addEventListener("change", () => {
-      const m = $("#set-model").value;
-      prewarmModel(m);
-      // Show recalculate prompt if hardware was already scanned
-      if (_detectedHardware) {
-        const info = $("#hw-detected-info");
-        const existing = info.querySelector(".recalc-prompt");
-        if (!existing) {
-          const prompt = document.createElement("div");
-          prompt.className = "recalc-prompt";
-          prompt.style.cssText = "margin-top:8px;";
-          prompt.innerHTML = `<button class="btn accent sm" id="btn-hw-recalc"><i class="ph ph-arrows-clockwise"></i>Recalculate for ${esc(m)}</button>`;
-          info.appendChild(prompt);
-          $("#btn-hw-recalc")?.addEventListener("click", () => {
-            detectHardware();
-          });
-        }
+    $("#set-model").addEventListener("change", async () => {
+      const sel = $("#set-model");
+      const m = sel.value;
+      if (!m) return;
+      const hint = $("#set-model-hint");
+      const prev = hint?.textContent;
+      sel.disabled = true;
+      if (hint) hint.textContent = "loading model into llama-server...";
+      try {
+        await api("/api/models/load", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ path: m }),
+        });
+        await refreshModels();
+        toast("model loaded", "ok", 2500);
+      } catch (e) {
+        if (hint) hint.textContent = prev || "";
+        toast("load failed: " + (e.message || e), "error", 6000);
+      } finally {
+        sel.disabled = false;
       }
     });
     $("#btn-sysctx-rescan").addEventListener("click", rescanSystemContext);
@@ -2538,9 +2766,6 @@
     $("#mem-add-text")?.addEventListener("keydown", (e) => {
       if (e.key === "Enter") { e.preventDefault(); addMemoryFromInput(); }
     });
-
-    // ----- hardware auto-tune -----
-    $("#btn-hw-detect")?.addEventListener("click", detectHardware);
 
     // ----- mobile toolbar overflow -----
     initMobileToolbarOverflow();

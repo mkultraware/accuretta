@@ -1,0 +1,13 @@
+requests>=2.31.0
+pillow>=10.0.0
+psutil>=5.9.0
+
+# firmware analysis tools (optional — bridge degrades gracefully if absent)
+# binwalk intentionally NOT used: pip "binwalk" package is broken/unrelated
+# to the real firmware tool. Signature scanning is implemented in-process.
+PySquashfsImage>=0.9
+pyelftools>=0.30
+# capstone: pure-Python multi-arch disassembler (MIPS/ARM/x86/PPC).
+# Powers disasm_at — without it the model can't read function bodies in
+# stripped router binaries.
+capstone>=5.0.0

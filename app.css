@@ -316,20 +316,24 @@ button { font-family: inherit; }
 .bubble-row.user .bubble-col { align-items: flex-end; }
 
 .bubble {
-  padding: 10px 14px;
-  border-radius: 12px;
+  padding: 11px 15px;
+  border-radius: 14px;
   font-size: 13px;
-  line-height: 1.55;
+  line-height: 1.6;
   color: var(--fg);
   word-wrap: break-word;
   overflow-wrap: break-word;
+  animation: bubble-in var(--dur-base, 220ms) var(--ease-out, ease-out) both;
+}
+@keyframes bubble-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 /* user bubble: lilac tint with dark text. palette colors so contrast is
    fixed and identical in light & dark — never depends on theme vars. */
 .bubble.user {
   background: var(--lilac) !important;
   color: var(--off-black) !important;
-  border-bottom-right-radius: 4px;
 }
 .bubble.user p,
 .bubble.user strong,
@@ -343,7 +347,7 @@ button { font-family: inherit; }
 .bubble.agent {
   background: var(--bg-raised);
   border: 1px solid var(--border);
-  border-bottom-left-radius: 4px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
 }
 .bubble.quiet {
   color: var(--fg-muted);
@@ -363,11 +367,24 @@ button { font-family: inherit; }
 }
 .bubble pre code { background: transparent; padding: 0; }
 .bubble-meta {
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--fg-faint);
-  padding: 0 6px;
+  padding: 0 4px;
+}
+.bubble-meta.streaming {
+  color: var(--fg-muted);
+}
+.bubble-meta.streaming::before {
+  content: "";
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 999px;
+  background: var(--accent, #f59e0b);
+  margin-right: 6px;
+  vertical-align: middle;
+  animation: pulse 1.2s ease-in-out infinite;
 }
 .copy-msg {
   opacity: 0;
@@ -432,6 +449,79 @@ button { font-family: inherit; }
 .tool-line.done i { color: var(--mint-3); }
 .tool-line.err { border-left-color: var(--danger); color: var(--danger); }
 .tool-line.err i { color: var(--danger); }
+
+/* conveyor belt elision pill — appears when older middle messages aren't
+   sent to the model so that the conversation stays under ctx budget. */
+.ctx-trim-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px;
+  margin-bottom: 6px;
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--fg-muted);
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  border-radius: 999px;
+  width: fit-content;
+}
+.ctx-trim-pill i { font-size: 12px; color: var(--fg-faint); flex-shrink: 0; }
+.ctx-trim-pill .ctx-trim-info { cursor: help; }
+.ctx-trim-pill .ctx-trim-info:hover { color: var(--accent); }
+
+/* collapsible group for non-command tools (reads, searches, listings) */
+.tool-group {
+  margin: 2px 0;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.tool-group-head {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 2px 0;
+  font-family: var(--font-mono); font-size: 12px;
+  color: var(--fg-muted);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  width: fit-content;
+  user-select: none;
+}
+.tool-group-head:hover { color: var(--fg); }
+.tool-group-head:hover .chevron { color: var(--fg-muted); }
+.tool-group-head .chevron {
+  font-size: 11px;
+  color: var(--fg-faint);
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.tool-group.collapsed .tool-group-head .chevron { transform: rotate(-90deg); }
+.tool-group-head .tool-icon { font-size: 13px; color: var(--fg-muted); }
+.tool-group-head .tool-icon.spinning {
+  color: var(--accent);
+  animation: spin 1.4s linear infinite;
+}
+.tool-group-head .tool-group-label { font-size: 12px; }
+.tool-group-body {
+  display: flex; flex-direction: column; gap: 2px;
+  padding-left: 22px;
+  overflow: hidden;
+  max-height: 2000px;
+  transition: max-height var(--dur-base) var(--ease-out), opacity var(--dur-base) var(--ease-out);
+}
+.tool-group.collapsed .tool-group-body {
+  max-height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+/* tool-lines inside a group render inline (no box) — the box only makes sense
+   for command tools that sit directly in the chat. */
+.tool-group-body .tool-line {
+  background: transparent;
+  border: 0;
+  border-left: 0;
+  border-radius: 0;
+  padding: 2px 0;
+  color: var(--fg-muted);
+}
+.tool-group-body .tool-line.running { background: transparent; border-left: 0; }
+.tool-group-body .tool-line.done { border-left: 0; }
+.tool-group-body .tool-line.err { border-left: 0; }
 .shimmer {
   background-image: linear-gradient(
     90deg,
@@ -933,20 +1023,6 @@ body.is-mobile { font-family: 'Geist', -apple-system, system-ui, sans-serif; }
   }
 }
 
-/* ============================================================
-   Auto-Tune UI Styles
-   ============================================================ */
-
-#hw-detected-info {
-  font-family: var(--font-mono);
-  line-height: 1.5;
-}
-
-#hw-detected-info strong {
-  color: var(--fg);
-  font-weight: 600;
-}
-
 /* Info tooltip icons in settings */
 .form-row label .ph-info {
   color: var(--fg-faint);
@@ -1193,21 +1269,26 @@ pre.code-block:hover .copy-code,
 .copy-code:hover { color: var(--fg); border-color: var(--border); }
 .copy-code.copied { color: var(--ok, #2f9e44); border-color: var(--ok, #2f9e44); opacity: 1; }
 
-/* ---- regenerate chip below last assistant bubble ---- */
-.regen-chip {
-  display: inline-flex; align-items: center; gap: 4px;
-  margin-top: 6px;
-  padding: 3px 8px;
-  font-size: 11px;
-  color: var(--fg-muted);
-  background: var(--bg-sunken);
-  border: 1px solid var(--border-subtle);
-  border-radius: 999px;
-  cursor: pointer;
-  transition: all var(--dur-fast) var(--ease-out);
+/* ---- icon-only action row under the last assistant bubble ---- */
+.bubble-actions {
+  display: inline-flex; align-items: center; gap: 2px;
+  margin-top: 4px;
+  padding: 0 2px;
 }
-.regen-chip:hover { color: var(--accent-strong); border-color: var(--accent); background: var(--accent-soft); }
-.regen-chip i { font-size: 11px; }
+.bubble-action {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--fg-faint);
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+}
+.bubble-action:hover { color: var(--fg); background: var(--bg-inset); }
+.bubble-action.copied { color: var(--mint-3, #2f9e44); }
+.bubble-action i { font-size: 14px; }
 
 /* ---- command palette ---- */
 .palette-scrim {
@@ -1449,4 +1530,94 @@ pre.code-block:hover .copy-code,
   .console-pane { max-height: 55%; }
   .mem-list { max-height: 220px; }
   .vp-group { display: none; }
+}
+
+/* ============================================================
+   2026 polish layer — refines existing rules without rewriting.
+   Keeps tokens from colors_and_type.css authoritative.
+   ============================================================ */
+
+/* smoother color transitions when toggling theme */
+html, body, .app, .sidebar, .topbar, .composer, .composer-wrap, .preview,
+.drawer, .bubble.agent, .btn, .iconbtn, .chip, .form-row input, .form-row select, .form-row textarea {
+  transition:
+    background-color var(--dur-base) var(--ease-out),
+    border-color var(--dur-base) var(--ease-out),
+    color var(--dur-base) var(--ease-out);
+}
+
+/* buttons: gain a subtle bg shift on hover (was border-only),
+   plus the existing scale-on-press feel */
+.btn { transition: background-color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out); }
+.btn:hover { background: var(--bg-inset); }
+.btn.accent:hover { background: var(--accent-hover); }
+.btn.ghost:hover { background: var(--bg-inset); }
+
+/* iconbtn: gentler radius + smoother hover */
+.iconbtn { border-radius: 8px; transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out); }
+
+/* chips: slightly nicer hover lift */
+.chip { transition: color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), background-color var(--dur-fast) var(--ease-out); }
+.chip:hover { background: var(--bg-inset); }
+
+/* composer: a touch more breathing room and a softer focus ring */
+.composer { padding: 10px 12px 12px; gap: 10px; border-radius: 14px; }
+.composer:focus-within { box-shadow: 0 0 0 4px var(--accent-subtle); }
+.composer-input { padding: 8px 4px; line-height: 1.55; }
+.composer-wrap { padding: 16px 14px 20px; }
+
+/* topbar: a little more vertical space */
+.topbar { transition: background-color var(--dur-base) var(--ease-out); }
+
+/* settings drawer: more generous spacing between rows + softer inputs */
+.drawer-body { padding: 18px 22px 28px; }
+.form-row { gap: 6px; margin-bottom: 18px; }
+.form-row input, .form-row select, .form-row textarea {
+  padding: 9px 11px;
+  border-radius: 8px;
+  transition: border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out);
+}
+.form-row input:focus, .form-row select:focus, .form-row textarea:focus {
+  box-shadow: 0 0 0 4px var(--accent-subtle);
+}
+.form-group { margin-top: 22px; }
+
+/* chat scroll: smooth jump-to-bottom */
+.chat-scroll { scroll-behavior: smooth; }
+
+/* avatars: soft entry */
+.avatar { transition: transform var(--dur-fast) var(--ease-out); }
+.bubble-row:hover .avatar { transform: scale(1.05); }
+
+/* code blocks inside bubbles: softer corners + quieter contrast */
+.bubble pre { border-radius: 8px; }
+.bubble code { border-radius: 4px; }
+
+/* tool-line (command tools sitting in chat): rounder, gentler */
+.tool-line { border-radius: 8px; }
+
+/* respect reduced-motion users — kill the bubble-in animation
+   and slow transitions for accessibility */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* mobile: bigger tap targets, more breathing room ----------- */
+@media (max-width: 600px) {
+  /* assistant action buttons need a finger-sized target */
+  .bubble-action { width: 34px; height: 34px; border-radius: 8px; }
+  .bubble-action i { font-size: 16px; }
+  /* composer slightly larger so the input isn't cramped against the screen edge */
+  .composer { border-radius: 12px; padding: 8px 10px 10px; }
+  .composer-input { font-size: 15px; min-height: 32px; }
+  /* drawer rows roomier on mobile */
+  .form-row { margin-bottom: 16px; }
+  .form-row input, .form-row select, .form-row textarea { padding: 10px 12px; font-size: 14px; }
+  /* topbar buttons tappable */
+  .iconbtn { width: 36px; height: 36px; }
 }

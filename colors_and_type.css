@@ -177,20 +177,20 @@
    ============================================================ */
 [data-theme="dark"],
 .dark {
-  --bg:        var(--off-black);
-  --bg-raised: var(--off-black-2);
-  --bg-sunken: #0E0E0C;
-  --bg-inset:  var(--off-black-3);
+  --bg:        #0F0F0E;
+  --bg-raised: #181815;
+  --bg-sunken: #0A0A09;
+  --bg-inset:  #232320;
 
   --fg:        var(--off-white);
-  --fg-muted:  var(--gray-30);
+  --fg-muted:  #B4B0A4;
   --fg-subtle: var(--gray-40);
-  --fg-faint:  var(--gray-50);
+  --fg-faint:  #6E6B62;
   --fg-invert: var(--off-black);
 
-  --border:        #2A2A26;
-  --border-strong: #3D3C38;
-  --border-subtle: #1E1E1B;
+  --border:        #232320;
+  --border-strong: #34332E;
+  --border-subtle: #1A1A17;
 
   --accent:        var(--ember);
   --accent-hover:  #F7B884;
