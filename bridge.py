@@ -8745,6 +8745,163 @@ def tool_batch_probe(args: dict) -> dict:
                     "no signatures fired for this payload set across the given endpoints."}
 
 
+# High-signal secret patterns for scan_js_secrets. Curated to keep false
+# positives low; the generic assignment catcher below is looser and flagged as
+# needs-verification.
+_SECRET_PATTERNS = [
+    ("AWS access key id", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("Google API key", re.compile(r"AIza[0-9A-Za-z\-_]{35}")),
+    ("Google OAuth token", re.compile(r"ya29\.[0-9A-Za-z\-_]{20,}")),
+    ("Slack token", re.compile(r"xox[baprs]-[0-9A-Za-z-]{10,}")),
+    ("Slack webhook", re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]+")),
+    ("GitHub token", re.compile(r"gh[pousr]_[0-9A-Za-z]{36,}")),
+    ("Stripe live secret key", re.compile(r"sk_live_[0-9a-zA-Z]{24,}")),
+    ("Stripe live publishable key", re.compile(r"pk_live_[0-9a-zA-Z]{24,}")),
+    ("SendGrid API key", re.compile(r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}")),
+    ("Twilio API key sid", re.compile(r"SK[0-9a-fA-F]{32}")),
+    ("Mailgun key", re.compile(r"key-[0-9a-zA-Z]{32}")),
+    ("Firebase database URL", re.compile(r"https://[a-z0-9-]+\.firebaseio\.com")),
+    ("Supabase URL", re.compile(r"https://[a-z0-9]+\.supabase\.co")),
+    ("JWT", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}")),
+    ("private key block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
+    ("basic-auth in URL", re.compile(r"https?://[A-Za-z0-9._%+-]+:[^@\s/'\"]{3,}@[A-Za-z0-9.-]+")),
+]
+
+# Loose catcher for `apiKey/secret/token/password = "value"` style assignments.
+_GENERIC_SECRET_RE = re.compile(
+    r"""['"]?(?P<k>[A-Za-z0-9_]*(?:api[_-]?key|secret|token|passwd|password|pwd|access[_-]?key|client[_-]?secret|auth[_-]?token)[A-Za-z0-9_]*)['"]?\s*[:=]\s*['"](?P<v>[A-Za-z0-9\-_./+=]{12,})['"]""",
+    re.IGNORECASE)
+
+# Keys commonly PUBLIC by design (client-side) — report but flag as maybe-intended.
+_OFTEN_PUBLIC = {"Google API key", "Firebase database URL", "Supabase URL"}
+
+
+def tool_scan_js_secrets(args: dict) -> dict:
+    """AUTHORIZED PENTEST. Fetch a page, pull its inline and linked JavaScript,
+    and hunt for hardcoded secrets: cloud keys (AWS / Google / Stripe / Slack /
+    GitHub / SendGrid / Twilio / Mailgun), JWTs, Firebase/Supabase endpoints,
+    private-key blocks, basic-auth URLs, and generic apiKey/secret/token = "..."
+    assignments. This is the "scrape the front-end for keys" primitive. Read-only.
+    Gated behind red_team_enabled."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    url = _recon_prep_url((args.get("url") or args.get("target") or "").strip())
+    if not url:
+        return {"error": "url required"}
+    timeout = max(2.0, min(float(args.get("timeout") or 8.0), 20.0))
+    page = _recon_fetch(url, timeout=timeout, max_bytes=600000)
+    if "error" in page:
+        return {"error": f"fetch failed: {page['error']}", "url": url}
+    html = page.get("body", "") or ""
+    js_urls = []
+    for m in re.finditer(r"<script[^>]+src=[\"']([^\"']+)[\"']", html, re.IGNORECASE):
+        js_urls.append(urllib.parse.urljoin(url, m.group(1)))
+    js_urls = list(dict.fromkeys(js_urls))[:20]
+
+    sources = [(url + " (html)", html)]
+
+    def fetch_js(ju):
+        r = _recon_fetch(ju, timeout=timeout, max_bytes=900000)
+        return (ju, r.get("body", "") or "")
+
+    if js_urls:
+        with ThreadPoolExecutor(max_workers=6, thread_name_prefix="jssec") as ex:
+            for ju, body in ex.map(fetch_js, js_urls):
+                if body:
+                    sources.append((ju, body))
+
+    findings, seen = [], set()
+    for src_label, text in sources:
+        for label, rx in _SECRET_PATTERNS:
+            for m in rx.finditer(text):
+                val = m.group(0)
+                if (label, val) in seen:
+                    continue
+                seen.add((label, val))
+                findings.append({"type": label, "match": val[:80], "source": src_label,
+                                 "note": "often public by design — verify it actually grants access"
+                                         if label in _OFTEN_PUBLIC else ""})
+        for m in _GENERIC_SECRET_RE.finditer(text):
+            k, v = m.group("k"), m.group("v")
+            if ("generic:" + k, v) in seen:
+                continue
+            seen.add(("generic:" + k, v))
+            findings.append({"type": f"hardcoded {k}",
+                             "match": (v[:60] + "…") if len(v) > 60 else v, "source": src_label,
+                             "note": "generic assignment — verify it is a real secret, not a placeholder"})
+
+    return {"url": url, "js_files_scanned": len(sources) - 1, "finding_count": len(findings),
+            "findings": findings[:200],
+            "note": ("secrets found — verify each grants access before reporting; some client-side "
+                     "keys (Firebase/Supabase/Google) are public by design."
+                     if findings else "no hardcoded secrets matched in the page or its JavaScript.")}
+
+
+def tool_cors_probe(args: dict) -> dict:
+    """AUTHORIZED PENTEST. Test a URL for CORS misconfiguration: sends requests
+    with crafted Origin headers and checks whether the server REFLECTS the origin
+    in Access-Control-Allow-Origin — especially alongside Access-Control-Allow-
+    Credentials: true, the combination that lets an attacker-controlled site read
+    authenticated responses. Also flags accepted 'null' origin and wildcard ACAO.
+    Read-only. Gated behind red_team_enabled."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    url = _recon_prep_url((args.get("url") or args.get("target") or "").strip())
+    if not url:
+        return {"error": "url required"}
+    timeout = max(2.0, min(float(args.get("timeout") or 8.0), 15.0))
+    host = urllib.parse.urlparse(url).netloc.split(":")[0]
+    rand = "".join(random.choice("abcdefghijklmnop") for _ in range(6))
+    tests = [
+        ("arbitrary origin", f"https://evil-{rand}.com"),
+        ("null origin", "null"),
+        ("target as subdomain of attacker", f"https://{host}.evil-{rand}.com"),
+        ("attacker as subdomain of target", f"https://evil-{rand}.{host}"),
+    ]
+
+    def probe(origin):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = urllib.request.Request(url, headers={"User-Agent": _RECON_UA, "Origin": origin})
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+        try:
+            resp = opener.open(req, timeout=timeout)
+            return {k.lower(): v for k, v in resp.headers.items()}
+        except urllib.error.HTTPError as e:
+            return {k.lower(): v for k, v in e.headers.items()}
+        except Exception:
+            return {}
+
+    results = []
+    for label, origin in tests:
+        h = probe(origin)
+        acao = h.get("access-control-allow-origin", "")
+        acac = (h.get("access-control-allow-credentials", "") or "").strip().lower()
+        vuln, severity, detail = False, "info", "no CORS reflection"
+        if acao and acao == origin:
+            vuln = True
+            detail = f"server reflects the attacker Origin into Access-Control-Allow-Origin"
+            severity = "high" if acac == "true" else "medium"
+        elif acao == "null" and origin == "null":
+            vuln = True
+            detail = "server accepts the 'null' origin"
+            severity = "high" if acac == "true" else "medium"
+        elif acao == "*":
+            detail = "wildcard ACAO (credentials not sendable; low risk unless the data is sensitive)"
+            severity = "low"
+        results.append({"test": label, "origin_sent": origin, "acao": acao,
+                        "allow_credentials": acac or "(unset)", "vulnerable": vuln,
+                        "severity": severity, "detail": detail})
+
+    any_vuln = any(r["vulnerable"] for r in results)
+    return {"url": url, "vulnerable": any_vuln, "tests": results,
+            "note": ("CORS misconfiguration: an attacker-controlled page can read this endpoint's "
+                     "responses — critical if it returns authenticated/sensitive data. Confirm with "
+                     "a credentialed request."
+                     if any_vuln else "no exploitable CORS reflection detected.")}
+
+
 # --- Tool 5: check_deps ---
 def tool_check_deps(args: dict) -> dict:
     """Check dependency manifests against OSV.dev vulnerabilities."""
@@ -9535,6 +9692,28 @@ TOOLS: dict[str, dict] = {
             "required": ["targets"],
         },
         "fn": tool_batch_probe,
+    },
+    "scan_js_secrets": {
+        "description": "AUTHORIZED PENTEST. Fetch a page + its inline/linked JavaScript and hunt for hardcoded secrets: cloud keys (AWS/Google/Stripe/Slack/GitHub/SendGrid/Twilio), JWTs, Firebase/Supabase endpoints, private keys, basic-auth URLs, and generic apiKey/secret/token='...' assignments. The 'scrape the front-end for keys' primitive. Read-only.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Page URL to scrape (its <script src> files are fetched and scanned too)."},
+            },
+            "required": ["url"],
+        },
+        "fn": tool_scan_js_secrets,
+    },
+    "cors_probe": {
+        "description": "AUTHORIZED PENTEST. Test a URL for CORS misconfiguration — sends crafted Origin headers and checks whether the server reflects the origin into Access-Control-Allow-Origin, especially with Allow-Credentials:true (lets an attacker site read authenticated responses). Also flags 'null' origin and wildcard acceptance. Read-only.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Endpoint URL to test for CORS reflection."},
+            },
+            "required": ["url"],
+        },
+        "fn": tool_cors_probe,
     },
     "recon_subdomains": {
         "description": "AUTHORIZED RECON ONLY. Passive subdomain enumeration via certificate transparency logs (crt.sh). No active brute-forcing. Read-only.",
@@ -10602,6 +10781,7 @@ _TOOL_RESULT_CAPS = {
     "sql_injection": 16000,  # dumped rows can be large
     "fuzz": 16000,           # many per-value response summaries
     "batch_probe": 16000,    # hits across many endpoints
+    "scan_js_secrets": 16000,  # many secret hits across bundles
     "scan_apk": 48000,
     "decompile_apk": 24000,
     # ghidra_analyze: imports + exports + 200 strings + decompiled function
@@ -10802,6 +10982,9 @@ _RED_TEAM_TOOL_NAMES = {
     "validate_finding",
     # one payload set -> every parameterized endpoint at once
     "batch_probe",
+    # front-end secret hunting + CORS misconfig testing
+    "scan_js_secrets",
+    "cors_probe",
 }
 
 
