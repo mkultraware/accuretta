@@ -288,67 +288,71 @@
 }
 
 /* ============================================================
-   DIM — warm "Taupe" theme (Claude-esque beige).
-   A light, cozy palette: warm greige paper, soft brown text, and a
-   rust-maroon clay accent. Dimmer and warmer than the crisp default
-   light theme — restful for long sessions without going dark.
-   Replaces the old Gruvbox charcoal + sage that read as "sad".
+   DIM — "Cappuccino" mid theme (dark brown / brick maroon).
+   The true in-between: surfaces sit at ~25% lightness — well above
+   dark mode's cool #1a1a1d, well below any light paper — and lean
+   hard into warmth so they read as roasted coffee-brown, not gray.
+   Steamed-milk cream text keeps ~9:1 contrast; the accent is a
+   brick/terracotta clay. Cozy candlelight, neither light nor dark.
    ============================================================ */
 [data-theme="dim"] {
-  /* Warm LIGHT "latte" — soft sand-beige surfaces, cream cards, warm brown
-     text and a muted bronze accent. Monochrome warm, cozy and easy. */
-  --bg:        #E9DFCD;
-  --bg-raised: #F4EEE1;
-  --bg-sunken: #DCD0BA;
-  --bg-inset:  #E3D8C4;
+  /* Roasted cappuccino surfaces: body is the coffee, raised panels are
+     the milk-foam lift, sunken wells drop toward espresso. All share
+     the same warm hue (~26°) so nothing drifts cool. */
+  --bg:        #483A30;
+  --bg-raised: #55453A;
+  --bg-sunken: #3A2E25;
+  --bg-inset:  #604E41;
 
-  --glass-bg:       rgba(244, 238, 225, 0.80);
-  --glass-border:   rgba(66, 58, 46, 0.08);
+  --glass-bg:       rgba(85, 69, 58, 0.72);
+  --glass-border:   rgba(255, 238, 220, 0.07);
 
-  --bg-gradient: linear-gradient(180deg, #F1EADC 0%, #E9DFCD 45%, #E0D5C0 100%);
+  --bg-gradient: linear-gradient(180deg, #514236 0%, #483A30 45%, #40332A 100%);
 
-  --fg:        #423A2E;
-  --fg-muted:  #877A66;
-  --fg-subtle: #A1937C;
-  --fg-faint:  #BBAE96;
-  --fg-invert: #F4EEE1;
+  /* Steamed-milk cream text, stepping down through latte tans. */
+  --fg:        #F2E6D5;
+  --fg-muted:  #C7B29D;
+  --fg-subtle: #A38D77;
+  --fg-faint:  #7E6C5A;
+  --fg-invert: #3A2E25;
 
-  --border:        #D8CBB4;
-  --border-strong: #C6B79C;
-  --border-subtle: #E3D9C6;
+  --border:        #5C4B3E;
+  --border-strong: #6F5B4B;
+  --border-subtle: #52433A;
 
-  --accent:        #A37C58; /* muted bronze / tan-brown — the latte accent */
-  --accent-hover:  #8C6843;
-  --accent-subtle: rgba(163, 124, 88, 0.15);
-  --accent-fg:     #FBF7EF; /* cream text on the bronze accent */
+  --accent:        #D97757; /* brick terracotta clay */
+  --accent-hover:  #E68A68; /* hover brightens — dark-surface convention */
+  --accent-subtle: rgba(217, 119, 87, 0.16);
+  --accent-fg:     #FFF4EB; /* cream text on the brick accent */
 
-  --success-subtle: rgba(106, 135, 89, 0.16);
-  --warning-subtle: rgba(176, 132, 47, 0.16);
-  --danger-subtle:  rgba(178, 58, 47, 0.14);
-  --info-subtle:    rgba(120, 110, 92, 0.15);
+  --success-subtle: rgba(143, 219, 184, 0.14);
+  --warning-subtle: rgba(232, 211, 112, 0.14);
+  --danger-subtle:  rgba(255, 106, 0, 0.14);
+  --info-subtle:    rgba(214, 199, 244, 0.14);
 
-  /* Soft, warm-tinted shadows for the light surface. */
-  --shadow-xs: 0 1px 0 rgba(66, 58, 46, 0.04);
-  --shadow-sm: 0 1px 2px rgba(66, 58, 46, 0.08), 0 0 0 1px rgba(66, 58, 46, 0.03);
-  --shadow-md: 0 4px 12px rgba(66, 58, 46, 0.10), 0 0 0 1px rgba(66, 58, 46, 0.04);
-  --shadow-lg: 0 12px 32px rgba(66, 58, 46, 0.14), 0 0 0 1px rgba(66, 58, 46, 0.05);
-  --shadow-pop: 0 22px 64px rgba(66, 58, 46, 0.18), 0 0 0 1px rgba(66, 58, 46, 0.06);
+  /* Warm espresso-black shadows with a faint cream hairline so raised
+     panels stay defined against same-toned neighbours. */
+  --shadow-xs: 0 1px 0 rgba(30, 20, 12, 0.35);
+  --shadow-sm: 0 1px 2px rgba(30, 20, 12, 0.40), 0 0 0 1px rgba(255, 238, 220, 0.05);
+  --shadow-md: 0 4px 14px rgba(30, 20, 12, 0.40), 0 0 0 1px rgba(255, 238, 220, 0.05);
+  --shadow-lg: 0 14px 40px rgba(30, 20, 12, 0.50), 0 0 0 1px rgba(255, 238, 220, 0.06);
+  --shadow-pop: 0 24px 70px rgba(30, 20, 12, 0.60), 0 0 0 1px rgba(255, 238, 220, 0.08);
 
-  --shadow-inset: inset 0 1px 2px rgba(66, 58, 46, 0.06);
+  --shadow-inset: inset 0 1px 0 rgba(30, 20, 12, 0.35), inset 0 0 0 1px rgba(255, 238, 220, 0.04);
 
-  --btn-shadow-rest:   inset 0 1px 0 rgba(255, 255, 255, 0.55),
-                       0 1px 1px rgba(66, 58, 46, 0.06),
-                       0 2px 5px rgba(66, 58, 46, 0.08),
-                       0 0 0 1px rgba(66, 58, 46, 0.05);
-  --btn-shadow-hover:  inset 0 1px 0 rgba(255, 255, 255, 0.65),
-                       0 3px 7px rgba(66, 58, 46, 0.10),
-                       0 7px 14px rgba(66, 58, 46, 0.10),
-                       0 0 0 1px rgba(66, 58, 46, 0.07);
-  --btn-shadow-active: inset 0 1px 3px rgba(66, 58, 46, 0.12),
-                       0 0 0 1px rgba(66, 58, 46, 0.05);
+  --btn-shadow-rest:   inset 0 1px 0 rgba(255, 238, 220, 0.08),
+                       0 1px 1px rgba(25, 16, 10, 0.30),
+                       0 2px 6px rgba(25, 16, 10, 0.28),
+                       0 0 0 1px rgba(255, 238, 220, 0.05);
+  --btn-shadow-hover:  inset 0 1px 0 rgba(255, 238, 220, 0.12),
+                       0 3px 8px rgba(25, 16, 10, 0.38),
+                       0 8px 18px rgba(25, 16, 10, 0.36),
+                       0 0 0 1px rgba(255, 238, 220, 0.07);
+  --btn-shadow-active: inset 0 1px 3px rgba(25, 16, 10, 0.45),
+                       0 0 0 1px rgba(255, 238, 220, 0.05);
 
-  --btn-send-gradient: linear-gradient(135deg, #A37C58 0%, #8C6843 100%);
-  --btn-send-glow:     0 6px 18px rgba(163, 124, 88, 0.22);
+  --btn-send-gradient: linear-gradient(135deg, #D97757 0%, #C05F45 55%, #A34832 100%);
+  --btn-send-glow:     0 6px 20px rgba(217, 119, 87, 0.35);
 }
 
 /* Apply the gradient at the page level only — children with their own
@@ -357,6 +361,7 @@
 [data-theme="dim"] body,
 [data-theme="aurora"] body,
 [data-theme="nebula"] body,
+[data-theme="operator"] body,
 .dark body {
   background: var(--bg-gradient, var(--bg)) fixed;
 }
@@ -551,6 +556,70 @@
 
   --btn-send-gradient: linear-gradient(135deg, #f472b6 0%, #d946ef 50%, #06b6d4 100%);
   --btn-send-glow:     0 6px 22px rgba(217, 70, 239, 0.40);
+}
+
+/* ============================================================
+   OPERATOR — clean professional slate.
+   A cool blue-slate dark theme in the vein of a modern dev
+   dashboard (Linear / Vercel): neutral graphite surfaces with the
+   faintest blue cast, crisp desaturated text, one confident azure
+   accent, soft quiet shadows. Distinct from every other theme —
+   not warm (dim), not purple (dark/nebula), not neon (aurora).
+   No gimmicks; the restraint is the point.
+   ============================================================ */
+[data-theme="operator"] {
+  --bg:        #12151C;  /* deep cool slate */
+  --bg-raised: #1A1E27;  /* cards, panels */
+  --bg-sunken: #0D0F14;  /* chat well */
+  --bg-inset:  #232834;  /* inputs, interactive fields */
+
+  --glass-bg:       rgba(26, 30, 39, 0.72);
+  --glass-border:   rgba(255, 255, 255, 0.06);
+
+  --bg-gradient: linear-gradient(180deg, #161A22 0%, #12151C 42%, #0F1116 100%);
+
+  --fg:        #E5E9F0;  /* clean cool white */
+  --fg-muted:  #99A2B2;
+  --fg-subtle: #6B7488;
+  --fg-faint:  #454D5D;
+  --fg-invert: #0D0F14;
+
+  --border:        #262C38;
+  --border-strong: #353D4C;
+  --border-subtle: #1C2029;
+
+  --accent:        #4D9EFF;  /* clean professional azure */
+  --accent-hover:  #6FB2FF;
+  --accent-subtle: rgba(77, 158, 255, 0.14);
+  --accent-fg:     #FFFFFF;
+
+  --success-subtle: rgba(106, 196, 154, 0.14);
+  --warning-subtle: rgba(232, 211, 112, 0.14);
+  --danger-subtle:  rgba(255, 106, 0, 0.14);
+  --info-subtle:    rgba(77, 158, 255, 0.14);
+
+  /* Soft, quiet shadows — modern dashboard depth, never harsh. */
+  --shadow-xs: 0 1px 0 rgba(0, 0, 0, 0.3);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.03);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04);
+  --shadow-lg: 0 14px 40px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  --shadow-pop: 0 24px 70px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.06);
+
+  --shadow-inset: inset 0 1px 0 rgba(0, 0, 0, 0.3), inset 0 0 0 1px rgba(255, 255, 255, 0.03);
+
+  --btn-shadow-rest:   inset 0 1px 0 rgba(255, 255, 255, 0.05),
+                       0 1px 1px rgba(0, 0, 0, 0.35),
+                       0 2px 6px rgba(0, 0, 0, 0.35),
+                       0 0 0 1px rgba(255, 255, 255, 0.04);
+  --btn-shadow-hover:  inset 0 1px 0 rgba(255, 255, 255, 0.08),
+                       0 3px 8px rgba(0, 0, 0, 0.45),
+                       0 8px 18px rgba(0, 0, 0, 0.45),
+                       0 0 0 1px rgba(255, 255, 255, 0.06);
+  --btn-shadow-active: inset 0 1px 3px rgba(0, 0, 0, 0.5),
+                       0 0 0 1px rgba(255, 255, 255, 0.04);
+
+  --btn-send-gradient: linear-gradient(135deg, #4D9EFF 0%, #2F7FE6 100%);
+  --btn-send-glow:     0 6px 18px rgba(77, 158, 255, 0.32);
 }
 
 /* ============================================================ */

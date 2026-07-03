@@ -1084,6 +1084,9 @@
     text = text.replace(/\[TOOL_CALLS\]\s*\[[\s\S]*?\]/gi, "");
     // Gemma 4 native: <|tool_call>call:NAME{...}<tool_call|>
     text = text.replace(/<\|tool_call>[\s\S]*?(?:<tool_call\|>)/gi, "");
+    // Gemma python dialect: ```tool_code\n name(arg=value) \n``` (the bridge
+    // parsed + executed this; strip the fence so the bubble isn't raw code).
+    text = text.replace(/```tool_code[\s\S]*?```/gi, "");
     // Self-closing XML tag: <tool_call name="..." />
     text = text.replace(/<tool_call\s+[^>]*?\/>/gi, "");
     
@@ -1094,6 +1097,7 @@
     text = text.replace(/<call:[a-zA-Z0-9_\-]+>[\s\S]*$/gi, "");
     text = text.replace(/<\|python_tag\|>[\s\S]*$/gi, "");
     text = text.replace(/<\|tool_call>[\s\S]*$/gi, "");
+    text = text.replace(/```tool_code[\s\S]*$/gi, "");
     text = text.replace(/\[TOOL_CALLS\][\s\S]*$/gi, "");
     text = text.replace(/```tool_call[\s\S]*$/gi, "");
     text = text.replace(/```json\s*\{[\s\S]*?"name"[\s\S]*?\}\s*```/gi, "");
@@ -1996,25 +2000,37 @@
               <img class="welcome-logo welcome-logo-dark" src="/logo-mark-dark.png" alt="" aria-hidden="true">
             </div>
             <h1 class="welcome-title">accuretta</h1>
-            <p class="welcome-subtitle">Welcome to Accuretta. What would you like to do today?</p>
+            <p class="welcome-subtitle">Your model, your machine. What are we building today?</p>
             <div class="welcome-suggestions">
               <button class="welcome-suggest-btn" data-prompt="Design a landing page for my product using HTML, CSS and JS.">
                 <div class="welcome-suggest-icon-wrap">
                   <i class="ph ph-layout"></i>
                 </div>
-                <span>Design a landing page</span>
+                <span class="welcome-suggest-text">
+                  <span class="welcome-suggest-label">Design a landing page</span>
+                  <span class="welcome-suggest-sub">HTML, CSS + JS, live preview</span>
+                </span>
+                <i class="ph ph-arrow-up-right welcome-suggest-go"></i>
               </button>
               <button class="welcome-suggest-btn" data-prompt="Create a Python backend script using FastAPI that serves a simple database.">
                 <div class="welcome-suggest-icon-wrap">
                   <i class="ph ph-database"></i>
                 </div>
-                <span>Create a Python backend</span>
+                <span class="welcome-suggest-text">
+                  <span class="welcome-suggest-label">Create a Python backend</span>
+                  <span class="welcome-suggest-sub">FastAPI over a simple DB</span>
+                </span>
+                <i class="ph ph-arrow-up-right welcome-suggest-go"></i>
               </button>
               <button class="welcome-suggest-btn" data-prompt="Help me debug a memory leak in my application.">
                 <div class="welcome-suggest-icon-wrap">
                   <i class="ph ph-bug"></i>
                 </div>
-                <span>Debug a memory leak</span>
+                <span class="welcome-suggest-text">
+                  <span class="welcome-suggest-label">Debug a memory leak</span>
+                  <span class="welcome-suggest-sub">paste code, get a diagnosis</span>
+                </span>
+                <i class="ph ph-arrow-up-right welcome-suggest-go"></i>
               </button>
             </div>
           </div>
@@ -2669,9 +2685,12 @@
     state.pendingImages = [];
     renderImageTray();
 
-    // show the image count in the user bubble so they know what got sent
+    // show the image count in the user bubble so they know what got sent.
+    // Plain text label — no emoji (rendered inline in stored content, where an
+    // SVG can't live; "nothing" per the no-emoji rule).
+    const imgNote = `${images.length} image${images.length > 1 ? "s" : ""} attached`;
     const bubbleText = images.length
-      ? (text ? `${text}\n\n📎 ${images.length} image${images.length > 1 ? "s" : ""} attached` : `📎 ${images.length} image${images.length > 1 ? "s" : ""} attached`)
+      ? (text ? `${text}\n\n${imgNote}` : imgNote)
       : text;
     const userMsg = { role: "user", content: bubbleText, t: Math.floor(Date.now() / 1000) };
     if (opts.invisible) {
@@ -2840,7 +2859,14 @@
           if (!line) continue;
           let evt;
           try { evt = JSON.parse(line.slice(6)); } catch { continue; }
-          handleEvent(evt, { bubble, toolStack, toolCards, row: agentRow, getBuf: () => buf, setBuf: v => buf = v });
+          try {
+            handleEvent(evt, { bubble, toolStack, toolCards, row: agentRow, getBuf: () => buf, setBuf: v => buf = v });
+          } catch (err) {
+            // A single bad event must not tear down the read loop — later events
+            // include stats (token/cost accounting) and the final message. Log
+            // and keep consuming.
+            console.error("handleEvent failed on", evt && evt.type, err);
+          }
           markActivity();
           if (evt.type === "chat_end") { ended = true; break; }
         }
@@ -3052,18 +3078,142 @@
       if (span) span.textContent = label;
     }
   }
+  // ---------- attack-chain progress rail (red-team flow) ----------
+  // A slim kill-chain visual that lights up as the model breaches. Driven
+  // entirely by events already emitted — tool_start (activity line + which
+  // stage is active) and breach (a captured FLAG advances a stage). Only shown
+  // when a red-team tool or breach fires, so ordinary coding turns never see
+  // it. Colors are theme tokens, so it adapts to every theme automatically.
+  const ATTACK_NODES = [
+    { label: "recon",  tech: "",      icon: "ph-crosshair" },
+    { label: "access", tech: "T1548", icon: "ph-key" },
+    { label: "pivot",  tech: "T1190", icon: "ph-path" },
+    { label: "rce",    tech: "T1059", icon: "ph-terminal-window" },
+  ];
+  function isRedTeamTool(name) {
+    return !!name && (name.startsWith("recon_") || name === "http_request" || name === "encode_decode");
+  }
+  function attackActivitySummary(name, args) {
+    args = args || {};
+    if (name === "http_request") {
+      const m = (args.method || "GET").toUpperCase();
+      let u = String(args.url || args.target || "");
+      u = u.replace(/^https?:\/\/[^/]+/i, "") || u; // keep path+query when possible
+      if (u.length > 44) u = u.slice(0, 44) + "…";
+      return `http_request → ${m} ${u || "/"}`;
+    }
+    if (name === "encode_decode") {
+      return `encode_decode → ${args.scheme || "base64"} ${args.operation || "encode"}`;
+    }
+    if (name && name.startsWith("recon_")) {
+      return `${name} → ${args.url || args.target || args.domain || args.host || ""}`;
+    }
+    return name || "";
+  }
+  function ensureAttackRail(row) {
+    if (!row) return null;
+    let rail = row.querySelector(".attack-rail");
+    if (rail) return rail;
+    const toolStack = row.querySelector(".tool-stack");
+    rail = document.createElement("div");
+    rail.className = "attack-rail";
+    rail.dataset.flags = "0";
+    rail.dataset.active = "-1";
+    rail.dataset.recondone = "0";
+    const nodesHtml = ATTACK_NODES.map((n, i) =>
+      `<div class="ar-node is-pending" data-i="${i}">` +
+        `<span class="ar-dot"><i class="ph ${n.icon}"></i></span>` +
+        `<span class="ar-label">${n.label}</span>` +
+        `<span class="ar-tech">${n.tech || "&nbsp;"}</span>` +
+      `</div>` +
+      (i < ATTACK_NODES.length - 1 ? `<span class="ar-seg" data-s="${i}"></span>` : "")
+    ).join("");
+    rail.innerHTML =
+      `<div class="ar-head">` +
+        `<span class="ar-title"><i class="ph ph-crosshair"></i> attack chain</span>` +
+        // No fixed denominator — real engagements have no set number of "flags"
+        // to find (that's a CTF concept). Hidden until a FLAG{...} is actually
+        // captured, then shows a plain running count. See renderRail.
+        `<span class="ar-flags" hidden><i class="ph ph-flag"></i> <span class="ar-flag-count"></span></span>` +
+      `</div>` +
+      `<div class="ar-track">${nodesHtml}</div>` +
+      `<div class="ar-activity"><span class="ar-pulse"></span><span class="ar-activity-text">initializing…</span></div>` +
+      `<div class="ar-banner"><i class="ph ph-shield-check"></i> confirmed access — full chain breached</div>`;
+    if (toolStack && toolStack.parentNode) toolStack.parentNode.insertBefore(rail, toolStack);
+    else row.appendChild(rail);
+    return rail;
+  }
+  function renderRail(rail) {
+    const flags = +rail.dataset.flags;
+    const active = +rail.dataset.active;
+    const reconDone = rail.dataset.recondone === "1";
+    // node 0 = recon (no flag; "done" once exploitation starts or any flag lands)
+    const done = [reconDone || flags >= 1, flags >= 1, flags >= 2, flags >= 3];
+    rail.querySelectorAll(".ar-node").forEach((el) => {
+      const i = +el.dataset.i;
+      el.classList.toggle("is-active", i === active);
+      el.classList.toggle("is-done", done[i] && i !== active);
+      el.classList.toggle("is-pending", !done[i] && i !== active);
+    });
+    rail.querySelectorAll(".ar-seg").forEach((el) => {
+      el.classList.toggle("is-done", done[+el.dataset.s]);
+    });
+    // Flag pill: hidden at zero (no misleading "0/N captured" on a clean
+    // target), then a plain count once something is actually captured.
+    const flagsRaw = +(rail.dataset.flagsraw || 0);
+    const flagsWrap = rail.querySelector(".ar-flags");
+    if (flagsWrap) flagsWrap.hidden = flagsRaw <= 0;
+    const fc = rail.querySelector(".ar-flag-count");
+    if (fc) fc.textContent = `${flagsRaw} captured`;
+    rail.classList.toggle("has-flags", flags > 0);
+    rail.classList.toggle("is-complete", flags >= 3);
+  }
+  function attackRailToolStart(row, name, args) {
+    if (!isRedTeamTool(name)) return;
+    const rail = ensureAttackRail(row);
+    if (!rail) return;
+    const txt = rail.querySelector(".ar-activity-text");
+    if (txt) txt.textContent = attackActivitySummary(name, args);
+    rail.querySelector(".ar-pulse")?.classList.add("live");
+    if (name.startsWith("recon_")) {
+      if (+rail.dataset.flags === 0 && rail.dataset.recondone !== "1") rail.dataset.active = "0";
+    } else {
+      // exploitation began — recon is behind us; light the current stage
+      rail.dataset.recondone = "1";
+      if (+rail.dataset.active < 1) rail.dataset.active = "1";
+    }
+    renderRail(rail);
+  }
+  function attackRailBreach(row, stage) {
+    const rail = ensureAttackRail(row);
+    if (!rail) return;
+    const raw = Math.max(1, parseInt(stage, 10) || 1);
+    // dataset.flags (capped at 3) drives the 4-node visual; flagsraw is the
+    // TRUE captured count shown in the pill, so a range with >3 flags isn't
+    // undercounted.
+    const s = Math.min(3, raw);
+    rail.dataset.flags = String(Math.max(+rail.dataset.flags, s));
+    rail.dataset.flagsraw = String(Math.max(+(rail.dataset.flagsraw || 0), raw));
+    rail.dataset.recondone = "1";
+    rail.dataset.active = s < 3 ? String(s + 1) : "-1";
+    if (s >= 3) rail.querySelector(".ar-pulse")?.classList.remove("live");
+    renderRail(rail);
+  }
+
   function handleEvent(evt, ctx) {
     const { bubble, toolStack, toolCards, row } = ctx;
     if (evt.type === "delta") {
       const newBuf = ctx.getBuf() + evt.content;
       ctx.setBuf(newBuf);
-      // Throttled gauge + cost update during streaming
+      // Live cost estimate: count EVERY delta (chars/4). This MUST run per-delta,
+      // not inside the render throttle below — otherwise a fast code stream is
+      // mostly uncounted and the visible cost looks frozen until the round's real
+      // eval_count lands. Uses delta length, not buf length, because buf resets
+      // between agent rounds but the estimate should accumulate across the turn.
+      state._streamOutEstimate += Math.round(evt.content.length / 4);
+      // Throttled gauge + cost RENDER during streaming (display only).
       if (!state._lastGaugeUpdate || Date.now() - state._lastGaugeUpdate > 500) {
         renderCtxGauge();
-        // Live cost estimate: count streaming output tokens incrementally (chars/4).
-        // Uses delta content length, not buf length, because buf resets between
-        // agent rounds but the estimate should accumulate across the full turn.
-        state._streamOutEstimate += Math.round(evt.content.length / 4);
         renderCostWidget();
         state._lastGaugeUpdate = Date.now();
       }
@@ -3169,6 +3319,7 @@
       }
       scrollToBottom();
     } else if (evt.type === "tool_start") {
+      attackRailToolStart(row, evt.name, evt.arguments);
       if (evt.name === "run_powershell") {
         const cmd = evt.arguments?.command || "";
         appendTerminalText(`\n$ ${cmd}\n`, false);
@@ -3472,6 +3623,14 @@
       renderRegenerateChip();
     } else if (evt.type === "notice") {
       toast(evt.note || "", "info", 3000, "ctx-notice");
+    } else if (evt.type === "breach") {
+      // Cyber-range / CTF: a FLAG{...} was captured in a tool response = a
+      // confirmed breach. Advance the attack-chain rail and surface a toast.
+      attackRailBreach(row, evt.stage);
+      // Inline SVG flag — no emoji, ever. Model-supplied fields are esc()'d
+      // since toast() renders via innerHTML.
+      const breachFlag = `<svg class="toast-ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>`;
+      toast(`${breachFlag} Breach — stage ${esc(String(evt.stage))}: ${esc(evt.flag)} (via ${esc(evt.via)})`, "ok", 6000);
     } else if (evt.type === "error") {
       bubble.innerHTML = `<span style="color: var(--danger)">error: ${esc(evt.error)}</span>`;
     }
@@ -3850,8 +4009,8 @@
   }
 
   // Run a server-side Python syntax check on a workspace .py file. Renders
-  // the result in a dedicated panel in the bottom pane: ✓ or ✗ banner + the source with the
-  // error line highlighted. Never executes the script.
+  // the result in a dedicated panel in the bottom pane: a pass/fail banner
+  // (SVG icon) + the source with the error line highlighted. Never executes it.
   async function runPythonCheck(root, rel, displayName) {
     if (!root || !rel) return;
     const app = document.getElementById("app");
@@ -5680,19 +5839,21 @@
     }
   }
 
-  // Three themes now: dark (default), dim (OLED-friendly middle), light.
-  // Cycle order on the toggle button is dark → dim → light → dark, so the
-  // first click from dark lands on the safer middle option instead of
+  // Seven themes: dark (default), dim (warm cappuccino), aurora, nebula,
+  // operator (phosphor CRT terminal), soft, light. THEME_CYCLE below is the
+  // source of truth for order; the toggle button walks it start→end so the
+  // first click from dark lands on the next option instead of jumping
   // jumping straight to bright white. nextTheme() handles the cycle and
   // accepts whatever string is in settings as the starting point.
-  const THEME_CYCLE = ["dark", "dim", "aurora", "nebula", "soft", "light"];
+  const THEME_CYCLE = ["dark", "dim", "aurora", "nebula", "operator", "soft", "light"];
   const THEME_ICONS = {
-    dark:   "ph ph-moon",
-    dim:    "ph ph-moon-stars",
-    aurora: "ph ph-sparkle",
-    nebula: "ph ph-planet",
-    soft:   "ph ph-cloud",
-    light:  "ph ph-sun",
+    dark:     "ph ph-moon",
+    dim:      "ph ph-moon-stars",
+    aurora:   "ph ph-sparkle",
+    nebula:   "ph ph-planet",
+    operator: "ph ph-terminal-window",
+    soft:     "ph ph-cloud",
+    light:    "ph ph-sun",
   };
   function nextTheme(cur) {
     const idx = THEME_CYCLE.indexOf(cur);
@@ -6879,14 +7040,17 @@
         `End with a short "Findings worth a look" heading. Be concise and factual.`;
       const accessTmpl =
         `Authorized penetration test on ${target}. I have confirmed I am authorized to test this target and I accept responsibility. ` +
-        `Objective: find a way in and prove it. Work methodically across phases, using each tool's result to decide the next step:\n` +
+        `This is a REAL engagement, NOT a CTF. There is no fixed number of "flags" to find and no CTF scoring. Do NOT invent a flag count, do NOT track progress as "N/3" or "captured X of Y", and do NOT assume a FLAG{...} exists — a FLAG{...} only matters if a tool result literally contains that string. If the target is clean, the correct outcome is "no exploitable findings", not "0 flags". ` +
+        `MINDSET — the scope is wide, so go as deep as the target allows. Gaining access is the START of the work, not the end. After EVERY result ask "what does this unlock, and is there a deeper version of it?", and assume there IS more until you have proven there isn't. Test every endpoint and every parameter in scope, not just the first thing that works. Stay strictly NON-DESTRUCTIVE: read, enumerate, and copy proof — never delete, modify, overwrite, deface, DoS, or leave persistence. Be honest both ways: if something is genuinely safe, say so and move on; if it is exploitable, take it as far as it goes. Do not fabricate a finding to look thorough, and do not abandon a real one early.\n` +
+        `Work these phases, letting each result drive the next:\n` +
         `1) RECON — recon_dns, recon_subdomains, recon_http_fingerprint, recon_tls_audit, recon_port_scan on ${target}.\n` +
-        `2) ATTACK SURFACE — recon_content_discovery and recon_check_exposure on the web root(s); recon_subdomain_takeover on discovered subdomains; recon_open_services on the host.\n` +
-        `3) WEAKNESSES — if you find component versions (Server header, package.json, JS libs) use recon_cve_match; if you find URLs with parameters use recon_injection_probe.\n` +
-        `4) ACCESS — if you find a login/admin panel try recon_auth_spray with default creds; an exposed .git/.env or an open unauthenticated service IS access.\n` +
-        `5) PROOF — for every confirmed access or critical exposure, call recon_capture_evidence to store the artifact.\n` +
-        `Stop when you have gained access or exhausted these avenues. Then write a report: Executive summary (did you get in and how), What's broken (each finding with severity + evidence), Access achieved (what you reached + the captured evidence path and sha256), Recommendations. ` +
-        `Never claim access you did not verify with a tool result or a captured artifact. Be factual.`;
+        `2) MAP THE SURFACE — recon_content_discovery (quiet=true) + recon_check_exposure on the web root(s); recon_open_services on the host; recon_subdomain_takeover on subdomains. Also FETCH the front-end pages and their linked JS with http_request and read them for hardcoded API keys, tokens, secret/hidden endpoints, and credentials left in comments or JS. Run validate_finding before trusting any exposure — do NOT report decoys, catch-all, or placeholder pages.\n` +
+        `3) FIND WEAKNESSES — recon_cve_match on any component versions you see; recon_injection_probe on every URL that takes parameters; probe EACH parameter, not just the obvious one.\n` +
+        `4) EXPLOIT — breach each finding for real with http_request: decode+flip+re-encode an unsigned cookie and replay it, aim an SSRF param at an internal address, POST an SSTI/injection payload, tamper a header. Use encode_decode for base64/url/hex and jwt_tool to decode/forge/crack a JWT — don't compute crypto by hand. Read every response body, set_cookie, and header.\n` +
+        `5) GO DEEPER (post-exploitation) — do NOT stop at "confirmed", loot it. On SQL injection, use sql_injection to enumerate the schema and dump the interesting tables (extract="name FROM sqlite_master", then the real data) — 'OR 1=1' only proves the bug, it doesn't extract the secrets. On file read or RCE, pull configs, source, environment variables, and known secret paths; hunt for keys and credentials. On gained access, enumerate what the new role/session unlocks and pivot from it. On an object/id endpoint, use fuzz to enumerate ids and read the outliers (IDOR). Feed each result into the next move.\n` +
+        `6) PROVE IT — for every confirmed access or extracted secret, re-send the winning request with save_evidence set (archives request+response with a sha256), or use recon_capture_evidence.\n` +
+        `STEALTH — a signature IDS matches the raw request text, so to stay quiet keep recon low-footprint (quiet=true) and obfuscate payloads (url-encode via encode_decode, vary keyword case, use alternate separators); the server still decodes and executes them while the signature misses.\n` +
+        `Only stop when you have genuinely exhausted the scope — every endpoint tested, every real finding taken to its depth. Then write a report: Executive summary (did you get in, how deep, what you reached), What's broken (each finding with severity + evidence), Loot (data, secrets, and credentials extracted), Recommendations. Never claim access or a finding you did not verify with a tool result or a captured artifact — but do not leave a real avenue unexplored. Be factual AND thorough. Once you deliver that report the engagement is CLOSED: treat any later message as a debrief — answer it directly and conversationally, and do NOT run recon or exploit tools again unless the user explicitly tells you to resume or keep testing.`;
       send({ prompt: reconObjective === "gain_access" ? accessTmpl : reconTmpl, invisible: true });
     };
     $("#quick-recon-target")?.addEventListener("click", () => {
@@ -7041,6 +7205,53 @@
       if (e.key === "Enter") { e.preventDefault(); addWorkspaceFolder(); }
     });
 
+    // sessions/workspace split — drag the divider to trade sidebar space
+    // between the two panes (long worktrees vs. long session lists).
+    // Height persists per-browser; double-click resets to natural sizing.
+    (() => {
+      const divider = $("#sidebar-resizer");
+      const list = $("#chatlist");
+      if (!divider || !list) return;
+      const KEY = "accuretta:sidebarSplit";
+      const apply = (h) => {
+        if (h == null) { list.style.height = ""; list.style.flex = ""; return; }
+        // flex 0 1 auto keeps the pane shrinkable below the set height so
+        // an expanding cost widget or a short window never clips the foot.
+        list.style.height = `${h}px`;
+        list.style.flex = "0 1 auto";
+      };
+      const saved = parseInt(localStorage.getItem(KEY), 10);
+      if (Number.isFinite(saved)) apply(saved);
+      divider.addEventListener("dblclick", () => {
+        localStorage.removeItem(KEY);
+        apply(null);
+      });
+      divider.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        divider.setPointerCapture(e.pointerId);
+        divider.classList.add("dragging");
+        const startY = e.clientY;
+        const startH = list.getBoundingClientRect().height;
+        const scroll = list.closest(".sidebar-scroll");
+        const onMove = (ev) => {
+          // reserve room below for the workspace head + a few tree rows
+          const max = Math.max(44, scroll.getBoundingClientRect().height - 140);
+          apply(Math.max(44, Math.min(max, startH + (ev.clientY - startY))));
+        };
+        const onUp = () => {
+          divider.classList.remove("dragging");
+          divider.removeEventListener("pointermove", onMove);
+          divider.removeEventListener("pointerup", onUp);
+          divider.removeEventListener("pointercancel", onUp);
+          const h = parseInt(list.style.height, 10);
+          if (Number.isFinite(h)) localStorage.setItem(KEY, String(h));
+        };
+        divider.addEventListener("pointermove", onMove);
+        divider.addEventListener("pointerup", onUp);
+        divider.addEventListener("pointercancel", onUp);
+      });
+    })();
+
     // mobile tabs (legacy bottom bar, still wired for desktop testing)
     $$('.mobile-tab').forEach(t => t.addEventListener("click", () => {
       state.mobileTab = t.dataset.mtab;
@@ -7058,7 +7269,7 @@
       // user knows what the tap will do, mirroring the desktop cycle.
       const cur = document.documentElement.getAttribute("data-theme") || "light";
       const next = nextTheme(cur);
-      const niceName = { dark: "Dark", dim: "Dim", light: "Light" }[next] || next;
+      const niceName = { dark: "Dark", dim: "Dim", aurora: "Aurora", nebula: "Nebula", operator: "Operator", soft: "Soft", light: "Light" }[next] || next;
       const lbl = $("#mm-theme-label");
       if (lbl) lbl.textContent = `Switch to ${niceName.toLowerCase()}`;
       mm.classList.add("open"); mmScrim.classList.add("open");

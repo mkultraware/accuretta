@@ -85,7 +85,7 @@
       </div>
       <div class="chatlist" id="chatlist"></div>
 
-      <hr class="sidebar-divider">
+      <div class="sidebar-divider" id="sidebar-resizer" role="separator" aria-orientation="horizontal" title="Drag to resize · double-click to reset"></div>
 
       <div class="section-head ws-section-head">
         <span>WORKSPACE</span>
@@ -437,8 +437,8 @@
     <b>Agent</b> — model calls tools to list files, read, write, run powershell. every write/run asks for your approval first.<br>
     <b>Auto</b> — bridge picks IDE vs. Agent based on what you asked.</p>
 
-    <div class="faq-q">why are tools disabled when i load a gemma model?</div>
-    <p>gemma emits a non-JSON, python-style function-call format — triple-quoted strings and its own <code>&lt;|tool_call&gt;</code> token dialect — that <code>llama.cpp</code> can't reliably parse. the result: tool calls silently fail while the model narrates a success that never happened (<i>"saved to…"</i> when nothing was written). rather than let you hit that trap, accuretta detects gemma and runs it in <b>chat-only</b> mode, with a notice explaining why. gemma's still fine for chat — for agentic/tool work (file reads/writes, powershell, git) use <b>Qwen</b>, <b>GLM</b>, <b>Llama</b>, or <b>GPT-OSS</b>, which all emit standard JSON tool calls.</p>
+    <div class="faq-q">how do tools work with a gemma model?</div>
+    <p>gemma emits a python-style function call — <code>name(arg=value)</code> inside a <code>```tool_code```</code> fence — instead of the JSON tool_call that <code>llama.cpp</code>'s native parser understands. so accuretta runs gemma in <b>text-tools</b> mode: the tools are still listed in the prompt, but accuretta parses the <code>tool_code</code> call out of the reply and executes it itself, rather than handing the tool schema to llama-server (which would silently no-op and let the model narrate a fake <i>"saved to…"</i>). tools work, just via a different path. models that emit standard JSON tool calls — <b>Qwen</b>, <b>GLM</b>, <b>Llama</b>, <b>GPT-OSS</b> — still use the faster native path.</p>
 
     <div class="faq-q">what is netscan inference device?</div>
     <p>a one-click prompt under the <svg class="faq-svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="8" cy="6" r="2" fill="currentColor"/><circle cx="16" cy="12" r="2" fill="currentColor"/><circle cx="10" cy="18" r="2" fill="currentColor"/></svg> button that asks the model to scan <i>this</i> machine's active TCP/UDP connections, listening ports, and recent DNS cache, then flag anything weird (unknown processes phoning home, suspicious remote IPs, etc.). a chart card renders inline showing connection counts, top processes, and top remote endpoints — favicons fetched from DuckDuckGo. all data is gathered locally via PowerShell — nothing leaves your machine.</p>
@@ -719,6 +719,7 @@
         <option value="dim">Dim</option>
         <option value="aurora">Aurora</option>
         <option value="nebula">Nebula</option>
+        <option value="operator">Operator</option>
         <option value="soft">Soft</option>
         <option value="light">Light</option>
       </select>

