@@ -459,7 +459,7 @@ DEFAULT_SETTINGS = {
     "num_batch": 512,
     "num_thread": 0,
     "num_predict": -1,
-    "temperature": 0.7,
+    "temperature": 0.5,
     "top_p": 0.9,
     "top_k": 40,
     "min_p": 0.05,
@@ -469,6 +469,7 @@ DEFAULT_SETTINGS = {
     "keep_alive": "30m",
     "theme": "light",
     "auto_approve_read": True,
+    "auto_approve_write": False,    # trust writes: skip approval for in-workspace file writes/edits (registry/system/powershell still always prompt)
     "allow_web_preview": True,
     # memory / performance
     "kv_cache_type": "q8_0",        # q4_0 | q8_0 | f16 — lower = less VRAM, slightly lower quality
@@ -478,8 +479,8 @@ DEFAULT_SETTINGS = {
     # reasoning / thinking (Qwen3-family and other reasoner models)
     "enable_thinking": True,        # when False, suppress <think> blocks entirely via chat_template_kwargs
     "thinking_budget": 4096,        # HARNESS-enforced cap on thinking tokens (we count + force-close; the model's template can't be trusted to honor it). -1 = unlimited
-    "max_tool_rounds": 60,          # how many tool-call rounds the model may run per user turn before forced stop
-    "preserve_prior_thinking": True,# rewrite prior <think>…</think> as plain text so it survives chat-template stripping
+    "max_tool_rounds": 120,         # how many tool-call rounds the model may run per user turn before forced stop
+    "preserve_prior_thinking": False,# replay prior <think> verbatim: bloats context + re-feeds doubt on long runs, so default off
     # llama-server lifecycle (bridge spawns it for us)
     "watchdog_enabled": True,       # auto-respawn llama-server on silent crash (OOM, segfault).
                                     # Circuit breaker stops trying after 3 crashes in 60s — fix
@@ -1457,8 +1458,24 @@ _approval_events: dict[str, threading.Event] = {}
 _approvals_lock = threading.Lock()
 
 
+# Approval kinds that are ordinary in-workspace file writes. When the user has
+# turned on "trust writes", these skip the approval prompt — the calling tools
+# have already validated the path is inside the workspace and not a blocked
+# system path, so nothing here can touch Windows/System32, the registry, etc.
+_SAFE_WRITE_KINDS = {"write_file", "edit_file", "replace_ast_node"}
+
+
 def request_approval(title: str, command: str, details: dict | None = None, timeout_s: int = 600) -> dict:
-    """Create a pending approval, block worker until user responds, return decision."""
+    """Create a pending approval, block worker until user responds, return decision.
+    When `auto_approve_write` is set, safe in-workspace file writes are approved
+    instantly; delete / registry / powershell / git / desktop / launch always
+    still prompt."""
+    details = details or {}
+    try:
+        if details.get("kind") in _SAFE_WRITE_KINDS and get_settings().get("auto_approve_write"):
+            return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
+    except Exception:
+        pass
     aid = uuid.uuid4().hex[:12]
     ev = threading.Event()
     entry = {
@@ -8902,6 +8919,85 @@ def tool_cors_probe(args: dict) -> dict:
                      if any_vuln else "no exploitable CORS reflection detected.")}
 
 
+def tool_tcp_send(args: dict) -> dict:
+    """AUTHORIZED PENTEST. Open a raw TCP connection to host:port, send data, and
+    read back whatever the service returns within a read window. This is a raw
+    socket, NOT a browser: it speaks bytes only, with no rendering or JS. Use it
+    to talk to non-HTTP services (redis, memcached, SMTP) or to submit a URL to a
+    CTF / report-to-admin bot and read the console.log output it pipes back over
+    the socket. For a bot that visits a page and waits, set read_timeout high
+    enough (e.g. 15). Optionally wrap in TLS. Gated behind red_team_enabled."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    host = (args.get("host") or args.get("target") or "").strip()
+    port = args.get("port")
+    if host and ":" in host and not port:  # accept host:port in one field
+        host, _, port = host.rpartition(":")
+    if not host:
+        return {"error": "host required"}
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return {"error": "valid port required"}
+    data = args.get("data")
+    if data is None:
+        data = args.get("payload") or ""
+    send_bytes = (data if isinstance(data, str) else str(data)).encode("utf-8", "replace")
+    use_tls = bool(args.get("tls"))
+    connect_timeout = max(1.0, min(float(args.get("connect_timeout") or 6.0), 20.0))
+    read_timeout = max(0.5, min(float(args.get("read_timeout") or 8.0), 40.0))
+    max_bytes = 64 * 1024
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(connect_timeout)
+    try:
+        s.connect((host, port))
+    except Exception as e:
+        try:
+            s.close()
+        except Exception:
+            pass
+        return {"error": f"connect to {host}:{port} failed: {e}"}
+    try:
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            s = ctx.wrap_socket(s, server_hostname=host)
+        if send_bytes:
+            s.sendall(send_bytes)
+        # Read until the peer closes the connection or the read window elapses
+        # (a visit-and-wait bot streams its output, then closes, so this returns
+        # as soon as it finishes rather than always blocking the full window).
+        chunks, total = [], 0
+        deadline = time.time() + read_timeout
+        s.settimeout(1.0)
+        while time.time() < deadline and total < max_bytes:
+            try:
+                chunk = s.recv(4096)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+            if not chunk:
+                break  # peer closed
+            chunks.append(chunk)
+            total += len(chunk)
+        text = b"".join(chunks).decode("utf-8", "replace")
+        return {"host": host, "port": port, "tls": use_tls,
+                "sent_bytes": len(send_bytes), "received_bytes": total,
+                "response": text[:60000],
+                "note": "raw socket response (no rendering, no JS). If you submitted a URL to a "
+                        "bot, any console.log it emitted is in the response above."}
+    except Exception as e:
+        return {"error": f"tcp exchange failed: {e}", "host": host, "port": port}
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
 # --- Tool 5: check_deps ---
 def tool_check_deps(args: dict) -> dict:
     """Check dependency manifests against OSV.dev vulnerabilities."""
@@ -9714,6 +9810,21 @@ TOOLS: dict[str, dict] = {
             "required": ["url"],
         },
         "fn": tool_cors_probe,
+    },
+    "tcp_send": {
+        "description": "AUTHORIZED PENTEST. Raw TCP: connect to host:port, send data, read the response within a window. Not a browser (bytes only, no JS/rendering). For non-HTTP services (redis, memcached, SMTP) or to submit a URL to a CTF / report-to-admin bot and read the console.log/output it pipes back. Set read_timeout high (e.g. 15) for a visit-and-wait bot. Optional tls.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Target host (or host:port)."},
+                "port": {"type": "integer", "description": "Target TCP port."},
+                "data": {"type": "string", "description": "Bytes to send (add a trailing newline if the service expects line input)."},
+                "read_timeout": {"type": "number", "description": "Seconds to read the response (default 8; use ~15 for a bot that visits a page)."},
+                "tls": {"type": "boolean", "description": "Wrap the connection in TLS."},
+            },
+            "required": ["host", "port"],
+        },
+        "fn": tool_tcp_send,
     },
     "recon_subdomains": {
         "description": "AUTHORIZED RECON ONLY. Passive subdomain enumeration via certificate transparency logs (crt.sh). No active brute-forcing. Read-only.",
@@ -10782,6 +10893,7 @@ _TOOL_RESULT_CAPS = {
     "fuzz": 16000,           # many per-value response summaries
     "batch_probe": 16000,    # hits across many endpoints
     "scan_js_secrets": 16000,  # many secret hits across bundles
+    "tcp_send": 32000,         # raw service/bot output can be verbose
     "scan_apk": 48000,
     "decompile_apk": 24000,
     # ghidra_analyze: imports + exports + 200 strings + decompiled function
@@ -10985,6 +11097,8 @@ _RED_TEAM_TOOL_NAMES = {
     # front-end secret hunting + CORS misconfig testing
     "scan_js_secrets",
     "cors_probe",
+    # raw TCP for non-HTTP services and report-to-admin/CTF bots
+    "tcp_send",
 }
 
 
@@ -12135,7 +12249,11 @@ keep responses tight."""
     parts.append(core)
 
     # === EMOTION STICKERS ===
-    parts.append("""visual stickers:
+    # Conversational modes only. On agent/IDE work the stickers are token cost
+    # plus a behavioral distraction ("append a happy sticker" is noise mid-
+    # refactor or mid-pentest), so we drop them there.
+    if chat_mode not in ("agent", "ide"):
+        parts.append("""visual stickers:
 you may occasionally append exactly one of these to the absolute end of your response (after any <cascade> tags). do NOT use regular unicode emojis.
 - ![celebrate](/accuMOTION/accu_CELEBRATE.png)
 - ![cool](/accuMOTION/accu_COOL.png)
@@ -12221,7 +12339,7 @@ def llama_options(settings: dict) -> dict:
     sampling/predict params here."""
     opt: dict = {}
     t = settings.get("temperature")
-    opt["temperature"] = float(t) if t is not None and t != "" else 0.7
+    opt["temperature"] = float(t) if t is not None and t != "" else 0.5
     p = settings.get("top_p")
     opt["top_p"] = float(p) if p is not None and p != "" else 0.9
     # Pass through additional sampler params if set. These prevent the model
@@ -12352,7 +12470,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
     _set_current_chat(chat_id)
     try:
         try:
-            max_tool_rounds = int(settings.get("max_tool_rounds") or 60)
+            max_tool_rounds = int(settings.get("max_tool_rounds") or 120)
         except Exception:
             max_tool_rounds = 60
         max_tool_rounds = max(1, min(max_tool_rounds, 500))
@@ -12390,10 +12508,11 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # conversation the server happily holds at 32K — and tool results
             # the model discovered earlier in the turn vanish from history.
             ctx_limit = _llama_props_ctx() or int(settings.get("num_ctx") or 32768)
-            # Reserve ~25% of ctx for the response + thinking so the model
-            # always has headroom to answer. The frontend gets a single event
-            # with the elided count so it can render a pill — no spammy toast.
-            reserve = max(int(ctx_limit * 0.25), 1024)
+            # Reserve headroom for the response + thinking, but CAP it: 25% of a
+            # 262K window is ~65K wasted on headroom no answer needs. Capping at
+            # ~16K hands that context back to the conversation on large windows
+            # while staying proportional on small ones.
+            reserve = max(min(int(ctx_limit * 0.25), 16000), 1024)
             # Tool spec overhead: llama-server's Jinja template inlines the
             # FULL tools array into the system message server-side. That can
             # be 6-10K tokens for our ~21 tools — invisible to us until the
@@ -12409,7 +12528,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     tools_overhead = 4096  # conservative fallback
             # Floor the messages budget at 2048 tokens — even if tools overhead
             # is huge, we still need room for at least the system + last user.
-            effective_reserve = min(reserve + tools_overhead, ctx_limit - 2048)
+            # +768 tokens of safety margin: the tools overhead is an estimate,
+            # and --no-context-shift hard-errors the whole turn if the real prompt
+            # slips over ctx. A little slack keeps us under the ceiling.
+            effective_reserve = min(reserve + tools_overhead + 768, ctx_limit - 2048)
             trimmed = truncate_messages(conversation, ctx_limit, reserve=effective_reserve)
             dropped = max(0, len(conversation) - len(trimmed))
             if dropped > 0:
@@ -12535,12 +12657,13 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             reasoning_open = True
                         content_buf.append(rpiece)
                         emit({"type": "delta", "content": rpiece})
-                        # Enforce the thinking budget the model's template ignores:
-                        # once reasoning exceeds the cap, force-close </think> and
-                        # break so we can re-prompt for a direct answer.
+                        # The thinking budget is a SOFT target (passed to the chat
+                        # template). This harness enforcer is only a RUNAWAY guard:
+                        # it fires at 2.5x the budget, so legitimate deep reasoning
+                        # up to and a bit past the target is never guillotined.
                         if _think_cap > 0 and budget_retries < 2:
                             think_chars += len(rpiece)
-                            if think_chars / CHARS_PER_TOKEN > _think_cap:
+                            if think_chars / CHARS_PER_TOKEN > _think_cap * 2.5:
                                 content_buf.append("</think>")
                                 emit({"type": "delta", "content": "</think>"})
                                 reasoning_open = False
@@ -12869,7 +12992,7 @@ def _sanitize_messages_for_openai(msgs: list[dict]) -> list[dict]:
     the `{role:'tool', tool_call_id, content}` shape, and ensure assistant
     tool_calls have a string `arguments` field."""
     try:
-        preserve_thinking = bool(get_settings().get("preserve_prior_thinking", True))
+        preserve_thinking = bool(get_settings().get("preserve_prior_thinking", False))
     except Exception:
         preserve_thinking = True
     out = []
@@ -15953,7 +16076,12 @@ class LlamaProcess:
         try:
             creationflags = 0
             if sys.platform == "win32":
-                creationflags = subprocess.CREATE_NEW_CONSOLE
+                # Desktop-app mode (ACCURETTA_APP, set by the pywebview launcher)
+                # runs llama-server hidden so there are NO stray console windows.
+                # Plain bridge/browser mode keeps the console for crash visibility.
+                creationflags = (subprocess.CREATE_NO_WINDOW
+                                 if os.environ.get("ACCURETTA_APP")
+                                 else subprocess.CREATE_NEW_CONSOLE)
             p = subprocess.Popen(
                 cmd,
                 cwd=str(Path(bin_path).parent),

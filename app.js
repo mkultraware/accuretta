@@ -1989,15 +1989,10 @@
     if (!state.messages.length) {
       inner.innerHTML = `
         <div class="welcome-screen">
-          <div class="welcome-blobs">
-            <div class="welcome-blob welcome-blob-1"></div>
-            <div class="welcome-blob welcome-blob-2"></div>
-          </div>
-          <canvas id="welcome-canvas"></canvas>
+          <div class="welcome-blobs"></div>
           <div class="welcome-content">
             <div class="welcome-logo-wrap">
-              <img class="welcome-logo welcome-logo-light" src="/logo-mark-light.png" alt="" aria-hidden="true">
-              <img class="welcome-logo welcome-logo-dark" src="/logo-mark-dark.png" alt="" aria-hidden="true">
+              <div class="welcome-logo welcome-logo-accent" aria-hidden="true"></div>
             </div>
             <h1 class="welcome-title">accuretta</h1>
             <p class="welcome-subtitle">Your model, your machine. What are we building today?</p>
@@ -2072,8 +2067,40 @@
       });
     });
 
-    // 2. WebGL Animation
-    initWelcomeWebGL();
+    // Background: soft vertical colour bars of varying height (no canvas).
+    buildWelcomeBars();
+  }
+
+  // Generates the welcome-screen backdrop: a warm→cool set of blurred vertical
+  // bars, each fading into the background at a different point (some at the
+  // top, some at the bottom, some spanning) so they read as varying lengths.
+  // Colours reference the --bar-* palette on .welcome-blobs, so they follow
+  // the active theme.
+  function buildWelcomeBars() {
+    const wrap = document.querySelector(".welcome-blobs");
+    if (!wrap) return;
+    // Deterministic PRNG so the layout stays stable across new chats.
+    let seed = 0x9e3779b9 >>> 0;
+    const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+    const palette = ["--bar-warm", "--bar-rose", "--bar-mid", "--bar-violet", "--bar-blue", "--bar-sky"];
+    const N = 18;
+    let html = "";
+    for (let i = 0; i < N; i++) {
+      const x = i / (N - 1);                                     // 0 → 1, left → right
+      const left = (x * 106 - 3 + (rnd() - 0.5) * 3).toFixed(1);
+      const width = (4 + rnd() * 5).toFixed(1);
+      const c = palette[Math.min(palette.length - 1, Math.floor(x * palette.length))];
+      const topFade = Math.round(rnd() * 42);                    // fade-in distance from the top
+      const botFade = Math.round(rnd() * 42);                    // fade-out distance before the bottom
+      const o = (0.32 + rnd() * 0.4).toFixed(2);
+      const blur = (16 + rnd() * 26).toFixed(0);
+      const dur = (18 + rnd() * 16).toFixed(1);
+      const delay = (-rnd() * 22).toFixed(1);
+      html += `<div class="welcome-bar" style="left:${left}%;width:${width}%;--o:${o};opacity:${o};`
+        + `background:linear-gradient(180deg,transparent 0%,var(${c}) ${topFade}%,var(${c}) ${100 - botFade}%,transparent 100%);`
+        + `filter:blur(${blur}px);animation-duration:${dur}s;animation-delay:${delay}s;"></div>`;
+    }
+    wrap.innerHTML = html;
   }
 
   function initWelcomeWebGL() {
@@ -2100,69 +2127,83 @@
     `;
 
     const fsSource = `
+      #ifdef GL_FRAGMENT_PRECISION_HIGH
+      precision highp float;
+      #else
       precision mediump float;
+      #endif
       uniform vec2 u_resolution;
       uniform float u_time;
       uniform vec2 u_mouse;
       uniform vec3 u_accent_color;
       uniform vec3 u_bg_color;
 
+      float hash21(vec2 p) {
+        p = fract(p * vec2(123.34, 345.45));
+        p += dot(p, p + 34.345);
+        return fract(p.x * p.y);
+      }
+
+      float vnoise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        float a = hash21(i);
+        float b = hash21(i + vec2(1.0, 0.0));
+        float c = hash21(i + vec2(0.0, 1.0));
+        float d = hash21(i + vec2(1.0, 1.0));
+        return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+      }
+
+      float fbm(vec2 p) {
+        float v = 0.0;
+        float amp = 0.5;
+        for (int i = 0; i < 3; i++) {
+          v += amp * vnoise(p);
+          p *= 2.02;
+          amp *= 0.5;
+        }
+        return v;
+      }
+
       void main() {
         vec2 uv = gl_FragCoord.xy / u_resolution.xy;
+        float aspect = u_resolution.x / u_resolution.y;
         vec2 st = uv * 2.0 - 1.0;
-        st.x *= u_resolution.x / u_resolution.y;
+        st.x *= aspect;
 
-        // Ethereal wide-spread slow-drifting trajectories (less concentrated)
-        float t = u_time * 0.14;
-        vec2 c1 = vec2(sin(t * 0.7) * 0.75, cos(t * 0.5) * 0.55);
-        vec2 c2 = vec2(cos(t * 0.6 + 2.0) * 0.85, sin(t * 0.8) * 0.65);
-        vec2 c3 = vec2(sin(t * 0.4 - 1.0) * 0.65, cos(t * 0.9 + 1.5) * 0.45);
+        // Gentle pointer parallax — dormant while the cursor rests at centre.
+        vec2 m = (u_mouse / u_resolution) * 2.0 - 1.0;
+        vec2 p = st * 0.8 - m * 0.06;
+        float t = u_time * 0.05;
 
-        // Lower spatial scaling factor for wide, organic glowing light fields instead of thick blobs
-        float f1 = exp(-length(st - c1) * 1.25);
-        float f2 = exp(-length(st - c2) * 1.45);
-        float f3 = exp(-length(st - c3) * 1.05);
+        // Companion tones derived from the theme accent — each theme drives
+        // its own palette with no per-theme branching.
+        vec3 shift1 = vec3(u_accent_color.z, u_accent_color.x, u_accent_color.y);
+        vec3 shift2 = vec3(u_accent_color.y, u_accent_color.z, u_accent_color.x);
+        vec3 base   = mix(u_bg_color, u_accent_color, 0.12);
+        vec3 bright = min(u_accent_color * 1.35 + 0.05, vec3(1.0));
 
-        // Combined field density
-        float density = f1 + f2 + f3;
+        // Domain-warped flow field (Inigo Quilez style) — smooth, liquid,
+        // slowly folding gradients rather than discrete blobs.
+        vec2 q = vec2(fbm(p + t), fbm(p + vec2(3.4, 1.7) - t));
+        vec2 r = vec2(fbm(p + 1.7 * q + vec2(1.2, 6.1) + t * 1.2),
+                      fbm(p + 1.7 * q + vec2(8.3, 2.4) - t * 0.9));
+        float f = fbm(p + 1.6 * r);
 
-        // Faint complementary tones derived by shifting the active theme accent color channels
-        // This ensures the extra tones remain perfectly suitable for the selected theme
-        vec3 colorShift1 = vec3(u_accent_color.z, u_accent_color.x, u_accent_color.y);
-        vec3 colorShift2 = vec3(u_accent_color.y, u_accent_color.z, u_accent_color.x);
+        // Blend the palette along the flow so colours pool and drift.
+        vec3 col = base;
+        col = mix(col, u_accent_color, smoothstep(0.15, 0.95, f + 0.15));
+        col = mix(col, shift1, clamp(q.x * 0.9, 0.0, 1.0));
+        col = mix(col, shift2, clamp(r.y * 0.8, 0.0, 1.0));
+        col = mix(col, bright, smoothstep(0.55, 1.05, f) * 0.6);
 
-        // Animated spectral dispersion (like light shining through a glass prism)
-        // RIppling 3-phase sine wave shifted by 120 degrees per color channel
-        float spectrumPhase = dot(st, vec2(0.4, 0.8)) * 1.3 + u_time * 0.22;
-        float specAmp = 0.11; // Faint, subtle spectrum glow
-        vec3 spectrum = vec3(
-          sin(spectrumPhase) * specAmp + specAmp,
-          sin(spectrumPhase + 2.094) * specAmp + specAmp,
-          sin(spectrumPhase + 4.188) * specAmp + specAmp
-        );
+        // Bold toward the edges, calmer behind the centred logo + title.
+        float centreClear = smoothstep(0.1, 1.1, length(st * vec2(0.7, 1.0)));
+        float vign = smoothstep(2.9, 0.2, length(st));
+        float amt = mix(0.4, 1.0, centreClear) * vign * 0.92;
 
-        // Base intensity mapping (max 0.22 prominence for gorgeous background integration)
-        float intensity = smoothstep(0.1, 0.95, density) * 0.22;
-
-        // Blend primary accent and shifted pastel tones based on spatial field densities
-        vec3 blobColor = mix(u_accent_color, colorShift1, f1 / (density + 0.001));
-        blobColor = mix(blobColor, colorShift2, f2 / (density + 0.001));
-
-        // Inject the faint rainbow spectrum wash
-        blobColor += spectrum * (density * 0.16);
-
-        // Smooth viewport vignette to avoid harsh edge boundaries
-        float vignette = smoothstep(2.5, 0.5, length(st));
-        intensity *= vignette;
-
-        // Final color composition with background
-        vec3 color = mix(u_bg_color, blobColor, intensity);
-
-        // A faint luminous highlight when cores overlap (refraction clash glow)
-        float clashGlow = smoothstep(1.3, 2.6, density) * 0.07 * vignette;
-        vec3 superchargedHighlight = u_accent_color * 1.4 + vec3(0.08, 0.08, 0.12);
-        color = mix(color, superchargedHighlight, clashGlow);
-
+        vec3 color = mix(u_bg_color, col, clamp(amt, 0.0, 1.0));
         gl_FragColor = vec4(color, 1.0);
       }
     `;
@@ -2216,6 +2257,14 @@
     let targetMouseX = mouseX;
     let targetMouseY = mouseY;
 
+    function onPointerMove(e) {
+      const rect = canvas.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      targetMouseX = e.clientX - rect.left;
+      targetMouseY = rect.height - (e.clientY - rect.top);
+    }
+    window.addEventListener("mousemove", onPointerMove, { passive: true });
+
     function getThemeColors() {
       const styles = getComputedStyle(document.documentElement);
       
@@ -2263,6 +2312,7 @@
 
     function render(now) {
       if (!document.getElementById("welcome-canvas")) {
+        window.removeEventListener("mousemove", onPointerMove);
         return;
       }
 
@@ -5851,7 +5901,7 @@
     dim:      "ph ph-moon-stars",
     aurora:   "ph ph-sparkle",
     nebula:   "ph ph-planet",
-    operator: "ph ph-terminal-window",
+    operator: "ph ph-command",
     soft:     "ph ph-cloud",
     light:    "ph ph-sun",
   };
@@ -5941,8 +5991,11 @@
     
     const modelName = state.settings.model || "no model loaded";
     
-    const ctxLimitVal = Number(state.settings.num_ctx) || 32768;
-    const ctxLimit = ctxLimitVal >= 1024 ? Math.round(ctxLimitVal / 1024) + "k" : ctxLimitVal;
+    const ctxUse = computeCtxUsage();
+    const ctxLimit = ctxUse.capacity >= 1024 ? Math.round(ctxUse.capacity / 1024) + "k" : ctxUse.capacity;
+    const ctxPct = Math.round(ctxUse.pct * 100);
+    const ctxCls = ctxUse.pct >= 0.9 ? "is-crit" : (ctxUse.pct >= 0.7 ? "is-warn" : "");
+    const ctxUsedTitle = `${ctxUse.used.toLocaleString()} / ${ctxUse.capacity.toLocaleString()} tokens of context used (~${ctxPct}%)`;
     
     let speedText = "- tok/s";
     if (isStreaming) {
@@ -5972,6 +6025,8 @@
       <span class="status-dot">·</span>
       <div class="status-item"><i class="ph ph-database"></i><span>${ctxLimit} ctx</span></div>
       <span class="status-dot">·</span>
+      <div class="status-item status-ctx ${ctxCls}" title="${esc(ctxUsedTitle)}"><i class="ph ph-gauge"></i><span>${ctxPct}%</span></div>
+      <span class="status-dot">·</span>
       <div class="status-item"><i class="ph ph-lightning"></i><span>${speedText}</span></div>
       <span class="status-dot">·</span>
       <div class="status-item status-state ${isStreaming ? 'is-streaming' : ''}">
@@ -5980,10 +6035,9 @@
       </div>
     `;
   }
-  function renderCtxGauge() {
-    const arc = $("#ctx-gauge-arc");
-    const label = $("#ctx-gauge-label");
-    if (!arc || !label) return;
+  // Shared context-window usage math, consumed by both the sidebar radial
+  // gauge and the conversation status bar so the two never disagree.
+  function computeCtxUsage() {
     // Prefer the live server ctx reported by /api/ctx-stats — settings.num_ctx
     // can drift from how llama-server was actually launched.
     const capacity = Math.max(1, Number(state._ctxCapacity) || Number(state.settings.num_ctx) || 32768);
@@ -6014,6 +6068,14 @@
       source = "char-count estimate (no live data yet)";
     }
     const pct = Math.min(1, used / capacity);
+    return { used, capacity, pct, source };
+  }
+
+  function renderCtxGauge() {
+    const arc = $("#ctx-gauge-arc");
+    const label = $("#ctx-gauge-label");
+    if (!arc || !label) return;
+    const { used, capacity, pct, source } = computeCtxUsage();
     const circ = 2 * Math.PI * 13;
     arc.setAttribute("stroke-dasharray", circ.toFixed(2));
     arc.setAttribute("stroke-dashoffset", (circ * (1 - pct)).toFixed(2));
@@ -6937,6 +6999,25 @@
 
     // image attach: click button, paste, drop
     $("#btn-attach-image")?.addEventListener("click", () => $("#file-image").click());
+
+    // trust-writes toggle: auto-approve in-workspace file writes/edits. Styled
+    // like the mode chips (.chip.on). Registry/system/PowerShell still prompt.
+    const trustBtn = $("#btn-trust-writes");
+    if (trustBtn) {
+      // .trust-on gets a quiet amber tint (see app.css) so the active state
+      // reads as caution rather than a normal accent-lit mode chip.
+      const syncTrust = () => trustBtn.classList.toggle("trust-on", !!(state.settings && state.settings.auto_approve_write));
+      syncTrust();
+      trustBtn.addEventListener("click", async () => {
+        const next = !(state.settings && state.settings.auto_approve_write);
+        trustBtn.classList.toggle("trust-on", next);
+        try { await saveSettings({ auto_approve_write: next }); } catch (_) {}
+        syncTrust();
+        toast(next ? "Trust writes on — files save and edit without asking. Registry, Windows system folders, and PowerShell still require approval."
+                   : "Trust writes off — file writes ask for approval again.",
+              next ? "warn" : "info", next ? 5000 : 3000);
+      });
+    }
     $("#file-image")?.addEventListener("change", async (e) => {
       await addImageFiles(Array.from(e.target.files || []));
       e.target.value = "";

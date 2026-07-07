@@ -617,15 +617,18 @@ button {
 /* file tree inside workspace panel */
 .ws-tree {
   padding: 2px 0 6px;
+  --tree-row-mid: 14px;   /* vertical centre of a row — where connectors turn */
 }
 
 .tree-node {
   display: flex;
   flex-direction: column;
+  position: relative;
 }
 
 .tree-row {
   display: flex;
+  position: relative;
   align-items: center;
   gap: 6px;
   padding: 3px 10px 3px 0;
@@ -751,25 +754,43 @@ button {
   display: none !important;
 }
 
-/* Indent guides — a faint vertical hairline under each expanded
-   subfolder's chevron so nesting reads at a glance. Root-level items
-   get no line (they're obviously the root's) — guides start at the
-   first nested folder, which keeps the left edge quiet. .tree-children
-   inherits --depth from its parent .tree-node, so the line lands on
-   the parent's chevron center: 4px row margin + 6px base padding +
-   depth×16px + 5px to mid-chevron. */
-.tree-children {
-  position: relative;
-}
-
-.tree-children::before {
+/* Tree connectors — solid full lines tying every nested item to its
+   parent: ├─ for a middle sibling, └─ for the last. Root-level items get
+   no line (they're obviously the root's); connectors begin one level in.
+   Geometry is locked to the row indent so the lines never drift: rows sit
+   at an 8px margin + 6px base pad + depth×16px, so the parent chevron —
+   and thus the vertical — lands at depth×16px + 3px. The elbow spans one
+   16px indent step from that vertical to the child's chevron, turning at
+   --tree-row-mid (the row's vertical centre). z-index keeps the lines
+   crisp over a hovered row's translucent background. */
+.tree-children > .tree-node::before {
   content: "";
   position: absolute;
-  top: 1px;
-  bottom: 3px;
-  left: calc(15px + var(--depth, 0) * 16px);
+  left: calc(var(--depth, 0) * 16px + 3px);
+  top: 0;
+  bottom: 0;
   width: 1px;
-  background: color-mix(in srgb, var(--border) 60%, transparent);
+  background: var(--border-strong);
+  z-index: 1;
+  pointer-events: none;
+}
+
+/* Last sibling turns the corner — stop the vertical at the elbow (└). */
+.tree-children > .tree-node:last-child::before {
+  bottom: auto;
+  height: calc(var(--tree-row-mid, 14px) + 1px);
+}
+
+/* Horizontal elbow from the vertical into the row, up to the chevron. */
+.tree-children > .tree-node > .tree-row::before {
+  content: "";
+  position: absolute;
+  left: calc(var(--depth, 0) * 16px - 5px);
+  top: var(--tree-row-mid, 14px);
+  width: 11px;
+  height: 1px;
+  background: var(--border-strong);
+  z-index: 1;
   pointer-events: none;
 }
 
@@ -3662,6 +3683,20 @@ button {
 :is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .toolbar-overflow-menu .chip.on,
 :is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .preview-overflow-menu .chip.on {
   color: var(--accent-hover);
+}
+
+/* Trust-writes active: a quiet amber "caution" tint instead of the accent glow,
+   so leaving approval off for file writes stays visible without shouting. */
+.chip.trust-on {
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  color: var(--warning);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warning) 42%, transparent);
+}
+.chip.trust-on i { color: var(--warning); }
+.chip.trust-on:hover {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 55%, transparent);
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
 }
 
 /* Composer toggle pills when active: outline-style tinted in the accent
@@ -7079,7 +7114,7 @@ body,
 
 .chatrow {
   margin: 4px 8px;
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 10px 14px;
   display: flex;
   align-items: center;
@@ -7110,9 +7145,23 @@ body,
   background: color-mix(in srgb, var(--bg-raised) 92%, transparent);
   color: var(--fg);
   font-weight: 600;
-  box-shadow:
-    0 2px 8px rgba(0, 0, 0, 0.12),
-    inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+/* Modern active-session indicator: the chat icon becomes a crisp accent dot
+   with a soft halo, on desktop as well as mobile. */
+.chatrow.active > i.ph:first-child { opacity: 0; }
+.chatrow.active::before {
+  content: "";
+  position: absolute;
+  left: 16px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  transform: translateY(-50%);
+  box-shadow: 0 0 0 3px var(--accent-subtle);
 }
 
 
@@ -7220,13 +7269,17 @@ body,
 .tree-row {
   margin: 1px 8px;
   padding: 5px 8px;
+  /* Keep the depth indentation — the shorthand above would otherwise flatten
+     padding-left to 8px, detaching every row from its connector line. */
+  padding-left: calc(6px + var(--depth, 0) * 16px);
   border-radius: 5px;
   transition: all var(--dur-fast) var(--ease-fluid);
 }
 
 .tree-row:hover {
   background: color-mix(in srgb, var(--bg-inset) 60%, transparent);
-  transform: translateX(2px);
+  /* No translateX here: shifting the row would slide its elbow off the
+     fixed vertical guide on hover. */
 }
 
 .tree-action {
@@ -8719,6 +8772,15 @@ body,
 .status-item.status-state.is-streaming {
   color: var(--accent);
 }
+/* Context-window fill readout: amber as it fills, red near capacity. */
+.status-item.status-ctx.is-warn,
+.status-item.status-ctx.is-warn i {
+  color: var(--warning);
+}
+.status-item.status-ctx.is-crit,
+.status-item.status-ctx.is-crit i {
+  color: var(--danger);
+}
 .heartbeat-icon {
   stroke: var(--accent) !important;
   animation: heartbeat-shimmer 2.2s cubic-bezier(0.25, 0.8, 0.25, 1) infinite;
@@ -9131,44 +9193,38 @@ body,
   pointer-events: none;
   overflow: hidden;
   z-index: 0;
+  /* Soft warm→cool bar palette, leaned off the theme accent so every theme
+     keeps its own identity while still spanning several hues. */
+  --bar-warm:   color-mix(in oklab, var(--accent) 55%, #ff6ea6);
+  --bar-rose:   color-mix(in oklab, var(--accent) 68%, #ff9ec4);
+  --bar-mid:    var(--accent);
+  --bar-violet: color-mix(in oklab, var(--accent) 62%, #8f7bff);
+  --bar-blue:   color-mix(in oklab, var(--accent) 55%, #6ea8ff);
+  --bar-sky:    color-mix(in oklab, var(--accent) 62%, #86ccff);
 }
 
-.welcome-blob {
+/* Soft vertical colour bars of varying height — a warm→cool set of blurred
+   columns, each fading into the background at a different point (some at the
+   top, some at the bottom, some spanning) and breathing gently. The bars are
+   generated in buildWelcomeBars(); their colours come from the --bar-* palette
+   above. This is the whole welcome backdrop (no canvas). */
+.welcome-bar {
   position: absolute;
-  border-radius: 50%;
-  background: var(--accent);
-  filter: blur(140px);
-  opacity: 0.035;
-  transition: background 0.3s ease;
-  animation: welcome-float 22s infinite ease-in-out;
+  top: -6%;
+  height: 112%;
+  will-change: transform, opacity;
+  animation-name: welcome-bar-breathe;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
 }
 
-.welcome-blob-1 {
-  width: 320px;
-  height: 320px;
-  top: 15%;
-  left: 15%;
-  animation-delay: 0s;
+@keyframes welcome-bar-breathe {
+  0%, 100% { transform: translateY(-1.5%) scaleY(1);   opacity: calc(var(--o, 0.5) * 0.72); }
+  50%      { transform: translateY(1.5%) scaleY(1.06); opacity: var(--o, 0.5); }
 }
 
-.welcome-blob-2 {
-  width: 380px;
-  height: 380px;
-  bottom: 15%;
-  right: 15%;
-  animation-delay: -7s;
-}
-
-@keyframes welcome-float {
-  0%, 100% {
-    transform: translate(0, 0) scale(1);
-  }
-  33% {
-    transform: translate(40px, -60px) scale(1.15);
-  }
-  66% {
-    transform: translate(-30px, 40px) scale(0.9);
-  }
+@media (prefers-reduced-motion: reduce) {
+  .welcome-bar { animation: none; opacity: var(--o, 0.5); }
 }
 
 #welcome-canvas {
@@ -9180,7 +9236,7 @@ body,
   height: 100%;
   pointer-events: none;
   z-index: 0;
-  opacity: 0.85;
+  opacity: 0.92;
 }
 
 .welcome-content {
@@ -9223,20 +9279,13 @@ body,
   object-fit: contain;
 }
 
-.welcome-logo-dark {
-  display: none;
-}
-
-.welcome-logo-light {
-  display: inline-block;
-}
-
-:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .welcome-logo-light {
-  display: none;
-}
-
-:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .welcome-logo-dark {
-  display: inline-block;
+/* Accent-tinted brand mark: the logo silhouette masks a flat accent fill, so
+   the A picks up each theme's accent color automatically. */
+.welcome-logo-accent {
+  background-color: var(--accent);
+  -webkit-mask: url(/logo-mark-dark.png) center / contain no-repeat;
+  mask: url(/logo-mark-dark.png) center / contain no-repeat;
+  transition: background-color 0.3s ease;
 }
 
 .welcome-title {
