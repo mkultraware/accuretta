@@ -21,18 +21,6 @@
   <img src="welcome_screen.png" alt="The Accuretta chat UI: session list on the left, a workspace tree, the chat with mode chips (IDE, Agent, Auto, Image, Trust writes), and a preview pane with Terminal, Backend, Shell, and Agent log tabs on the right." width="880" />
 </p>
 
-<div align="center">
-
-<a href="https://github.com/user-attachments/assets/ff7ff8b8-56f9-4393-b4fa-1538a99b87f7" title="Click to play the demo video">
-  <img src="media/demo-poster.png" alt="Accuretta demo video. Click to play." width="760" />
-</a>
-
-<sub>Click to watch the demo (about 23 seconds, 1.9 MB).</sub>
-
-</div>
-
-<br />
-
 ## What it is
 
 You drop a GGUF model file in a folder, point Accuretta at a llama.cpp binary, and you get a chat UI with real tool use: a live HTML preview, a workspace the model can read and write, a Python syntax checker, interactive shells, web search, and a full security-analysis toolkit. Everything runs on your computer. The model stays on your disk, and your prompts never touch anyone else's server.
