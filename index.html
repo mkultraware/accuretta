@@ -70,7 +70,7 @@
         <img class="brand-mark brand-mark-light" src="/logo-mark-light.png" alt="" aria-hidden="true">
         <img class="brand-mark brand-mark-dark" src="/logo-mark-dark.png" alt="" aria-hidden="true">
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.6.1</span>
+        <span class="v" id="brand-v">v0.6.2</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -244,7 +244,11 @@
             <span class="composer-spacer"></span>
           </div>
           <div class="image-tray hidden" id="image-tray"></div>
-          <textarea class="composer-input" id="composer-input" rows="2" placeholder="ask, build, or instruct…"></textarea>
+          <div class="composer-input-wrap">
+            <div class="composer-mirror" id="composer-mirror" aria-hidden="true"></div>
+            <textarea class="composer-input" id="composer-input" rows="2" placeholder="ask, build, or instruct…" spellcheck="false" autocomplete="off"></textarea>
+          </div>
+          <div class="mention-menu hidden" id="mention-menu" role="listbox" aria-label="Workspace files"></div>
           <div class="composer-foot">
             <span class="composer-hint">⌘⏎ send · Shift⏎ newline</span>
             <div class="composer-foot-actions">
@@ -321,6 +325,8 @@
         <div class="term-tabs-header">
           <button class="term-tab active" data-tab="terminal"><i class="ph ph-terminal-window"></i>Terminal</button>
           <button class="term-tab" data-tab="pycheck"><i class="ph ph-check-square"></i>Python check</button>
+          <button class="term-tab" data-tab="backend"><i class="ph ph-cpu"></i>Backend</button>
+          <button class="term-tab" data-tab="shell"><i class="ph ph-terminal"></i>Shell</button>
           <button class="term-tab" data-tab="agentlog"><i class="ph ph-activity"></i>Agent log</button>
           <span class="grow"></span>
           <button class="iconbtn sm" id="btn-term-clear" title="Clear active console"><i class="ph ph-trash"></i></button>
@@ -333,6 +339,30 @@
             <div class="pycheck-pane" id="pycheck-pane">
               <div class="pycheck-banner pending" id="pycheck-banner">No python check run yet. Run check from a .py file in the workspace.</div>
               <pre class="pycheck-code" id="pycheck-code"><code></code></pre>
+            </div>
+          </div>
+          <div class="term-tab-pane hidden" id="term-pane-backend">
+            <div class="backend-pane" id="backend-pane">
+              <div class="backend-status is-idle" id="backend-status">
+                <span class="backend-dot"></span>
+                <span class="backend-status-text" id="backend-status-text">idle</span>
+                <span class="backend-model" id="backend-model"></span>
+              </div>
+              <pre class="term-pre backend-log-pre" id="backend-log-pre"><code>[system] no backend output yet — load or reload a model to watch llama.cpp progress here.</code></pre>
+            </div>
+          </div>
+          <div class="term-tab-pane hidden" id="term-pane-shell">
+            <div class="shell-pane">
+              <div class="shell-bar">
+                <select id="shell-session" class="shell-select" title="Active session"></select>
+                <span class="shell-status" id="shell-status"><span class="dot"></span>no session</span>
+                <button type="button" id="shell-kill" class="shell-kill" title="Terminate session">Kill</button>
+              </div>
+              <pre class="term-pre shell-out" id="shell-out"><code>[system] no interactive session yet — the agent opens one with session_start; you can watch and type into it here once it does.</code></pre>
+              <form id="shell-form" class="shell-form" autocomplete="off">
+                <span class="shell-prompt">&rsaquo;</span>
+                <input type="text" id="shell-input" class="shell-input" placeholder="type a command — shared live with the agent" autocomplete="off" spellcheck="false" />
+              </form>
             </div>
           </div>
           <div class="term-tab-pane hidden" id="term-pane-agentlog">
@@ -757,6 +787,30 @@
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+      <span>Sandbox</span>
+      <span class="grow" style="flex:1;"></span>
+      <span class="sandbox-chip" id="sandbox-chip" data-state="unknown">checking…</span>
+    </div>
+    <div class="form-row">
+      <span class="hint">an isolated Ubuntu guest (<code>accuretta-sbx</code>, via WSL2) for running offensive tools and unpacking untrusted files off your host — the workspace is visible inside at <code>/mnt/…</code>. optional: in a web red-team the exploits run on the target, not here, so this matters mainly when you pull loot back to analyze locally. first-time set-up with full progress lives in the <b>Setup Wizard</b>.</span>
+    </div>
+    <div class="form-row inline" id="sandbox-actions" style="gap:8px;flex-wrap:wrap;">
+      <button class="btn sm" id="btn-sandbox-setup" type="button"><i class="ph ph-cube"></i>Set up / repair</button>
+      <button class="btn sm" id="btn-sandbox-test" type="button"><i class="ph ph-pulse"></i>Test</button>
+      <button class="btn sm" id="btn-sandbox-remove" type="button"><i class="ph ph-trash"></i>Remove</button>
+    </div>
+    <div class="form-row" id="sandbox-progress-row" style="display:none;">
+      <div class="setup-scanner-card" id="sandbox-card">
+        <div class="header">
+          <i class="ph ph-spinner-gap pulse-icon spin" id="sandbox-card-icon" style="font-size:18px;display:inline-block;"></i>
+          <div class="title" id="sandbox-card-title">Setting up…</div>
+        </div>
+        <div class="desc" id="sandbox-card-desc"></div>
+        <pre id="sandbox-card-log" class="sandbox-log" style="display:none;"></pre>
+      </div>
+    </div>
+
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
       <span>Discord remote bridge</span>
     </div>
     <div class="form-row">
@@ -879,6 +933,16 @@
         <input type="text" id="setup-models-dir" placeholder="e.g. D:\\MODELS" />
         <span class="hint">Where your .gguf files live. Leave blank to use the default.</span>
       </div>
+      <div class="setup-step" id="step-sandbox">
+        <label>Sandbox <span class="hint" style="font-weight:normal;">— optional, isolated Linux guest</span></label>
+        <div class="setup-scanner-card" id="sbx-wiz-card">
+          <div class="header">
+            <i class="ph ph-spinner-gap pulse-icon spin" id="sbx-wiz-icon" style="font-size:18px;display:inline-block;"></i>
+            <div class="title" id="sbx-wiz-title">Checking for WSL…</div>
+          </div>
+          <div class="desc" id="sbx-wiz-desc">Runs offensive tools and unpacks untrusted files in an isolated Ubuntu guest (via WSL2) so nothing touches your host. Your workspace is visible inside it.</div>
+        </div>
+      </div>
     </div>
     <div class="setup-footer">
       <button class="btn accent sm" id="setup-save">Save &amp; Start</button>
@@ -933,6 +997,83 @@
       .catch(function() {
         runDetection();
       });
+
+    // --- Optional WSL sandbox card (independent of Save & Start) -------------
+    var sbxPoll = null;
+    function sbxEl(id) { return document.getElementById(id); }
+    function escSbx(s) { return String(s).replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
+    var SBX_BUSY = ['downloading','extracting','importing','provisioning'];
+
+    function initSandboxWizard() {
+      fetch('/api/sandbox/status').then(function(r){ return r.json(); }).then(function(st){
+        var p = st.provision || {};
+        if (SBX_BUSY.indexOf(p.status) >= 0) { renderSbxProgress(p); if (!sbxPoll) sbxPoll = setInterval(pollSbx, 700); }
+        else renderSbx(st);
+      }).catch(function(){
+        var t = sbxEl('sbx-wiz-title'); if (t) t.textContent = 'Sandbox status unavailable';
+        var ic = sbxEl('sbx-wiz-icon'); if (ic) { ic.className = 'ph ph-warning'; }
+      });
+    }
+
+    function renderSbx(st) {
+      var card = sbxEl('sbx-wiz-card'), icon = sbxEl('sbx-wiz-icon'),
+          title = sbxEl('sbx-wiz-title'), desc = sbxEl('sbx-wiz-desc');
+      if (!card) return;
+      card.className = 'setup-scanner-card';
+      if (icon) icon.classList.remove('spin');
+      if (st.state === 'ready') {
+        card.className = 'setup-scanner-card success';
+        icon.className = 'ph ph-check-circle success-icon';
+        title.textContent = 'Sandbox ready';
+        desc.innerHTML = 'Isolated guest <code>' + escSbx(st.sandbox_distro) + '</code> is provisioned. Manage it later in Settings &rarr; Sandbox.';
+      } else if (st.state === 'no_wsl') {
+        icon.className = 'ph ph-warning pulse-icon';
+        title.textContent = 'WSL not installed (one-time)';
+        desc.innerHTML = 'The sandbox needs WSL2. In an <strong>elevated PowerShell</strong> run <code>wsl --install</code>, reboot once, then reopen this wizard — everything after is automatic. This step is optional; you can start using accuretta without it.';
+      } else {
+        icon.className = 'ph ph-cube';
+        title.textContent = (st.state === 'present_unprovisioned')
+          ? 'WSL detected — sandbox needs provisioning'
+          : 'WSL detected — sandbox not set up';
+        desc.innerHTML = 'One click builds an isolated Ubuntu guest and installs the toolset (~230 MB download, a few minutes). No reboot needed.' +
+          '<div style="margin-top:10px;"><button class="btn-installer-download" id="sbx-wiz-btn"><i class="ph ph-download-simple"></i> Set up sandbox</button></div>';
+        var b = sbxEl('sbx-wiz-btn'); if (b) b.addEventListener('click', startSbx);
+      }
+    }
+
+    function renderSbxProgress(p) {
+      var card = sbxEl('sbx-wiz-card'), icon = sbxEl('sbx-wiz-icon'),
+          title = sbxEl('sbx-wiz-title'), desc = sbxEl('sbx-wiz-desc');
+      if (!card) return;
+      card.className = 'setup-scanner-card downloading';
+      icon.className = 'ph ph-spinner-gap pulse-icon spin';
+      title.textContent = p.step || 'Setting up sandbox…';
+      var pct = (typeof p.pct === 'number') ? p.pct : 0;
+      var last = (p.log && p.log.length) ? p.log[p.log.length - 1] : '';
+      desc.innerHTML =
+        '<div class="setup-download-container"><div class="setup-download-bar">' +
+        '<div class="setup-download-fill" style="width:' + pct + '%;"></div></div>' +
+        '<div class="setup-download-meta"><span>' + escSbx(p.status || '') + '</span><span>' + pct + '%</span></div></div>' +
+        (last ? '<div class="sandbox-lastline">' + escSbx(last) + '</div>' : '');
+    }
+
+    function startSbx() {
+      fetch('/api/sandbox/setup', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' })
+        .then(function(r){ return r.json(); }).then(function(){
+          if (sbxPoll) clearInterval(sbxPoll);
+          sbxPoll = setInterval(pollSbx, 700);
+        });
+    }
+
+    function pollSbx() {
+      fetch('/api/sandbox/status').then(function(r){ return r.json(); }).then(function(st){
+        var p = st.provision || {};
+        if (SBX_BUSY.indexOf(p.status) >= 0) { renderSbxProgress(p); }
+        else { if (sbxPoll) { clearInterval(sbxPoll); sbxPoll = null; } renderSbx(st); }
+      }).catch(function(){});
+    }
+
+    initSandboxWizard();
 
     // 2. Fetch and run scanner detection
     function runDetection() {

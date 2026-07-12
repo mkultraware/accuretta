@@ -2465,6 +2465,54 @@ def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000) -> di
     return result
 
 
+def _catastrophic_cmd(cmd: str) -> str | None:
+    """Refuse — not merely prompt — commands that would wipe the machine or the
+    user's data: whole-drive/profile recursive deletes, disk format/wipe, fork
+    bombs, raw-disk overwrites. Deliberately NARROW so a normal 'delete this
+    build folder' still flows through the usual approval, not a hard block.
+    Returns a short reason if catastrophic, else None."""
+    if not cmd:
+        return None
+    c = " ".join(cmd.lower().split())   # collapse whitespace so patterns stay simple
+    standalone = [
+        (r"\bformat\s+[a-z]:", "formats a drive"),
+        (r"\bdiskpart\b", "runs diskpart (can wipe partitions)"),
+        (r"\b(clear-disk|format-volume|remove-partition|initialize-disk)\b", "destroys a disk or partition"),
+        (r"\bcipher\s+/w", "wipes free space (cipher /w)"),
+        (r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", "is a fork bomb"),
+        (r"\bdd\b.*\bof=/dev/(sd|nvme|hd|disk)", "raw-writes a disk device (dd)"),
+        (r"\bmkfs\.", "formats a filesystem (mkfs)"),
+        (r">\s*/dev/(sd|nvme|hd)[a-z0-9]", "overwrites a raw disk device"),
+    ]
+    for pat, why in standalone:
+        if re.search(pat, c):
+            return why
+    recurse_delete = bool(
+        re.search(r"remove-item\b.*\brecurse\b.*\bforce\b", c)
+        or re.search(r"remove-item\b.*\bforce\b.*\brecurse\b", c)
+        or re.search(r"\brm\s+-\w*r\w*f\b|\brm\s+-\w*f\w*r\b", c)
+        or re.search(r"\b(rd|rmdir)\s+/s\b", c)
+        or re.search(r"\bdel\s+/s\b", c)
+    )
+    if recurse_delete:
+        targets = [
+            r"\s[a-z]:\\?(?:$|\s|['\"|&;])",            # a bare drive root, e.g. C:\
+            r"[a-z]:\\windows\b",                       # C:\Windows
+            r"[a-z]:\\users\b(?![\\a-z0-9])",           # the WHOLE C:\Users
+            r"\$env:systemroot\b|\$env:windir\b",
+            r"\$env:userprofile(?![\\a-z0-9])|\$home(?![\\/\w])",
+            r"\brm\s+-\w+\s+/\s*(?:$|\*)",              # rm -rf /  or  rm -rf /*
+            r"\brm\s+-\w+\s+~\s*(?:$|/\*)",             # rm -rf ~  or  rm -rf ~/*
+            r"/mnt/[a-z](?![/\w])",                     # a Windows drive mounted in WSL, e.g. /mnt/c
+            r"/mnt/[a-z]/\*",                           # /mnt/c/*  — everything on the drive
+            r"/mnt/[a-z]/users(?![/\w])",               # the whole Users tree via WSL
+        ]
+        for pat in targets:
+            if re.search(pat, c):
+                return "would recursively force-delete a drive root, Windows, or your whole profile"
+    return None
+
+
 def tool_run_powershell(args: dict) -> dict:
     cmd = (args.get("command") or "").strip()
     if not cmd:
@@ -2480,6 +2528,17 @@ def tool_run_powershell(args: dict) -> dict:
                 "than 'all python.exe' or 'whatever listens on 8787'."
             ),
             "refused_command": cmd,
+        }
+    catastrophic = _catastrophic_cmd(cmd)
+    if catastrophic:
+        return {
+            "error": (
+                f"refused: this command {catastrophic}. Accuretta hard-blocks "
+                "whole-machine / whole-drive destruction — it never even reaches "
+                "the approval queue. If you truly intend this, run it yourself."
+            ),
+            "refused_command": cmd,
+            "catastrophic": True,
         }
     # Registry tier check runs BEFORE the generic powershell approval so
     # system-hive writes never even reach the approval queue. Refusal here
@@ -2519,6 +2578,224 @@ def tool_run_powershell(args: dict) -> dict:
         if approval.get("decision") != "approve":
             return {"error": f"user denied command ({approval.get('status')})"}
     return _run_powershell(cmd, timeout=int(args.get("timeout", 120)))
+
+
+# ---- interactive sessions --------------------------------------------------
+# A long-lived child process the agent AND the user (via the shared Shell tab)
+# can drive statefully — send input, read output, across many tool calls. This
+# is what one-shot run_powershell can't do: it closes the gap for reverse
+# shells, ssh, REPLs, debuggers, DB clients, and anything prompt-driven. Output
+# is drained by a reader thread into a capped buffer with absolute offsets, so
+# the model (its own cursor) and the UI (its own since=) can each tail it.
+# v1 uses pipes, not a real PTY: line-based interaction works everywhere, but
+# full-screen TUIs and TTY-only password prompts may misbehave (pywinpty later).
+_SESSION_BUF_CAP = 200_000   # chars kept per session
+
+class Session:
+    def __init__(self, sid: str, command: str):
+        self.id = sid
+        self.command = command
+        self.created = time.time()
+        self._proc: Optional[subprocess.Popen] = None
+        self._out = ""      # recent output (front-trimmed at the cap)
+        self._base = 0      # absolute offset of _out[0] (chars already dropped)
+        self._cursor = 0    # the model's read cursor (absolute)
+        self._lock = threading.Lock()
+
+    def start(self, cwd: Optional[str] = None) -> None:
+        self._proc = subprocess.Popen(
+            self.command,
+            shell=True,
+            cwd=cwd or None,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
+        )
+        threading.Thread(target=self._pump, name=f"session-{self.id}", daemon=True).start()
+
+    def _append(self, text: str) -> None:
+        with self._lock:
+            self._out += text
+            if len(self._out) > _SESSION_BUF_CAP:
+                drop = len(self._out) - _SESSION_BUF_CAP
+                self._out = self._out[drop:]
+                self._base += drop
+
+    def _pump(self) -> None:
+        try:
+            if not self._proc or not self._proc.stdout:
+                return
+            for line in iter(self._proc.stdout.readline, ""):
+                self._append(line)
+        except Exception:
+            pass
+
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def exit_code(self):
+        return None if self._proc is None else self._proc.poll()
+
+    def send(self, text: str, enter: bool = True) -> bool:
+        if not self.alive() or not self._proc or not self._proc.stdin:
+            return False
+        try:
+            data = text + ("\n" if enter and not text.endswith("\n") else "")
+            self._append(data if data.endswith("\n") else data + "\n")  # echo into the shared view
+            self._proc.stdin.write(data)
+            self._proc.stdin.flush()
+            return True
+        except Exception:
+            return False
+
+    def read_since(self, offset: int):
+        with self._lock:
+            start = max(0, offset - self._base)
+            return self._out[start:], self._base + len(self._out)
+
+    def read_model(self, cap: int = 12000) -> str:
+        text, newcur = self.read_since(self._cursor)
+        self._cursor = newcur
+        if len(text) > cap:
+            text = "… [earlier output truncated — read again for more] …\n" + text[-cap:]
+        return text
+
+    def stop(self) -> None:
+        try:
+            if self._proc and self._proc.poll() is None:
+                self._proc.terminate()
+        except Exception:
+            pass
+
+    def info(self) -> dict:
+        return {"id": self.id, "command": self.command, "alive": self.alive(),
+                "exit_code": self.exit_code(), "created": self.created}
+
+
+class SessionManager:
+    def __init__(self):
+        self._sessions: dict[str, Session] = {}
+        self._lock = threading.Lock()
+        self._n = 0
+
+    def create(self, command: str, cwd: Optional[str] = None) -> Session:
+        with self._lock:
+            self._n += 1
+            sid = f"s{self._n}"
+            s = Session(sid, command)
+            self._sessions[sid] = s
+        s.start(cwd=cwd)
+        return s
+
+    def get(self, sid: Optional[str]) -> Optional[Session]:
+        with self._lock:
+            return self._sessions.get(sid or "")
+
+    def list(self) -> list:
+        with self._lock:
+            return [s.info() for s in self._sessions.values()]
+
+    def stop(self, sid: str) -> bool:
+        s = self.get(sid)
+        if s:
+            s.stop()
+            return True
+        return False
+
+    def stop_all(self) -> None:
+        with self._lock:
+            sessions = list(self._sessions.values())
+        for s in sessions:
+            s.stop()
+
+
+_session_mgr = SessionManager()
+
+
+def _session_wait(ms) -> None:
+    try:
+        ms = int(ms)
+    except Exception:
+        ms = 600
+    ms = max(0, min(ms, 6000))
+    if ms:
+        time.sleep(ms / 1000.0)
+
+
+def tool_session_start(args: dict) -> dict:
+    command = (args.get("command") or ("powershell" if sys.platform == "win32" else "bash")).strip()
+    if not command:
+        return {"error": "empty command"}
+    threat = bridge_self_threat(command)
+    if threat:
+        return {"error": f"refused: {threat}", "refused_command": command}
+    catastrophic = _catastrophic_cmd(command)
+    if catastrophic:
+        return {"error": f"refused: this command {catastrophic}. Run it yourself if you truly mean to.",
+                "refused_command": command, "catastrophic": True}
+    approval = request_approval(title="Interactive session", command=command, details={"kind": "session"})
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied session ({approval.get('status')})"}
+    s = _session_mgr.create(command, cwd=(args.get("cwd") or None))
+    _session_wait(args.get("wait_ms", 600))
+    return {
+        "session_id": s.id, "alive": s.alive(), "output": s.read_model(),
+        "note": "Interactive session started. Drive it with session_send (input=command), "
+                "poll new output with session_read, and end it with session_stop.",
+    }
+
+
+def tool_session_send(args: dict) -> dict:
+    sid = args.get("session_id") or args.get("id")
+    s = _session_mgr.get(sid)
+    if not s:
+        return {"error": f"no such session: {sid}", "sessions": _session_mgr.list()}
+    if not s.alive():
+        return {"error": f"session {sid} has exited", "exit_code": s.exit_code()}
+    text = args.get("input")
+    if text is None:
+        text = args.get("text", "")
+    text = str(text)
+    threat = bridge_self_threat(text)
+    if threat:
+        return {"error": f"refused: {threat}", "refused_input": text}
+    catastrophic = _catastrophic_cmd(text)
+    if catastrophic:
+        return {"error": f"refused: this input {catastrophic}. Run it yourself if you truly mean to.",
+                "refused_input": text, "catastrophic": True}
+    if needs_approval(text):
+        approval = request_approval(title="Session input (write/modify)", command=text,
+                                    details={"kind": "session", "session_id": sid})
+        if approval.get("decision") != "approve":
+            return {"error": f"user denied input ({approval.get('status')})"}
+    if not s.send(text, enter=bool(args.get("enter", True))):
+        return {"error": "failed to write to session (it may have exited)", "alive": s.alive()}
+    _session_wait(args.get("wait_ms", 700))
+    return {"session_id": sid, "alive": s.alive(), "output": s.read_model()}
+
+
+def tool_session_read(args: dict) -> dict:
+    sid = args.get("session_id") or args.get("id")
+    s = _session_mgr.get(sid)
+    if not s:
+        return {"error": f"no such session: {sid}", "sessions": _session_mgr.list()}
+    _session_wait(args.get("wait_ms", 0))
+    return {"session_id": sid, "alive": s.alive(), "exit_code": s.exit_code(), "output": s.read_model()}
+
+
+def tool_session_stop(args: dict) -> dict:
+    sid = args.get("session_id") or args.get("id")
+    if not sid:
+        return {"error": "session_id required", "sessions": _session_mgr.list()}
+    return {"session_id": sid, "stopped": _session_mgr.stop(sid)}
+
+
+def tool_session_list(args: dict) -> dict:
+    return {"sessions": _session_mgr.list()}
 
 
 _NETSNAP_PS = r"""
@@ -10079,6 +10356,61 @@ TOOLS: dict[str, dict] = {
         },
         "fn": tool_run_powershell,
     },
+    "session_start": {
+        "description": "Open a PERSISTENT interactive session — a long-lived process you drive statefully across turns (unlike run_powershell, which is one-shot and loses all state: cwd, env, connections). Use it to hold a shell you obtained (reverse/bind shell, ssh), or a REPL / DB client / debugger (python, sqlite3, gdb). `command` is the process to launch (defaults to a local shell). Returns a session_id + initial output; then use session_send / session_read / session_stop. The user can watch and type into the same session live in the Shell tab. Requires approval to start.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Process/command line to launch, e.g. 'powershell', 'ssh user@host', 'nc host 4444', 'python'. Defaults to a local shell."},
+                "cwd": {"type": "string", "description": "Optional working directory to start in."},
+                "wait_ms": {"type": "integer", "description": "Milliseconds to wait for initial output before returning (default 600, max 6000)."},
+            },
+            "required": [],
+        },
+        "fn": tool_session_start,
+    },
+    "session_send": {
+        "description": "Send a line of input to a running interactive session (from session_start) — run a command inside the held shell / type into the REPL — and return the new output. State persists between calls. Write/modify inputs may require approval.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "The id returned by session_start."},
+                "input": {"type": "string", "description": "The line to send (a newline is added unless enter=false)."},
+                "enter": {"type": "boolean", "description": "Append a newline / press Enter. Default true."},
+                "wait_ms": {"type": "integer", "description": "Milliseconds to wait for output after sending (default 700, max 6000)."},
+            },
+            "required": ["session_id", "input"],
+        },
+        "fn": tool_session_send,
+    },
+    "session_read": {
+        "description": "Read any NEW output from a running interactive session since your last read (for output that arrives slowly, or after a long-running command). Pass wait_ms to block briefly for more.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "The session id."},
+                "wait_ms": {"type": "integer", "description": "Milliseconds to wait for more output before returning (default 0, max 6000)."},
+            },
+            "required": ["session_id"],
+        },
+        "fn": tool_session_read,
+    },
+    "session_stop": {
+        "description": "Terminate a running interactive session and free its process.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "The session id to stop."},
+            },
+            "required": ["session_id"],
+        },
+        "fn": tool_session_stop,
+    },
+    "session_list": {
+        "description": "List active interactive sessions (id, command, alive, exit_code).",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+        "fn": tool_session_list,
+    },
     "open_program": {
         "description": "Launch a program by absolute path. Requires approval.",
         "parameters": {
@@ -10889,6 +11221,11 @@ _TOOL_RESULT_CAPS = {
     # Exploit responses (SSTI output, dumped configs, flag-bearing bodies) need
     # room so the model can read the whole thing and confirm access.
     "http_request": 16000,
+    # Interactive sessions self-cap their output in read_model(); these are the
+    # outer safety nets for the serialized envelope.
+    "session_start": 16000,
+    "session_send": 16000,
+    "session_read": 16000,
     "sql_injection": 16000,  # dumped rows can be large
     "fuzz": 16000,           # many per-value response summaries
     "batch_probe": 16000,    # hits across many endpoints
@@ -11113,6 +11450,10 @@ def _active_tools() -> dict:
         excluded |= _DESKTOP_TOOL_NAMES
     if not s.get("red_team_enabled"):
         excluded |= _RED_TEAM_TOOL_NAMES
+    # The sandbox tool is only useful once the guest is provisioned; don't pay
+    # its token cost (or tempt the model to call it) before then.
+    if not _sandbox_ready_cached():
+        excluded.add("sandbox_run")
     if not excluded:
         return TOOLS
     return {k: v for k, v in TOOLS.items() if k not in excluded}
@@ -11323,7 +11664,10 @@ def invoke_tool(name: str, args: dict) -> dict:
     # have been a glitch, try again" pattern — read_file truncation is the
     # most common trigger but it can happen on list_directory, etc. too.
     count = _record_tool_call(canon, args or {})
-    if count > TOOL_REPEAT_LIMIT:
+    # Session tools are stateful — the same args legitimately return DIFFERENT
+    # output as the live process runs (the model polls session_read to wait for
+    # more), so the "identical call = stuck loop" guard must not apply to them.
+    if count > TOOL_REPEAT_LIMIT and not canon.startswith("session_"):
         suggestions = []
         if canon == "read_file":
             suggestions.append("for large files, use `offset` to read the next chunk (see the `hint` field in the truncated response)")
@@ -12123,6 +12467,25 @@ def llama_post_stream(path: str, payload: dict, base: str | None = None):
     return urllib.request.urlopen(req, timeout=None)
 
 
+def _is_ctx_overflow(e: Exception) -> bool:
+    """True when a llama-server request failed because the prompt exceeded n_ctx.
+    With --no-context-shift the server rejects (HTTP error) rather than sliding
+    the window, so we detect it and re-trim + retry instead of failing the turn."""
+    import urllib.error
+    if not isinstance(e, urllib.error.HTTPError):
+        return False
+    body = ""
+    try:
+        body = e.read().decode("utf-8", "replace")
+    except Exception:
+        pass
+    blob = (body + " " + str(e)).lower()
+    return (("context" in blob and "exceed" in blob)
+            or "context shift" in blob
+            or "n_ctx" in blob
+            or "exceeds the available context" in blob)
+
+
 def describe_image(b64: str, hint: str = "") -> str:
     """Hand a base64 image to a vision-capable llama-server via
     /v1/chat/completions with image_url content. llama-server must be started
@@ -12184,13 +12547,6 @@ def build_system_prompt(include_tools: bool, chat_mode: str = "auto") -> str:
     parts = []
 
     is_ide = (chat_mode == "ide") or (chat_mode == "auto" and not include_tools)
-
-    # Today's date — injected into every system prompt so the model doesn't
-    # hallucinate from its training cutoff when the user asks "what's today's
-    # date" or makes time-relative requests ("yesterday's news", "this week").
-    # Cheap to compute; rounds the model's awareness up to the actual day.
-    _today_str = time.strftime("%A, %B %d, %Y")
-    parts.append(f"current date: {_today_str}")
 
     # === CORE PROMPT (compact, always present) ===
     if is_ide:
@@ -12297,6 +12653,15 @@ you may occasionally append exactly one of these to the absolute end of your res
                 "FLAG{...} exists. a clean target = \"no exploitable findings\", not "
                 "\"0 flags\". only cite a FLAG{...} if a tool result actually contains one."
             )
+        if _sandbox_ready_cached():
+            parts.append(
+                "sandbox: an isolated Linux guest is available via sandbox_run(command, cwd?). "
+                "PREFER it for two things: running offensive/recon tools (nmap, sqlmap, binwalk), "
+                "and — most importantly — unpacking or analyzing UNTRUSTED files pulled back from "
+                "a target (firmware images, malware samples, archives), so a booby-trapped file "
+                "cannot compromise the host. The workspace is visible inside at /mnt/<drive>/... ; "
+                "pass cwd as a Windows path. Ordinary host tasks still use run_powershell."
+            )
 
     # === MEMORIES (most useful only, not all) ===
     mems = _select_memories_for_prompt()
@@ -12327,6 +12692,16 @@ you may occasionally append exactly one of these to the absolute end of your res
         parts.append("workspace:\n" + "\n".join(f"- {f}" for f in ws))
     else:
         parts.append("workspace: none (file tools will refuse)")
+
+    # Today's date — placed LAST, not at the top. It changes daily while
+    # everything before it stays byte-identical, so keeping it out of the
+    # prompt's cacheable PREFIX means a new day reprefills only this short tail
+    # instead of the whole static system prompt. (llama-server prompt-cache
+    # reuse keys on the longest unchanged prefix; mutable content up front is
+    # the classic cache killer.) Still rounds the model's time awareness up to
+    # the actual day so it doesn't answer date-relative questions from its
+    # training cutoff.
+    parts.append(f"current date: {time.strftime('%A, %B %d, %Y')}")
 
     return "\n".join(parts)
 
@@ -12422,6 +12797,15 @@ _ASKS_TO_CONTINUE_RE = re.compile(
     r"(?:shall|should|may|can)\s+i\s|do\s+you\s+want\s+me\s+to|"
     r"want\s+me\s+to\s+(?:continue|proceed)|ready\s+to\s+(?:continue|proceed)",
     re.IGNORECASE,
+)
+
+# Chat turn-boundary markers. When a model fails to stop at the end of its turn
+# and rolls straight into a new one (Qwen3.6 Q4 in particular emits these as
+# LITERAL text instead of the special stop token, so llama-server's own stop
+# never fires and it re-answers forever), these let the stream loop cut it off.
+_TURN_BOUNDARY_STOPS = ["<|im_end|>", "<|im_start|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>"]
+_TURN_BOUNDARY_RE = re.compile(
+    r"<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|eot_id\|>|<\|end_of_text\|>"
 )
 
 def _looks_unfinished(text: str) -> bool:
@@ -12582,16 +12966,44 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 tpl_kwargs["thinking_budget"] = tb_int
             if tpl_kwargs:
                 payload["chat_template_kwargs"] = tpl_kwargs
+            # Hard turn-boundary stops. Belt-and-suspenders for models (Qwen3.6
+            # Q4 seen doing this) that sail past their own end-of-turn token and
+            # re-answer forever — llama-server halts server-side the instant one
+            # of these literal markers appears, instead of running to n_ctx.
+            payload["stop"] = list(_TURN_BOUNDARY_STOPS)
             if use_tools and native_tools:
                 payload["tools"] = tools_for_llama()
                 payload["tool_choice"] = "auto"
 
-            try:
-                resp = llama_post_stream("/v1/chat/completions", payload)
-            except Exception as e:
-                emit({"type": "error",
-                      "error": f"llama-server unreachable at {LLAMA}: {e}. "
-                               f"Start it with: llama-server -m <model.gguf> --host 127.0.0.1 --port 8080 --jinja"})
+            # Open the stream. If the prompt overflows n_ctx (--no-context-shift
+            # makes the server reject rather than slide the window), trim older
+            # turns harder and retry instead of failing the whole turn — the
+            # tools-overhead estimate above can undershoot the real inlined spec.
+            resp = None
+            for _ctx_attempt in range(4):
+                try:
+                    resp = llama_post_stream("/v1/chat/completions", payload)
+                    break
+                except Exception as e:
+                    if _ctx_attempt < 3 and _is_ctx_overflow(e):
+                        pad = max(2048, int(ctx_limit * 0.12)) * (_ctx_attempt + 1)
+                        tighter = min(effective_reserve + pad, ctx_limit - 1024)
+                        trimmed = truncate_messages(conversation, ctx_limit, reserve=tighter)
+                        payload["messages"] = _sanitize_messages_for_openai(trimmed)
+                        emit({"type": "notice",
+                              "note": "prompt exceeded the context window — trimmed older turns and retrying"})
+                        continue
+                    if _is_ctx_overflow(e):
+                        emit({"type": "error",
+                              "error": ("prompt still exceeds the context window after trimming — the system "
+                                        "prompt + tool specs alone are near your num_ctx. Raise num_ctx in "
+                                        "Settings, or turn off some tools for this turn.")})
+                    else:
+                        emit({"type": "error",
+                              "error": f"llama-server request failed at {LLAMA}: {e}. Is it running? "
+                                       f"Start it with: llama-server -m <model.gguf> --host 127.0.0.1 --port 8080 --jinja"})
+                    return None
+            if resp is None:
                 return None
             _set_cancel_resp(chat_id, resp)
 
@@ -12603,6 +13015,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # only recognizes inline <think>…</think>, so we re-wrap here and
             # forward as one continuous stream.
             reasoning_open = False
+            runaway_stop = False   # tripped if a turn-boundary marker leaks into the answer
             # Harness-enforced thinking budget. The model's chat template often
             # IGNORES thinking_budget (Qwen3.6 ran 48k tokens on a 2048 cap), so
             # we count reasoning chars ourselves and force-close a runaway.
@@ -12671,12 +13084,23 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                                 break
                     piece = delta.get("content") or ""
                     if piece:
+                        # Runaway guard: if a turn-boundary marker slips through
+                        # as content, llama-server's own stop didn't fire and the
+                        # model is rolling into a fresh turn to re-answer. Keep
+                        # everything before the marker and cut the stream here.
+                        _b = _TURN_BOUNDARY_RE.search(piece)
+                        if _b:
+                            piece = piece[:_b.start()]
+                            runaway_stop = True
                         if reasoning_open:
                             content_buf.append("</think>")
                             emit({"type": "delta", "content": "</think>"})
                             reasoning_open = False
-                        content_buf.append(piece)
-                        emit({"type": "delta", "content": piece})
+                        if piece:
+                            content_buf.append(piece)
+                            emit({"type": "delta", "content": piece})
+                        if runaway_stop:
+                            break
                     # tool-call deltas come as partial fragments — `arguments`
                     # is a string that concatenates into a JSON blob across
                     # many chunks.
@@ -13388,6 +13812,463 @@ def download_and_extract_llama(build_type: str):
             })
 
 
+# ---- WSL sandbox: isolated Linux guest for loot / offensive tooling ---------
+#
+# Why this exists: in a red-team run the exploits execute on the TARGET, not
+# here - the only local risk is (a) parsing untrusted loot (firmware / binaries
+# pulled back from a target) with local tools, and (b) the agent being steered
+# by target content into touching the host. This provides an opt-in,
+# kernel-isolated Ubuntu guest, `accuretta-sbx`, created via `wsl --import` so
+# it never touches the user's other distros and needs no interactive first-run
+# (imported distros default to root). The Windows workspace is visible inside
+# at /mnt/... so tools operate on the same files; we translate with wslpath.
+#
+# Frictionless by design: on a machine that already has WSL2 there is no reboot
+# and no admin - just download a clean rootfs, import it, apt-install a toolset.
+# The only un-automatable steps exist solely when WSL itself is ABSENT: one UAC
+# prompt + one reboot for `wsl --install` (a Windows constraint), plus firmware
+# virtualization if it happens to be off. The setup wizard surfaces those
+# explicitly rather than failing cryptically.
+
+SANDBOX_DISTRO = "accuretta-sbx"
+SANDBOX_DIR = DATA / "sandbox"                  # holds the distro's ext4.vhdx
+SANDBOX_STATE_FILE = DATA / "sandbox_state.json"
+# Ubuntu cloud rootfs (URLs verified live). `.tar.xz` - we decompress to `.tar`
+# before import because `wsl --import` does not reliably accept xz. Tried in
+# order; first reachable one wins.
+SANDBOX_ROOTFS_URLS = [
+    "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64-root.tar.xz",
+    "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64-root.tar.xz",
+    "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64-root.tar.xz",
+]
+# Kept modest so the first provision is minutes, not an hour. The agent can
+# apt-install more on demand once the guest is up.
+SANDBOX_APT_TOOLS = [
+    "ca-certificates", "curl", "wget", "git", "python3", "python3-pip",
+    "file", "unzip", "xxd", "binutils", "binwalk", "sqlmap", "nmap",
+]
+
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+SANDBOX_LOCK = threading.Lock()
+SANDBOX_PROGRESS = {
+    "status": "idle",   # idle|downloading|extracting|importing|provisioning|done|failed
+    "step": "",         # human-readable current step
+    "pct": 0,           # 0..100 best-effort
+    "log": [],          # ring buffer of setup output lines
+    "error": "",
+}
+
+
+def _sbx_set(**kw):
+    with SANDBOX_LOCK:
+        SANDBOX_PROGRESS.update(kw)
+
+
+def _sbx_log(msg: str):
+    line = str(msg).rstrip()
+    if not line:
+        return
+    with SANDBOX_LOCK:
+        SANDBOX_PROGRESS["log"].append(line)
+        if len(SANDBOX_PROGRESS["log"]) > 300:
+            del SANDBOX_PROGRESS["log"][:-300]
+    try:
+        print("[sandbox]", line, flush=True)
+    except Exception:
+        pass
+
+
+def _wsl_exe() -> str:
+    return shutil.which("wsl") or "wsl"
+
+
+def _wsl_run(args, timeout=60):
+    """Run a wsl.exe command, return (returncode, combined_output).
+    WSL_UTF8=1 makes wsl.exe emit UTF-8 (its native output is UTF-16LE, which
+    otherwise arrives full of NUL bytes)."""
+    env = dict(os.environ)
+    env["WSL_UTF8"] = "1"
+    try:
+        r = subprocess.run([_wsl_exe(), *args], capture_output=True, text=True,
+                           timeout=timeout, env=env, creationflags=_NO_WINDOW,
+                           encoding="utf-8", errors="replace")
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+    except FileNotFoundError:
+        return 127, "wsl not found"
+    except Exception as e:
+        return 1, str(e)
+
+
+def _wsl_bash(distro, script, timeout=120):
+    """Run a bash script as root inside `distro`, passing it over STDIN.
+
+    Critical: wsl.exe performs its own $VAR substitution on command-line
+    arguments (expanding undefined vars to empty and ignoring bash quoting), so
+    passing a script via `bash -lc "<script>"` silently corrupts anything with
+    shell variables — `for t in ...; do ... $t ...` yields empty `$t`, and even
+    single-quoted `$t` gets stripped. Feeding the script through stdin bypasses
+    that arg mangling completely. Returns (returncode, combined_output)."""
+    env = dict(os.environ)
+    env["WSL_UTF8"] = "1"
+    try:
+        r = subprocess.run([_wsl_exe(), "-d", distro, "-u", "root", "--", "bash", "-l"],
+                           input=script, capture_output=True, text=True, timeout=timeout,
+                           env=env, creationflags=_NO_WINDOW, encoding="utf-8", errors="replace")
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+    except FileNotFoundError:
+        return 127, "wsl not found"
+    except Exception as e:
+        return 1, str(e)
+
+
+def _wsl_in(distro, script, timeout=120):
+    """Run a bash script as root inside a distro (stdin-fed, see _wsl_bash)."""
+    return _wsl_bash(distro, script, timeout=timeout)
+
+
+def _wsl_distros() -> list:
+    """Names of installed distros (empty if WSL absent)."""
+    rc, out = _wsl_run(["-l", "-q"], timeout=15)
+    if rc != 0:
+        return []
+    names = []
+    for line in out.replace("\x00", "").splitlines():
+        n = line.strip()
+        if n and not n.lower().startswith("windows subsystem"):
+            names.append(n)
+    return names
+
+
+def wsl_probe() -> dict:
+    """Cheap snapshot of WSL + sandbox state for the setup wizard and settings.
+    Safe to call on a poll."""
+    info = {
+        "wsl_installed": False, "wsl_version": "", "kernel": "",
+        "distros": [], "sandbox_distro": SANDBOX_DISTRO,
+        "sandbox_present": False, "sandbox_provisioned": False,
+        "ready": False, "state": "no_wsl", "provision": None,
+    }
+    rc, out = _wsl_run(["--version"], timeout=15)
+    if rc == 0 and out.strip():
+        info["wsl_installed"] = True
+        for line in out.splitlines():
+            low = line.lower()
+            if "wsl version" in low:
+                info["wsl_version"] = line.split(":", 1)[-1].strip()
+            elif "kernel version" in low:
+                info["kernel"] = line.split(":", 1)[-1].strip()
+    else:
+        rc2, _ = _wsl_run(["--status"], timeout=15)
+        info["wsl_installed"] = (rc2 == 0)
+    if info["wsl_installed"]:
+        info["distros"] = _wsl_distros()
+        info["sandbox_present"] = SANDBOX_DISTRO in info["distros"]
+    st = load_json(SANDBOX_STATE_FILE, {})
+    info["sandbox_provisioned"] = bool(st.get("provisioned")) and info["sandbox_present"]
+    if not info["wsl_installed"]:
+        info["state"] = "no_wsl"
+    elif not info["sandbox_present"]:
+        info["state"] = "no_distro"
+    elif not info["sandbox_provisioned"]:
+        info["state"] = "present_unprovisioned"
+    else:
+        info["state"] = "ready"
+    info["ready"] = info["state"] == "ready"
+    with SANDBOX_LOCK:
+        info["provision"] = dict(SANDBOX_PROGRESS, log=list(SANDBOX_PROGRESS["log"][-40:]))
+    return info
+
+
+def _sbx_download_rootfs(dest) -> None:
+    """Download the Ubuntu rootfs with live progress, trying URLs in order."""
+    last_err = ""
+    for url in SANDBOX_ROOTFS_URLS:
+        try:
+            _sbx_set(status="downloading", step="Downloading Ubuntu rootfs...", pct=0)
+            _sbx_log(f"GET {url}")
+            req = urllib.request.Request(url, headers={"User-Agent": "AccurettaSandbox/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                total = int(resp.info().get("Content-Length", 0))
+                written = 0
+                last = time.time()
+                last_b = 0
+                with open(dest, "wb") as f:
+                    while True:
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        written += len(chunk)
+                        now = time.time()
+                        if now - last >= 0.5:
+                            pct = int(written * 100 / total) if total else 0
+                            spd = (written - last_b) / (now - last)
+                            mb = written // (1024 * 1024)
+                            tot = f" / {total // (1024*1024)}MB" if total else ""
+                            _sbx_set(status="downloading", pct=pct,
+                                     step=f"Downloading rootfs - {mb}MB{tot} ({spd/(1024*1024):.1f} MB/s)")
+                            last, last_b = now, written
+            _sbx_log(f"Downloaded {written // (1024*1024)}MB")
+            return
+        except Exception as e:
+            last_err = str(e)
+            _sbx_log(f"download failed for {url}: {e}")
+    raise RuntimeError(f"all rootfs URLs failed: {last_err}")
+
+
+def _sbx_decompress_xz(src, dst) -> None:
+    import lzma
+    with lzma.open(src, "rb") as fi, open(dst, "wb") as fo:
+        while True:
+            chunk = fi.read(1024 * 1024)
+            if not chunk:
+                break
+            fo.write(chunk)
+
+
+def _sbx_stream_provision(script, timeout=1800) -> int:
+    """Run a provisioning script in the guest, streaming stdout into the log."""
+    env = dict(os.environ)
+    env["WSL_UTF8"] = "1"
+    cmd = [_wsl_exe(), "-d", SANDBOX_DISTRO, "-u", "root", "--", "bash", "-lc", script]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, env=env, creationflags=_NO_WINDOW, bufsize=1,
+                         encoding="utf-8", errors="replace")
+    t0 = time.time()
+    try:
+        for line in p.stdout:
+            _sbx_log(line.rstrip())
+            if time.time() - t0 > timeout:
+                p.kill()
+                _sbx_log("provision timed out")
+                break
+        p.wait(timeout=30)
+    finally:
+        try:
+            p.stdout.close()
+        except Exception:
+            pass
+    return p.returncode if p.returncode is not None else 1
+
+
+def _sbx_provision_thread(reinstall: bool = False) -> None:
+    """Background orchestrator: download -> decompress -> import -> apt-provision.
+    Idempotent and resumable - skips stages already complete."""
+    try:
+        _sbx_set(status="downloading", step="Checking WSL...", pct=0, error="")
+        probe = wsl_probe()
+        if not probe["wsl_installed"]:
+            _sbx_set(status="failed", step="WSL not installed",
+                     error="WSL is not installed. Open an elevated PowerShell, run "
+                           "`wsl --install`, reboot once, then retry.")
+            return
+
+        os.makedirs(SANDBOX_DIR, exist_ok=True)
+        have = SANDBOX_DISTRO in _wsl_distros()
+
+        if have and reinstall:
+            _sbx_log(f"Removing existing {SANDBOX_DISTRO} for a clean reinstall...")
+            _wsl_run(["--terminate", SANDBOX_DISTRO], timeout=60)
+            _wsl_run(["--unregister", SANDBOX_DISTRO], timeout=120)
+            have = False
+
+        if not have:
+            tar_xz = SANDBOX_DIR / "rootfs.tar.xz"
+            tar_path = SANDBOX_DIR / "rootfs.tar"
+            _sbx_download_rootfs(tar_xz)
+            _sbx_set(status="extracting", step="Decompressing rootfs (xz -> tar)...", pct=0)
+            _sbx_log("Decompressing rootfs...")
+            _sbx_decompress_xz(tar_xz, tar_path)
+            try:
+                os.remove(tar_xz)
+            except Exception:
+                pass
+            _sbx_set(status="importing", step="Creating isolated distro...", pct=0)
+            _sbx_log(f"wsl --import {SANDBOX_DISTRO}")
+            rc, out = _wsl_run(["--import", SANDBOX_DISTRO, str(SANDBOX_DIR),
+                                str(tar_path), "--version", "2"], timeout=600)
+            _sbx_log((out or "").strip() or f"import rc={rc}")
+            if rc != 0 or SANDBOX_DISTRO not in _wsl_distros():
+                _sbx_set(status="failed", step="Import failed",
+                         error=f"wsl --import failed (rc={rc}): {(out or '').strip()[:400]}")
+                return
+            try:
+                os.remove(tar_path)
+            except Exception:
+                pass
+        else:
+            _sbx_log(f"{SANDBOX_DISTRO} already imported - provisioning only.")
+
+        _sbx_set(status="provisioning", step="Installing toolset (apt)...", pct=0)
+        save_json(SANDBOX_STATE_FILE, {"provisioned": False, "distro": SANDBOX_DISTRO,
+                                       "updated": time.time()})
+        tools = " ".join(SANDBOX_APT_TOOLS)
+        script = (
+            "set -e; export DEBIAN_FRONTEND=noninteractive; "
+            # A fresh Ubuntu cloud rootfs ships /etc/resolv.conf as a symlink to a
+            # systemd-resolved path that isn't running under WSL, so DNS is dead
+            # and apt fails. Drop the dangling symlink and write a static resolver
+            # for this session; once the symlink is gone WSL auto-generates a
+            # working resolv.conf on later boots.
+            "rm -f /etc/resolv.conf; "
+            "printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf; "
+            "echo '== apt-get update =='; apt-get update; "
+            f"echo '== installing: {tools} =='; "
+            f"apt-get install -y --no-install-recommends {tools}; "
+            "apt-get clean; echo PROVISION_DONE"
+        )
+        _sbx_stream_provision(script, timeout=1800)
+
+        rc, out = _wsl_in(SANDBOX_DISTRO, "echo ACCURETTA_SBX_OK", timeout=60)
+        if "ACCURETTA_SBX_OK" not in out:
+            _sbx_set(status="failed", step="Verification failed",
+                     error=(out or "").strip()[:400])
+            return
+        save_json(SANDBOX_STATE_FILE, {"provisioned": True, "distro": SANDBOX_DISTRO,
+                                       "tools": SANDBOX_APT_TOOLS, "updated": time.time()})
+        _sbx_set(status="done", step="Sandbox ready.", pct=100)
+        _sbx_log("Sandbox ready.")
+        broadcast_event({"type": "sandbox:update"})
+    except Exception as e:
+        _sbx_set(status="failed", step="Error", error=str(e))
+        _sbx_log(f"ERROR: {e}")
+
+
+def start_sandbox_setup(reinstall: bool = False) -> dict:
+    """Kick off provisioning in a background thread unless one is already live."""
+    with SANDBOX_LOCK:
+        busy = SANDBOX_PROGRESS["status"] in ("downloading", "extracting", "importing", "provisioning")
+    if busy:
+        return {"started": False, "reason": "already running"}
+    _sbx_set(status="downloading", step="Starting...", pct=0, error="", log=[])
+    threading.Thread(target=_sbx_provision_thread, args=(reinstall,), daemon=True).start()
+    return {"started": True}
+
+
+def _win_to_wsl_path(p: str) -> str:
+    """Translate a Windows path to its /mnt/... path inside the guest."""
+    if not p:
+        return "~"
+    rc, out = _wsl_run(["-d", SANDBOX_DISTRO, "-u", "root", "--", "wslpath", "-u", p], timeout=20)
+    if rc == 0 and out.strip():
+        return out.strip().splitlines()[0]
+    m = re.match(r"^([A-Za-z]):[\\/](.*)$", p)
+    if m:
+        return "/mnt/" + m.group(1).lower() + "/" + m.group(2).replace("\\", "/")
+    return p
+
+
+def sandbox_run(command: str, cwd: str = "", timeout: int = 300) -> dict:
+    """Run a shell command inside the isolated accuretta-sbx guest. Windows
+    workspace paths are visible at /mnt/... ; pass cwd as a Windows path and it
+    is translated. This is the execution primitive the model-facing sandbox
+    tool / auto-routing will build on."""
+    probe = wsl_probe()
+    if not probe["ready"]:
+        return {"error": f"sandbox not ready (state={probe['state']}). Set it up in Settings -> Sandbox.",
+                "state": probe["state"]}
+    wsl_cwd = _win_to_wsl_path(cwd) if cwd else ""
+    prefix = f"cd {shlex.quote(wsl_cwd)} 2>/dev/null; " if wsl_cwd else ""
+    rc, out = _wsl_bash(SANDBOX_DISTRO, prefix + command, timeout=timeout)
+    return {"exit_code": rc, "output": (out or "")[-20000:], "distro": SANDBOX_DISTRO,
+            "cwd": wsl_cwd or "~"}
+
+
+def sandbox_selftest() -> dict:
+    """Canned diagnostic used by the Settings 'Test' button - never runs
+    client-supplied commands, just proves the guest is alive and tooled."""
+    probe = wsl_probe()
+    if not probe["ready"]:
+        return {"ok": False, "state": probe["state"],
+                "error": "sandbox not ready - set it up first."}
+    rc, out = _wsl_in(SANDBOX_DISTRO,
+                      "uname -a; echo '---'; for t in python3 nmap sqlmap binwalk file git; do "
+                      "printf '%-10s ' \"$t\"; (command -v $t || echo 'missing'); done",
+                      timeout=60)
+    return {"ok": rc == 0, "output": (out or "").strip()[-4000:], "exit_code": rc}
+
+
+# --- model-facing sandbox tool ----------------------------------------------
+# `sandbox_run` is only advertised to the model once the guest is provisioned
+# (see _active_tools). Probing WSL is a subprocess, too slow to run every turn,
+# so readiness is cached with a short TTL and short-circuited by the state file
+# (no probe at all until the user has actually provisioned).
+_SBX_READY_CACHE = {"t": 0.0, "ready": False}
+
+
+def _sandbox_ready_cached(ttl: float = 30.0) -> bool:
+    now = time.time()
+    if now - _SBX_READY_CACHE["t"] < ttl:
+        return _SBX_READY_CACHE["ready"]
+    if not load_json(SANDBOX_STATE_FILE, {}).get("provisioned"):
+        _SBX_READY_CACHE.update(t=now, ready=False)
+        return False
+    ready = bool(wsl_probe().get("ready"))
+    _SBX_READY_CACHE.update(t=now, ready=ready)
+    return ready
+
+
+def tool_sandbox_run(args: dict) -> dict:
+    """Run a shell command inside the isolated accuretta-sbx Linux guest. Gated
+    the same way as run_powershell: catastrophic commands are hard-refused, and
+    write/modify commands need approval. The guest is kernel-isolated from the
+    host except the workspace, which is visible at /mnt/... — so a delete
+    targeting /mnt IS a delete of the user's real files, hence the same guards."""
+    command = (args.get("command") or "").strip()
+    if not command:
+        return {"error": "empty command"}
+    catastrophic = _catastrophic_cmd(command)
+    if catastrophic:
+        return {
+            "error": (
+                f"refused: this command {catastrophic}. Even inside the sandbox, "
+                "/mnt/<drive> is a window into the user's real filesystem, so this "
+                "is hard-blocked. Run it yourself if you truly intend it."
+            ),
+            "refused_command": command,
+            "catastrophic": True,
+        }
+    if needs_approval(command):
+        approval = request_approval(
+            title="Sandbox command (write/modify)",
+            command=command,
+            details={"kind": "sandbox", "distro": SANDBOX_DISTRO},
+        )
+        if approval.get("decision") != "approve":
+            return {"error": f"user denied sandbox command ({approval.get('status')})"}
+    return sandbox_run(command, cwd=(args.get("cwd") or ""), timeout=int(args.get("timeout", 300)))
+
+
+TOOLS["sandbox_run"] = {
+    "description": (
+        "Run a shell command inside an ISOLATED Ubuntu Linux guest (kernel-isolated "
+        "from the host via WSL2). Use this for anything that shouldn't touch the host "
+        "directly: running offensive/recon tools (nmap, sqlmap, binwalk), and — most "
+        "importantly — unpacking or analyzing UNTRUSTED files pulled back from a target "
+        "(firmware images, malware samples, archives) so a booby-trapped file can't "
+        "compromise the user's machine. The user's workspace is visible inside the guest "
+        "at /mnt/<drive>/... ; pass `cwd` as a normal Windows path and it is translated. "
+        "Runs as root. Read-only commands run freely; write/modify commands require approval; "
+        "commands that would wipe a drive are refused. Preinstalled: python3, nmap, sqlmap, "
+        "binwalk, binutils, file, xxd, unzip, git, curl (apt-get more as needed)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "Bash command line to run inside the guest."},
+            "cwd": {"type": "string", "description": "Optional working directory as a Windows path (e.g. the workspace folder); translated to /mnt/..."},
+            "timeout": {"type": "integer", "description": "seconds, default 300"},
+        },
+        "required": ["command"],
+    },
+    "fn": tool_sandbox_run,
+}
+
+
 # ---- HTTP handler ----------------------------------------------------------
 
 MIME = {
@@ -13428,9 +14309,57 @@ class Handler(BaseHTTPRequestHandler):
     # ---- helpers
 
     def _set_cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE,PUT,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        # Same-origin only: the UI is served by THIS bridge, so it needs no CORS.
+        # Advertising Access-Control-Allow-Origin:* let any website you visit read
+        # the agent's responses / drive it from your browser — deliberately gone.
+        return
+
+    def _host_ok(self) -> bool:
+        # DNS-rebinding defense. Legit access is always via localhost or an IP
+        # literal (LAN or Tailscale). A Host header that's a DOMAIN NAME is the
+        # signature of a rebinding attack aimed at this port, so reject it.
+        host = (self.headers.get("Host") or "").strip()
+        if not host:
+            return True
+        if host.startswith("["):                       # IPv6, e.g. [::1]:8787
+            hostname = host[1:host.find("]")] if "]" in host else host[1:]
+        else:
+            hostname = host.split(":", 1)[0]
+        hostname = hostname.strip().lower()
+        # localhost + Tailscale MagicDNS names (….ts.net is Tailscale-owned, not
+        # publicly registrable, so it can't be used to rebind at your machine).
+        if hostname == "localhost" or hostname.endswith(".ts.net"):
+            return True
+        import ipaddress
+        try:
+            ipaddress.ip_address(hostname)             # any IP literal is fine
+            return True
+        except ValueError:
+            return False
+
+    def _peer_ok(self) -> bool:
+        # Only THIS machine (loopback) or YOUR Tailnet (Tailscale's
+        # 100.64.0.0/10 and fd7a:115c:a1e0::/48 ranges) may connect. Everyone
+        # else on the local network — untrusted Wi-Fi and the like — is refused.
+        # Tailscale already proves the remote device is yours, so no password is
+        # needed. client_address is the real TCP peer; it can't be forged.
+        import ipaddress
+        try:
+            ip = ipaddress.ip_address((self.client_address or ("",))[0])
+        except (ValueError, IndexError, TypeError):
+            return False
+        if ip.is_loopback:
+            return True
+        for cidr in ("100.64.0.0/10", "fd7a:115c:a1e0::/48"):
+            try:
+                if ip in ipaddress.ip_network(cidr):
+                    return True
+            except ValueError:
+                pass
+        return False
+
+    def _request_ok(self) -> bool:
+        return self._peer_ok() and self._host_ok()
 
     def _send_json(self, status: int, obj: Any):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -13483,6 +14412,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         p = parsed.path
+        if not self._request_ok():
+            return self._send_json(403, {"error": "forbidden"})
         try:
             if p == "/" or p == "":
                 return self._serve_static("index.html")
@@ -13499,6 +14430,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         p = parsed.path
+        if not self._request_ok():
+            return self._send_json(403, {"error": "forbidden"})
         try:
             if p.startswith("/api/"):
                 return self._handle_api_post(p, parsed)
@@ -13510,6 +14443,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         parsed = urllib.parse.urlparse(self.path)
         p = parsed.path
+        if not self._request_ok():
+            return self._send_json(403, {"error": "forbidden"})
         try:
             if p.startswith("/api/chats/"):
                 cid = p.split("/")[-1]
@@ -13556,6 +14491,30 @@ class Handler(BaseHTTPRequestHandler):
                 # legacy alias so older frontend builds don't break
                 "ollama": LLAMA,
             })
+        if p == "/api/llama-log":
+            # Live tail of the llama.cpp backend's stdout/stderr — powers the
+            # Backend terminal tab so model loads/reloads show real progress.
+            qs = urllib.parse.parse_qs(parsed.query)
+            try:
+                tail = int(qs.get("tail", ["400"])[0])
+            except Exception:
+                tail = 400
+            return self._send_json(200, _llama.read_log(max(1, min(tail, 800))))
+        if p == "/api/session/list":
+            return self._send_json(200, {"sessions": _session_mgr.list()})
+        if p == "/api/session/read":
+            qs = urllib.parse.parse_qs(parsed.query)
+            sid = (qs.get("id", [""])[0] or "").strip()
+            try:
+                since = int(qs.get("since", ["0"])[0])
+            except Exception:
+                since = 0
+            s = _session_mgr.get(sid)
+            if not s:
+                return self._send_json(404, {"error": "no such session", "alive": False})
+            out, offset = s.read_since(since)
+            return self._send_json(200, {"output": out, "offset": offset, "alive": s.alive(),
+                                         "exit_code": s.exit_code(), "command": s.command})
         if p == "/api/models":
             # List .gguf files under settings.models_dir. Each entry includes a
             # `loaded` flag so the UI can highlight the active model.
@@ -13580,6 +14539,37 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, get_settings())
         if p == "/api/workspace":
             return self._send_json(200, get_workspace())
+        if p == "/api/workspace/files":
+            # Flat, bounded file list across all workspace folders — powers the
+            # @-mention picker in the composer. Skips heavy/vendor dirs.
+            skip = ("/node_modules/", "/.git/", "/__pycache__/", "/.venv/",
+                    "/venv/", "/dist/", "/build/", "/.next/", "/.cache/")
+            ws = get_workspace()
+            out = []
+            seen = set()
+            for root in (ws.get("folders") or []):
+                if len(out) >= 4000:
+                    break
+                try:
+                    base = Path(root)
+                    for f in safe_rglob_files(root, "*", max_depth=8):
+                        ap = str(f.resolve())
+                        if ap in seen:
+                            continue
+                        seen.add(ap)
+                        try:
+                            rel = str(f.relative_to(base)).replace("\\", "/")
+                        except Exception:
+                            rel = f.name
+                        if any(sd in ("/" + rel) for sd in skip):
+                            continue
+                        out.append({"name": f.name, "rel": rel, "path": ap})
+                        if len(out) >= 4000:
+                            break
+                except Exception:
+                    continue
+            out.sort(key=lambda m: m["rel"].lower())
+            return self._send_json(200, {"files": out, "count": len(out), "truncated": len(out) >= 4000})
         if p == "/api/link_preview":
             # Hover-preview support for clickable links inside chat bubbles.
             # Lightweight: fetches the page, pulls Open Graph + <title>, caches
@@ -13806,6 +14796,8 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/setup/download-status":
             with DOWNLOAD_LOCK:
                 return self._send_json(200, DOWNLOAD_STATE)
+        if p == "/api/sandbox/status":
+            return self._send_json(200, wsl_probe())
         if p == "/api/setup/detect":
             # Scan for llama-server.exe in common locations and list available models.
             # Returns data for the initial setup wizard so new users don't have to
@@ -13871,6 +14863,21 @@ class Handler(BaseHTTPRequestHandler):
             build_type = body.get("build_type", "CPU")
             threading.Thread(target=download_and_extract_llama, args=(build_type,), daemon=True).start()
             return self._send_json(200, {"success": True})
+        if p == "/api/sandbox/setup":
+            return self._send_json(200, start_sandbox_setup(reinstall=bool(body.get("reinstall"))))
+        if p == "/api/sandbox/test":
+            return self._send_json(200, sandbox_selftest())
+        if p == "/api/sandbox/remove":
+            _wsl_run(["--terminate", SANDBOX_DISTRO], timeout=60)
+            rc, out = _wsl_run(["--unregister", SANDBOX_DISTRO], timeout=120)
+            try:
+                if SANDBOX_STATE_FILE.exists():
+                    SANDBOX_STATE_FILE.unlink()
+            except Exception:
+                pass
+            _sbx_set(status="idle", step="", pct=0, error="", log=[])
+            broadcast_event({"type": "sandbox:update"})
+            return self._send_json(200, {"removed": rc == 0, "output": (out or "").strip()[:400]})
         if p == "/api/settings":
             cur = get_settings()
             cur.update({k: v for k, v in body.items() if k in DEFAULT_SETTINGS})
@@ -14028,6 +15035,18 @@ class Handler(BaseHTTPRequestHandler):
                 "loaded_model": loaded,
                 "models": files,
             })
+        if p == "/api/session/send":
+            # The human operator typing into the shared session — no approval
+            # gate here (that's the user at their own keyboard, not the model).
+            sid = (body.get("id") or body.get("session_id") or "").strip()
+            s = _session_mgr.get(sid)
+            if not s:
+                return self._send_json(404, {"error": "no such session"})
+            ok = s.send(str(body.get("input", "")), enter=bool(body.get("enter", True)))
+            return self._send_json(200, {"ok": ok, "alive": s.alive()})
+        if p == "/api/session/stop":
+            sid = (body.get("id") or body.get("session_id") or "").strip()
+            return self._send_json(200, {"stopped": _session_mgr.stop(sid)})
         if p == "/api/models/load":
             # Switch the active model. Kills current llama-server, spawns new.
             target = (body.get("path") or "").strip()
@@ -15491,8 +16510,18 @@ def find_mmproj_for(model_path: str) -> str:
     return ""
 
 
+def _is_mmproj_name(name: str) -> bool:
+    """A vision projector (mmproj) is a .gguf that belongs to a multimodal model
+    — it's loaded via --mmproj alongside the real model, not runnable on its own.
+    Match the common naming so these stay out of the model picker."""
+    l = (name or "").lower()
+    return "mmproj" in l or "mm-proj" in l or "mm_proj" in l
+
+
 def scan_gguf_dir(root: str) -> list[dict]:
-    """List .gguf files under root (recursive). Returns [{name,path,size,modified_at}]."""
+    """List selectable .gguf models under root (recursive). Vision projectors
+    (mmproj) are excluded — they're part of another model, not something you can
+    load on its own. Returns [{name,path,size,modified_at}]."""
     if not root:
         return []
     try:
@@ -15501,6 +16530,8 @@ def scan_gguf_dir(root: str) -> list[dict]:
         return []
     out = []
     for p in files:
+        if _is_mmproj_name(p.name):
+            continue
         try:
             st = p.stat()
             out.append({
@@ -15589,6 +16620,8 @@ def find_all_gguf_files() -> list[dict]:
         try:
             found = safe_rglob_files(root, "*.gguf", max_depth=6)
             for p in found:
+                if _is_mmproj_name(p.name):
+                    continue   # vision projector, not a selectable model
                 p_abs = str(p.resolve())
                 if p_abs not in seen_files:
                     seen_files.add(p_abs)
@@ -15663,6 +16696,12 @@ class LlamaProcess:
         # args while the user's new one is still loading. Cleared in a
         # finally so it's always released, even on spawn failure.
         self._starting = False
+        # Ring buffer of the child's combined stdout/stderr, drained by a daemon
+        # reader thread, so the UI can show the llama.cpp backend (model-load
+        # progress, errors) instead of a hidden or stray console window.
+        self._log_lines: list[str] = []
+        self._log_lock = threading.Lock()
+        self._log_reader: Optional[threading.Thread] = None
 
     def loaded_model(self) -> str:
         with self._lock:
@@ -15679,6 +16718,34 @@ class LlamaProcess:
     def is_running(self) -> bool:
         with self._lock:
             return self._proc is not None and self._proc.poll() is None
+
+    def _append_log(self, line: str) -> None:
+        with self._log_lock:
+            self._log_lines.append(line)
+            if len(self._log_lines) > 800:
+                del self._log_lines[:-800]
+
+    def _start_log_reader(self, proc: "subprocess.Popen") -> None:
+        # Drain the child's combined stdout/stderr into the ring buffer. Daemon
+        # thread; ends on EOF when the process exits or is respawned.
+        def _pump():
+            try:
+                if not proc.stdout:
+                    return
+                for raw in iter(proc.stdout.readline, ""):
+                    self._append_log(raw.rstrip("\r\n"))
+            except Exception:
+                pass
+        t = threading.Thread(target=_pump, name="llama-log", daemon=True)
+        t.start()
+        self._log_reader = t
+
+    def read_log(self, tail: int = 400) -> dict:
+        running = self.is_running()
+        model = self.loaded_model()
+        with self._log_lock:
+            lines = list(self._log_lines[-tail:])
+        return {"running": running, "model": model, "lines": lines}
 
     def stop(self, timeout: float = 5.0) -> bool:
         with self._lock:
@@ -15998,6 +17065,15 @@ class LlamaProcess:
             "-ub", str(n_ubatch),
             "--cache-type-k", kv_type,
             "--cache-type-v", kv_type,
+            # NOTE: we deliberately do NOT pass --cache-reuse. Its KV-shift reuse
+            # corrupts positional info on some models (repetition / looping),
+            # most visibly right after a large tool result — web_fetch/web_search
+            # page text — reshapes the middle of the context. It also gave the
+            # MTP model this box runs zero benefit (llama-server auto-disables it
+            # there: "cache_reuse is not supported by this context"). Net: pure
+            # risk, no upside here. Likewise no explicit --cache-ram: the server
+            # default (8192 MiB host cache) is already on and was never the
+            # problem. Prompt PREFIX caching (cache_prompt) stays on by default.
             "--parallel", str(n_parallel),
             "--reasoning-format", "deepseek",
         ]
@@ -16075,18 +17151,24 @@ class LlamaProcess:
             print(f"[llama] launch: {cmd}")
         try:
             creationflags = 0
-            if sys.platform == "win32":
-                # Desktop-app mode (ACCURETTA_APP, set by the pywebview launcher)
-                # runs llama-server hidden so there are NO stray console windows.
-                # Plain bridge/browser mode keeps the console for crash visibility.
-                creationflags = (subprocess.CREATE_NO_WINDOW
-                                 if os.environ.get("ACCURETTA_APP")
-                                 else subprocess.CREATE_NEW_CONSOLE)
+            # Always run windowless and capture stdout+stderr so the backend's
+            # load progress and errors surface in the app's Backend tab, instead
+            # of a hidden (desktop app) or stray (browser mode) console window.
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            with self._log_lock:
+                self._log_lines.clear()
+            self._append_log("[accuretta] launching: " + " ".join(cmd))
             p = subprocess.Popen(
                 cmd,
                 cwd=str(Path(bin_path).parent),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                encoding="utf-8",
+                errors="replace",
                 creationflags=creationflags,
             )
+            self._start_log_reader(p)
         except Exception as e:
             return {"ok": False, "error": f"spawn failed: {e}"}
 
@@ -16514,6 +17596,7 @@ def main():
     # the subprocess from underneath it, which would trigger an
     # at-shutdown respawn race.
     import atexit
+    atexit.register(_session_mgr.stop_all)   # kill any interactive sessions on exit
     atexit.register(_llama.stop)
     atexit.register(_llama.shutdown_watchdog)
     atexit.register(_vision_llama.stop)

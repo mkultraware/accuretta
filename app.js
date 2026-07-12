@@ -1840,8 +1840,74 @@
     }
   }
 
+  // Styled confirmation dialog matching the app's modal system — a promise-based
+  // drop-in for the native window.confirm(). Resolves true on confirm, false on
+  // cancel / Escape / scrim click.
+  function confirmModal(opts = {}) {
+    const {
+      title = "Are you sure?",
+      message = "",
+      confirmText = "Confirm",
+      cancelText = "Cancel",
+      danger = false,
+      icon = danger ? "ph-warning-circle" : "ph-question",
+    } = opts;
+    return new Promise((resolve) => {
+      const scrim = document.createElement("div");
+      scrim.className = "modal-scrim";
+      const modal = document.createElement("aside");
+      modal.className = "modal confirm-modal";
+      modal.setAttribute("role", "dialog");
+      modal.setAttribute("aria-modal", "true");
+      modal.innerHTML = `
+        <div class="modal-head">
+          <i class="ph ${icon}"></i>
+          <h3>${esc(title)}</h3>
+          <button class="iconbtn" data-act="cancel" aria-label="Cancel"><i class="ph ph-x"></i></button>
+        </div>
+        <div class="modal-body">
+          ${message ? `<p>${esc(message)}</p>` : ""}
+          <div class="confirm-actions">
+            <button class="btn" data-act="cancel">${esc(cancelText)}</button>
+            <button class="btn ${danger ? "danger" : "accent"}" data-act="confirm">${esc(confirmText)}</button>
+          </div>
+        </div>`;
+      document.body.appendChild(scrim);
+      document.body.appendChild(modal);
+      // Next frame so the .open transition animates in rather than snapping.
+      requestAnimationFrame(() => { scrim.classList.add("open"); modal.classList.add("open"); });
+
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        document.removeEventListener("keydown", onKey);
+        scrim.classList.remove("open");
+        modal.classList.remove("open");
+        setTimeout(() => { scrim.remove(); modal.remove(); }, 220);
+        resolve(result);
+      };
+      const onKey = (e) => {
+        if (e.key === "Escape") { e.preventDefault(); finish(false); }
+        else if (e.key === "Enter") { e.preventDefault(); finish(true); }
+      };
+      modal.querySelectorAll('[data-act="cancel"]').forEach(b => b.addEventListener("click", () => finish(false)));
+      modal.querySelector('[data-act="confirm"]').addEventListener("click", () => finish(true));
+      scrim.addEventListener("click", () => finish(false));
+      document.addEventListener("keydown", onKey);
+      requestAnimationFrame(() => modal.querySelector('[data-act="confirm"]').focus());
+    });
+  }
+
   async function deleteChat(id) {
-    if (!confirm("Delete this session and its versions?")) return;
+    const ok = await confirmModal({
+      title: "Delete session",
+      message: "This deletes the session and all its saved versions. This can't be undone.",
+      confirmText: "Delete",
+      danger: true,
+      icon: "ph-trash",
+    });
+    if (!ok) return;
     await fetch(`/api/chats/${id}`, { method: "DELETE" });
     localStorage.removeItem("accuretta:draft:" + id);
     await loadChats();
@@ -2083,19 +2149,23 @@
     let seed = 0x9e3779b9 >>> 0;
     const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
     const palette = ["--bar-warm", "--bar-rose", "--bar-mid", "--bar-violet", "--bar-blue", "--bar-sky"];
-    const N = 18;
-    let html = "";
+    // A broad warm→cool wash fills the field first, so the streaks read as
+    // soft variations within a colour rather than isolated panels on black
+    // (which looked like curtains).
+    let html = `<div class="welcome-wash"></div>`;
+    const N = 13;
     for (let i = 0; i < N; i++) {
       const x = i / (N - 1);                                     // 0 → 1, left → right
-      const left = (x * 106 - 3 + (rnd() - 0.5) * 3).toFixed(1);
-      const width = (4 + rnd() * 5).toFixed(1);
+      // Wide, irregular, overlapping placement — not evenly-spaced panels.
+      const left = (x * 112 - 6 + (rnd() - 0.5) * 9).toFixed(1);
+      const width = (6 + rnd() * 12).toFixed(1);
       const c = palette[Math.min(palette.length - 1, Math.floor(x * palette.length))];
-      const topFade = Math.round(rnd() * 42);                    // fade-in distance from the top
-      const botFade = Math.round(rnd() * 42);                    // fade-out distance before the bottom
-      const o = (0.32 + rnd() * 0.4).toFixed(2);
-      const blur = (16 + rnd() * 26).toFixed(0);
-      const dur = (18 + rnd() * 16).toFixed(1);
-      const delay = (-rnd() * 22).toFixed(1);
+      const topFade = Math.round(8 + rnd() * 40);                // long, soft fade-in from the top
+      const botFade = Math.round(8 + rnd() * 40);                // long, soft fade-out before the bottom
+      const o = (0.14 + rnd() * 0.24).toFixed(2);
+      const blur = (26 + rnd() * 40).toFixed(0);
+      const dur = (20 + rnd() * 16).toFixed(1);
+      const delay = (-rnd() * 24).toFixed(1);
       html += `<div class="welcome-bar" style="left:${left}%;width:${width}%;--o:${o};opacity:${o};`
         + `background:linear-gradient(180deg,transparent 0%,var(${c}) ${topFade}%,var(${c}) ${100 - botFade}%,transparent 100%);`
         + `filter:blur(${blur}px);animation-duration:${dur}s;animation-delay:${delay}s;"></div>`;
@@ -2346,7 +2416,7 @@
       ? `<div class="avatar user">me</div>`
       : AGENT_AVATAR_HTML;
 
-    let visible = m.content || "";
+    let visible = stripMentionRefs(m.content || "");
     let thoughtChip = "";
     let cascadeChips = "";
     if (m.role === "assistant") {
@@ -2416,6 +2486,7 @@
       });
       row.querySelector(".bubble-col").appendChild(actions);
     }
+    highlightMentionsInBubble(row.querySelector(".bubble"));
     enhanceCodeBlocks(row);
     return row;
   }
@@ -2730,6 +2801,7 @@
     if (opts.prompt === undefined) {
       ta.value = "";
       autoResize(ta);
+      hideMentionMenu();
     }
     if (state.chatId) localStorage.removeItem("accuretta:draft:" + state.chatId);
     state.pendingImages = [];
@@ -2786,7 +2858,7 @@
     setStreamingUI(true);
 
     try {
-      await streamChat(text, agentRow, state.abortCtl.signal, images, opts);
+      await streamChat(withMentionRefs(text), agentRow, state.abortCtl.signal, images, opts);
     } catch (e) {
       const b = agentRow.querySelector("#stream-bubble") || agentRow.querySelector(".bubble");
       if (b) {
@@ -3135,10 +3207,10 @@
   // when a red-team tool or breach fires, so ordinary coding turns never see
   // it. Colors are theme tokens, so it adapts to every theme automatically.
   const ATTACK_NODES = [
-    { label: "recon",  tech: "",      icon: "ph-crosshair" },
-    { label: "access", tech: "T1548", icon: "ph-key" },
-    { label: "pivot",  tech: "T1190", icon: "ph-path" },
-    { label: "rce",    tech: "T1059", icon: "ph-terminal-window" },
+    { label: "Recon",  tech: "",      icon: "ph-crosshair" },
+    { label: "Access", tech: "T1548", icon: "ph-key" },
+    { label: "Pivot",  tech: "T1190", icon: "ph-path" },
+    { label: "RCE",    tech: "T1059", icon: "ph-terminal-window" },
   ];
   function isRedTeamTool(name) {
     return !!name && (name.startsWith("recon_") || name === "http_request" || name === "encode_decode");
@@ -3160,27 +3232,49 @@
     }
     return name || "";
   }
+  function fmtElapsed(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    const p = (n) => String(n).padStart(2, "0");
+    return `${p(Math.floor(s / 3600))}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}`;
+  }
+  // Current-action line. Split the "cmd → target" summary so the arrow + target
+  // can be tinted separately (matches the mockup), falling back to plain cmd.
+  function setAttackActivity(rail, name, args) {
+    const el = rail.querySelector(".ar-activity-text");
+    if (!el) return;
+    const summary = attackActivitySummary(name, args);
+    const cut = summary.indexOf(" → ");
+    if (cut >= 0) {
+      el.innerHTML =
+        `<span class="ar-cmd">${esc(summary.slice(0, cut))}</span>` +
+        `<span class="ar-arrow">→</span>` +
+        `<span class="ar-target">${esc(summary.slice(cut + 3))}</span>`;
+    } else {
+      el.innerHTML = `<span class="ar-cmd">${esc(summary)}</span>`;
+    }
+  }
   function ensureAttackRail(row) {
     if (!row) return null;
     let rail = row.querySelector(".attack-rail");
     if (rail) return rail;
     const toolStack = row.querySelector(".tool-stack");
     rail = document.createElement("div");
-    rail.className = "attack-rail";
+    rail.className = "attack-rail is-running";
     rail.dataset.flags = "0";
     rail.dataset.active = "-1";
     rail.dataset.recondone = "0";
+    rail.dataset.start = String(Date.now());
     const nodesHtml = ATTACK_NODES.map((n, i) =>
       `<div class="ar-node is-pending" data-i="${i}">` +
         `<span class="ar-dot"><i class="ph ${n.icon}"></i></span>` +
         `<span class="ar-label">${n.label}</span>` +
-        `<span class="ar-tech">${n.tech || "&nbsp;"}</span>` +
+        `<span class="ar-active-badge">ACTIVE</span>` +
       `</div>` +
       (i < ATTACK_NODES.length - 1 ? `<span class="ar-seg" data-s="${i}"></span>` : "")
     ).join("");
     rail.innerHTML =
       `<div class="ar-head">` +
-        `<span class="ar-title"><i class="ph ph-crosshair"></i> attack chain</span>` +
+        `<span class="ar-title"><i class="ph ph-crosshair"></i> Attack chain</span>` +
         // No fixed denominator — real engagements have no set number of "flags"
         // to find (that's a CTF concept). Hidden until a FLAG{...} is actually
         // captured, then shows a plain running count. See renderRail.
@@ -3188,9 +3282,26 @@
       `</div>` +
       `<div class="ar-track">${nodesHtml}</div>` +
       `<div class="ar-activity"><span class="ar-pulse"></span><span class="ar-activity-text">initializing…</span></div>` +
+      `<div class="ar-foot">` +
+        `<div class="ar-stat"><span class="ar-stat-ico"><i class="ph ph-clock"></i></span><span class="ar-stat-body"><span class="ar-stat-label">Elapsed</span><span class="ar-stat-val ar-elapsed">00:00:00</span></span></div>` +
+        `<div class="ar-stat"><span class="ar-stat-ico"><i class="ph ph-list-checks"></i></span><span class="ar-stat-body"><span class="ar-stat-label">Steps completed</span><span class="ar-stat-val ar-steps">0 / 4</span></span></div>` +
+        `<div class="ar-stat"><span class="ar-stat-ico ar-stat-ico-status"><i class="ph ph-activity"></i></span><span class="ar-stat-body"><span class="ar-stat-label">Status</span><span class="ar-stat-val ar-status">Running</span></span></div>` +
+      `</div>` +
       `<div class="ar-banner"><i class="ph ph-shield-check"></i> confirmed access — full chain breached</div>`;
     if (toolStack && toolStack.parentNode) toolStack.parentNode.insertBefore(rail, toolStack);
     else row.appendChild(rail);
+    // Live elapsed clock — ticks while the turn streams, freezes on full breach
+    // or turn end, and self-cleans if the bubble is torn down (chat switch).
+    const tick = () => {
+      if (!document.body.contains(rail)) { clearInterval(rail._timer); return; }
+      const frozen = rail.classList.contains("is-complete") || !state.streaming;
+      if (!frozen) rail.dataset.elapsed = String(Date.now() - (+rail.dataset.start || Date.now()));
+      const el = rail.querySelector(".ar-elapsed");
+      if (el) el.textContent = fmtElapsed(+(rail.dataset.elapsed || 0));
+      if (frozen) clearInterval(rail._timer);
+    };
+    rail._timer = setInterval(tick, 1000);
+    tick();
     return rail;
   }
   function renderRail(rail) {
@@ -3206,7 +3317,11 @@
       el.classList.toggle("is-pending", !done[i] && i !== active);
     });
     rail.querySelectorAll(".ar-seg").forEach((el) => {
-      el.classList.toggle("is-done", done[+el.dataset.s]);
+      const s = +el.dataset.s;
+      el.classList.toggle("is-done", done[s]);
+      // The segment leaving the active node lights up too, so progress reads as
+      // flowing into the next stage (dashed = still pending).
+      el.classList.toggle("is-active", !done[s] && active === s);
     });
     // Flag pill: hidden at zero (no misleading "0/N captured" on a clean
     // target), then a plain count once something is actually captured.
@@ -3215,15 +3330,24 @@
     if (flagsWrap) flagsWrap.hidden = flagsRaw <= 0;
     const fc = rail.querySelector(".ar-flag-count");
     if (fc) fc.textContent = `${flagsRaw} captured`;
+    // Footer stats. Steps = stages reached (active counts as in-progress);
+    // status tracks the live pulse and full-breach completion.
+    const complete = flags >= 3;
+    const live = rail.querySelector(".ar-pulse")?.classList.contains("live");
+    const reachedCount = active >= 0 ? Math.max(done.filter(Boolean).length, active + 1) : done.filter(Boolean).length;
+    const stepsEl = rail.querySelector(".ar-steps");
+    if (stepsEl) stepsEl.textContent = `${Math.min(4, reachedCount)} / 4`;
+    const statusEl = rail.querySelector(".ar-status");
+    if (statusEl) statusEl.textContent = complete ? "Breached" : (live ? "Running" : "Idle");
     rail.classList.toggle("has-flags", flags > 0);
-    rail.classList.toggle("is-complete", flags >= 3);
+    rail.classList.toggle("is-running", live && !complete);
+    rail.classList.toggle("is-complete", complete);
   }
   function attackRailToolStart(row, name, args) {
     if (!isRedTeamTool(name)) return;
     const rail = ensureAttackRail(row);
     if (!rail) return;
-    const txt = rail.querySelector(".ar-activity-text");
-    if (txt) txt.textContent = attackActivitySummary(name, args);
+    setAttackActivity(rail, name, args);
     rail.querySelector(".ar-pulse")?.classList.add("live");
     if (name.startsWith("recon_")) {
       if (+rail.dataset.flags === 0 && rail.dataset.recondone !== "1") rail.dataset.active = "0";
@@ -3370,6 +3494,9 @@
       scrollToBottom();
     } else if (evt.type === "tool_start") {
       attackRailToolStart(row, evt.name, evt.arguments);
+      if (evt.name === "session_start") {
+        surfaceShell(evt.arguments?.session_id || evt.arguments?.id || "");
+      }
       if (evt.name === "run_powershell") {
         const cmd = evt.arguments?.command || "";
         appendTerminalText(`\n$ ${cmd}\n`, false);
@@ -4450,7 +4577,13 @@
     });
     let resp = await send(false);
     if (resp.status === 409) {
-      if (!confirm(`"${filename.trim()}" already exists in ${root}. Overwrite?`)) return;
+      const ok = await confirmModal({
+        title: "Overwrite file",
+        message: `"${filename.trim()}" already exists in ${root}. Overwrite it?`,
+        confirmText: "Overwrite",
+        icon: "ph-warning-circle",
+      });
+      if (!ok) return;
       resp = await send(true);
     }
     const data = await resp.json().catch(() => ({}));
@@ -5284,6 +5417,90 @@
     populateSettingsForm();
     loadSystemContext();
     loadDetectedVram();
+    refreshSandboxStatus();
+  }
+
+  // ---------- Sandbox (WSL) ----------
+  // Status + management live here (not the composer, by design). The guided
+  // first-run experience is in the Setup Wizard; this mirrors its state and
+  // lets you set up / test / remove later. Polls itself only while a provision
+  // is actually running.
+  let _sbxPoll = null;
+  const SBX_BUSY = ["downloading", "extracting", "importing", "provisioning"];
+
+  function _sbxChip(state, label) {
+    const chip = $("#sandbox-chip");
+    if (!chip) return;
+    chip.dataset.state = state;
+    chip.textContent = label;
+  }
+
+  async function refreshSandboxStatus() {
+    if (!$("#sandbox-chip")) return;
+    try {
+      const st = await api("/api/sandbox/status");
+      renderSandbox(st);
+      const p = st.provision || {};
+      if (SBX_BUSY.includes(p.status)) {
+        if (!_sbxPoll) _sbxPoll = setInterval(refreshSandboxStatus, 800);
+      } else if (_sbxPoll) {
+        clearInterval(_sbxPoll); _sbxPoll = null;
+      }
+    } catch (e) {
+      _sbxChip("error", "unavailable");
+    }
+  }
+
+  function renderSandbox(st) {
+    const p = st.provision || {};
+    const busy = SBX_BUSY.includes(p.status);
+    const row = $("#sandbox-progress-row");
+    const setupBtn = $("#btn-sandbox-setup");
+    const testBtn = $("#btn-sandbox-test");
+    const rmBtn = $("#btn-sandbox-remove");
+
+    if (busy) _sbxChip("installing", p.step || "setting up…");
+    else if (st.state === "ready") _sbxChip("ready", "ready");
+    else if (st.state === "no_wsl") _sbxChip("no_wsl", "WSL not installed");
+    else if (st.state === "present_unprovisioned") _sbxChip("warn", "needs provisioning");
+    else _sbxChip("off", "not set up");
+
+    if (setupBtn) {
+      setupBtn.disabled = busy || st.state === "no_wsl";
+      setupBtn.dataset.reinstall = st.state === "ready" ? "1" : "";
+      setupBtn.innerHTML = st.state === "ready"
+        ? '<i class="ph ph-arrow-clockwise"></i>Reinstall'
+        : '<i class="ph ph-cube"></i>Set up sandbox';
+    }
+    if (testBtn) testBtn.disabled = busy || st.state !== "ready";
+    if (rmBtn) rmBtn.disabled = busy || !st.sandbox_present;
+
+    if (busy) {
+      if (row) row.style.display = "";
+      const icon = $("#sandbox-card-icon"), title = $("#sandbox-card-title"),
+            desc = $("#sandbox-card-desc"), log = $("#sandbox-card-log");
+      if (icon) icon.className = "ph ph-spinner-gap pulse-icon spin";
+      if (title) title.textContent = p.step || "Setting up…";
+      const pct = typeof p.pct === "number" ? p.pct : 0;
+      if (desc) desc.innerHTML =
+        '<div class="setup-download-container"><div class="setup-download-bar">' +
+        '<div class="setup-download-fill" style="width:' + pct + '%;"></div></div>' +
+        '<div class="setup-download-meta"><span>' + esc(p.status || "") + '</span><span>' + pct + '%</span></div></div>';
+      if (log) {
+        if (p.log && p.log.length) { log.style.display = ""; log.textContent = p.log.slice(-8).join("\n"); log.scrollTop = log.scrollHeight; }
+        else log.style.display = "none";
+      }
+    } else if (p.status === "failed" && p.error) {
+      if (row) row.style.display = "";
+      const icon = $("#sandbox-card-icon"), title = $("#sandbox-card-title"),
+            desc = $("#sandbox-card-desc"), log = $("#sandbox-card-log");
+      if (icon) icon.className = "ph ph-warning-circle";
+      if (title) title.textContent = "Setup failed";
+      if (desc) desc.innerHTML = '<span style="color:var(--danger);">' + esc(p.error) + '</span>';
+      if (log) log.style.display = "none";
+    } else if (row) {
+      row.style.display = "none";
+    }
   }
 
   // ---------- VRAM auto-tune ----------
@@ -5634,7 +5851,14 @@
     });
   }
   async function clearCmdHistory() {
-    if (!confirm("Clear all PowerShell command history? This can't be undone.")) return;
+    const ok = await confirmModal({
+      title: "Clear command history",
+      message: "Clear all PowerShell command history? This can't be undone.",
+      confirmText: "Clear history",
+      danger: true,
+      icon: "ph-trash",
+    });
+    if (!ok) return;
     try {
       await api("/api/cmd-history", { method: "DELETE" });
       toast("history cleared", "ok", 1500);
@@ -5941,6 +6165,138 @@
       const active = pane.id === `term-pane-${tabId}`;
       pane.classList.toggle("hidden", !active);
     });
+    if (tabId === "backend") startBackendLogPoll();
+    else stopBackendLogPoll();
+    if (tabId === "shell") startShellPoll();
+    else stopShellPoll();
+  }
+
+  // ---- llama.cpp backend log (Backend terminal tab) ----
+  let _backendLogTimer = null;
+  async function refreshBackendLog() {
+    const pre = document.getElementById("backend-log-pre");
+    const codeEl = pre?.querySelector("code");
+    if (!codeEl) return;
+    let data;
+    try {
+      data = await (await fetch("/api/llama-log?tail=500")).json();
+    } catch { return; }
+    const status = document.getElementById("backend-status");
+    const statusText = document.getElementById("backend-status-text");
+    const modelEl = document.getElementById("backend-model");
+    if (status) status.className = "backend-status " + (data.running ? "is-running" : "is-stopped");
+    if (statusText) statusText.textContent = data.running ? "running" : "stopped";
+    if (modelEl) modelEl.textContent = data.model ? data.model.split(/[\\/]/).pop() : "";
+    const lines = data.lines || [];
+    // Skip the DOM rewrite when nothing changed, so we don't fight the scroll.
+    const sig = lines.length + "|" + (lines[lines.length - 1] || "");
+    if (codeEl.dataset.sig === sig) return;
+    const pane = pre.closest(".term-tab-pane");
+    const atBottom = pane ? (pane.scrollHeight - pane.scrollTop - pane.clientHeight < 48) : true;
+    // Drop leading blank lines — llama.cpp's stdout often starts with empties,
+    // which would otherwise render as an empty gap under the status bar.
+    let _s = 0;
+    while (_s < lines.length && !String(lines[_s]).trim()) _s++;
+    const shown = lines.slice(_s);
+    codeEl.innerHTML = shown.length
+      ? shown.map(colorizeBackendLine).join("")
+      : "[system] waiting for backend output…";
+    codeEl.dataset.sig = sig;
+    if (pane && atBottom) pane.scrollTop = pane.scrollHeight;
+  }
+  function startBackendLogPoll() {
+    refreshBackendLog();
+    if (_backendLogTimer) return;
+    _backendLogTimer = setInterval(refreshBackendLog, 800);
+  }
+  function stopBackendLogPoll() {
+    if (_backendLogTimer) { clearInterval(_backendLogTimer); _backendLogTimer = null; }
+  }
+
+  // ---- shared interactive shell (Shell tab) ----
+  let _shellTimer = null;
+  let _shellActive = "";   // active session id being viewed
+  let _shellOffset = 0;    // this viewer's read cursor (absolute) for that session
+  function selectShellSession(id) {
+    if (id === _shellActive) return;
+    _shellActive = id;
+    _shellOffset = 0;
+    const code = document.getElementById("shell-out")?.querySelector("code");
+    if (code) code.textContent = "";
+  }
+  async function refreshShellSessions() {
+    let data;
+    try { data = await (await fetch("/api/session/list")).json(); } catch { return; }
+    const sessions = data.sessions || [];
+    const sel = document.getElementById("shell-session");
+    if (!sel) return;
+    sel.innerHTML = sessions.length
+      ? sessions.map(s => `<option value="${esc(s.id)}">${esc(s.id)} · ${esc((s.command || "").slice(0, 44))}${s.alive ? "" : " (exited)"}</option>`).join("")
+      : `<option value="">no sessions</option>`;
+    if (_shellActive && sessions.some(s => s.id === _shellActive)) sel.value = _shellActive;
+    else if (sessions.length) { selectShellSession(sessions[sessions.length - 1].id); sel.value = _shellActive; }
+  }
+  async function refreshShellOutput() {
+    if (!_shellActive) return;
+    let data;
+    try { data = await (await fetch(`/api/session/read?id=${encodeURIComponent(_shellActive)}&since=${_shellOffset}`)).json(); } catch { return; }
+    const status = document.getElementById("shell-status");
+    if (status) {
+      status.className = "shell-status" + (data.alive ? " alive" : "");
+      status.innerHTML = `<span class="dot"></span>${data.alive ? "running" : ("exited" + (data.exit_code != null ? ` (${data.exit_code})` : ""))}`;
+    }
+    const out = document.getElementById("shell-out");
+    const code = out?.querySelector("code");
+    if (!code || typeof data.offset !== "number") return;
+    if (data.output) {
+      const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 60;
+      if (_shellOffset === 0) code.textContent = "";   // first paint drops the placeholder
+      code.insertAdjacentText("beforeend", data.output);
+      if (atBottom) out.scrollTop = out.scrollHeight;
+    }
+    _shellOffset = data.offset;
+  }
+  function startShellPoll() {
+    refreshShellSessions();
+    refreshShellOutput();
+    if (_shellTimer) return;
+    _shellTimer = setInterval(() => { refreshShellSessions(); refreshShellOutput(); }, 800);
+  }
+  function stopShellPoll() {
+    if (_shellTimer) { clearInterval(_shellTimer); _shellTimer = null; }
+  }
+  async function shellSend(text) {
+    if (!_shellActive) return;
+    try { await fetch("/api/session/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: _shellActive, input: text }) }); } catch {}
+    setTimeout(refreshShellOutput, 150);
+  }
+  async function shellKill() {
+    if (!_shellActive) return;
+    try { await fetch("/api/session/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: _shellActive }) }); } catch {}
+    setTimeout(() => { refreshShellSessions(); refreshShellOutput(); }, 200);
+  }
+  // Called when the agent opens/uses a session — surface the Shell tab live.
+  function surfaceShell(sessionId) {
+    try { toggleConsolePane(true); } catch {}
+    if (sessionId) { selectShellSession(sessionId); const sel = document.getElementById("shell-session"); if (sel) sel.value = sessionId; }
+    activateTerminalTab("shell");
+  }
+  // Approximate llama.cpp's terminal colouring on its piped (colourless) output:
+  // errors red, warnings amber, ready/success green, and the "component:" prefix
+  // that leads most llama.cpp log lines tinted so the stream stays scannable.
+  function colorizeBackendLine(line) {
+    const safe = esc(line);
+    if (/\b(err(or)?|failed|failure|cannot|no such|not found|traceback|abort(ed)?|fatal|out of memory|oom|segmentation|assert(ion)?|invalid|exception|denied)\b/i.test(line))
+      return `<span class="bl-line bl-err">${safe}</span>`;
+    if (/\b(warn(ing)?|deprecated|unsupported|fallback|skipp?ing|retry|retrying)\b/i.test(line))
+      return `<span class="bl-line bl-warn">${safe}</span>`;
+    if (/(server is listening|model loaded|all slots (are )?idle|slot released|starting the main loop)/i.test(line)
+        || (/\b(GET|POST|HEAD|PUT|DELETE)\b/.test(line) && /\b(200|201|204)\b/.test(line)))
+      return `<span class="bl-line bl-ok">${safe}</span>`;
+    const m = line.match(/^([a-z][a-z0-9 _.\-]{1,38}?):(?:\s|$)/i);
+    if (m)
+      return `<span class="bl-line"><span class="bl-key">${esc(m[1])}:</span>${esc(line.slice(m[1].length + 1))}</span>`;
+    return `<span class="bl-line">${safe}</span>`;
   }
 
   function appendTerminalText(text, isError) {
@@ -5950,34 +6306,39 @@
     if (!codeEl) return;
     
     const cursor = consolePre.querySelector(".term-cursor");
-    
+    const pane = consolePre.closest('.term-tab-pane');
+    // Follow the latest output only when the user is already at the bottom (or
+    // the pane was hidden) — if they've scrolled up to read history, leave them.
+    const stick = !pane || pane.classList.contains("hidden")
+      || (pane.scrollHeight - pane.scrollTop - pane.clientHeight < 60);
+
     let safeText = esc(text);
     if (isError) {
       safeText = `<span class="term-err">${safeText}</span>`;
     }
-    
     if (cursor) {
       cursor.insertAdjacentHTML("beforebegin", safeText);
     } else {
       codeEl.insertAdjacentHTML("beforeend", safeText);
     }
-    
-    const pane = consolePre.closest('.term-tab-pane');
-    if (pane) pane.scrollTop = pane.scrollHeight;
     activateTerminalTab("terminal");
+    if (pane && stick) pane.scrollTop = pane.scrollHeight;
   }
 
   function appendAgentLog(msg) {
     const agentLogPre = document.getElementById("term-agent-log-pre");
     if (!agentLogPre) return;
     const codeEl = agentLogPre.querySelector("code") || agentLogPre;
-    
+    const pane = agentLogPre.closest('.term-tab-pane');
+    // Auto-follow only when already at the bottom, so scrolling up to review
+    // the agent's history isn't yanked back down by the next log line.
+    const stick = !pane || pane.classList.contains("hidden")
+      || (pane.scrollHeight - pane.scrollTop - pane.clientHeight < 60);
+
     const timestamp = new Date().toLocaleTimeString();
     const safeMsg = esc(msg);
-    
     codeEl.insertAdjacentHTML("beforeend", `[${timestamp}] ${safeMsg}<br>`);
-    const pane = agentLogPre.closest('.term-tab-pane');
-    if (pane) pane.scrollTop = pane.scrollHeight;
+    if (pane && stick) pane.scrollTop = pane.scrollHeight;
   }
 
   function renderStatus(speed, stateStr) {
@@ -6481,6 +6842,8 @@
       }
     }
     if (hint) hint.textContent = "loading model into llama-server...";
+    // Surface the backend output so the model-load progress is visible live.
+    try { toggleConsolePane(true); activateTerminalTab("backend"); } catch {}
     try {
       const persistPayload = {
         model_path: modelPath,
@@ -6642,6 +7005,209 @@
   function autoResize(ta) {
     ta.style.height = "auto";
     ta.style.height = Math.min(200, ta.scrollHeight) + "px";
+    if (ta && ta.id === "composer-input") updateComposerMirror();
+  }
+
+  // ===== @-mention: reference workspace files in the composer =====
+  // Type "@" → pick a workspace file; it renders as an accent chip (via a
+  // mirror layer behind the textarea) in the box and in chat, and on send the
+  // model is quietly handed the resolved path so it knows which file you mean.
+  const _MENTION_RE = /(^|[\s(])@([\w./-]+)/g;
+
+  async function loadWorkspaceFiles(force) {
+    if (!force && state._wsFiles && Date.now() - (state._wsFilesAt || 0) < 8000) return state._wsFiles;
+    try {
+      const r = await (await fetch("/api/workspace/files")).json();
+      state._wsFiles = r.files || [];
+      state._wsFilesAt = Date.now();
+    } catch { state._wsFiles = state._wsFiles || []; }
+    return state._wsFiles;
+  }
+
+  // Resolve a raw @token (maybe with trailing punctuation) to a workspace file.
+  function resolveMentionToken(token) {
+    const files = state._wsFiles || [];
+    if (!files.length || !token) return null;
+    let t = token;
+    for (let i = 0; i < 4 && t.length; i++) {
+      const tl = t.toLowerCase();
+      const f = files.find(x => x.name.toLowerCase() === tl) || files.find(x => x.rel.toLowerCase() === tl);
+      if (f) return { file: f, matched: t };
+      if (/[^A-Za-z0-9]$/.test(t)) t = t.slice(0, -1); else break;
+    }
+    return null;
+  }
+
+  function renderComposerMentions(text) {
+    let out = "", last = 0, m;
+    _MENTION_RE.lastIndex = 0;
+    while ((m = _MENTION_RE.exec(text)) !== null) {
+      const at = m.index + m[1].length;   // index of '@'
+      out += esc(text.slice(last, at));
+      const r = resolveMentionToken(m[2]);
+      if (r) { out += `<span class="composer-chip">@${esc(r.matched)}</span>`; last = at + 1 + r.matched.length; }
+      else { out += "@"; last = at + 1; }
+    }
+    out += esc(text.slice(last));
+    return out.replace(/\n/g, "<br>");
+  }
+
+  // Copy the textarea's REAL computed text-layout styles onto the mirror so the
+  // two lay out identically (any letter-spacing / font metric the textarea has
+  // is mirrored exactly), instead of hand-matching CSS and drifting.
+  function syncComposerMirrorStyle() {
+    const ta = document.getElementById("composer-input");
+    const mirror = document.getElementById("composer-mirror");
+    if (!ta || !mirror) return;
+    const cs = getComputedStyle(ta);
+    ["fontFamily", "fontSize", "fontWeight", "fontStyle", "fontVariant",
+     "fontStretch", "fontKerning", "fontFeatureSettings", "letterSpacing",
+     "wordSpacing", "lineHeight", "textTransform", "textIndent", "tabSize",
+     "paddingTop", "paddingRight", "paddingBottom", "paddingLeft"].forEach(p => {
+      try { mirror.style[p] = cs[p]; } catch {}
+    });
+  }
+  function updateComposerMirror() {
+    const ta = document.getElementById("composer-input");
+    const mirror = document.getElementById("composer-mirror");
+    if (!ta || !mirror) return;
+    mirror.innerHTML = renderComposerMentions(ta.value);
+    mirror.scrollTop = ta.scrollTop;
+    mirror.scrollLeft = ta.scrollLeft;
+  }
+
+  // ---- the @ autocomplete menu ----
+  let _mentionItems = [];
+  let _mentionActive = 0;
+  function composerMentionQuery() {
+    const ta = document.getElementById("composer-input");
+    if (!ta || ta.selectionStart !== ta.selectionEnd) return null;
+    const pos = ta.selectionStart;
+    const before = ta.value.slice(0, pos);
+    const m = before.match(/(?:^|[\s(])@([\w./-]*)$/);
+    if (!m) return null;
+    return { query: m[1], at: pos - m[1].length - 1 };
+  }
+  function updateMentionMenu() {
+    const q = composerMentionQuery();
+    if (!q) { hideMentionMenu(); return; }
+    loadWorkspaceFiles();
+    const files = state._wsFiles || [];
+    const ql = q.query.toLowerCase();
+    let items = files;
+    if (ql) {
+      items = files.filter(f => f.name.toLowerCase().includes(ql) || f.rel.toLowerCase().includes(ql));
+      items.sort((a, b) =>
+        (a.name.toLowerCase().startsWith(ql) ? 0 : 1) - (b.name.toLowerCase().startsWith(ql) ? 0 : 1)
+        || a.rel.length - b.rel.length);
+    }
+    items = items.slice(0, 8);
+    if (!items.length) { hideMentionMenu(); return; }
+    _mentionItems = items;
+    if (_mentionActive >= items.length) _mentionActive = 0;
+    showMentionMenu();
+  }
+  function showMentionMenu() {
+    const menu = document.getElementById("mention-menu");
+    if (!menu) return;
+    menu.innerHTML = _mentionItems.map((f, i) =>
+      `<div class="mention-item${i === _mentionActive ? " active" : ""}" data-i="${i}">` +
+        `<i class="ph ph-file"></i><span class="mention-name">${esc(f.name)}</span>` +
+        `<span class="mention-rel">${esc(f.rel)}</span></div>`).join("");
+    menu.classList.remove("hidden");
+    menu.querySelectorAll(".mention-item").forEach(el =>
+      el.addEventListener("mousedown", (e) => { e.preventDefault(); insertMention(_mentionItems[+el.dataset.i]); }));
+  }
+  function hideMentionMenu() {
+    const menu = document.getElementById("mention-menu");
+    if (menu) menu.classList.add("hidden");
+    _mentionItems = [];
+    _mentionActive = 0;
+  }
+  function mentionMenuOpen() {
+    const menu = document.getElementById("mention-menu");
+    return !!(menu && !menu.classList.contains("hidden") && _mentionItems.length);
+  }
+  function mentionMenuKeydown(e) {
+    if (!mentionMenuOpen()) return false;
+    if (e.key === "ArrowDown") { _mentionActive = (_mentionActive + 1) % _mentionItems.length; showMentionMenu(); e.preventDefault(); return true; }
+    if (e.key === "ArrowUp")   { _mentionActive = (_mentionActive - 1 + _mentionItems.length) % _mentionItems.length; showMentionMenu(); e.preventDefault(); return true; }
+    if (e.key === "Enter" || e.key === "Tab") { insertMention(_mentionItems[_mentionActive]); e.preventDefault(); return true; }
+    if (e.key === "Escape") { hideMentionMenu(); e.preventDefault(); return true; }
+    return false;
+  }
+  function insertMention(file) {
+    const ta = document.getElementById("composer-input");
+    const q = composerMentionQuery();
+    if (!ta || !q || !file) { hideMentionMenu(); return; }
+    const before = ta.value.slice(0, q.at);
+    const after = ta.value.slice(ta.selectionStart);
+    // Use the rel path when the bare name is ambiguous (duplicate filenames in
+    // a crowded workspace), so it resolves to the exact file the user picked.
+    const dup = (state._wsFiles || []).filter(f => f.name.toLowerCase() === file.name.toLowerCase()).length > 1;
+    const token = "@" + (dup ? file.rel : file.name) + " ";
+    ta.value = before + token + after;
+    const pos = (before + token).length;
+    ta.setSelectionRange(pos, pos);
+    hideMentionMenu();
+    autoResize(ta);
+    if (state.chatId) localStorage.setItem("accuretta:draft:" + state.chatId, ta.value);
+    ta.focus();
+  }
+
+  // ---- send-time + render-time helpers ----
+  function resolveMentions(text) {
+    const found = [];
+    let m;
+    _MENTION_RE.lastIndex = 0;
+    while ((m = _MENTION_RE.exec(text)) !== null) {
+      const r = resolveMentionToken(m[2]);
+      if (r && !found.some(x => x.path === r.file.path)) found.push(r.file);
+    }
+    return found;
+  }
+  function withMentionRefs(text) {
+    const files = resolveMentions(text);
+    if (!files.length) return text;
+    const lines = files.map(f => `- ${f.rel} = ${f.path}`).join("\n");
+    return `${text}\n\n[referenced-files]\nThe user @-referenced these workspace files (use read_file to view them):\n${lines}\n[/referenced-files]`;
+  }
+  function stripMentionRefs(text) {
+    return (text || "").replace(/\n*\[referenced-files\][\s\S]*?\[\/referenced-files\]\s*$/, "").trimEnd();
+  }
+  // Post-render: turn resolved @file tokens in a rendered bubble into accent
+  // chips. Skips code/pre/links; only chips tokens that match a known file.
+  function highlightMentionsInBubble(root) {
+    if (!root || !(state._wsFiles || []).length) return;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(n) {
+        if (!n.nodeValue || n.nodeValue.indexOf("@") < 0) return NodeFilter.FILTER_REJECT;
+        if (n.parentElement && n.parentElement.closest("code, pre, a, .mention-chip")) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    const targets = [];
+    let node;
+    while ((node = walker.nextNode())) targets.push(node);
+    for (const tn of targets) {
+      const text = tn.nodeValue;
+      _MENTION_RE.lastIndex = 0;
+      let m, last = 0, frag = null;
+      while ((m = _MENTION_RE.exec(text)) !== null) {
+        const at = m.index + m[1].length;
+        const r = resolveMentionToken(m[2]);
+        if (!r) continue;
+        if (!frag) frag = document.createDocumentFragment();
+        frag.appendChild(document.createTextNode(text.slice(last, at)));
+        const chip = document.createElement("span");
+        chip.className = "mention-chip";
+        chip.textContent = "@" + r.matched;
+        chip.title = r.file.path;
+        frag.appendChild(chip);
+        last = at + 1 + r.matched.length;
+      }
+      if (frag) { frag.appendChild(document.createTextNode(text.slice(last))); tn.parentNode.replaceChild(frag, tn); }
+    }
   }
 
   
@@ -6836,6 +7402,56 @@
       saveSettings({ red_team_enabled: e.currentTarget.classList.contains("on") });
       toast("red team setting saved", "ok", 1500);
     });
+    $("#btn-sandbox-setup")?.addEventListener("click", async (e) => {
+      const reinstall = e.currentTarget.dataset.reinstall === "1";
+      if (reinstall) {
+        const ok = await confirmModal({
+          title: "Reinstall sandbox?",
+          message: "This removes the current accuretta-sbx guest and rebuilds it from a fresh download. Anything stored only inside the sandbox is lost.",
+          confirmText: "Reinstall", danger: true,
+        });
+        if (!ok) return;
+      }
+      try {
+        await api("/api/sandbox/setup", { method: "POST", body: JSON.stringify({ reinstall }) });
+        toast(reinstall ? "rebuilding sandbox…" : "setting up sandbox…", "ok", 2500);
+        refreshSandboxStatus();
+      } catch (err) { toast("sandbox setup failed: " + err.message, "error"); }
+    });
+    $("#btn-sandbox-test")?.addEventListener("click", async () => {
+      const btn = $("#btn-sandbox-test");
+      if (btn) btn.disabled = true;
+      try {
+        const r = await api("/api/sandbox/test", { method: "POST" });
+        const row = $("#sandbox-progress-row"), title = $("#sandbox-card-title"),
+              desc = $("#sandbox-card-desc"), icon = $("#sandbox-card-icon"), log = $("#sandbox-card-log");
+        if (row) row.style.display = "";
+        if (icon) icon.className = r.ok ? "ph ph-check-circle success-icon" : "ph ph-warning-circle";
+        if (title) title.textContent = r.ok ? "Sandbox test passed" : "Sandbox test failed";
+        if (desc) desc.innerHTML = "";
+        if (log) { log.style.display = ""; log.textContent = (r.output || r.error || "").trim(); }
+        toast(r.ok ? "sandbox OK" : "sandbox: " + (r.error || "not ready"), r.ok ? "ok" : "warn", 3500);
+      } catch (err) { toast("test failed: " + err.message, "error"); }
+      finally {
+        // Re-enable the button directly rather than a full refreshSandboxStatus(),
+        // which would re-render the (ready) state and hide the result row we just
+        // populated. The result stays visible until the next real status render.
+        if (btn) btn.disabled = false;
+      }
+    });
+    $("#btn-sandbox-remove")?.addEventListener("click", async () => {
+      const ok = await confirmModal({
+        title: "Remove sandbox?",
+        message: "Unregisters the accuretta-sbx WSL distro and deletes its disk image. You can set it up again anytime.",
+        confirmText: "Remove", danger: true,
+      });
+      if (!ok) return;
+      try {
+        await api("/api/sandbox/remove", { method: "POST" });
+        toast("sandbox removed", "ok", 2500);
+        refreshSandboxStatus();
+      } catch (err) { toast("remove failed: " + err.message, "error"); }
+    });
     // Discord controls auto-save on change (the drawer's Save button isn't the
     // only path, and "save & quit" doesn't flush settings — so persist eagerly
     // or an enabled toggle silently vanishes on restart).
@@ -6991,11 +7607,23 @@
     $("#btn-stop").addEventListener("click", stopStreaming);
     $("#composer-input").addEventListener("input", e => autoResize(e.target));
     $("#composer-input").addEventListener("keydown", e => {
+      if (mentionMenuKeydown(e)) return;   // ↑↓/Enter/Tab/Esc drive the @ picker
       if (e.key !== "Enter") return;
       if (e.shiftKey) return; // newline
       e.preventDefault();
       send();
     });
+    // @-mention wiring: mirror highlight + file picker
+    loadWorkspaceFiles();
+    syncComposerMirrorStyle();
+    updateComposerMirror();
+    window.addEventListener("resize", syncComposerMirrorStyle);
+    $("#composer-input").addEventListener("input", () => { updateComposerMirror(); updateMentionMenu(); });
+    $("#composer-input").addEventListener("scroll", () => { const mm = document.getElementById("composer-mirror"), t = document.getElementById("composer-input"); if (mm && t) { mm.scrollTop = t.scrollTop; mm.scrollLeft = t.scrollLeft; } });
+    $("#composer-input").addEventListener("keyup", (e) => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) updateMentionMenu(); });
+    $("#composer-input").addEventListener("click", updateMentionMenu);
+    $("#composer-input").addEventListener("focus", () => loadWorkspaceFiles());
+    $("#composer-input").addEventListener("blur", () => setTimeout(hideMentionMenu, 150));
 
     // image attach: click button, paste, drop
     $("#btn-attach-image")?.addEventListener("click", () => $("#file-image").click());
@@ -7453,7 +8081,14 @@
     // ----- memories panel -----
     $("#btn-mem-refresh")?.addEventListener("click", loadMemories);
     $("#btn-mem-clear")?.addEventListener("click", async () => {
-      if (!confirm("Forget all memories? This cannot be undone.")) return;
+      const ok = await confirmModal({
+        title: "Forget all memories",
+        message: "This permanently clears every saved memory. This can't be undone.",
+        confirmText: "Forget all",
+        danger: true,
+        icon: "ph-trash",
+      });
+      if (!ok) return;
       try {
         await api("/api/memories/clear", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
       } catch (e) { toast("clear failed: " + e.message, "error"); }
@@ -7502,7 +8137,26 @@
       btn.addEventListener("click", () => {
         const tabId = btn.dataset.tab;
         activateTerminalTab(tabId);
+        // Opening a log tab jumps to the latest line; auto-follow on append
+        // only kicks in when already at the bottom, so history stays reachable.
+        const openedPane = document.getElementById(`term-pane-${tabId}`);
+        if (openedPane) openedPane.scrollTop = openedPane.scrollHeight;
       });
+    });
+
+    // Shell tab — shared interactive session controls (user types into the
+    // same process the agent is driving).
+    document.getElementById("shell-form")?.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const input = document.getElementById("shell-input");
+      const val = input ? input.value : "";
+      if (input) input.value = "";
+      shellSend(val);
+    });
+    document.getElementById("shell-kill")?.addEventListener("click", shellKill);
+    document.getElementById("shell-session")?.addEventListener("change", (e) => {
+      selectShellSession(e.target.value);
+      refreshShellOutput();
     });
 
     // ----- clear active terminal console -----

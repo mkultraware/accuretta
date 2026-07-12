@@ -1200,56 +1200,130 @@ button {
    comes from a theme token (--accent, --fg-muted, --bg-sunken, --border-*) so
    it adapts to every theme. Sits above the tool-stack; text/thoughts untouched. */
 .attack-rail {
-  margin: 6px 0 10px;
-  padding: 9px 16px 10px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 12px;
-  background: var(--bg-sunken);
-  font-family: var(--font-mono);
+  margin: 8px 0 12px;
+  padding: 14px 18px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-raised);
+  font-family: var(--font-sans);
   animation: ar-fade-in 0.3s ease;
-  /* Fill more of the agent column on desktop (the column left-aligns to
-     content by default), but cap it so it never overflows a phone: on a narrow
-     screen the column is < max-width, so it just renders full-width and normal. */
   width: 100%;
-  max-width: 460px;
+  max-width: 640px;
+  box-sizing: border-box;
 }
 @keyframes ar-fade-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
-.ar-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
-.ar-title { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-muted); letter-spacing: 0.02em; }
-.ar-title i, .ar-flags i { font-size: 14px; }
-.ar-flags { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--fg-muted); transition: color 0.3s; }
-/* display:inline-flex above beats the [hidden] attribute — restore it so the
-   flag pill stays gone until a flag is actually captured. */
+
+/* header */
+.ar-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.ar-title { display: inline-flex; align-items: center; gap: 9px; font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg); }
+.ar-title i { font-size: 16px; color: var(--accent); }
+.ar-flags { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--fg-muted); transition: color 0.3s; }
 .ar-flags[hidden] { display: none; }
+.ar-flags i { font-size: 13px; }
 .attack-rail.has-flags .ar-flags { color: var(--accent); }
-.ar-track { display: flex; align-items: flex-start; }
-.ar-node { flex: 0 0 auto; width: 64px; display: flex; flex-direction: column; align-items: center; gap: 3px; text-align: center; }
+
+/* stage track */
+.ar-track { display: flex; align-items: flex-start; padding: 0 2px; }
+.ar-node { flex: 0 0 auto; width: 88px; display: flex; flex-direction: column; align-items: center; gap: 6px; text-align: center; }
 .ar-dot {
-  width: 30px; height: 30px; border-radius: 50%;
+  width: 46px; height: 46px; border-radius: 50%;
   display: flex; align-items: center; justify-content: center;
-  border: 1.5px solid var(--border-strong); color: var(--fg-muted);
-  transition: color 0.35s, border-color 0.35s, background 0.35s;
+  border: 1.5px solid var(--border-strong); color: var(--fg-faint);
+  background: var(--bg-sunken);
+  transition: color 0.35s, border-color 0.35s, background 0.35s, box-shadow 0.35s;
 }
-.ar-dot i { font-size: 15px; }
-.ar-label { font-size: 11px; color: var(--fg-muted); transition: color 0.35s; }
-.ar-tech { font-size: 10px; color: var(--fg-muted); opacity: 0.7; }
-/* Pending segments use --border-strong (not --border-subtle) so the connector
-   lines stay visible against the sunken background before a stage is breached. */
-.ar-seg { flex: 1; height: 2px; margin: 14px 0 0; border-radius: 2px; background: var(--border-strong); transition: background 0.4s; }
+.ar-dot i { font-size: 20px; }
+.ar-label { font-size: 14px; font-weight: 600; color: var(--fg-muted); transition: color 0.35s; }
+.ar-active-badge {
+  display: none;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.07em;
+  padding: 2px 9px; border-radius: 6px;
+  background: var(--accent-subtle); color: var(--accent);
+}
+
+/* connectors — animated shimmer flows toward the next step; dashed = pending */
+.ar-seg {
+  flex: 1; height: 2px; margin: 22px 8px 0; border-radius: 2px;
+  background: repeating-linear-gradient(90deg, var(--border-strong) 0 5px, transparent 5px 11px);
+  transition: background 0.4s;
+}
 .ar-seg.is-done { background: var(--accent); }
-.ar-node.is-active .ar-dot { border-color: var(--accent); color: var(--accent); animation: ar-pulse 1.1s ease-in-out infinite; }
-.ar-node.is-active .ar-label { color: var(--accent); }
+.ar-seg.is-active {
+  background-color: var(--accent);
+  background-image: linear-gradient(90deg, transparent, color-mix(in oklab, var(--accent) 40%, #fff), transparent);
+  background-size: 45% 100%;
+  background-repeat: no-repeat;
+  box-shadow: 0 0 10px -2px var(--accent);
+  animation: ar-flow 1.3s linear infinite;
+}
+@keyframes ar-flow { 0% { background-position: -45% 0; } 100% { background-position: 145% 0; } }
+
+/* node states */
+.ar-node.is-active .ar-dot {
+  border-color: var(--accent); color: var(--accent);
+  background: var(--accent-subtle);
+  box-shadow: 0 0 0 4px var(--accent-subtle), 0 0 18px -5px var(--accent);
+  animation: ar-glow 1.7s ease-in-out infinite;
+}
+.ar-node.is-active .ar-label { color: var(--fg); }
+.ar-node.is-active .ar-active-badge { display: inline-block; }
 .ar-node.is-done .ar-dot { background: var(--accent-subtle); border-color: var(--accent); color: var(--accent); }
-.ar-node.is-done .ar-label { color: var(--accent); }
-@keyframes ar-pulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
-.ar-activity { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-subtle); }
-.ar-pulse { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--fg-muted); }
-.ar-pulse.live { background: var(--accent); animation: ar-pulse 0.9s ease-in-out infinite; }
-.ar-activity-text { font-size: 12px; color: var(--fg-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.ar-banner { display: none; align-items: center; gap: 8px; margin-top: 10px; padding: 8px 10px; border-radius: 8px; background: var(--accent-subtle); color: var(--accent); font-size: 12px; }
-.ar-banner i { font-size: 15px; }
+.ar-node.is-done .ar-label { color: var(--fg); }
+@keyframes ar-glow {
+  0%, 100% { box-shadow: 0 0 0 4px var(--accent-subtle), 0 0 13px -6px var(--accent); }
+  50%      { box-shadow: 0 0 0 5px var(--accent-subtle), 0 0 24px -3px var(--accent); }
+}
+
+/* current-action row */
+.ar-activity {
+  display: flex; align-items: center; gap: 12px;
+  margin-top: 16px; padding: 10px 14px;
+  border: 1px solid var(--border-subtle); border-radius: 10px;
+  background: var(--bg-sunken);
+  font-family: var(--font-mono); font-size: 13px;
+}
+.ar-pulse { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: var(--fg-faint); }
+.ar-pulse.live { background: var(--success); box-shadow: 0 0 8px -1px var(--success); animation: ar-blink 1.4s ease-in-out infinite; }
+@keyframes ar-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.ar-activity-text { display: inline-flex; align-items: center; gap: 8px; min-width: 0; white-space: nowrap; overflow: hidden; }
+.ar-cmd { color: var(--fg); flex: 0 0 auto; }
+.ar-arrow { color: var(--success); flex: 0 0 auto; }
+.ar-target { color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; }
+
+/* footer stats */
+.ar-foot {
+  display: flex; align-items: center; gap: 22px;
+  margin-top: 12px; padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+}
+.ar-stat { display: inline-flex; align-items: center; gap: 10px; }
+.ar-stat-ico {
+  width: 30px; height: 30px; border-radius: 8px; flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--accent-subtle); color: var(--accent); font-size: 15px;
+}
+.ar-stat-ico-status { background: color-mix(in oklab, var(--success) 16%, transparent); color: var(--success); }
+.ar-stat-body { display: flex; flex-direction: column; gap: 2px; line-height: 1.15; }
+.ar-stat-label { font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--fg-faint); }
+.ar-stat-val { font-size: 14px; font-weight: 600; color: var(--fg); font-family: var(--font-mono); }
+.attack-rail.is-running .ar-status,
+.attack-rail.is-complete .ar-status { color: var(--success); }
+
+/* completion banner */
+.ar-banner { display: none; align-items: center; gap: 8px; margin-top: 11px; padding: 9px 12px; border-radius: 10px; background: var(--accent-subtle); color: var(--accent); font-size: 13px; }
+.ar-banner i { font-size: 16px; }
 .attack-rail.is-complete .ar-banner { display: flex; }
-.attack-rail.is-complete .ar-pulse { animation: none; background: var(--accent); }
+.attack-rail.is-complete .ar-pulse { animation: none; background: var(--success); }
+
+@media (max-width: 600px) {
+  .attack-rail { padding: 12px 14px 10px; }
+  .ar-node { width: 62px; }
+  .ar-dot { width: 40px; height: 40px; }
+  .ar-dot i { font-size: 18px; }
+  .ar-label { font-size: 13px; }
+  .ar-seg { margin-top: 19px; }
+  .ar-foot { flex-wrap: wrap; gap: 12px 18px; }
+}
 
 /* Context gauge — sidebar lower-left.
    Compact card with a small label "context", the live percentage, and the
@@ -1515,6 +1589,22 @@ button {
   padding: 2px 4px;
   border-radius: 4px;
   font-size: 0.9em;
+}
+
+/* Confirmation dialog — a compact, styled replacement for window.confirm(). */
+.modal.confirm-modal {
+  width: min(420px, calc(100vw - 32px));
+}
+
+.confirm-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+.confirm-actions .btn {
+  min-width: 96px;
 }
 
 /* Apple-style alternating loader */
@@ -3920,6 +4010,78 @@ button {
   line-height: 1.5;
   min-height: 36px;
   max-height: 200px;
+}
+
+/* @-mention: a mirror layer behind the textarea draws accent chips behind the
+   @file tokens (the textarea's real text sits on top, transparent bg). Metrics
+   below MUST match .composer-input exactly or the chips drift off the tokens. */
+.composer-input-wrap { position: relative; width: 100%; }
+.composer-input-wrap .composer-input { position: relative; z-index: 1; }
+.composer-mirror {
+  position: absolute;
+  inset: 0;
+  padding: 6px 4px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  color: transparent;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  overflow: hidden;
+  pointer-events: none;
+  box-sizing: border-box;
+}
+.composer-mirror .composer-chip {
+  border-radius: 3px;
+  background: var(--accent-subtle);
+  box-shadow: 0 0 0 1px var(--accent);
+  color: transparent;
+}
+
+/* @ autocomplete menu (floats above the composer) */
+.mention-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 12px;
+  right: 12px;
+  max-height: 244px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.20);
+  z-index: 40;
+}
+.mention-menu.hidden { display: none; }
+.mention-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--fg);
+}
+.mention-item i { font-size: 14px; color: var(--fg-faint); flex: 0 0 auto; }
+.mention-item .mention-name { font-family: var(--font-mono); }
+.mention-item .mention-rel { margin-left: auto; max-width: 56%; color: var(--fg-faint); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mention-item.active,
+.mention-item:hover { background: var(--accent-subtle); }
+.mention-item.active .mention-name { color: var(--accent); }
+
+/* the chip as it appears inside a chat bubble */
+.mention-chip {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  color: var(--accent);
+  background: var(--accent-subtle);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 5px;
+  padding: 0 5px;
+  white-space: nowrap;
 }
 
 .composer-foot {
@@ -8619,6 +8781,64 @@ body,
   line-height: 1.4;
 }
 
+/* Sandbox status chip (Settings) + provisioning log */
+.sandbox-chip {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  background: var(--bg-inset);
+  white-space: nowrap;
+  letter-spacing: .01em;
+}
+.sandbox-chip[data-state="ready"] {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, transparent);
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+}
+.sandbox-chip[data-state="installing"] {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.sandbox-chip[data-state="warn"],
+.sandbox-chip[data-state="no_wsl"] {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 45%, transparent);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+}
+.sandbox-chip[data-state="error"] {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+}
+.sandbox-log {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--fg-muted);
+  max-height: 130px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.sandbox-lastline {
+  margin-top: 8px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  color: var(--fg-muted);
+  opacity: .85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .setup-download-container {
   display: flex;
   flex-direction: column;
@@ -9149,6 +9369,51 @@ body,
 :is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .term-err {
   color: #ff8787;
 }
+
+/* Backend tab — live llama.cpp stdout/stderr (model-load progress, errors). */
+.backend-pane { min-height: 100%; }
+.backend-status {
+  position: sticky; top: 0; z-index: 1;
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 6px; padding: 2px 0 6px;
+  background: var(--bg-sunken);
+  border-bottom: 1px solid var(--border-subtle);
+  font-family: var(--font-sans); font-size: 11px;
+  letter-spacing: 0.04em; text-transform: uppercase; color: var(--fg-muted);
+}
+.backend-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--fg-faint); flex: 0 0 auto; }
+.backend-status.is-running .backend-dot { background: var(--success); box-shadow: 0 0 7px -1px var(--success); animation: ar-blink 1.4s ease-in-out infinite; }
+.backend-status.is-stopped .backend-dot { background: var(--danger); }
+.backend-status.is-running .backend-status-text { color: var(--success); }
+.backend-model { margin-left: auto; text-transform: none; letter-spacing: 0; font-family: var(--font-mono); color: var(--fg-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
+.backend-log-pre .bl-line { display: block; white-space: pre-wrap; word-break: break-word; }
+.backend-log-pre .bl-err { color: var(--danger, #c92a2a); }
+.backend-log-pre .bl-warn { color: #b7791f; }
+.backend-log-pre .bl-ok { color: #2f9e44; }
+.backend-log-pre .bl-key { color: #1971c2; }
+:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .backend-log-pre .bl-err { color: #ff8787; }
+:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .backend-log-pre .bl-warn { color: #e5c07b; }
+:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .backend-log-pre .bl-ok { color: #98c379; }
+:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .backend-log-pre .bl-key { color: #61afef; }
+
+/* Shell tab — shared interactive session (agent + user drive the same process).
+   Scoped to :not(.hidden) so the ID doesn't out-specify .term-tab-pane.hidden. */
+#term-pane-shell:not(.hidden) { display: flex; flex-direction: column; overflow: hidden; padding: 0; }
+.shell-pane { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.shell-bar { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-sunken); flex: 0 0 auto; }
+.shell-select { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12px; font-family: var(--font-mono); max-width: 60%; }
+.shell-status { font-size: 11px; color: var(--fg-muted); font-family: var(--font-sans); display: inline-flex; align-items: center; }
+.shell-status .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--fg-faint); margin-right: 6px; }
+.shell-status.alive { color: var(--success); }
+.shell-status.alive .dot { background: var(--success); box-shadow: 0 0 7px -1px var(--success); }
+.shell-kill { margin-left: auto; background: none; border: 1px solid var(--border-strong); color: var(--fg-muted); border-radius: 6px; padding: 3px 12px; font-size: 11px; cursor: pointer; font-family: var(--font-sans); flex: 0 0 auto; }
+.shell-kill:hover { border-color: var(--danger); color: var(--danger); }
+.shell-out { flex: 1; min-height: 0; margin: 0; overflow: auto; padding: 12px 16px; white-space: pre-wrap; word-break: break-word; }
+.shell-form { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-top: 1px solid var(--border-subtle); background: var(--bg-sunken); flex: 0 0 auto; }
+.shell-prompt { color: var(--accent); font-family: var(--font-mono); font-size: 14px; flex: 0 0 auto; }
+.shell-input { flex: 1; background: transparent; border: none; outline: none; color: var(--fg); font-family: var(--font-mono); font-size: 13px; min-width: 0; }
+.shell-input::placeholder { color: var(--fg-faint); }
+
 .term-cursor {
   display: inline-block;
   width: 7px;
@@ -9208,6 +9473,26 @@ body,
    top, some at the bottom, some spanning) and breathing gently. The bars are
    generated in buildWelcomeBars(); their colours come from the --bar-* palette
    above. This is the whole welcome backdrop (no canvas). */
+
+/* Broad warm→cool wash beneath the streaks so they blend into a colour field
+   instead of reading as isolated panels on the background. */
+.welcome-wash {
+  position: absolute;
+  inset: -8% -12%;
+  background: linear-gradient(100deg,
+    var(--bar-warm), var(--bar-rose) 22%, var(--bar-mid) 44%,
+    var(--bar-violet) 64%, var(--bar-blue) 84%, var(--bar-sky));
+  filter: blur(90px);
+  opacity: 0.4;
+  will-change: transform;
+  animation: welcome-wash-sway 30s ease-in-out infinite;
+}
+
+@keyframes welcome-wash-sway {
+  0%, 100% { transform: translateX(-1.5%) scale(1.02); }
+  50%      { transform: translateX(1.5%) scale(1.06); }
+}
+
 .welcome-bar {
   position: absolute;
   top: -6%;
@@ -9224,6 +9509,7 @@ body,
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .welcome-wash { animation: none; }
   .welcome-bar { animation: none; opacity: var(--o, 0.5); }
 }
 

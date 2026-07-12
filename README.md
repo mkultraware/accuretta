@@ -1,32 +1,33 @@
 <div align="center">
 
 <picture>
-  <!-- GitHub honors prefers-color-scheme inside <picture><source> tags, so
-       the README mark adapts to whichever theme the visitor's GitHub
-       profile is set to: dark slab on light pages, white slab on dark. -->
   <source srcset="logo-mark-dark.png" media="(prefers-color-scheme: dark)">
   <source srcset="logo-mark-light.png" media="(prefers-color-scheme: light)">
-  <img src="logo-mark-light.png" alt="Accuretta logo" width="140" />
+  <img src="logo-mark-light.png" alt="Accuretta logo" width="130" />
 </picture>
 
 # Accuretta
 
-**A fully local AI workspace. Your model, your files, your machine.**
+**A local AI workspace. Your model, your machine, your files.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Powered by llama.cpp](https://img.shields.io/badge/powered%20by-llama.cpp-orange.svg)](https://github.com/ggerganov/llama.cpp)
-[![100% Local](https://img.shields.io/badge/100%25-local-brightgreen.svg)](#privacy)
-[![No Telemetry](https://img.shields.io/badge/telemetry-none-success.svg)](#privacy)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#quick-start)
+[![Powered by llama.cpp](https://img.shields.io/badge/backend-llama.cpp-orange.svg)](https://github.com/ggml-org/llama.cpp)
+[![Runs local](https://img.shields.io/badge/runs-100%25%20local-brightgreen.svg)](#privacy)
 
-<br />
+</div>
+
+<p align="center">
+  <img src="welcome_screen.png" alt="The Accuretta chat UI: session list on the left, a workspace tree, the chat with mode chips (IDE, Agent, Auto, Image, Trust writes), and a preview pane with Terminal, Backend, Shell, and Agent log tabs on the right." width="880" />
+</p>
+
+<div align="center">
 
 <a href="https://github.com/user-attachments/assets/ff7ff8b8-56f9-4393-b4fa-1538a99b87f7" title="Click to play the demo video">
-  <img src="media/demo-poster.png" alt="Accuretta demo. Click to play." width="780" />
+  <img src="media/demo-poster.png" alt="Accuretta demo video. Click to play." width="760" />
 </a>
 
-<sub>Click the image above to watch the demo (about 23 seconds, 1.9 MB).</sub>
+<sub>Click to watch the demo (about 23 seconds, 1.9 MB).</sub>
 
 </div>
 
@@ -34,151 +35,166 @@
 
 ## What it is
 
-Accuretta is a small, friendly desktop AI workspace that runs entirely on your computer. You drop a GGUF model file in a folder, point it at the binary, and you get a chat UI with real tool use, a live HTML preview pane, a Python syntax checker, and a workspace tree that lets the model read and write files you choose. The bridge talks to llama.cpp through llama-server, so you get the speed and the knobs without having to wire up the whole stack yourself.
+You drop a GGUF model file in a folder, point Accuretta at a llama.cpp binary, and you get a chat UI with real tool use: a live HTML preview, a workspace the model can read and write, a Python syntax checker, interactive shells, web search, and a full security-analysis toolkit. Everything runs on your computer. The model stays on your disk, and your prompts never touch anyone else's server.
 
-It is built on a few HTML files, one CSS file, one JS file, and one Python file. No build step, no npm, no electron wrapper. You can read every line in an afternoon.
+Under the hood it's a few static files and one Python script (`bridge.py`) sitting on top of `llama-server`. No build step, no npm, no Electron. You can read the whole thing in an afternoon.
 
-## Why I made it
+## Why I built it
 
-This started as a personal frustration. I had been paying for cloud AI subscriptions and watching the goalposts shift every few weeks. One service trimmed quotas. Another quietly swapped the model behind the same name. Then I tried Google Antigravity, decided I was tired of renting tools that could change under me, and started building something I actually owned.
+I got tired of renting AI. I was paying for cloud subscriptions and watching the terms move every few weeks. One service cut quotas. Another swapped the model behind the same name without saying so. I tried Google Antigravity, decided I didn't want tools that could change under me, and started building something I actually own.
 
-The two rules from day one:
+Two rules from day one:
 
-1. The model lives on my disk. Nothing leaves the computer unless I explicitly ask.
-2. No subscriptions. The GPU is already paid for.
+1. The model lives on my disk. Nothing leaves the computer unless I ask for it.
+2. No subscriptions. I already paid for the GPU.
 
-I came in fresh from Ollama and figured llama.cpp would be a sidegrade. It was not. Same hardware, same model file, noticeably faster generation, and clean control over things like KV cache quantization, flash attention, and speculative decoding. The tradeoff is that you wire it up yourself. Accuretta is partly that wiring, dressed up in a UI you can actually use.
+I came from Ollama and expected llama.cpp to be a sidegrade. It wasn't. Same hardware, same model file, faster generation, and real control over KV cache quantization, flash attention, and speculative decoding. The catch is that you wire it up yourself. Accuretta is that wiring with a usable UI on top.
 
-## A look at the agent in action
+---
 
-The agent has hands. It can read files, write files, run commands, fetch web pages, take screenshots, and inspect network state. Anything destructive (file writes, shell commands) is gated by an approval card, so nothing dangerous happens silently. Read style actions like web fetches can run automatically depending on the model and your settings.
+## Setup (start here)
+
+This is the whole thing, step by step. You need three items: Python, one model file, and a llama.cpp binary. Accuretta can fetch the binary for you, so really you need Python and a model.
+
+### 1. Install Python
+
+Get Python 3.10 or newer from [python.org](https://www.python.org/downloads/). On Windows, tick **"Add Python to PATH"** in the installer. Confirm it worked:
+
+```
+python --version
+```
+
+### 2. Get the code
+
+Download or clone this repository into a folder, for example `C:\accuretta`.
+
+### 3. Install dependencies
+
+Open a terminal in that folder and run:
+
+```
+pip install -r requirements.txt
+```
+
+Only Pillow is genuinely needed. Everything else is optional and loads only if it's present, so you can skip this and the app still runs. The optional packages just turn on extra tools (screenshots, APK/binary analysis, PDF parsing, the Discord bridge, and so on) when you install them.
+
+### 4. Get a model
+
+You need one GGUF model file on disk. Grab one from Hugging Face (search "GGUF"; **unsloth** and **bartowski** publish reliable ones). A `Q4_K_M` quant of a 7B to 35B model is a sane first pick. Put it anywhere, for example `D:\MODELS\`.
+
+### 5. Start it
+
+- **Windows, the easy way:** double-click `start.bat`. It frees the port, installs the desktop-window dependency once, and opens Accuretta as its own application window. No browser, no leftover console.
+- **Any OS:** run `python bridge.py`, then open the URL it prints (usually `http://localhost:8787`) in your browser.
+
+### 6. Let the setup wizard finish the job
+
+On first launch a wizard opens and walks you through the rest.
 
 <p align="center">
-  <img src="media/screenshot.png" alt="Agent writing a haiku to disk after exploring an empty workspace folder" width="780" />
+  <img src="media/setup_process.png" alt="The Accuretta setup wizard scanning system hardware, offering a one-click llama.cpp binary download matched to the detected GPU, and listing detected GGUF models." width="820" />
 </p>
 
-<p align="center"><em>Above: the model picks up that the workspace is empty, decides to write a haiku to <code>haiku.txt</code>, and the file lands on disk. The session, the workspace, and the model are all visible in one place.</em></p>
+It does four things:
 
-A more interesting example. Below the model is asked to run a network snapshot, group active TCP connections by process, flag anything suspicious, and summarize recent DNS activity. It calls the snapshot tool, gets back a structured payload, then reasons about it in a real markdown table. No round trip to a cloud, no API key, no rate limit.
+- scans your GPU and picks the right llama.cpp build (CUDA for NVIDIA, Vulkan for AMD/Intel, CPU otherwise),
+- downloads that binary for you if you don't already have one,
+- lists the GGUF models it found on your drives,
+- auto-tunes the model you choose (context size, GPU offload split, cache type) before it starts the backend.
+
+Click **Save & Start** and you're chatting. Your sessions, settings, workspace pointers, and memories land in a `data/` folder next to `bridge.py`. Back it up to keep them, delete it for a clean slate.
+
+### When something breaks
+
+A few failures are common enough to name:
+
+- **llama-server crashes instantly on NVIDIA.** You're missing the CUDA runtime DLLs. Download the `cudart-llama-bin-win-cuda-*.zip` that matches your build and extract it into the same folder as `llama-server.exe`. Match the CUDA version to your driver: run `nvidia-smi` and read the CUDA Version in the top right. A CUDA 13 build needs a 13.x driver.
+- **`error loading model: missing tensor 'blk.NN.ssm_conv1d.weight'`.** Your llama.cpp is too old for that model, usually a new MTP or hybrid GGUF. Use a non-MTP version of the same model, or update your binary.
+- **llama-server exits the moment speculative decoding turns on.** Set Settings → Speculative decoding to `off` (or `ngram-mod`) and reload. `draft-mtp` only works on models that ship MTP heads and a recent build.
+- **Port 8787 already in use.** Something else is on it. `start.bat` clears it for you; in manual mode set `ACCURETTA_PORT` to another number.
+
+---
+
+## What you can do with it
+
+### Build things and watch them render
+
+Ask for a webpage and you see it render next to the chat as the model writes it. Switch between the rendered view and the source with one click. IDE mode keeps the model in "emit an HTML fence, don't wrap it in a tool call" behavior so the preview stays live.
 
 <p align="center">
-  <img src="media/network_sniff_investigation.png" alt="Agent running a network snapshot tool and producing a TCP analysis grouped by process" width="780" />
+  <img src="Coding_Agent.png" alt="Accuretta in IDE mode: the model has written an HTML page for a PR firm, the source is visible in the chat, and a polished dark 'AURELIUS' site renders live in the preview pane. The agent log streams tool activity underneath." width="880" />
 </p>
 
-One more, from a real session. I asked the agent to help tune my in-ear monitors (Linsoul 7Hz x Crinacle Zero:2) using Peace Equalizer APO. It searched audio review sites, Reddit threads, and AutoEQ measurement databases, picked a target curve (Harman In-Ear 2019), generated ten parametric filters with the right gain/Q/frequency for that specific IEM, and wrote a complete `.peace` profile straight into the EqualizerAPO config folder — including a PreAmp setting to prevent clipping and a heads-up that one of the boosts was unusually aggressive. No copy-pasting filters from a forum. No translating frequency tables into config syntax by hand. Ask, approve the writes, done.
+<p align="center"><em>IDE mode. The model wrote the page, the preview pane renders it live from the HTML fence, and the agent log tracks every tool call.</em></p>
+
+### Let the agent touch the machine, with approvals in the way
+
+The agent has hands. It reads and writes files, runs shell commands, opens interactive shells, fetches web pages, searches the web, takes screenshots, and inspects processes and network state. Anything that changes your system (file writes, shell commands, registry edits) is gated by an approval card, so nothing destructive happens silently. Read-only work like web fetches can run on its own when you flip on **Trust writes** or approve a class of action.
 
 <p align="center">
-  <img src="media/Sound_Question_and_search.png" alt="Agent researching IEM tuning across reference-audio-analyzer.pro, audiosciencereview.com, head-fi.org, and Reddit" width="780" />
+  <img src="Approval_Gate_Plus_Discord.png" alt="An approval card in Accuretta showing a pending command, alongside the same approval arriving as a Discord message that can be approved with a reaction." width="880" />
 </p>
 
-<p align="center"><em>Above: the agent searches reference-audio-analyzer.pro, audiosciencereview.com, head-fi.org, and Reddit for measurements and recommended targets for the specific IEMs.</em></p>
+<p align="center"><em>The approval gate holds every write and command. The same prompt reaches you over Discord, where a reaction runs or denies it, so the safety gate works from your phone.</em></p>
+
+### Authorized red-team tooling
+
+Turn on **Red team tools** in Settings and the model gains a recon and exploitation suite: stealth port scanning, TLS audit, HTTP fingerprinting, passive subdomain enumeration, DNS recon, content discovery, exposure checks, subdomain-takeover detection, CVE matching, an injection and SQL-injection prober, a request fuzzer, an auth-spray primitive, a raw HTTP client, JWT decode/forge/crack, an encoder/decoder, front-end secret scanning, CORS probing, raw TCP, and evidence capture. It's off by default so a normal coding turn doesn't carry a dozen tools it will never use.
+
+The suite is gated twice: the Settings toggle, and an authorization prompt before any run. Point it only at systems you own or have written permission to test.
 
 <p align="center">
-  <img src="media/sound_profile_applied_by_accuretta.png" alt="Agent writing a complete Peace Equalizer profile to disk with activation instructions" width="780" />
+  <img src="RedTeam_Start.png" alt="The start of an authorized red-team run in Accuretta: the model confirms authorization and begins reconnaissance against a target." width="880" />
 </p>
 
-<p align="center"><em>Above: ten parametric filters written to <code>C:\Program Files\EqualizerAPO\config\Qwen_Optimized.peace</code>, with clear activation steps and a frank note about the more aggressive corrections so I could dial them back if I wanted.</em></p>
+<p align="center">
+  <img src="RedTeam_Finish.png" alt="The end of a red-team run: the model has finished the flow and summarized findings." width="880" />
+</p>
 
-## What you get
+<p align="center"><em>An authorized run, start to finish. Authorization first, then recon and exploitation, then a written summary of what it found.</em></p>
 
-* **Chat with real tool use.** Read files, write files, run shell commands, fetch URLs, take screenshots, inspect processes and network state. Every destructive call goes through an approval card.
-* **Live HTML preview.** When the model writes a webpage, you see it render next to the conversation. Switch between rendered view and source with one click.
-* **Open existing HTML from your workspace.** Click the lightning bolt next to any `.html` file in the workspace tree and it loads into the preview pane with its real CSS, JS, and images intact. The bridge serves through a hardened endpoint with strict path traversal checks, so the iframe can only ever reach files inside the folder you opened.
-* **Python syntax checker.** Click the checkmark next to any `.py` file and the bridge runs `compile()` on it. You get a green banner if it parses, or a red one with the line, column, and message. Nothing executes. No imports run. No risk.
-* **Approval cards for everything destructive.** File writes and shell commands always prompt. Read style calls like web fetches can run automatically when you trust the model with that.
-* **Conversation history on disk.** Sessions live in a folder you control. Branch them, rename them, delete them. Nothing is locked into a database.
-* **A real settings drawer.** Context window, sampler temperature, top p, top k, KV cache type, GPU layers, batch size, thinking budget, model swap. All on the fly with a quick reload.
-* **Mobile aware UI.** The whole thing works on a phone browser. Composer, sidebar, settings, swipe back to chat from the menu. No app store, no install, just open the localhost URL on the same network.
-* **Tiny surface area.** A few static files and one Python script. Auditable in an afternoon.
+### See what's talking to your network
 
-## One-click auto-tune
+Ask for a network snapshot and the model groups active TCP and UDP connections by process, flags anything odd, and summarizes recent DNS activity in a real table. No round trip to a cloud, no API key, no rate limit.
 
-Picking a model in Settings (with a VRAM tier set) automatically runs a tuner that reads the GGUF header for the model's actual architecture — layer count, attention config, MoE expert count, KV head dimensions — and computes the largest context window and the right CPU/GPU offload split for your card. No more hand-picking `--n-cpu-moe`, `--ctx-size`, or `--batch-size`. It picks them, applies them, reloads the model, you chat.
+<p align="center">
+  <img src="Blue_Team_Recon_NetworkSnapshot.png" alt="Accuretta running a local network snapshot and analyzing active connections grouped by process, with a summary of recent DNS activity." width="880" />
+</p>
 
-* **GGUF-direct math, not eyeballed.** KV cache cost per token comes from the model's actual `2 × n_layer × head_count_kv × head_dim × dtype_bytes`, not a size bucket. So a Q3 of a given architecture gets *more* context than a Q4 of the same architecture, because the smaller weights file leaves more VRAM free for KV cache.
-* **MoE aware.** When the model is mixture-of-experts, the tuner figures out the dense vs expert split and offloads only as many expert layers to CPU as needed to fit, with a 70%-of-layers cap before it nudges you to grab a smaller quant instead. Speculative decoding is auto-disabled because it's net-negative on MoE per public benchmarks.
-* **Grow only on context.** If autotune comes back with a smaller number than what you already had working, the larger value wins. Your saved ctx never shrinks behind your back.
-* **Self-healing on boot.** Every time the app starts, autotune quietly re-runs in the background and updates flags if the algorithm has improved since you last saved. One toast tells you what changed.
-* **Single click, single load.** Picking a model = "do the right thing for this model on my GPU." No separate Suggest step, no Save step, no manual reload.
+### Take apart untrusted files
 
-> **\*Caveat — bigger context is not always better.** Some models will happily autoload very large contexts (200K+ tokens) when their GGUF reports it as supported. The math says it fits in VRAM, but attention itself slows down as the context window grows even before the conversation fills it. If you care more about tokens-per-second than maximum context, **lower the context window manually in Settings** for that specific use case. On a 16 GB card with a small MoE, **32K-65K is usually the sweet spot for sustained 30+ tok/s**. Bigger ctx = more headroom for long documents and conversations; smaller ctx = faster generation. Pick the one that matches what you are actually doing.
+The bridge ships a reverse-engineering toolkit. Every scanner returns one structured report the model can reason over instead of a raw dump.
 
-## APK static analysis
+- **APKs.** `scan_apk` does pure-Python triage (package metadata, signing certs, dangerous permissions, exported components, and a secret hunt over DEX and native libs). `decompile_apk` shells out to [JADX](https://github.com/skylot/jadx) for Java sources when you've narrowed down what matters.
+- **Native binaries.** `binary_inspect` gives fast PE/ELF/Mach-O triage (sections with entropy, imports, packer hints, signature presence) in about 50ms. `ghidra_analyze` runs [Ghidra](https://github.com/NationalSecurityAgency/ghidra) in-process via [pyghidra](https://pypi.org/project/pyghidra/) for a full report plus C-like decompilation of a named function.
+- **Firmware.** Squashfs extraction, ELF parsing, and a multi-architecture disassembler (via `PySquashfsImage`, `pyelftools`, `capstone`) for router and IoT images.
+- **Pattern matching.** `yara_scan` runs YARA rules (a bundled malware-tell set, or your own `.yar`) over a file or directory in tens of milliseconds.
 
-Drop an `.apk` into a workspace folder and the model can audit it directly through two tools the bridge ships with.
-
-* **`scan_apk(path)`** — pure-Python triage. No external tools, no approval needed. Returns one structured report: package metadata, signing certs (subject/issuer/sha256, no key bytes), all requested permissions with the dangerous ones flagged, exported components, dex / native-lib / asset inventory, and a regex-driven secret hunt over DEX + `.so` files. The hunt covers AWS access keys, Google API keys, Firebase URLs, JWTs, GitHub PATs, Stripe keys, PEM private key blocks, hardcoded HTTP endpoints, IPv4 literals, and a generic `(api[_-]?key|secret|password|token)=…` assignment pattern. Findings are deduped and long literals are redacted in the middle so you see enough context to judge severity without echoing live tokens. A `risk_summary` field at the top surfaces the headlines (debuggable=true, allowBackup, cleartext traffic, dangerous permission count, exported component count, possible secret kinds) so the model can lead with what matters.
-* **`decompile_apk(path, classes?)`** — shells out to [JADX](https://github.com/skylot/jadx). Writes Java sources + resources into a sandbox subdirectory next to the APK. Destructive (writes a folder), gated by an approval card. After it finishes, the model navigates the output with the existing `read_file` and `grep_files` tools. Pass `classes='com.target.foo.*'` to scope the decompile and finish faster on big APKs.
-
-**Optional dependencies** (the tools degrade gracefully when these aren't installed):
+Optional packages, installed only if you want the feature:
 
 ```
-pip install androguard            # full manifest / permissions / signing parse for scan_apk
-# JADX 1.5+              -> https://github.com/skylot/jadx/releases (needs Java 11+)
-```
-
-If JADX isn't on `PATH`, set `jadx_path` in `data/settings.json` to the full path of `jadx.bat` (Windows) or `jadx` (Linux/macOS). Without androguard, `scan_apk` falls back to ZIP-only mode — file inventory and the secret hunt still run, but manifest/permissions are skipped and the report's `notes` field tells you what to install.
-
-> **\*Real-world caveat.** Modern APKs ship R8-obfuscated. Decompiled output looks like `a.a.b.c` until you let JADX deobf-rename. Native libraries are increasingly where the interesting logic hides (auth, DRM) and static analysis only goes so far without dynamic instrumentation. `scan_apk` is the right first move every time — it gives the model a structured findings report to reason over instead of a raw ZIP. `decompile_apk` is for when you've narrowed down which class actually matters.
-
-## Native binary analysis (Ghidra)
-
-For the parts of an APK that JADX can't help with — the `.so` files in `lib/` — the bridge ships a `ghidra_analyze` tool that runs Ghidra in-process via [pyghidra](https://pypi.org/project/pyghidra/). Same idea as `scan_apk`: the model gets a structured JSON report (format, imports, exports, defined strings, function listing, dangerous-import flags) plus optional C-like decompilation of one named function. Works on any native binary, not just `.so` — also `.exe`, `.dll`, ELF, Mach-O, raw firmware.
-
-* **`ghidra_analyze(path, function?, decompile?)`** — gated by approval, returns the report. With `function='SSL_verify'` and `decompile=true`, you get pseudocode for that one function. With no `function`, you get the metadata + risk summary so the model can pick where to dig.
-
-**Setup:**
-
-```
-pip install pyghidra
-# Ghidra (CLI bundle)  -> https://github.com/NationalSecurityAgency/ghidra/releases
-# JDK 21+ (Temurin)    -> https://adoptium.net
-```
-
-Then point the bridge at your Ghidra install root in `data/settings.json`:
-
-```json
-"ghidra_path": "C:\\Program Files\\ghidra_12.0.4_PUBLIC"
-```
-
-(Or set `$GHIDRA_INSTALL_DIR`. Auto-detects common Windows install patterns if neither is set.)
-
-**Performance.** First call boots the JVM (~10s) and then runs Ghidra auto-analysis (~30s on a typical `.so`). The JVM stays loaded for the lifetime of the bridge process, so calls 2..N reuse it — analysis on a small file usually finishes in under 5 seconds. Memory cost: ~600 MB resident once started, regardless of how many binaries you've analyzed. If you don't plan to use it, leave `pyghidra` uninstalled and the import is a no-op.
-
-> **\*Why Ghidra.** Ghidra has the best free decompiler (the one that ships with IDA Pro costs a four-figure license) and Python automation through pyghidra means we don't need a custom Ghidra script per query. The risk surface (`strcpy`, `system`, `dlopen`, `mprotect`, `ptrace`, etc.) is flagged automatically, so the model can lead with "this binary loads code at runtime" or "this binary disables write-protection on memory pages" without having to enumerate imports manually.
-
-## Fast triage (binary_inspect) and pattern matching (yara_scan)
-
-Ghidra is the right tool for "show me the pseudocode of this function" — it's the wrong tool for "is this exe worth looking at." Two lighter tools cover that gap and run in milliseconds instead of half a minute, so the model can use them as a default starting point and only escalate when the triage looks interesting.
-
-* **`binary_inspect(path)`** — pure-Python PE/ELF/Mach-O triage via [pefile](https://pypi.org/project/pefile/) and [pyelftools](https://pypi.org/project/pyelftools/). Returns format, architecture, sections (with R/W/X flags and per-section Shannon entropy), the full import table grouped by DLL, exports, Authenticode signature presence, imphash, and packer hints (`.upx`, `.vmp`, `.themida`, `.aspack`, etc.) — plus a `risk_summary` that combines dangerous imports + high-entropy sections + unsigned-PE into a single short list. Approval-free, ~50 ms on a typical exe. The model uses this to decide whether `ghidra_analyze` is worth ~30 s.
-
-* **`yara_scan(path, rules?, recursive?)`** — pattern matching over a file or directory using [yara-python](https://pypi.org/project/yara-python/). Ships with a small bundled rule set covering common malware tells (autorun registry keys, process-injection API combos, `mimikatz` strings, base64-encoded MZ headers, encoded PowerShell, suspicious paste/discord/ngrok URLs). Pass `rules='C:\\path\\to\\my.yar'` to point at a custom rule file, or pass an inline rule source string for ad-hoc queries. Approval-free, single-file scans land in tens of milliseconds.
-
-**Setup:**
-
-```
+pip install androguard              # full APK manifest / permissions / signing
 pip install pefile pyelftools yara-python
+pip install pyghidra                # needs Ghidra + JDK 21 (adoptium.net)
 ```
 
-All three are pure-Python wheels with prebuilt binaries on PyPI — no compiler dance, no JDK, no extra config. If any of them is missing the tool returns a friendly "install with: pip install …" message instead of crashing the bridge.
+If a package is missing, the tool returns a "install with: pip install ..." note instead of crashing.
 
-## Agentic Coding Tools
+### Run risky things in a throwaway Linux box
 
-To drastically reduce the token-overhead of working with large projects, the bridge exposes three native, standard-library-only tools for the model to use when reasoning about code:
+Set up the optional **sandbox** and Accuretta provisions an isolated Ubuntu guest (`accuretta-sbx`) over WSL2. The model runs offensive tools and, more to the point, unpacks untrusted files pulled back from a target inside that guest, so a booby-trapped sample can't touch your host. Your workspace is visible inside at `/mnt/...`, and the guest is kernel-isolated from Windows. One click in the Setup Wizard or Settings builds it; there's no reboot on a machine that already has WSL2.
 
-*   **`read_skeleton(path)`** — extracts the structural skeleton (classes, functions, signatures, docstrings) of a Python or JS/TS file without reading the entire file. This allows the model to scan a 5,000-line file using only a few hundred tokens of context.
-*   **`check_syntax(path)`** — runs `ast.parse` (or `node --check`) on a target file to verify its syntax. The model uses this automatically to verify its own edits are correct before returning control to you.
-*   **`run_tests(command, cwd)`** — a subprocess wrapper that runs test suites (like `pytest` or `npm test`) and intelligently filters the noise from `stdout`, returning just the failure hints, tracebacks, and pass/fail booleans to the agent.
+### Drive a persistent shell
 
-## Universal MCP Support (Model Context Protocol)
+`run_powershell` is one-shot and forgets everything between calls. When you need state (a reverse shell you caught, an SSH session, a Python REPL, a database client, a debugger), the interactive **session** tools hold a live process across turns. You and the model share the same shell in the Shell tab, so you can watch it work and type into it yourself.
 
-Accuretta natively supports any external MCP Server via a lightweight, dependency-free stdio client built directly into `bridge.py`.
+### Agentic coding helpers
 
-You can plug in official servers (like GitHub, SQLite, Google Drive, PostgreSQL) and their capabilities are dynamically mapped into native tools for the agent to use.
+Three standard-library tools keep token cost low on big projects: `read_skeleton` pulls the classes, functions, and signatures out of a 5,000-line file for a few hundred tokens; `check_syntax` runs `ast.parse` (or `node --check`) so the model verifies its own edits; and `run_tests` runs `pytest`/`npm test` and hands back only the failures and tracebacks.
 
-**Zero-Friction Setup:**
-Simply drop a `bridge_mcp_config.json` next to `bridge.py` using the exact same standard configuration schema used by Claude Desktop:
+### Plug in MCP servers
+
+Accuretta speaks the Model Context Protocol through a dependency-free stdio client built into `bridge.py`. Drop a `bridge_mcp_config.json` next to the bridge (same schema Claude Desktop uses), restart, and the server's tools appear in the model's toolbelt. Every MCP call is approval-gated by default, since an MCP server can run arbitrary commands.
 
 ```json
 {
@@ -192,107 +208,80 @@ Simply drop a `bridge_mcp_config.json` next to `bridge.py` using the exact same 
 }
 ```
 
-Restart `bridge.py`, and the new tools instantly appear in the agent's toolbelt.
+### A real example, start to finish
 
-> **\*Safety First:** Because MCP servers can run arbitrary commands depending on their implementation, **every single MCP tool call is strictly Approval-Gated by default**. The bridge will prompt you with an approval card showing the tool name and exact JSON payload before allowing the server to execute anything.
+I asked the agent to tune my in-ear monitors (Linsoul 7Hz x Crinacle Zero:2) with Peace Equalizer APO. It searched audio review sites, Reddit, and AutoEQ measurement databases, picked a target curve (Harman In-Ear 2019), generated ten parametric filters with the right gain, Q, and frequency for that specific IEM, and wrote a complete `.peace` profile straight into the EqualizerAPO config folder, including a PreAmp value to prevent clipping and a note that one boost was unusually aggressive so I could dial it back.
 
-## Who this is for
+<p align="center">
+  <img src="media/Sound_Question_and_search.png" alt="The agent researching IEM tuning across reference-audio-analyzer.pro, audiosciencereview.com, head-fi.org, and Reddit." width="780" />
+</p>
 
-* People who want a Cursor or Antigravity style experience without the subscription
-* People who already have a decent GPU and would rather use it than rent one through an API
-* Tinkerers who want to swap models around (Qwen, GLM, Llama, Gemma, anything llama.cpp supports) and see what works best for their box
-* Privacy people who do not want their drafts, their code, or their thinking sent to a server somewhere
-* Anyone who got tired of watching big AI companies decide what their tool is allowed to do this week
+<p align="center">
+  <img src="media/sound_profile_applied_by_accuretta.png" alt="The agent writing a complete Peace Equalizer profile to disk with activation instructions." width="780" />
+</p>
 
-## What it is not
+<p align="center"><em>Research, then ten filters written to disk with activation steps and a frank note about the aggressive corrections. No copy-pasting from a forum, no translating frequency tables into config syntax by hand.</em></p>
 
-* Not a polished commercial product. There are rough edges and the docs are mostly this README.
-* Not going to beat Claude Sonnet or GPT 5 on a 24B model running on a laptop. Local is local. Pick the right tool for the job.
-* Not a llama.cpp replacement. It is a friendly front end that sits on top of llama-server.
-* Not trying to be a code editor. It is a chat workspace that happens to render code, preview HTML, and check Python syntax.
+---
+
+## Auto-tune
+
+Picking a model in Settings (with a VRAM tier set) runs a tuner that reads the GGUF header for the model's real architecture (layer count, attention config, MoE expert count, KV head dimensions) and computes the largest context window plus the right CPU/GPU offload split for your card. No hand-picking `--n-cpu-moe`, `--ctx-size`, or `--batch-size`.
+
+- **GGUF-direct math.** KV cost per token comes from the model's actual `2 x n_layer x head_count_kv x head_dim x dtype_bytes`, not a size bucket. A Q3 of an architecture gets more context than a Q4 of the same one, because the smaller weights leave more VRAM for cache.
+- **MoE aware.** For mixture-of-experts models it works out the dense-vs-expert split and offloads only as many expert layers to CPU as needed to fit, capping at 70% of layers before it suggests a smaller quant. Speculative decoding is auto-disabled on MoE since it's net-negative there.
+- **Grow-only context.** If a re-tune comes back smaller than what you already had working, the larger value wins. Your saved context never shrinks behind your back.
+- **Re-runs on boot.** Auto-tune quietly re-runs in the background at startup and updates flags if the algorithm improved since you last saved. One toast tells you what changed.
+
+Bigger context isn't always better. Attention slows down as the window grows, even before the conversation fills it. If you care more about tokens per second than maximum length, lower the context manually for that task. On a 16 GB card with a small MoE, 32K to 65K is usually the sweet spot for sustained 30+ tok/s.
+
+## Reach it from your phone
+
+The bridge listens on your LAN, so any device on the same network can open `http://<your-machine-name>:8787`. Pair that with [Tailscale](https://tailscale.com) and you have a private AI server reachable from anywhere: same UI, same model, same history, nothing leaving your tailnet. No cloud relay, no port forwarding, no open hole to the internet. Install Tailscale on the host and on whatever you want to chat from, and the URL just works. The mobile UI is built for exactly this.
+
+The Discord bridge is the other remote path, and it's better for firing off a task from your lock screen. Accuretta runs as a bot that connects outbound to Discord, so your machine stays closed. It obeys exactly one Discord user id (yours), and every write still needs approval, which you give by reacting.
+
+```
+pip install discord.py
+```
+
+Then create an app at [discord.com/developers](https://discord.com/developers/applications), copy the bot token, turn on the Message Content Intent, paste the token and your user id into Settings → Discord remote bridge, toggle it on, and restart. DM the bot and it does anything you'd ask in the web UI, prompting for approval on anything that touches the machine.
 
 ## Privacy
 
-Nothing about you, your prompts, or your files leaves your computer. The bridge talks to two things on localhost: your llama-server instance and your browser. That is it. There is no telemetry, no analytics, no anonymous account, no cloud sync, no opt out screen because there is nothing to opt out of.
+Nothing about you, your prompts, or your files leaves your computer. The bridge talks to two things on localhost: your llama-server instance and your browser. There's no telemetry, no analytics, no account, no cloud sync.
 
-The one outbound channel is the agent's own web fetch tool. When the model asks to read a URL, that request goes out from your machine to that site, the same way your browser would. Some models will ask first via an approval card, others will just do it as part of answering your question. Either way nothing is sent unless the model decided it needed something off the open web for the task you gave it.
+The one outbound channel is the agent's own web fetch and search. When the model reads a URL, that request goes from your machine to that site, the same way your browser would. Some models ask first, others just do it as part of answering. Nothing is sent unless the model decided it needed something off the open web for the task you gave it.
 
-If you are paranoid (and you should be), run Wireshark next to it. The only outbound traffic you will see is whatever the agent fetched. Want full silence? Run with the network unplugged or block the bridge process at the firewall. The model itself runs offline once loaded, so you can chat all day with no internet at all.
+If you want to check, run Wireshark next to it. The only outbound traffic you'll see is what the agent fetched. Want silence? Block the bridge process at the firewall, or unplug the network. The model runs fully offline once loaded, so you can chat all day with no internet.
 
-## Before you start
+## What it doesn't do
 
-A few things that will save you a long debugging session:
-
-* **Python 3.10 or newer.** 3.14 works too. earlier versions might run but are not tested.
-* **A llama-server binary that actually loads your model.** download a release from [ggml-org/llama.cpp/releases](https://github.com/ggml-org/llama.cpp/releases). NVIDIA users grab the CUDA build (e.g. `llama-bNNNN-bin-win-cuda-13-x64.zip`) AND the matching CUDA DLLs zip (e.g. `cudart-llama-bin-win-cuda-13.1-x64.zip`). extract both into the same folder. without the DLLs llama-server crashes on launch with no useful error.
-* **Match the CUDA build to your driver.** run `nvidia-smi` and look at the CUDA Version field top right. CUDA 13 build needs a 13.x driver, CUDA 12 build runs on 12.x or newer drivers.
-* **At least one GGUF model on disk.** anything llama.cpp can load. avoid the brand-new MTP / hybrid variants (e.g. some Qwen3.6 MTP GGUFs from Unsloth) unless your llama.cpp build is recent enough to load SSM tensors. if you see `error loading model: missing tensor 'blk.NN.ssm_conv1d.weight'` your binary is too old for that model. grab the non-MTP version of the same model and you're fine.
-* **Pick a speculative-decoding strategy that matches your llama.cpp build.** the `spec_strategy` setting (Settings → Speculative decoding, or `data/settings.json`) takes three values: `"ngram-mod"` (default, works on any model and any reasonably modern build), `"draft-mtp"` (uses the model's built-in MTP heads — Qwen 3.5/3.6, DeepSeek V3/R1 — and needs a llama.cpp build from **2026-05-16** or later, PR #22673), and `"off"` (no speculative decoding at all). picking `draft-mtp` on a model without MTP heads, or on an older binary, makes llama-server exit on startup — set it to `"off"` and reload if that happens. older settings files with `"enable_speculative": false` still work; the bridge migrates the value lazily.
-
-## Quick start
-
-Accuretta now comes with a polished setup wizard that scans your hardware, downloads the recommended llama.cpp binaries automatically, and autotunes your selected models for optimal performance.
-
-<p align="center">
-  <img src="media/setup_process.png" alt="Accuretta Quick Setup Wizard" width="780" />
-</p>
-
-1. Install Python 3.10 or newer.
-2. Install dependencies: `pip install -r requirements.txt`
-3. Have at least one GGUF model file in a folder on your computer.
-4. Double click `start.bat` (Windows) or run `python bridge.py` in your terminal.
-5. Open the printed URL in your browser (default is `http://localhost:8787`).
-6. The setup wizard will automatically open to guide you through:
-   * **System Hardware Scan**: Accuretta detects your GPU and hardware capabilities.
-   * **1-Click Binary Downloader**: Links or downloads the official llama.cpp binary built specifically for your hardware (CUDA for NVIDIA, Vulkan for AMD/Intel, or LLVM CPU).
-   * **Model Selection & Auto-Tune**: Select your model and Accuretta automatically suggests and applies optimal parameters (such as optimal context size, GPU offload layers, and cache quantization) before spawning the backend.
-
-The first session creates a `data/` folder next to `bridge.py` that holds your chats, settings, workspace pointers, and memories. Back it up if you care about it. Delete it if you want a clean slate.
-
-## Remote access over Tailscale
-
-The bridge listens on your LAN by default, so any device on the same network can already reach it at `http://<your-machine-name>:8787`. Pair that with [Tailscale](https://tailscale.com) and you have your own private AI server reachable from anywhere — laptop in a coffee shop, phone on cellular, friend's couch. Same UI, same model, same conversation history. Nothing leaves your tailnet.
-
-No cloud relay, no port forwarding, no exposing your machine to the open internet. Install Tailscale on the machine running Accuretta and on whatever device you want to chat from, and the URL `http://<machine-name>:8787` (or the tailnet IP) just works. The mobile UI is built for this exact use case — phone browser, no app store, no install. Open the URL and you are in.
-
-A nice side effect: your conversations and your model never round-trip through someone else's data center. The privacy story holds even when you are not at home.
-
-## Remote control over Discord
-
-Tailscale gives you the full web UI from anywhere. Discord gives you something different: a chat thread you can fire off from your phone's lock screen, with real push notifications, while Accuretta does the work on your PC. Handy when the mobile browser has suspended the web app, or when you just want to kick off a task and get pinged when it finishes.
-
-Accuretta runs as a Discord bot that connects outbound to Discord. No port forwarding, no inbound hole in your firewall, your machine stays closed. It obeys exactly one Discord user id (yours), and every write, command, or file change still needs approval. You approve straight from the chat by reacting, so the safety gate works from your pocket.
-
-Setup, once:
-
-1. `pip install discord.py`
-2. Create an application at https://discord.com/developers/applications, open the Bot tab, copy the token, and turn on the Message Content Intent.
-3. Invite the bot to any server you are in (OAuth2, URL Generator, `bot` scope) so Discord lets you open a DM with it.
-4. In Discord, enable Developer Mode, then right click your own name and Copy User ID.
-5. In Accuretta Settings, under Discord remote bridge, paste the token and your user id, toggle it on, and restart the bridge.
-
-Now DM the bot and ask it to do anything you would ask in the web UI. When a tool needs approval it posts the command with a check and a cross, and your tap runs or denies it. Friends you let into the server can chat with it too, but only you can make it touch the machine, and if no model is loaded it simply says it is offline.
+- It isn't a polished commercial product. There are rough edges, and the docs are mostly this file.
+- A 24B model on a laptop won't beat Claude or GPT-5. Local is local. Pick the right tool for the job.
+- It doesn't replace llama.cpp. It's a front end on `llama-server`.
+- It isn't a code editor. It's a chat workspace that happens to render code, preview HTML, and check Python syntax.
 
 ## Repository layout
 
 ```
 accuretta/
   bridge.py              the Python bridge (model launcher, tool runtime, HTTP server)
+  accuretta_app.py       desktop launcher (native window via pywebview, no console)
+  start.bat              Windows one-click launcher
   index.html             the UI shell
   app.js                 all UI logic
   app.css                main stylesheet
   colors_and_type.css    theme tokens
-  logo-mark.png          the orbital A logo
-  start.bat              minimal Windows launcher
-  requirements.txt       Python dependencies
+  requirements.txt       optional Python dependencies
   data/                  runtime state, created on first run
   media/                 readme assets (screenshots, demo video)
 ```
 
 ## Status
 
-Personal project. I work on it when I feel like it. Pull requests are welcome but I am not building a roadmap or chasing stars. If you fork it and make it your own, that is the entire point.
+Personal project. I work on it when I feel like it. Pull requests are welcome, but I'm not building a roadmap or chasing stars. If you fork it and make it your own, that's the point.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Free for personal use. Use it, change it, ship it. The only thing I ask is that you do not pretend you wrote the parts you did not.
+MIT. See [LICENSE](LICENSE). Use it, change it, ship it. The only thing I ask is that you don't pretend you wrote the parts you didn't.
