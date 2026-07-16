@@ -54,3 +54,6 @@ settings.json
 workspace.json
 approvals.json
 versions/
+
+# MCP server config — holds API keys (Shodan, VirusTotal, etc.). Local per-machine.
+bridge_mcp_config.json

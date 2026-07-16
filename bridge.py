@@ -203,6 +203,7 @@ SNAPSHOTS_DIR = DATA / "snapshots"
 CHATS_FILE = DATA / "chats.json"
 SETTINGS_FILE = DATA / "settings.json"
 WORKSPACE_FILE = DATA / "workspace.json"
+SAVINGS_FILE = DATA / "savings.json"
 SYSTEM_CONTEXT_FILE = DATA / "ACCURETTA.md"
 MEMORIES_FILE = DATA / "memories.jsonl"
 MEMORIES_MAX_INJECT = 15          # how many to load into every system prompt
@@ -438,6 +439,63 @@ def save_json(path: Path, value: Any) -> None:
         tmp.replace(path)
 
 
+# ---- lifetime savings counters --------------------------------------------
+# The "saved vs cloud" card totals every token this machine has run so users can
+# watch months of savings add up. That number must NOT live in the browser
+# (localStorage is per-browser, per-device, and wiped by the desktop webview's
+# private mode) — so it's persisted server-side here, in the same durable data
+# dir as chats.json, and read back over /api/savings. Tokens only: cost is
+# derived client-side from the selected provider's pricing, so switching
+# provider re-prices the whole history for free.
+_SAVINGS_LOCK = threading.Lock()
+_savings_cache: dict | None = None
+_SAVINGS_DEFAULT = {"tok_in": 0, "tok_out": 0, "turns": 0, "since": 0}
+
+
+def _savings_ensure_locked() -> None:
+    """Load savings.json into the cache once. Caller must hold _SAVINGS_LOCK."""
+    global _savings_cache
+    if _savings_cache is not None:
+        return
+    data = load_json(SAVINGS_FILE, None)
+    if not isinstance(data, dict):
+        data = dict(_SAVINGS_DEFAULT)
+    else:
+        for k, v in _SAVINGS_DEFAULT.items():
+            data.setdefault(k, v)
+    if not data.get("since"):
+        data["since"] = int(time.time())   # first-ever run: stamp the start date
+    _savings_cache = data
+
+
+def _savings_get() -> dict:
+    with _SAVINGS_LOCK:
+        _savings_ensure_locked()
+        return dict(_savings_cache)
+
+
+def _savings_add(tok_in: int, tok_out: int) -> dict:
+    """Add one turn's tokens to the lifetime counters and persist. Returns a
+    copy of the new totals. Never raises."""
+    try:
+        ti = max(0, int(tok_in or 0))
+        to = max(0, int(tok_out or 0))
+    except (TypeError, ValueError):
+        ti = to = 0
+    with _SAVINGS_LOCK:
+        _savings_ensure_locked()
+        _savings_cache["tok_in"] += ti
+        _savings_cache["tok_out"] += to
+        if ti or to:
+            _savings_cache["turns"] += 1
+        snap = dict(_savings_cache)
+    try:
+        save_json(SAVINGS_FILE, snap)   # its own lock; keep it out of _SAVINGS_LOCK
+    except Exception:
+        pass
+    return snap
+
+
 DEFAULT_SETTINGS = {
     "model": "",
     "vision_model": "lighton-ocr",
@@ -446,6 +504,15 @@ DEFAULT_SETTINGS = {
     # red-team recon suite (off by default — opt-in; keeps ~13 recon tools out
     # of the prompt for normal coding turns)
     "red_team_enabled": False,
+    # durable mission state for authorized red-team runs. Auto-captures the
+    # target/scope/objective + confirmed-access facts into per-chat state and
+    # re-injects them so the model can't drift off-task on long runs. rt_tail_*
+    # control the recency-end echo (the large-window fix); 0 = auto-scale off
+    # the live context (see _rt_tail_params). See tool_pin_note / _rt_mission_*.
+    "rt_mission_state": True,        # master: auto-capture + top-of-prompt inject
+    "rt_tail_echo": True,           # also echo a compact state block at the recency end
+    "rt_tail_trigger_frac": 0,      # 0 = auto (clamp(S/ctx)); else fill-fraction to start echoing
+    "rt_tail_budget_frac": 0,       # 0 = auto (~1% of ctx, 256–1024 tok); else fraction of ctx
     # discord remote bridge (off by default — DM accuretta from your phone with
     # push notifications + reaction approvals; outbound only, locked to owner id)
     "discord_enabled": False,
@@ -717,9 +784,17 @@ def truncate_messages(msgs: list[dict], max_tokens: int, reserve: int = 256) -> 
 # the context window, so short sessions keep full detail and we never spend a
 # summary call prematurely. Fractions are of the LIVE context limit, so a bigger
 # window naturally summarizes later.
+#
+# CACHE COST: folding rewrites the oldest turns into a summary, which changes the
+# prompt PREFIX. llama.cpp reuses the KV cache only for the unchanged prefix, so a
+# fold forces a full reprocess of the whole window on that turn — a visible stall
+# (seconds) at large ctx. On a 130K window firing at 0.55 meant reprocessing ~130K
+# tokens at ~72K fill, for space we weren't short on. So we fire LATE (near the
+# real limit): compaction becomes a rare "about to overflow" safety net, not a
+# routine tax. truncate_messages is the hard backstop below it.
 _SUMMARY_MIN_KEEP = 6          # always keep at least this many recent messages raw
-_SUMMARY_TRIGGER_FRAC = 0.55  # summarize once the unsummarized tail exceeds this much of ctx
-_SUMMARY_KEEP_FRAC = 0.35     # after folding, keep ~this much of ctx as recent raw turns
+_SUMMARY_TRIGGER_FRAC = 0.85  # summarize only once the tail is near the limit (was 0.55 — premature, cache-busting)
+_SUMMARY_KEEP_FRAC = 0.55     # after folding, keep ~this much raw — a wide gap below the trigger so folds are infrequent
 _SUMMARY_INSTR = (
     "You are compressing an earlier slice of a coding-assistant conversation into a dense, "
     "factual summary for the assistant's OWN future reference. Merge the PRIOR SUMMARY (if any) "
@@ -849,6 +924,41 @@ def tool_pin_note(args: dict) -> dict:
             "note": "Pinned for this session — stays in context permanently, won't be trimmed."}
 
 
+def tool_update_plan(args: dict) -> dict:
+    """Show/update the docked task-progress checklist the user sees. Call once at
+    the start of a multi-step task with all steps, then call again to flip a
+    step's status as you go. Statuses: pending | active | done. Pure UI signal —
+    stored on the chat and streamed to the panel; costs no model context."""
+    raw = args.get("steps") or []
+    if not isinstance(raw, list) or not raw:
+        return {"error": "steps must be a non-empty list of {title, status}"}
+    steps = []
+    for s in raw:
+        if isinstance(s, str):
+            steps.append({"title": s[:120], "status": "pending"})
+        elif isinstance(s, dict):
+            st = str(s.get("status") or "pending").lower()
+            if st not in ("pending", "active", "done"):
+                st = "pending"
+            title = str(s.get("title") or s.get("step") or s.get("name") or "")[:120]
+            steps.append({"title": title, "status": st})
+    steps = [s for s in steps if s["title"]][:12]
+    if not steps:
+        return {"error": "no valid steps"}
+    cid = _get_current_chat()
+    if cid:
+        chats = get_chats()
+        chat = chats.get("chats", {}).get(cid)
+        if chat is not None:
+            chat["plan"] = steps
+            save_json(CHATS_FILE, chats)
+    _emit_chat_event({"type": "plan", "steps": steps})
+    done = sum(1 for s in steps if s["status"] == "done")
+    return {"ok": True, "steps": len(steps), "done": done, "active": next(
+        (s["title"] for s in steps if s["status"] == "active"), None),
+        "note": "Plan shown to the user. Flip each step to 'done' as you finish it."}
+
+
 def tool_unpin_note(args: dict) -> dict:
     """Remove a pin from this session by exact text or 1-based index."""
     cid = _get_current_chat()
@@ -872,6 +982,154 @@ def tool_unpin_note(args: dict) -> dict:
     chat["pins"] = pins
     save_json(CHATS_FILE, chats)
     return {"unpinned": removed, "total_pins": len(pins)}
+
+
+# ---- durable mission state (authorized red-team runs) ----------------------
+# On long agentic runs the model drifts off-task: the mission (target, scope,
+# objective, confirmed access) gets summarized away on small windows or falls
+# out of attention range on huge ones. This is a PARALLEL path to pin_note that
+# does NOT depend on the model choosing to pin — we derive the mission from what
+# actually happens (the initiating instruction + target-touching tool calls +
+# captured flags) and re-inject it. Storage mirrors the pin idiom (dedup +
+# [-N:] cap + save_json) on a separate chat key so it never fights user pins.
+
+_RT_MISSION_FACTS_MAX = 8       # keep the N most-recent established facts (pin-style cap)
+# S = reliable-attention span: the rough token distance a model attends over
+# cleanly regardless of window size. A MODEL property, not a GPU tuning — the
+# one honest constant here. It seeds the tail-echo trigger in _rt_tail_params.
+_RT_ATTN_SPAN = 16000
+
+
+def _rt_url_host(u: str) -> str:
+    """Best-effort host[:port] from a url or bare host. '' on failure."""
+    s = (u or "").strip()
+    if not s:
+        return ""
+    try:
+        if "://" not in s:
+            s = "//" + s
+        netloc = urllib.parse.urlsplit(s).netloc or ""
+        return netloc or (u or "").strip()[:80]
+    except Exception:
+        return (u or "").strip()[:80]
+
+
+def _rt_target_from_args(name: str, args: dict) -> str:
+    """Pull the target host from a red-team tool's arguments, if any."""
+    if not isinstance(args, dict):
+        return ""
+    for k in ("url", "base_url", "target", "host", "endpoint", "origin"):
+        v = args.get(k)
+        if isinstance(v, str) and v.strip():
+            return _rt_url_host(v)
+    return ""
+
+
+def _rt_mission_get(chat: dict) -> dict | None:
+    m = chat.get("mission")
+    return m if isinstance(m, dict) and any(
+        m.get(k) for k in ("target", "scope", "objective", "facts")) else None
+
+
+def _rt_mission_seed(chat: dict, user_text: str) -> bool:
+    """Seed objective from the initiating instruction on the first red-team turn.
+    Only fills empty fields — never overwrites an established objective."""
+    obj = (user_text or "").strip()
+    if not obj:
+        return False
+    m = chat.get("mission")
+    if not isinstance(m, dict):
+        m = {"target": "", "scope": "", "objective": "", "facts": [], "ts": int(time.time())}
+    if m.get("objective"):
+        return False
+    m["objective"] = obj[:300]
+    chat["mission"] = m
+    return True
+
+
+def _rt_mission_note(chat: dict, target: str = "", fact: str = "") -> bool:
+    """Set the target if not yet known and append a deduped, capped fact.
+    Returns True if the mission changed. Same cap idiom as pins."""
+    m = chat.get("mission")
+    if not isinstance(m, dict):
+        m = {"target": "", "scope": "", "objective": "", "facts": [], "ts": int(time.time())}
+    changed = False
+    if target and not m.get("target"):
+        m["target"] = target[:120]
+        # In-scope defaults to the confirmed target host when nothing else is known.
+        if not m.get("scope"):
+            m["scope"] = target[:120]
+        changed = True
+    if fact:
+        fact = fact.strip()[:200]
+        facts = m.get("facts") or []
+        if fact and fact not in facts:
+            facts.append(fact)
+            m["facts"] = facts[-_RT_MISSION_FACTS_MAX:]
+            changed = True
+    if changed:
+        chat["mission"] = m
+    return changed
+
+
+def _rt_mission_render(chat: dict, budget_chars: int | None = None) -> str:
+    """Compact mission block for injection. Header fields always kept; facts
+    trimmed oldest-first to fit budget_chars (the tail echo passes a budget)."""
+    m = _rt_mission_get(chat)
+    if not m:
+        return ""
+    head = []
+    if m.get("target"):
+        head.append(f"target: {m['target']}")
+    if m.get("scope"):
+        head.append(f"scope: {m['scope']}")
+    if m.get("objective"):
+        head.append(f"objective: {m['objective']}")
+    facts = list(m.get("facts") or [])
+    if budget_chars is not None:
+        used = sum(len(h) + 1 for h in head) + 40
+        kept: list[str] = []
+        for f in reversed(facts):   # newest first when trimming
+            line = f"- {f}"
+            if used + len(line) + 1 > budget_chars:
+                break
+            kept.append(line)
+            used += len(line) + 1
+        facts_lines = list(reversed(kept))
+    else:
+        facts_lines = [f"- {f}" for f in facts]
+    out = "\n".join(head)
+    if facts_lines:
+        out += "\nestablished:\n" + "\n".join(facts_lines)
+    return out
+
+
+def _rt_tail_params(ctx: int, settings: dict) -> tuple[float, int]:
+    """Scaling math for the recency-end echo, in ONE place. Returns
+    (trigger_fill_fraction, tail_budget_tokens), both derived from the LIVE
+    context window `ctx` (the value autotune computed for this card+model) so a
+    32k user and a 262k user both get sane behavior with zero hand-tuning.
+
+    trigger fraction = clamp(S/ctx): a large window yields a tiny fraction, so we
+    echo EARLY (262k → ~0.06: fire once the mission sits ~16k tokens back, past
+    the reliable-attention span S). A small window yields a large fraction toward
+    0.95 → effectively never (an 8k–32k window fits inside span; the top block +
+    summary already carry the mission). tail budget = ~1% of ctx, clamped tight
+    (256–1024 tok) so the echo never meaningfully eats the window. Because both
+    read ctx live each turn, an autotune recompute shifts this automatically.
+    Non-zero rt_tail_* settings override the auto defaults."""
+    ctx = max(int(ctx or 0), 1)
+    lo = 0.5 if ctx <= 32768 else 0.06
+    trig = _RT_ATTN_SPAN / ctx
+    trig = max(lo, min(0.95, trig))
+    ovr_t = settings.get("rt_tail_trigger_frac") or 0
+    if isinstance(ovr_t, (int, float)) and ovr_t > 0:
+        trig = float(ovr_t)
+    budget = max(256, min(1024, round(ctx * 0.01)))
+    ovr_b = settings.get("rt_tail_budget_frac") or 0
+    if isinstance(ovr_b, (int, float)) and ovr_b > 0:
+        budget = max(64, round(ctx * float(ovr_b)))
+    return trig, int(budget)
 
 
 # ---- system context (ACCURETTA.md) ----------------------------------------
@@ -1465,6 +1723,12 @@ _approvals_lock = threading.Lock()
 _SAFE_WRITE_KINDS = {"write_file", "edit_file", "replace_ast_node"}
 
 
+# Kinds the user chose "Always allow (this session)" for — auto-approved until
+# the bridge restarts. Never persisted to disk; destructive kinds never enter it
+# (the UI only offers "always allow" on safe operations).
+_approval_session_allow: set[str] = set()
+
+
 def request_approval(title: str, command: str, details: dict | None = None, timeout_s: int = 600) -> dict:
     """Create a pending approval, block worker until user responds, return decision.
     When `auto_approve_write` is set, safe in-workspace file writes are approved
@@ -1474,6 +1738,8 @@ def request_approval(title: str, command: str, details: dict | None = None, time
     try:
         if details.get("kind") in _SAFE_WRITE_KINDS and get_settings().get("auto_approve_write"):
             return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
+        if details.get("kind") and details.get("kind") in _approval_session_allow:
+            return {"status": "session-approved", "decision": "approve", "auto": True, "details": details}
     except Exception:
         pass
     aid = uuid.uuid4().hex[:12]
@@ -1503,7 +1769,7 @@ def request_approval(title: str, command: str, details: dict | None = None, time
     return final
 
 
-def decide_approval(aid: str, decision: str) -> bool:
+def decide_approval(aid: str, decision: str, always: bool = False) -> bool:
     with _approvals_lock:
         entry = _approvals.get(aid)
         ev = _approval_events.get(aid)
@@ -1511,6 +1777,10 @@ def decide_approval(aid: str, decision: str) -> bool:
             return False
         entry["decision"] = "approve" if decision == "approve" else "deny"
         entry["status"] = "decided"
+        if always and entry["decision"] == "approve":
+            kind = (entry.get("details") or {}).get("kind")
+            if kind:
+                _approval_session_allow.add(kind)
         ev.set()
     broadcast_event({"type": "approval:decided", "id": aid, "decision": entry["decision"]})
     return True
@@ -1901,6 +2171,138 @@ def _run_linter(path: str) -> str:
     return ""
 
 
+# ---- per-turn undo journal -------------------------------------------------
+# Snapshots a file's prior state right before a mutating tool writes it, so the
+# whole turn's file changes can be reverted from the UI in one click. The agent
+# loop is serial (one active turn at a time), so a single in-memory journal plus
+# one on-disk copy per turn is enough. Restore writes prior content back, or
+# deletes files the turn newly created. Directories and binary/unreadable files
+# are skipped (not offered for undo) rather than risk a bad restore.
+_UNDO_DIR = DATA / "undo"
+_undo_turn_id = None
+_undo_journal: dict[str, dict] = {}
+
+
+def _emit_chat_event(evt: dict) -> None:
+    """Emit an SSE event on the active chat's live stream, if one is running."""
+    try:
+        cid = _current_chat_id.get()
+        emit = _chat_emitters.get(cid) if cid else None
+        if emit:
+            emit(evt)
+    except Exception:
+        pass
+
+
+def _undo_begin_turn(chat_id: str) -> None:
+    global _undo_turn_id, _undo_journal
+    _undo_turn_id = uuid.uuid4().hex
+    _undo_journal = {}
+
+
+def _undo_snapshot(path: str) -> None:
+    """Record a file's pre-write state once per turn (first touch wins)."""
+    if _undo_turn_id is None:
+        return
+    try:
+        np = normalize_path(path)
+    except Exception:
+        np = path
+    if np in _undo_journal or os.path.isdir(np):
+        return
+    existed = os.path.isfile(np)
+    prior = None
+    if existed:
+        try:
+            prior = Path(np).read_text(encoding="utf-8")
+        except Exception:
+            return  # binary / unreadable — don't offer undo for it
+    _undo_journal[np] = {"existed": existed, "prior": prior}
+
+
+def _undo_prune(keep: int = 40) -> None:
+    try:
+        js = sorted(_UNDO_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in js[keep:]:
+            old.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _undo_commit_turn() -> dict | None:
+    """Persist the turn journal; return a change summary for the UI, or None if
+    the turn changed no files on net."""
+    if not _undo_turn_id or not _undo_journal:
+        return None
+    import difflib
+    files = []
+    total_added = total_deleted = 0
+    for np, snap in _undo_journal.items():
+        try:
+            cur = Path(np).read_text(encoding="utf-8") if os.path.isfile(np) else None
+        except Exception:
+            cur = None
+        prior = snap["prior"]
+        if (prior or "") == (cur or "") and snap["existed"] == (cur is not None):
+            continue  # net-unchanged (written then reverted within the turn)
+        a = d = 0
+        for ln in difflib.unified_diff((prior or "").splitlines(keepends=True),
+                                       (cur or "").splitlines(keepends=True), n=0):
+            if ln.startswith("+") and not ln.startswith("+++"):
+                a += 1
+            elif ln.startswith("-") and not ln.startswith("---"):
+                d += 1
+        total_added += a
+        total_deleted += d
+        files.append({"path": np, "name": os.path.basename(np), "added": a, "deleted": d,
+                      "created": not snap["existed"], "removed": cur is None})
+    if not files:
+        return None
+    try:
+        _UNDO_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"turn_id": _undo_turn_id, "t": int(time.time()),
+                   "entries": [{"path": np, "existed": s["existed"], "prior": s["prior"]}
+                               for np, s in _undo_journal.items()]}
+        (_UNDO_DIR / f"{_undo_turn_id}.json").write_text(json.dumps(payload), encoding="utf-8")
+        _undo_prune()
+    except Exception:
+        pass
+    return {"turn_id": _undo_turn_id, "files": files,
+            "added": total_added, "deleted": total_deleted}
+
+
+def _undo_restore(turn_id: str) -> dict:
+    tid = os.path.basename((turn_id or "").strip())
+    if not tid:
+        return {"error": "no turn id"}
+    jf = _UNDO_DIR / f"{tid}.json"
+    if not jf.is_file():
+        return {"error": "nothing to undo (snapshot expired or already undone)"}
+    try:
+        payload = json.loads(jf.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"error": f"undo journal unreadable: {e}"}
+    restored = 0
+    errors = []
+    for ent in payload.get("entries", []):
+        path = ent.get("path")
+        existed = ent.get("existed")
+        prior = ent.get("prior")
+        try:
+            if existed:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_text(prior if prior is not None else "", encoding="utf-8")
+                _record_file_read(path)
+            elif os.path.isfile(path):
+                os.remove(path)
+            restored += 1
+        except Exception as ex:
+            errors.append(f"{os.path.basename(str(path))}: {ex}")
+    jf.unlink(missing_ok=True)  # consume the journal — one undo per turn
+    broadcast_event({"type": "workspace:update"})
+    return {"ok": True, "restored": restored, "errors": errors}
+
+
 def tool_write_file(args: dict) -> dict:
     path = normalize_path(args.get("path") or "")
     content = args.get("content", "")
@@ -1945,6 +2347,7 @@ def tool_write_file(args: dict) -> dict:
     )
     if approval.get("decision") != "approve":
         return {"error": f"user denied write ({approval.get('status')})"}
+    _undo_snapshot(path)
     try:
         old_text = ""
         if os.path.isfile(path):
@@ -2065,6 +2468,7 @@ def tool_edit_file(args: dict) -> dict:
     )
     if approval.get("decision") != "approve":
         return {"error": f"user denied edit ({approval.get('status')})"}
+    _undo_snapshot(path)
 
     try:
         import difflib
@@ -2308,6 +2712,7 @@ def tool_delete_file(args: dict) -> dict:
     )
     if approval.get("decision") != "approve":
         return {"error": f"user denied delete ({approval.get('status')})"}
+    _undo_snapshot(path)
     try:
         if os.path.isdir(path):
             shutil.rmtree(path)
@@ -2384,6 +2789,35 @@ def _read_cmd_history(limit: int = 200, chat_id: str = "") -> list[dict]:
     return out[:limit]
 
 
+# Registry of the shell command currently running per chat, so the UI's
+# per-command kill button can terminate JUST that process (the turn keeps
+# going — the tool returns a killed result and the model continues). Tools run
+# sequentially within a turn, so one live command per chat at a time.
+_running_cmds_lock = threading.Lock()
+_running_cmds: dict[str, subprocess.Popen] = {}
+# Procs terminated via the kill button. Windows TerminateProcess sets exit code
+# 1 (indistinguishable from a real exit 1 by returncode), so we mark the kill
+# explicitly and read it back in _run_powershell.
+_killed_procs: set = set()
+
+
+def _kill_current_command(chat_id: str) -> bool:
+    """Kill the shell command currently running for this chat, if any."""
+    with _running_cmds_lock:
+        proc = _running_cmds.get(chat_id or "")
+        if proc is not None:
+            _killed_procs.add(proc)
+    if proc is None:
+        return False
+    try:
+        proc.kill()
+        return True
+    except Exception:
+        with _running_cmds_lock:
+            _killed_procs.discard(proc)
+        return False
+
+
 def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000) -> dict:
     t_start = time.time()
     try:
@@ -2424,45 +2858,66 @@ def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000) -> di
     t_out.start()
     t_err.start()
 
+    # Register for the per-command kill button; always deregister on the way out.
+    _cid = _get_current_chat() or ""
+    if _cid:
+        with _running_cmds_lock:
+            _running_cmds[_cid] = proc
     try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _append_cmd_history({
+                "ts": int(t_start * 1000),
+                "chat_id": _get_current_chat(),
+                "command": cmd,
+                "exit": -1,
+                "ok": False,
+                "duration_ms": int((time.time() - t_start) * 1000),
+                "stdout": "".join(out_lines)[-max_stdout:],
+                "stderr": "".join(err_lines)[-4000:],
+                "timed_out": True,
+            })
+            return {"error": f"timeout after {timeout}s"}
+
+        t_out.join(timeout=5)
+        t_err.join(timeout=5)
+
+        stdout = "".join(out_lines)[-max_stdout:]
+        stderr = "".join(err_lines)[-4000:]
+        # Was this terminated by the kill button? Check the explicit marker
+        # (returncode alone can't tell on Windows) plus the POSIX negative code.
+        with _running_cmds_lock:
+            killed = proc in _killed_procs
+        if proc.returncode is not None and proc.returncode < 0:
+            killed = True
+        result = {
+            "ok": proc.returncode == 0,
+            "exit": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+        if killed:
+            result["killed"] = True
+            result["error"] = "command was killed"
         _append_cmd_history({
             "ts": int(t_start * 1000),
             "chat_id": _get_current_chat(),
             "command": cmd,
-            "exit": -1,
-            "ok": False,
+            "exit": proc.returncode,
+            "ok": result["ok"],
             "duration_ms": int((time.time() - t_start) * 1000),
-            "stdout": "".join(out_lines)[-max_stdout:],
-            "stderr": "".join(err_lines)[-4000:],
-            "timed_out": True,
+            "stdout": stdout,
+            "stderr": stderr,
+            "killed": killed,
         })
-        return {"error": f"timeout after {timeout}s"}
-
-    t_out.join(timeout=5)
-    t_err.join(timeout=5)
-
-    stdout = "".join(out_lines)[-max_stdout:]
-    stderr = "".join(err_lines)[-4000:]
-    result = {
-        "ok": proc.returncode == 0,
-        "exit": proc.returncode,
-        "stdout": stdout,
-        "stderr": stderr,
-    }
-    _append_cmd_history({
-        "ts": int(t_start * 1000),
-        "chat_id": _get_current_chat(),
-        "command": cmd,
-        "exit": proc.returncode,
-        "ok": result["ok"],
-        "duration_ms": int((time.time() - t_start) * 1000),
-        "stdout": stdout,
-        "stderr": stderr,
-    })
-    return result
+        return result
+    finally:
+        with _running_cmds_lock:
+            if _cid and _running_cmds.get(_cid) is proc:
+                _running_cmds.pop(_cid, None)
+            _killed_procs.discard(proc)
 
 
 def _catastrophic_cmd(cmd: str) -> str | None:
@@ -3985,6 +4440,96 @@ def tool_web_search(args: dict) -> dict:
         if len(results) >= max_results:
             break
     return {"query": q, "results": results, "count": len(results)}
+
+
+def tool_web_image_search(args: dict) -> dict:
+    """Search for images on the web. Returns a list of image details with their title, direct image URL (image), and source page URL (url)."""
+    import urllib.request
+    import urllib.parse
+    import re
+    import json
+    import http.cookiejar
+
+    q = (args.get("query") or args.get("q") or "").strip()
+    if not q:
+        return {"error": "query required"}
+    max_results = int(args.get("max_results") or 5)
+    max_results = max(1, min(max_results, 20))
+
+    try:
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        
+        # Phase 1: Fetch main page to get VQD
+        headers = [
+            ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+            ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
+            ("Accept-Language", "en-US,en;q=0.9"),
+            ("Connection", "keep-alive"),
+            ("Sec-Fetch-Dest", "document"),
+            ("Sec-Fetch-Mode", "navigate"),
+            ("Sec-Fetch-Site", "none"),
+            ("Sec-Fetch-User", "?1"),
+            ("Upgrade-Insecure-Requests", "1")
+        ]
+        opener.addheaders = headers
+        
+        main_url = "https://duckduckgo.com/?q=" + urllib.parse.quote(q)
+        with opener.open(main_url, timeout=12) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+            
+        m = re.search(r'vqd\s*=\s*[\x27\x22]([^\x27\x22]+)[\x27\x22]', html)
+        if not m:
+            m = re.search(r'vqd\s*:\s*[\x27\x22]([^\x27\x22]+)[\x27\x22]', html)
+        if not m:
+            return {"error": "Failed to extract VQD token from search page"}
+            
+        vqd = m.group(1)
+        
+        # Phase 2: Fetch JSON from image search endpoint
+        ajax_headers = [
+            ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+            ("Accept", "application/json, text/javascript, */*; q=0.01"),
+            ("Accept-Language", "en-US,en;q=0.9"),
+            ("Connection", "keep-alive"),
+            ("Referer", "https://duckduckgo.com/"),
+            ("Sec-Fetch-Dest", "empty"),
+            ("Sec-Fetch-Mode", "cors"),
+            ("Sec-Fetch-Site", "same-origin"),
+            ("X-Requested-With", "XMLHttpRequest")
+        ]
+        opener.addheaders = ajax_headers
+        
+        params = {
+            "l": "wt-wt",
+            "o": "json",
+            "q": q,
+            "vqd": vqd,
+            "f": ",,,",
+            "p": "1"
+        }
+        api_url = "https://duckduckgo.com/i.js?" + urllib.parse.urlencode(params)
+        with opener.open(api_url, timeout=12) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            
+        results = []
+        raw_results = data.get("results", [])
+        for r in raw_results:
+            title = r.get("title")
+            image = r.get("image")
+            source_url = r.get("url")
+            if image:
+                results.append({
+                    "title": title or "",
+                    "image": image,
+                    "url": source_url or ""
+                })
+            if len(results) >= max_results:
+                break
+                
+        return {"query": q, "results": results, "count": len(results)}
+    except Exception as e:
+        return {"error": f"image search failed: {e}"}
 
 
 # ---- desktop automation ---------------------------------------------------
@@ -9831,6 +10376,28 @@ TOOLS: dict[str, dict] = {
         },
         "fn": tool_read_skeleton,
     },
+    "update_plan": {
+        "description": "Show or update a task checklist the user sees in a docked progress panel. Call it ONCE at the start of a multi-step task with all the steps (status 'pending'), mark the step you're on as 'active', and flip finished steps to 'done' as you go. Skip it for trivial one-step requests. Keep titles short (under ~8 words).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "description": "Ordered steps. Each item: {title: string, status: 'pending'|'active'|'done'}.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string", "description": "Short step label."},
+                            "status": {"type": "string", "enum": ["pending", "active", "done"]},
+                        },
+                        "required": ["title"],
+                    },
+                },
+            },
+            "required": ["steps"],
+        },
+        "fn": tool_update_plan,
+    },
     "pin_note": {
         "description": "Pin a fact, decision, or fix to THIS session so it stays in context permanently and is never trimmed. Use it the moment you fix a bug (record the root cause + the fix), make a design decision, or the user states a constraint — so you never undo it or repeat the mistake.",
         "parameters": {
@@ -10438,6 +11005,24 @@ TOOLS: dict[str, dict] = {
             "required": ["query"],
         },
         "fn": tool_web_search,
+    },
+    "web_image_search": {
+        "description": (
+            "Search the web for images matching a query. Returns a list of results "
+            "containing {title, image, url}. ALWAYS render the images in your response "
+            "using standard Markdown image syntax, e.g. `![title](image_url)`. Place consecutive "
+            "images on the same line or next to each other so the UI renders them as a beautiful grid. "
+            "Example: `![Falcon 9](img1_url) ![Falcon Heavy](img2_url)`."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "search query for images"},
+                "max_results": {"type": "integer", "description": "1-20, default 5"},
+            },
+            "required": ["query"],
+        },
+        "fn": tool_web_image_search,
     },
     "web_fetch": {
         "description": "Fetch a URL and return stripped text content. Use after web_search to read a specific page.",
@@ -11526,6 +12111,8 @@ TOOL_ALIASES = {
     "search_web": "web_search",
     "google": "web_search",
     "duckduckgo": "web_search",
+    "image_search": "web_image_search",
+    "search_images": "web_image_search",
     "fetch": "web_fetch",
     "http_get": "web_fetch",
     "screenshot_screen": "screenshot",
@@ -12311,9 +12898,52 @@ def _llama_props_ctx() -> int | None:
 
 def _llama_props_ctx_invalidate() -> None:
     """Call after stopping/restarting llama-server so the next turn re-polls."""
-    global _LLAMA_PROPS_CTX_CACHE, _TOOLS_OVERHEAD_CACHE
+    global _LLAMA_PROPS_CTX_CACHE, _TOOLS_OVERHEAD_CACHE, _RT_TRAIL_SYS_CACHE
     _LLAMA_PROPS_CTX_CACHE = None
     _TOOLS_OVERHEAD_CACHE = ("", 0)
+    _RT_TRAIL_SYS_CACHE = None
+
+
+# Whether THIS model's chat template accepts a system message that isn't first
+# (some do — chatml/llama3/mistral/qwen; Gemma's errors). Decides how the
+# recency-end mission echo rides: a trailing `system` reminder (cleaner "out of
+# band" signal) vs folded into a trailing `user` turn. We PROBE the live server
+# rather than guess, and fall back to the Gemma heuristic if the probe can't run.
+# Cached per server; cleared on restart above.
+_RT_TRAIL_SYS_CACHE: bool | None = None
+
+
+def _rt_trailing_system_ok() -> bool:
+    global _RT_TRAIL_SYS_CACHE
+    if _RT_TRAIL_SYS_CACHE is not None:
+        return _RT_TRAIL_SYS_CACHE
+    ok: bool | None = None
+    try:
+        req = urllib.request.Request(
+            f"{LLAMA}/v1/chat/completions",
+            data=json.dumps({
+                "model": "local", "stream": False, "max_tokens": 1,
+                "messages": [
+                    {"role": "user", "content": "ping"},
+                    {"role": "system", "content": "ok"},
+                ],
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            ok = 200 <= resp.status < 300
+    except urllib.error.HTTPError:
+        ok = False   # template rejected the non-leading system message
+    except Exception:
+        ok = None    # server unreachable/busy — don't cache a transient failure
+    if ok is None:
+        # Fall back to the model-family heuristic; do not cache the guess.
+        return not any(_is_gemma_model(m) for m in (
+            get_settings().get("model"), get_settings().get("model_path"),
+            _llama.loaded_model()))
+    _RT_TRAIL_SYS_CACHE = ok
+    return ok
 
 
 # Cache for the tools-spec token count. Re-tokenized only when the rendered
@@ -12597,7 +13227,7 @@ rules:
 7. CHAIN TOOLS AGGRESSIVELY: when the user asks you to read a file, read it immediately after finding it. do not stop after list_directory. when asked to write, write immediately after confirming the path. complete tasks in the fewest tool calls possible. never ask the user "shall i read it?" or "would you like me to proceed?" — just do it.
 8. NEVER re-emit full file content you already generated in a previous turn. if the user asks you to save something you already built, call write_file with the content but do NOT dump the full code in the visible chat text — just confirm "saved to <path>".
 9. proactive suggestions: if there are obvious, highly actionable next steps for the user, output up to 3 short suggestions at the end of your message in this exact format: <cascade>["Action 1", "Action 2"]</cascade>. Only do this if genuinely applicable. Keep suggestions under 5 words.
-10. editing: use edit_file for small changes (it verifies the match itself); write_file only for new files or full rewrites. after writing a file, TRUST it — you can't run it, so don't rewrite "to be safe". never rewrite the same file from scratch twice — imagined flaws aren't real flaws; fix a SPECIFIC defect with edit_file instead.
+10. editing: use edit_file for small changes (it verifies the match itself); write_file only for new files or full rewrites. after writing a file, TRUST it — you can't run it, so don't rewrite "to be safe". never rewrite the same file from scratch twice — imagined flaws aren't real flaws; fix a SPECIFIC defect with edit_file instead. when SHOWING a code change in chat (not writing it), put a unified diff in a ```diff fence (add path=<file> if known) instead of re-pasting the whole file — it renders as a proper side-by-side/inline diff.
 11. don't loop on refusals: if a tool returns "path outside workspace" or a sandbox/approval refusal, STOP — name what you tried and tell the user how to fix it (add the folder, approve). do not retry variants or fall back to powershell.
 12. surgical & simple: write the minimum that solves the request — no speculative features, no abstractions for single-use code. when editing, touch ONLY what the task needs; don't refactor or restyle working code, match the existing style, and make every changed line trace to what was asked.
 
@@ -12641,6 +13271,14 @@ you may occasionally append exactly one of these to the absolute end of your res
             sig = ",".join(f"{k}:{v.get('type','any')[:3]}" for k, v in params.items())
             tool_lines.append(f"- {name}({sig})")
         parts.append("\n".join(tool_lines))
+        # Nudge the progress panel: for genuinely multi-step work the model should
+        # publish a checklist so the user can watch it advance. Kept opt-in so a
+        # trivial one-shot turn doesn't spam a plan.
+        parts.append(
+            "task plan: for a multi-step request (roughly 3+ distinct steps), call update_plan ONCE up front "
+            "with the whole checklist, mark the step you're on 'active', and flip each to 'done' as you finish it. "
+            "Skip it for simple one-step asks. It is a UI signal only — do not narrate it in your reply."
+        )
         # CTF-tuned red-team models (e.g. RavenX-CyberAgent) narrate CTF framing
         # from training priors — "0/3 flags captured", "objective: 3 flags" —
         # even against a real target with nothing to find. Kill it: real
@@ -12652,6 +13290,16 @@ you may occasionally append exactly one of these to the absolute end of your res
                 "count or progress like \"N/3\"/\"X of Y flags\"; never assume a "
                 "FLAG{...} exists. a clean target = \"no exploitable findings\", not "
                 "\"0 flags\". only cite a FLAG{...} if a tool result actually contains one."
+            )
+            parts.append(
+                "recon vs attack: when the user asks to \"look around\", \"see what you "
+                "can find\", do \"OSINT\", or \"recon\" a target, stay PASSIVE — DNS, "
+                "whois, cert transparency, subdomain enumeration, TLS/HTTP fingerprint, "
+                "exposure checks, and the osint_* tools. do NOT run intrusive/active "
+                "probes (recon_injection_probe, sql_injection, fuzz, auth spray, or "
+                "http_request as an exploit) unless the user explicitly asks to test for "
+                "vulnerabilities, exploit, or break in. gather and report what's exposed "
+                "first; escalate to active testing only on a clear go-ahead."
             )
         if _sandbox_ready_cached():
             parts.append(
@@ -12784,8 +13432,8 @@ def _warmup_tool_grammar() -> None:
 # automatically. Negative lookaheads keep sign-offs ("I'll be here", "let me
 # know") from tripping it.
 _UNFINISHED_PLAN_RE = re.compile(
-    r"(?:i(?:'|’)?ll\s+(?:now\s+|also\s+|then\s+)?(?!be\b|know|let|wait|stop|leave)\w+|"
-    r"i\s+will\s+(?:now\s+|also\s+|then\s+)?(?!be\b|know|wait|stop)\w+|"
+    r"(?:i(?:'|’)?ll\s+(?:now\s+|also\s+|then\s+)?(?!be\b|have\b|get\b|see\b|use\b|keep\b|need\b|know|let|wait|stop|leave|remember|note|explain|mention|cover|include)\w+|"
+    r"i\s+will\s+(?:now\s+|also\s+|then\s+)?(?!be\b|have\b|get\b|see\b|use\b|keep\b|need\b|know|wait|stop|remember|note|explain|mention|cover|include)\w+|"
     r"let\s+me\s+(?!know)\w+|"
     r"i(?:'|’)?m\s+going\s+to\s+\w+|i\s+am\s+going\s+to\s+\w+|"
     r"next,?\s+(?:i(?:'|’)?ll|i\s+will|step)|"
@@ -12808,18 +13456,26 @@ _TURN_BOUNDARY_RE = re.compile(
     r"<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|eot_id\|>|<\|end_of_text\|>"
 )
 
-def _looks_unfinished(text: str) -> bool:
-    """True when a reply reads like the model dropped out of its own plan:
-    it announces further actions, trails off on a colon, or asks permission
-    to continue instead of delivering a result."""
+_COMPLETED_SIGNAL_RE = re.compile(
+    r"(?:all\s+done|no\s+further\s+action|task\s+(?:is\s+)?(?:complete|done|finished)|"
+    r"everything\s+(?:is\s+)?(?:complete|done|finished)|successfully\s+completed|"
+    r"nothing\s+(?:left|else|more)\s+to\s+do|that\s+(?:completes|concludes|finishes)|"
+    r"no\s+(?:additional|more)\s+(?:steps|actions|changes)\s+(?:needed|required|necessary)|"
+    r"already\s+completed|already\s+done|have\s+been\s+completed|has\s+been\s+completed)",
+    re.IGNORECASE,
+)
+
+
+def _looks_unfinished(text: str, finish_reason: str = None) -> bool:
+    """True when a reply is truncated by token limit or trails off on a colon."""
+    if finish_reason == "length":
+        return True
     tail = (text or "").strip()
     if not tail:
         return False
     if tail.endswith(":"):
         return True
-    if tail.endswith("?") and _ASKS_TO_CONTINUE_RE.search(tail[-240:]):
-        return True
-    return bool(_UNFINISHED_PLAN_RE.search(tail[-400:]))
+    return False
 
 
 def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
@@ -12872,6 +13528,21 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         # in a tool response IS confirmed access. Track distinct flags seen this
         # turn so we report each stage once and can summarize at the end.
         captured_flags: list = []
+        # Durable mission state. Loaded ONCE from disk into a working holder and
+        # kept fresh in memory as tools capture the target/flags this turn, so the
+        # recency echo reflects mid-turn progress without a per-round disk read.
+        # Changes are handed back on final["_mission_updates"] for the caller to
+        # persist (one save, outside the hot loop). Only when tracking is enabled.
+        _rt_on = bool(settings.get("red_team_enabled") and settings.get("rt_mission_state", True))
+        _rt_chat: dict = {}
+        _rt_dirty = False
+        if _rt_on:
+            try:
+                _c0 = get_chats().get("chats", {}).get(chat_id) or {}
+                if isinstance(_c0.get("mission"), dict):
+                    _rt_chat["mission"] = dict(_c0["mission"])
+            except Exception:
+                pass
         force_no_think = False   # set when the thinking-budget enforcer aborts a runaway
         budget_retries = 0       # cap how many times we force-stop thinking per turn
         conversation = list(messages)
@@ -12920,6 +13591,25 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             dropped = max(0, len(conversation) - len(trimmed))
             if dropped > 0:
                 emit({"type": "context_trimmed", "dropped": dropped, "total": len(conversation)})
+
+            # Recency-end mission echo — the large-window drift fix. The top-of-
+            # prompt mission block falls outside reliable attention once enough
+            # tokens pile up beneath it; re-echo a compact copy right before
+            # generation, where attention actually lands. Trigger (how full the
+            # window must be) and budget both scale off the live ctx via
+            # _rt_tail_params, so it fires early on a 262k window and effectively
+            # never on a small one. Mutates the per-round `trimmed` copy ONLY —
+            # never `conversation` — so it is never persisted or double-counted.
+            if _rt_on and settings.get("rt_tail_echo", True):
+                _trig, _budget = _rt_tail_params(ctx_limit, settings)
+                _fill = _last_prompt_tokens_by_chat.get(chat_id, 0)
+                if _fill >= ctx_limit * _trig:
+                    _mtxt = _rt_mission_render(_rt_chat, budget_chars=_budget * 4)
+                    if _mtxt:
+                        _body = ("[MISSION STATE — authorized run in progress; stay on "
+                                 "this task, do not drift to generic chat]\n" + _mtxt)
+                        _role = "system" if _rt_trailing_system_ok() else "user"
+                        trimmed = trimmed + [{"role": _role, "content": _body}]
 
             payload = {
                 "model": model or "local",
@@ -13010,6 +13700,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             content_buf: list[str] = []
             tool_calls_by_index: dict[int, dict] = {}
             last_stats: dict = {}
+            finish_reason = None
             # llama-server with --reasoning-format deepseek splits thinking into
             # its own `reasoning_content` delta. The frontend's splitThinking()
             # only recognizes inline <think>…</think>, so we re-wrap here and
@@ -13060,6 +13751,9 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     if not choices:
                         continue
                     ch = choices[0]
+                    fr = ch.get("finish_reason")
+                    if fr:
+                        finish_reason = fr
                     delta = ch.get("delta") or ch.get("message") or {}
                     # reasoning first — wrap as <think>…</think> for the UI
                     rpiece = delta.get("reasoning_content") or delta.get("reasoning") or ""
@@ -13284,7 +13978,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 # type "continue" per step. Bump automatically, budgeted so a
                 # model that keeps narrating instead of acting still lands.
                 if (_final_text and rounds > 0 and rounds < max_tool_rounds
-                        and auto_continues < 3 and _looks_unfinished(_final_text)):
+                        and auto_continues < 3 and _looks_unfinished(_final_text, finish_reason)):
                     auto_continues += 1
                     conversation.append(assistant_msg)
                     _fence_hint = ("" if native_tools
@@ -13312,6 +14006,20 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 if turn_prompt_total:
                     turn_stats["prompt_eval_count"] = turn_prompt_total
                 assistant_msg["_stats"] = turn_stats
+                # Lifetime savings: add this turn's tokens to the durable counters
+                # (summed per-round, as a cloud API would bill) and push the new
+                # totals to the widget. Fall back to a char estimate when the
+                # backend reported no usage, mirroring the frontend fallback.
+                _sv_in = turn_prompt_total
+                _sv_out = turn_eval_total or (len(assistant_msg.get("content") or "") // 4)
+                if _sv_in or _sv_out:
+                    try:
+                        _sv = _savings_add(_sv_in, _sv_out)
+                        emit({"type": "savings", "tok_in": _sv["tok_in"],
+                              "tok_out": _sv["tok_out"], "turns": _sv["turns"],
+                              "since": _sv["since"]})
+                    except Exception:
+                        pass
                 # Breach summary for the red-team flow: which flags were captured
                 # this turn and how many stages that clears.
                 if captured_flags:
@@ -13319,6 +14027,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         "flags": captured_flags,
                         "count": len(captured_flags),
                     }
+                # Durable mission state advanced this turn — the caller persists
+                # the merged mission onto chat["mission"] (one save).
+                if _rt_dirty and _rt_chat.get("mission"):
+                    assistant_msg["_mission_updates"] = dict(_rt_chat["mission"])
                 # Intermediate working memory for this turn: every tool result
                 # and intermediate-assistant-with-tool-calls the loop appended.
                 # The caller persists these so the next user turn replays the
@@ -13361,8 +14073,15 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                                       "flag": _flag, "via": name,
                                       "total": len(captured_flags)})
                                 print(f"[breach] stage {len(captured_flags)} — {_flag} (via {name})", flush=True)
+                                if _rt_on and _rt_mission_note(_rt_chat, fact=f"access via {name}: {_flag}"):
+                                    _rt_dirty = True
                     except Exception:
                         pass
+                # Mission target: the first host a red-team tool points at.
+                if _rt_on and name in _RED_TEAM_TOOL_NAMES:
+                    _t = _rt_target_from_args(name, args)
+                    if _t and _rt_mission_note(_rt_chat, target=_t):
+                        _rt_dirty = True
                 # analysis tools produce large structured output (string lists,
                 # grep hit lists, disasm listings). Cap looser so the model can
                 # actually reason over the output. Chatty tools stay tight.
@@ -14537,6 +15256,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, recommended_settings(name))
         if p == "/api/settings":
             return self._send_json(200, get_settings())
+        if p == "/api/savings":
+            # Lifetime token totals for the "saved vs cloud" card. Server-side so
+            # it survives restarts and follows the machine, not the browser.
+            return self._send_json(200, _savings_get())
         if p == "/api/workspace":
             return self._send_json(200, get_workspace())
         if p == "/api/workspace/files":
@@ -15135,8 +15858,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(200, chats["chats"][cid])
             return self._send_json(404, {"error": "not found"})
         if p == "/api/approvals/decide":
-            ok = decide_approval(body.get("id") or "", body.get("decision") or "deny")
+            ok = decide_approval(body.get("id") or "", body.get("decision") or "deny",
+                                 always=bool(body.get("always")))
             return self._send_json(200 if ok else 404, {"ok": ok})
+        if p == "/api/undo":
+            return self._send_json(200, _undo_restore(body.get("turn_id") or ""))
         if p == "/api/tools/call":
             job_id = uuid.uuid4().hex[:12]
             name = body.get("name") or ""
@@ -15244,6 +15970,13 @@ class Handler(BaseHTTPRequestHandler):
             if not cid:
                 return self._send_json(400, {"error": "chat_id required"})
             ok = cancel_chat(cid)
+            return self._send_json(200, {"ok": ok, "chat_id": cid})
+        if p == "/api/kill-command":
+            # Kill JUST the shell command running for this chat (not the turn).
+            cid = (body.get("chat_id") or "").strip()
+            if not cid:
+                return self._send_json(400, {"error": "chat_id required"})
+            ok = _kill_current_command(cid)
             return self._send_json(200, {"ok": ok, "chat_id": cid})
         if p == "/api/prewarm":
             # llama-server keeps the model resident after startup, so "prewarm"
@@ -15560,7 +16293,24 @@ class Handler(BaseHTTPRequestHandler):
                     save_json(CHATS_FILE, chats)
             except Exception:
                 traceback.print_exc()
+        # Durable mission state (authorized red-team runs): seed the objective
+        # from the initiating instruction so it survives long runs. Saved here so
+        # run_chat_turn's snapshot + persistence see it. See _rt_mission_*.
+        if get_settings().get("red_team_enabled") and get_settings().get("rt_mission_state", True):
+            try:
+                if _rt_mission_seed(chat, user_text):
+                    save_json(CHATS_FILE, chats)
+            except Exception:
+                traceback.print_exc()
         system_prompt = build_system_prompt(include_tools=use_tools, chat_mode=mode)
+        # Durable mission block — TOP of the appended sections for primacy; never
+        # trimmed. Parallel to pins but auto-derived (no model cooperation).
+        _mission = _rt_mission_render(chat) if get_settings().get("rt_mission_state", True) else ""
+        if _mission:
+            system_prompt += (
+                "\n\n=== MISSION (authorized run — hold this; do NOT drift off-task) ===\n"
+                + _mission
+            )
         # Pinned facts/fixes — verbatim, highest priority, never trimmed.
         _pins = chat.get("pins") or []
         if _pins:
@@ -15662,6 +16412,7 @@ class Handler(BaseHTTPRequestHandler):
             broadcast_event(evt)
 
         emit({"type": "chat_start", "chat_id": chat_id})
+        _undo_begin_turn(chat_id)
         if tools_off_reason:
             emit({"type": "tools_unavailable", "message": tools_off_reason})
         tok = _current_chat_id.set(chat_id)
@@ -15688,6 +16439,12 @@ class Handler(BaseHTTPRequestHandler):
                 # skips them — they stay in the JSON purely so the model can
                 # replay them on the next user turn.
                 appended = final.pop("_appended_intermediate", None) or []
+                # Durable mission state advanced during the turn (target host,
+                # confirmed-access facts) — merge onto the chat so the next turn
+                # injects it. Already dedup/capped by _rt_mission_note.
+                _mu = final.pop("_mission_updates", None)
+                if isinstance(_mu, dict):
+                    chat["mission"] = _mu
                 now_t = int(time.time())
                 for im in appended:
                     role = im.get("role")
@@ -15736,6 +16493,13 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                 save_json(CHATS_FILE, chats)
+
+        _changes = _undo_commit_turn()
+        if _changes:
+            try:
+                emit({"type": "turn_changes", **_changes})
+            except Exception:
+                pass
 
         try:
             emit({"type": "chat_end"})
@@ -17351,7 +18115,17 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
                         save_json(CHATS_FILE, chats)
                 except Exception:
                     traceback.print_exc()
+            if get_settings().get("red_team_enabled") and get_settings().get("rt_mission_state", True):
+                try:
+                    if _rt_mission_seed(chat, user_text):
+                        save_json(CHATS_FILE, chats)
+                except Exception:
+                    traceback.print_exc()
             system_prompt = build_system_prompt(include_tools=True, chat_mode="agent")
+            _mission = _rt_mission_render(chat) if get_settings().get("rt_mission_state", True) else ""
+            if _mission:
+                system_prompt += ("\n\n=== MISSION (authorized run — hold this; do NOT drift off-task) ===\n"
+                                  + _mission)
             _pins = chat.get("pins") or []
             if _pins:
                 system_prompt += ("\n\n=== PINNED FOR THIS SESSION (established facts/fixes — do NOT undo or repeat) ===\n"
@@ -17395,6 +18169,9 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
         chats = get_chats()
         chat = chats["chats"].get(chat_id)
         if chat is not None:
+            _mu = final.get("_mission_updates")
+            if isinstance(_mu, dict):
+                chat["mission"] = _mu
             for im in (final.get("_appended_intermediate") or []):
                 chat["messages"].append(im)
             amsg = {"role": "assistant", "content": final.get("content", "")}
@@ -17537,6 +18314,7 @@ def _discord_start() -> None:
 
 
 def main():
+    _load_mcp_servers()
     print(f"accuretta bridge")
     print(f"  root:    {ROOT}")
     print(f"  llama:   {LLAMA}")
@@ -17716,7 +18494,6 @@ def main():
 
 
 if __name__ == "__main__":
-    _load_mcp_servers()
     try:
         main()
     except Exception as e:

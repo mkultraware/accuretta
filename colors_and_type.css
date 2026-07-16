@@ -98,40 +98,40 @@
   --gray-90: #141412;
 
   /* ---- SEMANTIC (LIGHT MODE DEFAULT) ---- */
-  --bg:        var(--off-white);
-  --bg-raised: #FBFAF6;
-  --bg-sunken: var(--off-white-2);
-  --bg-inset:  var(--off-white-3);
+  --bg:        #FAFAFB;
+  --bg-raised: #FFFFFF;
+  --bg-sunken: #F3F3F5;
+  --bg-inset:  #EBEBEF;
 
   /* ---- GLASSMORPHISM ---- */
-  --glass-bg:       rgba(251, 250, 246, 0.75);
-  --glass-border:   rgba(20, 20, 18, 0.06);
+  --glass-bg:       rgba(255, 255, 255, 0.75);
+  --glass-border:   rgba(9, 9, 11, 0.05);
   --glass-blur:     16px;
 
-  --fg:        var(--off-black);
-  --fg-muted:  var(--gray-50);
-  --fg-subtle: var(--gray-40);
-  --fg-faint:  var(--gray-30);
-  --fg-invert: var(--off-white);
+  --fg:        #09090B;
+  --fg-muted:  #52525B;
+  --fg-subtle: #71717A;
+  --fg-faint:  #A1A1AA;
+  --fg-invert: #FFFFFF;
 
-  --border:         var(--gray-10);
-  --border-strong:  var(--gray-20);
-  --border-subtle:  var(--gray-05);
+  --border:         #E4E4E7;
+  --border-strong:  #D4D4D8;
+  --border-subtle:  #F4F4F5;
 
-  --accent:         #007AFF;
-  --accent-hover:   #0063D1;
-  --accent-subtle:  #D6E8FF;
+  --accent:         #0066FF;
+  --accent-hover:   #0052CC;
+  --accent-subtle:  rgba(0, 102, 255, 0.08);
   --accent-fg:      #FFFFFF;
 
   --success:  var(--mint-3);
   --warning:  var(--lemon-3);
   --danger:   var(--pink-3);
-  --info:     var(--lilac-3);
+  --info:     #0066FF;
 
   --success-subtle: var(--mint);
   --warning-subtle: var(--lemon);
   --danger-subtle:  var(--pink);
-  --info-subtle:    var(--lilac);
+  --info-subtle:    rgba(0, 102, 255, 0.08);
 
   /* ---- RADII ---- */
   --r-xs: 4px;
@@ -217,47 +217,36 @@
    ============================================================ */
 [data-theme="dark"],
 .dark {
-  /* Cool neutrals: pure-ish gray with a hint of blue, no warm tint.
-     Body sits at #1a1a1d (mid-dark, easy on the eyes), raised lifts
-     to #222227 (cards, panels), sunken drops to #141417 (chat scroll
-     well). All tuned so a 1px border between them is just barely
-     visible — that's where the depth comes from, not max-contrast. */
-  --bg:        #1a1a1d;
-  --bg-raised: #222227;
-  --bg-sunken: #141417;
-  --bg-inset:  #2a2a30;
+  /* Cool OLED neutrals: deep obsidian black with high-end tech-indigo accents */
+  --bg:        #09090B;
+  --bg-raised: #121215;
+  --bg-sunken: #050507;
+  --bg-inset:  #1C1C21;
 
-  --glass-bg:       rgba(34, 34, 39, 0.7);
+  --glass-bg:       rgba(18, 18, 21, 0.7);
   --glass-border:   rgba(255, 255, 255, 0.05);
 
-  /* Subtle vertical gradient applied to body — page eases from a
-     slightly lighter top down to the base, which gives the "off-black
-     gradient" feel without darkening the chat itself. */
-  --bg-gradient: linear-gradient(180deg, #1f1f23 0%, #1a1a1d 38%, #161618 100%);
+  --bg-gradient: linear-gradient(180deg, #121216 0%, #09090B 40%, #050507 100%);
 
-  --fg:        #ECEAE5;
-  --fg-muted:  #A8A6A0;
-  --fg-subtle: #7C7A75;
-  --fg-faint:  #5A5854;
-  --fg-invert: var(--off-black);
+  --fg:        #F4F4F5;
+  --fg-muted:  #A1A1AA;
+  --fg-subtle: #71717A;
+  --fg-faint:  #4B4B52;
+  --fg-invert: #09090B;
 
-  --border:        #2a2a2f;
-  --border-strong: #38383e;
-  --border-subtle: #1f1f23;
+  --border:        #1E1E24;
+  --border-strong: #2D2D36;
+  --border-subtle: #121217;
 
-  /* Dark mode accent flips to purple — light mode keeps ember.
-     Mid value is the "send button" purple; subtle is the focus-ring
-     wash. accent-fg is white because purple at this brightness pairs
-     better with white than with off-black. */
-  --accent:        var(--purple-2);
-  --accent-hover:  var(--purple);
-  --accent-subtle: rgba(155,126,232,0.16);
+  --accent:        #6366F1;
+  --accent-hover:  #818CF8;
+  --accent-subtle: rgba(99, 102, 241, 0.12);
   --accent-fg:     #FFFFFF;
 
   --success-subtle: rgba(106,196,154,0.14);
   --warning-subtle: rgba(232,211,112,0.14);
   --danger-subtle:  rgba(255,106,0,0.14);
-  --info-subtle:    rgba(142,114,209,0.14);
+  --info-subtle:    rgba(99,102,241,0.12);
 
   --shadow-xs: 0 1px 0 rgba(0,0,0,0.3);
   --shadow-sm: 0 1px 2px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.04);
@@ -442,37 +431,38 @@
    Vibrant, highly modern dark theme with luminous highlights.
    ============================================================ */
 [data-theme="aurora"] {
-  --bg:        #0b1212;  /* polar night obsidian */
-  --bg-raised: #121e1e;  /* glass spruce card */
-  --bg-sunken: #070b0b;  /* deep frozen valley */
-  --bg-inset:  #1b2d2d;  /* interactive elements */
+  /* Arctic polar obsidian: deep glass spruce with luminous neon northern lights */
+  --bg:        #050808;
+  --bg-raised: #0B1414;
+  --bg-sunken: #030505;
+  --bg-inset:  #122020;
 
-  --glass-bg:       rgba(18, 30, 30, 0.65);
+  --glass-bg:       rgba(11, 20, 20, 0.7);
   --glass-border:   rgba(0, 255, 196, 0.08);
   --ambient-orb-1:  radial-gradient(circle, rgba(0, 255, 196, 0.08) 0%, transparent 70%);
   --ambient-orb-2:  radial-gradient(circle, rgba(0, 180, 216, 0.05) 0%, transparent 70%);
 
-  --bg-gradient: linear-gradient(180deg, #101c1c 0%, #0b1212 40%, #060808 100%);
+  --bg-gradient: linear-gradient(180deg, #091010 0%, #050808 40%, #020303 100%);
 
-  --fg:        #e3f6f3;  /* frosted cyan */
-  --fg-muted:  #9abdb9;  /* aurora fog */
-  --fg-subtle: #6c918c;  /* pine needles */
-  --fg-faint:  #44605c;  /* boreal shade */
-  --fg-invert: #0b1212;
+  --fg:        #E8F8F5;
+  --fg-muted:  #8DB2AD;
+  --fg-subtle: #5C827D;
+  --fg-faint:  #3A5652;
+  --fg-invert: #050808;
 
-  --border:        #182a2a;
-  --border-strong: #243e3e;
-  --border-subtle: #0f1c1c;
+  --border:        #0F1E1E;
+  --border-strong: #1D3434;
+  --border-subtle: #080C0C;
 
-  --accent:        #00ffc4;  /* luminous aurora */
-  --accent-hover:  #00e6b0;
+  --accent:        #00FFC4;
+  --accent-hover:  #34FFD2;
   --accent-subtle: rgba(0, 255, 196, 0.12);
-  --accent-fg:     #0b1212;
+  --accent-fg:     #050808;
 
   --success-subtle: rgba(106, 196, 154, 0.14);
   --warning-subtle: rgba(232, 211, 112, 0.14);
   --danger-subtle:  rgba(255, 106, 0, 0.14);
-  --info-subtle:    rgba(0, 255, 196, 0.14);
+  --info-subtle:    rgba(0, 255, 196, 0.12);
 
   --shadow-xs: 0 1px 0 rgba(0,0,0,0.4);
   --shadow-sm: 0 1px 2px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.02);
@@ -503,37 +493,38 @@
    and luminous, glowing violet/pink/cyan stardust highlights.
    ============================================================ */
 [data-theme="nebula"] {
-  --bg:        #090810;  /* deep cosmic void */
-  --bg-raised: #131221;  /* raised nebula glass panel */
-  --bg-sunken: #050409;  /* sunken starlight well */
-  --bg-inset:  #1d1b32;  /* dark violet interactive fields */
+  /* Cosmic midnight void: deep space violet with luminous neon lavender stardust */
+  --bg:        #050409;
+  --bg-raised: #0D0B17;
+  --bg-sunken: #020205;
+  --bg-inset:  #161329;
 
-  --glass-bg:       rgba(19, 18, 33, 0.62);
+  --glass-bg:       rgba(13, 11, 23, 0.7);
   --glass-border:   rgba(192, 132, 252, 0.08);
   --ambient-orb-1:  radial-gradient(circle, rgba(217, 70, 239, 0.08) 0%, transparent 70%);
   --ambient-orb-2:  radial-gradient(circle, rgba(6, 182, 212, 0.05) 0%, transparent 70%);
 
-  --bg-gradient: linear-gradient(180deg, #120e28 0%, #090810 40%, #050308 100%);
+  --bg-gradient: linear-gradient(180deg, #0d0920 0%, #050409 40%, #020104 100%);
 
-  --fg:        #f3efff;  /* frosted cosmic stardust */
-  --fg-muted:  #b3aed0;  /* soft nebula lavender */
-  --fg-subtle: #847fa2;  /* deep space fog */
-  --fg-faint:  #535071;  /* cold dark matter */
-  --fg-invert: #090810;
+  --fg:        #F4F0FF;
+  --fg-muted:  #A59FB8;
+  --fg-subtle: #736C8C;
+  --fg-faint:  #4A4561;
+  --fg-invert: #050409;
 
-  --border:        #1f1c34;  /* frosted purple margin */
-  --border-strong: #332d56;  /* luminous stardust seam */
-  --border-subtle: #121021;  /* faint purple boundary */
+  --border:        #141024;
+  --border-strong: #261F3F;
+  --border-subtle: #090712;
 
-  --accent:        #c084fc;  /* electric lavender neon */
-  --accent-hover:  #d8b4fe;  /* bright lavender starlight */
-  --accent-subtle: rgba(167, 139, 250, 0.15);
-  --accent-fg:     #090810;
+  --accent:        #C084FC;
+  --accent-hover:  #D8B4FE;
+  --accent-subtle: rgba(192, 132, 252, 0.15);
+  --accent-fg:     #050409;
 
   --success-subtle: rgba(106, 196, 154, 0.14);
   --warning-subtle: rgba(232, 211, 112, 0.14);
   --danger-subtle:  rgba(255, 106, 0, 0.14);
-  --info-subtle:    rgba(167, 139, 250, 0.14);
+  --info-subtle:    rgba(192, 132, 252, 0.15);
 
   --shadow-xs: 0 1px 0 rgba(0,0,0,0.5);
   --shadow-sm: 0 1px 2px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.01);
@@ -568,35 +559,36 @@
    No gimmicks; the restraint is the point.
    ============================================================ */
 [data-theme="operator"] {
-  --bg:        #12151C;  /* deep cool slate */
-  --bg-raised: #1A1E27;  /* cards, panels */
-  --bg-sunken: #0D0F14;  /* chat well */
-  --bg-inset:  #232834;  /* inputs, interactive fields */
+  /* Developer Slate: sleek professional IDE workstation with sky-blue accents */
+  --bg:        #0D0E12;
+  --bg-raised: #151821;
+  --bg-sunken: #08090C;
+  --bg-inset:  #1E222E;
 
-  --glass-bg:       rgba(26, 30, 39, 0.72);
+  --glass-bg:       rgba(21, 24, 33, 0.72);
   --glass-border:   rgba(255, 255, 255, 0.06);
 
-  --bg-gradient: linear-gradient(180deg, #161A22 0%, #12151C 42%, #0F1116 100%);
+  --bg-gradient: linear-gradient(180deg, #12151D 0%, #0D0E12 40%, #07080A 100%);
 
-  --fg:        #E5E9F0;  /* clean cool white */
-  --fg-muted:  #99A2B2;
-  --fg-subtle: #6B7488;
-  --fg-faint:  #454D5D;
-  --fg-invert: #0D0F14;
+  --fg:        #E2E8F0;
+  --fg-muted:  #94A3B8;
+  --fg-subtle: #64748B;
+  --fg-faint:  #475569;
+  --fg-invert: #08090C;
 
-  --border:        #262C38;
-  --border-strong: #353D4C;
-  --border-subtle: #1C2029;
+  --border:        #1F2433;
+  --border-strong: #2F374D;
+  --border-subtle: #12151E;
 
-  --accent:        #4D9EFF;  /* clean professional azure */
-  --accent-hover:  #6FB2FF;
-  --accent-subtle: rgba(77, 158, 255, 0.14);
-  --accent-fg:     #FFFFFF;
+  --accent:        #38BDF8;
+  --accent-hover:  #7DD3FC;
+  --accent-subtle: rgba(56, 189, 248, 0.12);
+  --accent-fg:     #0D0E12;
 
   --success-subtle: rgba(106, 196, 154, 0.14);
   --warning-subtle: rgba(232, 211, 112, 0.14);
   --danger-subtle:  rgba(255, 106, 0, 0.14);
-  --info-subtle:    rgba(77, 158, 255, 0.14);
+  --info-subtle:    rgba(56, 189, 248, 0.12);
 
   /* Soft, quiet shadows — modern dashboard depth, never harsh. */
   --shadow-xs: 0 1px 0 rgba(0, 0, 0, 0.3);

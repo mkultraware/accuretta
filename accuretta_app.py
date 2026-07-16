@@ -27,7 +27,9 @@ static-file root should resolve there when frozen. That is the one packaging
 touch-up; running directly with python needs nothing.
 """
 
+import base64
 import os
+import re
 import socket
 import sys
 import threading
@@ -100,14 +102,102 @@ def _acquire_single_instance(lock_port: int = 8799) -> bool:
         return False
 
 
-_SPLASH_HTML = """<!doctype html><html><head><meta charset="utf-8"></head>
-<body style="margin:0;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#12151c;color:#e6e6e6;font-family:system-ui,-apple-system,Segoe UI,sans-serif;user-select:none">
-  <div style="font-size:30px;font-weight:600;letter-spacing:.01em">accuretta</div>
-  <div style="margin-top:10px;font-size:13px;color:#8b93a3">starting your engine…</div>
-  <div style="margin-top:20px;width:180px;height:3px;background:#232834;border-radius:3px;overflow:hidden">
-    <div style="width:38%;height:100%;background:#c084fc;border-radius:3px;animation:sl 1.1s ease-in-out infinite"></div>
-  </div>
-  <style>@keyframes sl{0%{transform:translateX(-110%)}100%{transform:translateX(420%)}}</style>
+# Themes whose splash uses a light background + the DARK-colored logo mark.
+# Mirrors app.css: :is([data-theme="light"],[data-theme="soft"]) shows .splash-logo-dark.
+_LIGHT_THEMES = {"", "light", "soft"}
+
+
+def _read_saved_theme() -> str:
+    """The last theme the user saved (settings.json). '' / unknown -> light."""
+    try:
+        return (bridge.get_settings().get("theme") or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _splash_palette(theme: str) -> dict:
+    """Pull bg/fg/muted/accent for `theme` straight from colors_and_type.css so
+    the splash matches the app rather than hardcoding a second copy of the palette.
+    Falls back to the light default if the file or a token can't be read."""
+    pal = {"bg": "#FAFAFB", "fg": "#09090B", "muted": "#52525B", "accent": "#0066FF"}
+    try:
+        css = (bridge.ROOT / "colors_and_type.css").read_text(encoding="utf-8")
+        css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)  # strip comments so [^{}] is safe
+        blocks = re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+
+        # Merge every custom property whose selector matches the scope, in document
+        # order (later rules win) — so the theme's palette block overrides the
+        # earlier `body` gradient rule, and :root supplies shared shades.
+        def vars_for(target: str) -> dict:
+            out = {}
+            for sel, body in blocks:
+                if target in sel:
+                    for name, val in re.findall(r"(--[\w-]+)\s*:\s*([^;]+);", body):
+                        out[name.strip()] = val.strip()
+            return out
+
+        vmap = vars_for(":root")
+        if theme:
+            vmap.update(vars_for(f'[data-theme="{theme}"]'))
+
+        # Follow var(--x) references (some accents alias a shared shade) to a literal.
+        def resolve(val: str, depth: int = 0) -> str:
+            val = (val or "").strip()
+            m = re.fullmatch(r"var\(\s*(--[\w-]+)\s*(?:,\s*(.+))?\)", val)
+            if m and depth < 8:
+                if m.group(1) in vmap:
+                    return resolve(vmap[m.group(1)], depth + 1)
+                if m.group(2):  # var(--x, fallback)
+                    return resolve(m.group(2), depth + 1)
+            return val
+
+        for key, var in (("bg", "--bg"), ("fg", "--fg"),
+                         ("muted", "--fg-muted"), ("accent", "--accent")):
+            if var in vmap:
+                pal[key] = resolve(vmap[var])
+    except Exception:
+        pass
+    return pal
+
+
+def _logo_data_uri(theme: str) -> str:
+    """Base64-embed the theme-appropriate logo. The splash renders before the
+    bridge serves files, so an http path (/logo-mark-*.png) can't load here."""
+    fname = "logo-mark-dark.png" if theme in _LIGHT_THEMES else "logo-mark-light.png"
+    try:
+        raw = (bridge.ROOT / fname).read_bytes()
+        return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    except Exception:
+        return ""
+
+
+def _build_splash_html() -> str:
+    """Branded boot splash that honors the last saved theme and shows a subtly
+    animated logo. Rebuilt each launch, so a theme change is reflected next boot."""
+    theme = _read_saved_theme()
+    pal = _splash_palette(theme)
+    logo = _logo_data_uri(theme)
+    accent = pal["accent"]
+    glow = accent + "55" if accent.startswith("#") and len(accent) == 7 else accent
+    logo_html = (
+        f'<img src="{logo}" alt="" style="width:76px;height:76px;object-fit:contain;'
+        f'filter:drop-shadow(0 0 22px {glow});animation:breathe 2.8s ease-in-out infinite">'
+        if logo else ""
+    )
+    squares = "".join(
+        f'<span class="sq" style="animation-delay:{i * 90}ms"></span>' for i in range(8)
+    )
+    return f"""<!doctype html><html><head><meta charset="utf-8"></head>
+<body style="margin:0;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:{pal['bg']};color:{pal['fg']};font-family:system-ui,-apple-system,'Segoe UI',sans-serif;user-select:none">
+  {logo_html}
+  <div style="margin-top:20px;font-size:30px;font-weight:700;letter-spacing:.01em">accuretta</div>
+  <div style="margin-top:8px;font-size:13px;color:{pal['muted']}">starting your engine…</div>
+  <div style="margin-top:24px;display:flex;gap:7px">{squares}</div>
+  <style>
+    @keyframes breathe {{0%,100%{{transform:scale(1);opacity:.9}}50%{{transform:scale(1.05);opacity:1}}}}
+    @keyframes pulse {{0%,100%{{opacity:.2;transform:scale(.82)}}35%{{opacity:1;transform:scale(1.15)}}}}
+    .sq{{width:12px;height:12px;border-radius:2px;background:{accent};opacity:0;animation:pulse 1.5s cubic-bezier(.2,.8,.2,1) infinite}}
+  </style>
 </body></html>"""
 
 _ALREADY_RUNNING_HTML = """<body style="margin:0;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#12151c;color:#e6e6e6;font-family:system-ui,sans-serif">
@@ -193,8 +283,14 @@ def main() -> int:
 
     # Show the branded splash immediately; boot the bridge in the background and
     # swap to the live app the moment it's ready.
-    win = webview.create_window("Accuretta", html=_SPLASH_HTML,
-                                width=1440, height=920, min_size=(960, 640))
+    # text_select=True: pywebview disables page text selection by default, which
+    # meant you couldn't highlight-and-copy part of a reply in the desktop app
+    # (only the whole message via the copy button). Turning it on restores normal
+    # selection + Ctrl+C + right-click copy. UI chrome stays unselectable via the
+    # `user-select: none` CSS on buttons, the sidebar, and code line numbers.
+    win = webview.create_window("Accuretta", html=_build_splash_html(),
+                                width=1440, height=920, min_size=(960, 640),
+                                text_select=True)
 
     def _boot() -> None:
         if not _port_in_use(PORT):
@@ -209,7 +305,18 @@ def main() -> int:
     threading.Thread(target=_set_app_icon, daemon=True).start()
 
     # gui='edgechromium' forces WebView2 on Windows for identical Chromium rendering.
-    webview.start(_boot, gui="edgechromium" if sys.platform == "win32" else None)
+    # private_mode=False + a stable storage_path: pywebview defaults to private
+    # mode, which tells WebView2 to DISCARD localStorage/cookies between launches
+    # — that wiped the cost widget's all-time token counters every restart (the
+    # card read $0.00 until you chatted again). Pin the profile under the app's
+    # own data dir (same place chats.json lives) so it persists like everything else.
+    _storage = str(bridge.DATA / "webview")
+    try:
+        os.makedirs(_storage, exist_ok=True)
+    except Exception:
+        _storage = None
+    webview.start(_boot, gui="edgechromium" if sys.platform == "win32" else None,
+                  private_mode=False, storage_path=_storage)
     return 0
 
 

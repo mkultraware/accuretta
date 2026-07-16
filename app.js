@@ -42,6 +42,7 @@
     _lastMsgPromptTokens: 0,
     _ctxPoll: null,
     touchedFiles: new Set(),
+    imageUrlToSourceMap: new Map(),
   };
 
   const app = $("#app");
@@ -50,13 +51,74 @@
   // ---------- utilities ----------
   // simple toast system — bottom-right, auto-dismiss. keyed toasts replace each other.
   const _toasts = new Map();
-  function toast(msg, kind = "info", ms = 3000, key = null) {
-    if (kind === "err" || kind === "error") {
+
+  function showDeckToast(msg, kind, ms = 3000) {
+    const deck = $("#revealer-deck");
+    if (!deck) return null;
+    
+    let card = deck.querySelector(".revealer-card.notifications");
+    if (!card) {
+      card = document.createElement("div");
+      card.className = "revealer-card notifications";
+      card.dataset.cardType = "notifications";
+      card.innerHTML = `
+        <div class="revealer-card-head">
+          <span class="revealer-card-icon"><i class="ph ph-bell"></i></span>
+          <span class="revealer-card-title">System Status</span>
+          <span class="grow"></span>
+        </div>
+        <div class="revealer-card-body"></div>
+      `;
+      deck.appendChild(card);
+    }
+    
+    const body = card.querySelector(".revealer-card-body");
+    const row = document.createElement("div");
+    row.className = `revealer-row notification-row ${kind}`;
+    
+    const iconMap = {
+      info: '<i class="ph ph-info" style="color:var(--accent)"></i>',
+      ok: '<i class="ph ph-check-circle" style="color:var(--success)"></i>',
+      warn: '<i class="ph ph-warning" style="color:var(--warning)"></i>',
+      err: '<i class="ph ph-x-circle" style="color:var(--danger)"></i>'
+    };
+    const iconHtml = iconMap[kind] || iconMap.info;
+    
+    row.innerHTML = `
+      <span class="notification-dot is-${kind}"></span>
+      <span class="notification-icon">${iconHtml}</span>
+      <span class="notification-text">${msg}</span>
+    `;
+    body.appendChild(row);
+    
+    setTimeout(() => {
+      row.remove();
+      if (body.children.length === 0) {
+        card.remove();
+        if (deck.children.length === 0) deck.innerHTML = "";
+      }
+    }, ms);
+    
+    return row;
+  }
+
+  function toast(msg, kind = "info", ms = 3000, key = null, html = false) {
+    // Only `.toast.err` has an error style; `"error"` was passed at ~12 call
+    // sites and silently rendered with the neutral accent dot. Normalize it.
+    if (kind === "error") kind = "err";
+    if (kind === "err") {
       triggerComposerStatus("error");
     } else if (msg.includes("auto-tuned") || msg.includes("auto-tune")) {
       triggerComposerStatus("autotuned");
     } else if (msg.includes("loaded") || msg.includes("ready")) {
       triggerComposerStatus("loaded");
+    }
+
+    // Try routing to the deck first
+    const deck = $("#revealer-deck");
+    if (deck) {
+      const deckRow = showDeckToast(msg, kind, ms);
+      if (deckRow) return deckRow;
     }
 
     let host = document.getElementById("toast-host");
@@ -75,7 +137,17 @@
     }
     const el = document.createElement("div");
     el.className = `toast ${kind}`;
-    el.innerHTML = msg;
+    
+    const iconMap = {
+      info: '<i class="ph ph-info toast-ico" style="color:var(--accent)"></i>',
+      ok: '<i class="ph ph-check-circle toast-ico" style="color:var(--success)"></i>',
+      warn: '<i class="ph ph-warning toast-ico" style="color:var(--warning)"></i>',
+      err: '<i class="ph ph-x-circle" style="color:var(--danger)"></i>'
+    };
+    const iconHtml = iconMap[kind] || iconMap.info;
+    const cleanMsg = html ? msg : esc(msg);
+    el.innerHTML = `${iconHtml}<span class="toast-text">${cleanMsg}</span>`;
+
     host.appendChild(el);
     if (key) _toasts.set(key, el);
     setTimeout(() => {
@@ -340,11 +412,12 @@
     let group = stack.querySelector(".tool-group");
     if (group) return { group, body: group.querySelector(".tool-group-body") };
     group = document.createElement("div");
-    group.className = "tool-group collapsed";
+    group.className = "tool-group collapsed";   /* always starts minimized; user clicks the head to expand */
     group.innerHTML = `
       <div class="tool-group-head">
         <span class="tool-group-icon spinning">${WRENCH_SVG}</span>
         <span class="tool-group-activity">working…</span>
+        <span class="tool-mcp-badge" hidden title="Runs through an external MCP server">MCP</span>
         <span class="tool-group-chips" hidden></span>
         <span class="tool-group-summary" hidden></span>
         <i class="ph ph-caret-down chevron"></i>
@@ -364,6 +437,8 @@
     if (!group || !evt) return;
     const activity = group.querySelector(".tool-group-activity");
     const iconSlot = group.querySelector(".tool-group-icon");
+    const mcpBadge = group.querySelector(".tool-mcp-badge");
+    if (mcpBadge) mcpBadge.hidden = !(evt.name && String(evt.name).startsWith("mcp_"));
     if (activity) {
       activity.classList.add("shimmer");
       activity.textContent = toolLabel(evt.name, evt.arguments).replace(/…$/, "");
@@ -423,29 +498,73 @@
     const stack = row.querySelector(".tool-stack");
     const bubble = row.querySelector(".bubble");
     if (!stack || !bubble) return;
-    const group = stack.querySelector(".tool-group");
-    if (!group) {
-      // No tools ran — clean the empty stack out so it doesn't leave a gap.
-      stack.remove();
-      return;
-    }
-    // Make sure summary is computed (running flag is now false).
-    updateToolGroupHead(stack);
     
-    // Reset the head icon back to the wrench — in finalized state the strip
-    // represents "tools the model used" generically, not a specific live tool.
-    const iconSlot = group.querySelector(".tool-group-icon");
-    if (iconSlot) {
-      iconSlot.classList.remove("spinning", "icon-out", "icon-in");
-      iconSlot.innerHTML = WRENCH_SVG;
+    // Clear active cards from revealer deck
+    const deck = $("#revealer-deck");
+    if (deck) {
+      // Move red-team cards from the deck back to the chat row!
+      const rail = deck.querySelector(".attack-rail");
+      if (rail) {
+        rail.classList.remove("revealer-card");
+        if (stack && stack.parentNode) {
+          stack.parentNode.insertBefore(rail, stack);
+        } else {
+          row.appendChild(rail);
+        }
+      }
+      const osint = deck.querySelector(".osint-card");
+      if (osint) {
+        osint.classList.remove("revealer-card");
+        if (stack && stack.parentNode) {
+          stack.parentNode.insertBefore(osint, stack);
+        } else {
+          row.appendChild(osint);
+        }
+      }
+      
+      deck.querySelectorAll(".revealer-card:not(.permissions):not(.attack-rail):not(.osint-card)").forEach(c => c.remove());
+      if (deck.children.length === 0) deck.innerHTML = "";
     }
-    // Move strip after the bubble in the bubble-col.
-    const col = bubble.parentNode;
-    if (col && bubble.nextSibling !== group) {
-      col.insertBefore(group, bubble.nextSibling);
+    
+    // Render finalized cards inside the stack
+    const activities = row._activities || { writes: [], commands: [], mcp: [] };
+    let html = "";
+    
+    // Render collapsed in history
+    html += buildWritesCardHtml(activities.writes, true);
+    html += buildCommandsCardHtml(activities.commands, true);
+    html += buildMcpCardHtml(activities.mcp, true);
+    
+    if (html) {
+      stack.innerHTML = `<div class="tool-group done-pill">${html}</div>`;
+      
+      // Wire collapse toggles for the history cards
+      stack.querySelectorAll(".revealer-card").forEach(card => {
+        const head = card.querySelector(".revealer-card-head");
+        head.addEventListener("click", () => card.classList.toggle("collapsed"));
+        
+        // Wire preview-file button
+        card.querySelectorAll(".btn-preview-file").forEach(btn => {
+          btn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            const path = btn.dataset.path;
+            if (path) {
+              const root = state.workspace?.folders?.[0] || "";
+              const rel = path.replace(/\\/g, "/").replace(root.replace(/\\/g, "/"), "").replace(/^\//, "");
+              previewWorkspaceSource(root, rel, rel);
+            }
+          });
+        });
+      });
+      
+      // Move stack after the bubble in the bubble-col.
+      const col = bubble.parentNode;
+      if (col && bubble.nextSibling !== stack) {
+        col.insertBefore(stack, bubble.nextSibling);
+      }
+    } else {
+      stack.remove();
     }
-    // Empty stack node can go now.
-    if (!stack.children.length) stack.remove();
   }
 
   function updateToolGroupHead(stack) {
@@ -515,6 +634,15 @@
 
   function toolLabel(name, args) {
     args = args || {};
+    // MCP tools register as `mcp_<server>_<tool>` — show a clean "server · tool"
+    // instead of the raw prefixed name. The MCP badge (added in the tool head)
+    // is the actual "this came from an MCP server" signal.
+    if (name && name.startsWith("mcp_")) {
+      const m = name.match(/^mcp_([^_]+)_(.+)$/);
+      const server = m ? m[1] : "";
+      const tool = m ? m[2] : name.slice(4);
+      return server ? `${server} · ${tool}…` : `${tool}…`;
+    }
     switch (name) {
       case "list_directory": return `Looking in ${shortPath(args.path) || "folder"}…`;
       case "read_file":      return `Reading ${shortPath(args.path)}…`;
@@ -1048,6 +1176,96 @@
       .split(SENT).join("\\");
   }
 
+  // ---------- unified-diff rendering (```diff fences) ----------
+  // The model emits a standard unified diff in a ```diff fence. We parse it once
+  // and render two layouts into one card: a split (before | after) grid and a
+  // unified single column. CSS shows split above the 600px breakpoint and
+  // unified below it — the same breakpoint the rest of the UI flips at. A big or
+  // very wide diff skips split and renders unified everywhere, since a half-width
+  // column is miserable for long lines.
+  function parseDiffRows(raw) {
+    const src = String(raw).replace(/\n+$/, "").split("\n");
+    const rows = [];
+    let oldN = 1, newN = 1;
+    for (const line of src) {
+      if (/^@@/.test(line)) {
+        const m = line.match(/@@\s*-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s*@@/);
+        if (m) { oldN = +m[1]; newN = +m[2]; }
+        rows.push({ t: "hunk", text: line });
+        continue;
+      }
+      if (/^(diff --git |index |--- |\+\+\+ )/.test(line)) continue;   // file headers
+      const c = line[0];
+      if (c === "+") { rows.push({ t: "add", text: line.slice(1), n: newN }); newN++; }
+      else if (c === "-") { rows.push({ t: "del", text: line.slice(1), o: oldN }); oldN++; }
+      else { rows.push({ t: "ctx", text: c === " " ? line.slice(1) : line, o: oldN, n: newN }); oldN++; newN++; }
+    }
+    return rows;
+  }
+
+  const _dc = (txt) => esc(txt) || "​";   // escaped code cell; zero-width so empty lines keep height
+
+  function renderDiffUnified(rows) {
+    return rows.map(r => {
+      if (r.t === "hunk")
+        return `<div class="dl dl-hunk"><span class="dl-g"></span><span class="dl-g"></span><span class="dl-m"></span><span class="dl-c">${esc(r.text)}</span></div>`;
+      if (r.t === "add")
+        return `<div class="dl dl-add"><span class="dl-g"></span><span class="dl-g">${r.n}</span><span class="dl-m">+</span><span class="dl-c">${_dc(r.text)}</span></div>`;
+      if (r.t === "del")
+        return `<div class="dl dl-del"><span class="dl-g">${r.o}</span><span class="dl-g"></span><span class="dl-m">−</span><span class="dl-c">${_dc(r.text)}</span></div>`;
+      return `<div class="dl"><span class="dl-g">${r.o}</span><span class="dl-g">${r.n}</span><span class="dl-m"></span><span class="dl-c">${_dc(r.text)}</span></div>`;
+    }).join("");
+  }
+
+  function renderDiffSplit(rows) {
+    const out = [];
+    let del = [], add = [];
+    const flush = () => {
+      const n = Math.max(del.length, add.length);
+      for (let k = 0; k < n; k++) {
+        const l = del[k], r = add[k];
+        out.push(
+          (l ? `<div class="dl dl-l dl-del"><span class="dl-g">${l.o}</span><span class="dl-m">−</span><span class="dl-c">${_dc(l.text)}</span></div>`
+             : `<div class="dl dl-l dl-empty"></div>`) +
+          (r ? `<div class="dl dl-r dl-add"><span class="dl-g">${r.n}</span><span class="dl-m">+</span><span class="dl-c">${_dc(r.text)}</span></div>`
+             : `<div class="dl dl-r dl-empty"></div>`)
+        );
+      }
+      del = []; add = [];
+    };
+    for (const r of rows) {
+      if (r.t === "hunk") { flush(); out.push(`<div class="dl dl-hunk dl-span"><span class="dl-c">${esc(r.text)}</span></div>`); continue; }
+      if (r.t === "del") { del.push(r); continue; }
+      if (r.t === "add") { add.push(r); continue; }
+      flush();
+      out.push(
+        `<div class="dl dl-l"><span class="dl-g">${r.o}</span><span class="dl-m"></span><span class="dl-c">${_dc(r.text)}</span></div>` +
+        `<div class="dl dl-r"><span class="dl-g">${r.n}</span><span class="dl-m"></span><span class="dl-c">${_dc(r.text)}</span></div>`
+      );
+    }
+    flush();
+    return out.join("");
+  }
+
+  function renderDiffCard(raw, filename) {
+    const rows = parseDiffRows(raw);
+    const codeRows = rows.filter(r => r.t !== "hunk");
+    const adds = codeRows.filter(r => r.t === "add").length;
+    const dels = codeRows.filter(r => r.t === "del").length;
+    const maxLen = codeRows.reduce((m, r) => Math.max(m, (r.text || "").length), 0);
+    const tooBig = codeRows.length > 500 || maxLen > 100;   // wide/long -> unified everywhere
+    const fname = filename || "diff";
+    const head =
+      `<div class="diff-head"><i class="ph ph-git-diff" aria-hidden="true"></i>` +
+      `<span class="diff-file">${esc(fname)}</span>` +
+      `<span class="diff-stat"><span class="diff-plus">+${adds}</span> <span class="diff-minus">−${dels}</span></span>` +
+      `<button type="button" class="cc-act cc-copy" title="Copy diff"><i class="ph ph-copy"></i></button></div>`;
+    const rawHolder = `<textarea class="diff-raw" hidden>${esc(raw)}</textarea>`;
+    const unified = `<div class="diff-unified">${renderDiffUnified(rows)}</div>`;
+    if (tooBig) return `<div class="diff-card only-unified">${head}${rawHolder}${unified}</div>`;
+    return `<div class="diff-card">${head}${rawHolder}<div class="diff-split">${renderDiffSplit(rows)}</div>${unified}</div>`;
+  }
+
   // ---------- markdown-lite for chat bubbles ----------
   // Preserves code fences, ignores tool_call tags (rendered as tool cards separately).
   function renderMarkdown(text) {
@@ -1243,7 +1461,19 @@
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
       .replace(/\*([^*]+)\*/g, "<em>$1</em>")
       .replace(/`([^`]+)`/g, "<code>$1</code>")
-      .replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, '<img src="$2" alt="$1">');
+      .replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, (_m, alt, src) => {
+        const sourceUrl = state.imageUrlToSourceMap?.get(src);
+        const imgHtml = `<img src="${src}" alt="${alt}">`;
+        if (sourceUrl) {
+          return `<a href="${sourceUrl}" target="_blank" rel="noopener noreferrer" class="img-source-link">${imgHtml}</a>`;
+        }
+        return imgHtml;
+      });
+
+    // Group consecutive images (or image-source links) into a scrollable horizontal grid gallery
+    out = out.replace(/(?:(?:<a[^>]*class="img-source-link"[^>]*><img[^>]+><\/a>|<img[^>]+>)\s*){2,}/g, (match) => {
+      return `<div class="md-image-grid">${match}</div>`;
+    });
 
     // Autolink URLs into clickable chips with hover preview. Runs BEFORE
     // fence restoration so URLs that the model embedded inside ``` blocks
@@ -1254,8 +1484,16 @@
 
     out = out.replace(/\x00F(\d+)\x00/g, (_, i) => {
       const { infoStr, code } = fences[+i];
+      // Skip empty/whitespace-only fences. They otherwise render as a blank
+      // code card with a lone copy button — happens mid-stream before the code
+      // arrives, or when the model emits a bare ``` ``` pair.
+      if (!code || !code.trim()) return "";
       const langLabel = (infoStr || "").trim().split(/\s+/)[0] || "";
       const displayLang = langLabel ? langLabel.toLowerCase() : "text";
+      if (displayLang === "diff") {
+        const dpm = (infoStr || "").match(/path=([^\s]+)/i);
+        return renderDiffCard(code, dpm ? dpm[1] : "");
+      }
       const highlighted = highlightCode(code, displayLang);
       const lined = wrapCodeLines(highlighted);
       // Dynamic single-line detection for super compact visual density
@@ -1714,6 +1952,26 @@
   function selectChat(id) {
     state.chatId = id;
     const chat = state.chats.chats[id];
+    
+    // Scan past messages to populate the image-to-source map
+    state.imageUrlToSourceMap.clear();
+    if (chat && chat.messages) {
+      for (const m of chat.messages) {
+        if (m.content) {
+          try {
+            const parsed = JSON.parse(m.content);
+            if (parsed && parsed.results && Array.isArray(parsed.results)) {
+              parsed.results.forEach(r => {
+                if (r.image && r.url) {
+                  state.imageUrlToSourceMap.set(r.image, r.url);
+                }
+              });
+            }
+          } catch (_) {}
+        }
+      }
+    }
+    
     // Only render visible bubbles. The chat record now also stores
     // intermediate assistant turns (with tool_calls) and tool-result messages
     // so the bridge can replay the full agentic working memory on the next
@@ -1923,17 +2181,23 @@
   function openPalette() {
     state.palette.open = true;
     state.palette.idx = 0;
-    $("#palette-scrim").classList.remove("hidden");
-    $("#palette").classList.remove("hidden");
+    const scrim = $("#palette-scrim");
+    const pal = $("#palette");
+    if (scrim) { scrim.classList.remove("hidden"); scrim.classList.add("open"); }
+    if (pal) { pal.classList.remove("hidden"); pal.classList.add("open"); }
     const inp = $("#palette-input");
-    inp.value = "";
-    refreshPaletteList("");
-    setTimeout(() => inp.focus(), 0);
+    if (inp) {
+      inp.value = "";
+      refreshPaletteList("");
+      setTimeout(() => inp.focus(), 0);
+    }
   }
   function closePalette() {
     state.palette.open = false;
-    $("#palette-scrim").classList.add("hidden");
-    $("#palette").classList.add("hidden");
+    const scrim = $("#palette-scrim");
+    const pal = $("#palette");
+    if (scrim) { scrim.classList.add("hidden"); scrim.classList.remove("open"); }
+    if (pal) { pal.classList.add("hidden"); pal.classList.remove("open"); }
   }
   function _fuzzyScore(query, text) {
     if (!query) return 0;
@@ -2609,6 +2873,24 @@
       }
     });
 
+    // Diff cards aren't <pre>, so the loop above skips them. Wire their copy
+    // button here — it copies the raw unified diff stashed in .diff-raw.
+    root.querySelectorAll(".diff-card").forEach(card => {
+      if (card.dataset.enhanced === "1") return;
+      card.dataset.enhanced = "1";
+      const btn = card.querySelector(".cc-copy");
+      const holder = card.querySelector(".diff-raw");
+      if (!btn || !holder) return;
+      btn.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(holder.value);
+          const icon = btn.querySelector("i");
+          if (icon) { icon.classList.remove("ph-copy"); icon.classList.add("ph-check"); }
+          setTimeout(() => { if (icon) { icon.classList.add("ph-copy"); icon.classList.remove("ph-check"); } }, 1200);
+        } catch { toast("Clipboard blocked", "warn", 2000); }
+      });
+    });
+
     // Code-only bubbles: when the agent reply is essentially just one code
     // card, drop the bubble's padding and background so the card itself
     // becomes the surface — kills the "card inside a card" effect.
@@ -2793,8 +3075,11 @@
 
     const images = state.pendingImages.slice();
     if (!text && !images.length) return;
+    // A new request starts fresh: drop any prior turn's plan panel. The model
+    // re-emits update_plan if this task is multi-step.
+    renderPlanPanel([]);
     if (!state.settings.model) {
-      alert("Pick a model in Settings first.");
+      toast("Pick a model in Settings first.", "warn", 3200, "no-model");
       openSettings();
       return;
     }
@@ -2904,8 +3189,24 @@
     }
   }
 
+  // Kill ONLY the shell command currently running (not the whole turn) — the
+  // tool returns a killed result and the agent continues with the next step.
+  function killCurrentCommand() {
+    const cid = state.chatId;
+    if (!cid) return;
+    try {
+      fetch("/api/kill-command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: cid }),
+        keepalive: true,
+      }).catch(() => {});
+    } catch {}
+  }
+
   async function streamChat(text, agentRow, signal, images, opts) {
     const regenerate = !!(opts && opts.regenerate);
+    agentRow._workStart = Date.now();   // spans the whole turn for "Worked for Xs"
     const bubble = agentRow.querySelector("#stream-bubble");
     const toolStack = agentRow.querySelector("#tool-stack");
     // Cleared each turn; the empty-reply branch sets it true so the retry
@@ -3006,6 +3307,10 @@
         // Move tool strip below the bubble + apply faded "done-pill" styling
         // so it looks like a footnote, not part of the answer.
         finalizeToolGroup(agentRow);
+        // Fold the whole work unit (thinking + tools) under one "Worked for Xs".
+        collapseWorkBlock(agentRow);
+        // Settle the OSINT recon card (stop the live pulse, show the summary).
+        osintCardFinalize(agentRow);
       }
       // safety net: if the model ran tools or thought for a while but ended
       // without a visible answer, surface what we have so the user isn't
@@ -3171,34 +3476,60 @@
     
     return { cascade, content };
   }
+  // Status label for the pure-reasoning phase. We deliberately do NOT echo the
+  // whole user message back — that read as parroting. Instead: if the request
+  // names a file, anchor on it ("Thinking about BlogPost.tsx"); otherwise stay
+  // honest and generic ("Thinking…"). The real detail lives in the action
+  // phases — smart tool labels ("Editing BlogPost.tsx", "Running command…") and
+  // "Writing response" once the answer streams.
+  function thinkingLabel() {
+    const msgs = state.messages || [];
+    let req = "";
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === "user") {
+        let t = msgs[i].content;
+        if (Array.isArray(t)) t = t.map(p => (p && p.type === "text") ? p.text : "").join(" ");
+        req = String(t || "");
+        break;
+      }
+    }
+    const file = req.match(/[\w./\\-]+\.(?:tsx?|jsx?|mjs|cjs|py|css|scss|html?|json|md|ya?ml|rs|go|java|rb|php|sql|sh|ps1|toml|cpp|cs)\b/i);
+    if (file) return `Thinking about ${file[0].split(/[\\/]/).pop()}`;
+    return "Thinking…";
+  }
+
   function updateThinkLine(row, running, label) {
     const container = row.querySelector(".think-container");
     if (!container) return;
     const span = container.querySelector(".think-title");
     const icon = container.querySelector(".think-check-icon");
     
-    if (running && !container._thinkStart) {
-      container._thinkStart = Date.now();
-    }
-    if (!running) {
-      container.classList.add("done");
-      if (span) span.classList.remove("shimmer");
-      const elapsed = container._thinkStart ? Math.max(1, Math.round((Date.now() - container._thinkStart) / 1000)) : 0;
-      const fmt = elapsed >= 60
-        ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
-        : `${elapsed}s`;
-      const finalLabel = elapsed > 0
-        ? `Thought for ${fmt}`
-        : (label || "Thought for a moment");
-      if (span) span.textContent = finalLabel;
-      if (icon) {
-        icon.className = "ph ph-check-circle think-check-icon done";
-      }
+    if (running) {
+      if (!container._thinkStart) container._thinkStart = Date.now();
+      // Re-entering activity (a new thinking phase, or a tool starting after
+      // some answer text already showed): clear the finished look so the label
+      // shimmers again instead of sitting frozen on "Thought for Xs".
+      container.classList.remove("done");
+      if (span) span.classList.add("shimmer");
+      if (label && span) span.textContent = label;
+      if (icon) icon.className = "ph ph-brain think-check-icon";
       return;
     }
-    if (label) {
-      if (span) span.textContent = label;
-    }
+    // Done. Freeze the elapsed ONCE — it used to be recomputed on every content
+    // delta, so "Thought for Xs" visibly climbed while the answer streamed.
+    container.classList.add("done");
+    if (span) span.classList.remove("shimmer");
+    if (container._thinkStart && !container._thinkEnd) container._thinkEnd = Date.now();
+    const end = container._thinkEnd || Date.now();
+    const elapsed = container._thinkStart ? Math.max(1, Math.round((end - container._thinkStart) / 1000)) : 0;
+    const fmt = elapsed >= 60
+      ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
+      : `${elapsed}s`;
+    const finalLabel = elapsed > 0
+      ? `Thought for ${fmt}`
+      : (label || "Thought for a moment");
+    if (span) span.textContent = finalLabel;
+    if (icon) icon.className = "ph ph-check-circle think-check-icon done";
   }
   // ---------- attack-chain progress rail (red-team flow) ----------
   // A slim kill-chain visual that lights up as the model breaches. Driven
@@ -3255,7 +3586,7 @@
   }
   function ensureAttackRail(row) {
     if (!row) return null;
-    let rail = row.querySelector(".attack-rail");
+    let rail = row.querySelector(".attack-rail") || document.querySelector("#revealer-deck .attack-rail");
     if (rail) return rail;
     const toolStack = row.querySelector(".tool-stack");
     rail = document.createElement("div");
@@ -3288,8 +3619,15 @@
         `<div class="ar-stat"><span class="ar-stat-ico ar-stat-ico-status"><i class="ph ph-activity"></i></span><span class="ar-stat-body"><span class="ar-stat-label">Status</span><span class="ar-stat-val ar-status">Running</span></span></div>` +
       `</div>` +
       `<div class="ar-banner"><i class="ph ph-shield-check"></i> confirmed access — full chain breached</div>`;
-    if (toolStack && toolStack.parentNode) toolStack.parentNode.insertBefore(rail, toolStack);
-    else row.appendChild(rail);
+    
+    const deck = document.getElementById("revealer-deck");
+    if (deck) {
+      rail.classList.add("revealer-card");
+      deck.appendChild(rail);
+    } else {
+      if (toolStack && toolStack.parentNode) toolStack.parentNode.insertBefore(rail, toolStack);
+      else row.appendChild(rail);
+    }
     // Live elapsed clock — ticks while the turn streams, freezes on full breach
     // or turn end, and self-cleans if the bubble is torn down (chat switch).
     const tick = () => {
@@ -3344,22 +3682,26 @@
     rail.classList.toggle("is-complete", complete);
   }
   function attackRailToolStart(row, name, args) {
-    if (!isRedTeamTool(name)) return;
+    // The kill-chain visual (Recon -> Access -> Pivot -> RCE) is for an actual
+    // break-in, not passive recon/OSINT. Recon tools alone must NOT summon it —
+    // they render in the normal tool timeline. It appears only once exploitation
+    // begins (http_request / encode_decode), or when a breach lands on a chain
+    // that's already open (see attackRailBreach).
+    if (!isRedTeamTool(name) || name.startsWith("recon_")) return;
     const rail = ensureAttackRail(row);
     if (!rail) return;
     setAttackActivity(rail, name, args);
     rail.querySelector(".ar-pulse")?.classList.add("live");
-    if (name.startsWith("recon_")) {
-      if (+rail.dataset.flags === 0 && rail.dataset.recondone !== "1") rail.dataset.active = "0";
-    } else {
-      // exploitation began — recon is behind us; light the current stage
-      rail.dataset.recondone = "1";
-      if (+rail.dataset.active < 1) rail.dataset.active = "1";
-    }
+    // exploitation began — recon is behind us; light the current stage
+    rail.dataset.recondone = "1";
+    if (+rail.dataset.active < 1) rail.dataset.active = "1";
     renderRail(rail);
   }
   function attackRailBreach(row, stage) {
-    const rail = ensureAttackRail(row);
+    // Only advance a chain that exploitation already opened. A breach during a
+    // recon-only/OSINT run (e.g. an injection PROBE flagging a candidate) should
+    // not conjure the whole kill-chain — the finding still shows in the timeline.
+    const rail = row.querySelector(".attack-rail");
     if (!rail) return;
     const raw = Math.max(1, parseInt(stage, 10) || 1);
     // dataset.flags (capped at 3) drives the 4-node visual; flagsraw is the
@@ -3372,6 +3714,124 @@
     rail.dataset.active = s < 3 ? String(s + 1) : "-1";
     if (s >= 3) rail.querySelector(".ar-pulse")?.classList.remove("live");
     renderRail(rail);
+  }
+
+  // ---------- OSINT recon card (passive intel gathering) ----------
+  // The calm counterpart to the attack-chain rail. OSINT isn't a linear kill-
+  // chain marching toward "breach" — it's accumulating intelligence into buckets
+  // — so this is a GRID of intel categories that fill with counts as passive
+  // recon runs, not a track that advances. Cool theme accent, no red, no
+  // theatrics. Only passive recon/OSINT tools summon it; active exploitation
+  // (http_request, injection/auth probes) stays with the attack rail.
+  const OSINT_CATS = [
+    { key: "surface",  label: "Surface",  icon: "ph-globe-hemisphere-west",
+      tools: ["recon_subdomains", "recon_dns", "recon_content_discovery", "recon_subdomain_takeover"] },
+    { key: "services", label: "Services", icon: "ph-stack",
+      tools: ["recon_port_scan", "recon_tls_audit", "recon_http_fingerprint", "recon_open_services"] },
+    { key: "exposure", label: "Exposure", icon: "ph-warning-diamond",
+      tools: ["recon_check_exposure", "scan_js_secrets", "recon_cve_match"] },
+    { key: "intel",    label: "Intel",    icon: "ph-fingerprint",
+      tools: ["validate_finding", "recon_capture_evidence"] },   // + any mcp_osint_* tool
+  ];
+  function osintCatForTool(name) {
+    if (!name) return null;
+    if (name.startsWith("mcp_osint")) return "intel";
+    for (const c of OSINT_CATS) if (c.tools.includes(name)) return c.key;
+    return null;
+  }
+  // Best-effort "how much did this source return" — biggest array or a count-ish
+  // number in the result. Falls back to 1 (one source queried, nothing counted).
+  function osintFindingCount(res) {
+    if (!res || typeof res !== "object" || res.error) return 0;
+    let best = 0;
+    for (const k of ["count", "total", "found", "matches", "hits", "records"]) {
+      if (typeof res[k] === "number") best = Math.max(best, res[k]);
+    }
+    for (const v of Object.values(res)) if (Array.isArray(v)) best = Math.max(best, v.length);
+    return best > 0 ? best : 1;
+  }
+  function ensureOsintCard(row) {
+    if (!row) return null;
+    let card = row.querySelector(".osint-card") || document.querySelector("#revealer-deck .osint-card");
+    if (card) return card;
+    const toolStack = row.querySelector(".tool-stack");
+    card = document.createElement("div");
+    card.className = "osint-card is-running";
+    card.dataset.total = "0";
+    const tiles = OSINT_CATS.map(c =>
+      `<div class="oc-cat is-empty" data-cat="${c.key}">` +
+        `<span class="oc-ico"><i class="ph ${c.icon}"></i></span>` +
+        `<span class="oc-cat-body"><span class="oc-cat-label">${c.label}</span>` +
+        `<span class="oc-cat-count">0</span></span>` +
+      `</div>`
+    ).join("");
+    card.innerHTML =
+      `<div class="oc-head">` +
+        `<span class="oc-title"><i class="ph ph-magnifying-glass"></i> OSINT recon</span>` +
+        `<span class="oc-live"><span class="oc-live-dot"></span><span class="oc-live-text">scanning</span></span>` +
+      `</div>` +
+      `<div class="oc-grid">${tiles}</div>` +
+      `<div class="oc-foot"><span class="oc-activity">gathering sources…</span>` +
+        `<span class="oc-total"><i class="ph ph-database"></i> <span class="oc-total-n">0</span> findings</span></div>`;
+    
+    const deck = document.getElementById("revealer-deck");
+    if (deck) {
+      card.classList.add("revealer-card");
+      deck.appendChild(card);
+    } else {
+      if (toolStack && toolStack.parentNode) toolStack.parentNode.insertBefore(card, toolStack);
+      else row.appendChild(card);
+    }
+    return card;
+  }
+  function osintCardToolStart(row, name, args) {
+    const cat = osintCatForTool(name);
+    if (!cat) return;
+    const card = ensureOsintCard(row);
+    if (!card) return;
+    card.classList.add("is-running");
+    card.querySelector(".oc-live-dot")?.classList.add("live");
+    const liveText = card.querySelector(".oc-live-text");
+    if (liveText) liveText.textContent = "scanning";
+    card.querySelectorAll(".oc-cat").forEach(t => t.classList.toggle("is-active", t.dataset.cat === cat));
+    const act = card.querySelector(".oc-activity");
+    if (act) {
+      const tgt = String((args && (args.url || args.target || args.domain || args.host || args.query)) || "").replace(/^https?:\/\//, "");
+      const clean = name.startsWith("mcp_osint") ? name.replace(/^mcp_osint_?/, "osint · ") : name;
+      act.textContent = tgt ? `${clean} → ${tgt.slice(0, 40)}` : `${clean}…`;
+    }
+  }
+  function osintCardToolResult(row, name, res) {
+    const cat = osintCatForTool(name);
+    if (!cat || !row) return;
+    const card = row.querySelector(".osint-card");
+    if (!card) return;
+    const tile = card.querySelector(`.oc-cat[data-cat="${cat}"]`);
+    if (!tile) return;
+    const add = (res && res.error) ? 0 : osintFindingCount(res);
+    const next = parseInt(tile.dataset.n || "0", 10) + add;
+    tile.dataset.n = String(next);
+    const countEl = tile.querySelector(".oc-cat-count");
+    if (countEl) countEl.textContent = String(next);
+    tile.classList.remove("is-empty", "is-active");
+    if (next > 0) tile.classList.add("has-data");
+    if (add > 0) { tile.classList.remove("just-hit"); void tile.offsetWidth; tile.classList.add("just-hit"); }
+    const total = parseInt(card.dataset.total || "0", 10) + add;
+    card.dataset.total = String(total);
+    const tn = card.querySelector(".oc-total-n");
+    if (tn) tn.textContent = String(total);
+  }
+  function osintCardFinalize(row) {
+    const card = row && row.querySelector(".osint-card");
+    if (!card) return;
+    card.classList.remove("is-running");
+    card.classList.add("is-done");
+    card.querySelector(".oc-live-dot")?.classList.remove("live");
+    const liveText = card.querySelector(".oc-live-text");
+    if (liveText) liveText.textContent = "done";
+    card.querySelectorAll(".oc-cat.is-active").forEach(t => t.classList.remove("is-active"));
+    const act = card.querySelector(".oc-activity");
+    if (act) act.textContent = parseInt(card.dataset.total || "0", 10) > 0 ? "recon complete" : "no sources returned data";
   }
 
   function handleEvent(evt, ctx) {
@@ -3421,13 +3881,19 @@
       content = cascadeRes.content;
       
       if (thinking && ctx.row) {
-        // first few words of current thinking snippet, shimmering
-        const preview = thinking.split(/\s+/).slice(-12).join(" ");
-        updateThinkLine(ctx.row, true, preview || "Thinking…");
         const thinkContent = ctx.row.querySelector(".think-content");
-        if (thinkContent) {
-          thinkContent.textContent = thinking;
-        }
+        if (thinkContent) thinkContent.textContent = thinking;   // full reasoning fills the expandable body
+      }
+      // Status line = a live, shimmering PHASE indicator, not a parrot of the
+      // request. It tracks what's actually happening, in priority order:
+      //   tool running     -> the tool's own label (set on tool_start; left alone)
+      //   answer streaming -> "Writing response"
+      //   reasoning only   -> thinkingLabel() ("Thinking…" / "Thinking about <file>")
+      // It shimmers until the turn ends; the finally block freezes it to
+      // "Thought for Xs" once, so it never flips mid-stream.
+      const _toolRunning = ctx.toolStack && ctx.toolStack.querySelector(".tool-line.running");
+      if (ctx.row && !_toolRunning) {
+        updateThinkLine(ctx.row, true, content.trim() ? "Writing response" : thinkingLabel());
       }
       
       // Render live cascade chips into the parent container regardless of other content
@@ -3447,16 +3913,34 @@
         if (container) container.remove();
       }
 
+      // Split the visible text into INTERIM narration (everything the model
+      // said up to its last tool call this turn) and the live ANSWER (after it).
+      // base = buf length captured at the last tool_start. If the model later
+      // folds that narration into a <think> block, `before` stops being a prefix
+      // of content and we demote nothing — safe fallback to plain rendering.
+      let interim = "";
+      let answer = content;
+      const _base = ctx.row ? (ctx.row._answerBufBase || 0) : 0;
+      if (_base > 0) {
+        let before = splitCascade(splitThinking(newBuf.slice(0, _base)).content).content;
+        if (before && before.trim() && content.startsWith(before)) {
+          interim = before;
+          answer = content.slice(before.length);
+        }
+      }
+      if (ctx.row) ctx.row._interimText = interim;   // reused by the final re-render
+
       if (content.trim()) {
         bubble.classList.remove("hidden");
-        // Detect an in-progress LARGE code fence. The full markdown render
-        // (strip + syntax-highlight + line-wrap) is O(N) on the whole buffer,
-        // so re-running it on every token while the model dumps a 700-line
-        // HTML doc lags the page hard. For that ONE case we swap to a cheap
-        // progress placeholder; everything else (plain text, small code
-        // snippets) still streams token-by-token like normal.
-        const openFenceMatch = content.match(/```(\w*)\n([\s\S]*)$/);
-        const inOpenFence = openFenceMatch && (content.match(/```/g) || []).length % 2 === 1;
+        // Interim narration renders dimmed + small; only the live answer gets
+        // full markdown treatment below.
+        const interimHtml = interim.trim()
+          ? `<div class="answer-interim">${renderMarkdown(interim)}</div>` : "";
+        // Detect an in-progress LARGE code fence in the ANSWER. The full markdown
+        // render is O(N); for a 700-line dump we swap to a cheap progress
+        // placeholder. Everything else streams token-by-token like normal.
+        const openFenceMatch = answer.match(/```(\w*)\n([\s\S]*)$/);
+        const inOpenFence = openFenceMatch && (answer.match(/```/g) || []).length % 2 === 1;
         const fenceBodyLen = inOpenFence ? openFenceMatch[2].length : 0;
 
         if (inOpenFence && fenceBodyLen > 4000) {
@@ -3468,20 +3952,21 @@
             const lang = (openFenceMatch[1] || "code").toLowerCase();
             const lines = (openFenceMatch[2].match(/\n/g) || []).length + 1;
             const kb = (fenceBodyLen / 1024).toFixed(1);
-            bubble.innerHTML = `<div class="code-progress"><i class="ph ph-code code-progress-icon"></i><span class="code-progress-text">writing <strong>${esc(lang)}</strong> — ${lines} lines, ${kb} KB so far…</span></div>`;
+            bubble.innerHTML = interimHtml + `<div class="code-progress"><i class="ph ph-code code-progress-icon"></i><span class="code-progress-text">writing <strong>${esc(lang)}</strong> — ${lines} lines, ${kb} KB so far…</span></div>`;
             bubble._lastProgressAt = now;
           }
         } else {
           // Plain text or small code: render every delta. Reset the
           // progress flag so the next big-code stream starts fresh.
           bubble._lastProgressAt = 0;
-          let renderable = content;
+          let renderable = answer;
           const openCount = (renderable.match(/```/g) || []).length;
           if (openCount % 2 === 1) renderable = renderable + "\n```";
-          bubble.innerHTML = renderMarkdown(renderable);
+          bubble.innerHTML = interimHtml + renderMarkdown(renderable);
           enhanceCodeBlocks(bubble);
         }
-        if (ctx.row) updateThinkLine(ctx.row, false);
+        // NB: no updateThinkLine(false) here — the status line stays a live
+        // shimmering indicator; the finally block finalizes it once at turn end.
       } else if (bubble.innerHTML && !bubble.classList.contains("hidden")) {
         // Content was stripped to empty (e.g. model emitted only a partial
         // </tool_call> that splitThinking's junk filters cleaned out).
@@ -3494,6 +3979,10 @@
       scrollToBottom();
     } else if (evt.type === "tool_start") {
       attackRailToolStart(row, evt.name, evt.arguments);
+      osintCardToolStart(row, evt.name, evt.arguments);
+      // Mark the content boundary: everything streamed before this tool call is
+      // interim narration (rendered dimmed), everything after is the live answer.
+      if (row) row._answerBufBase = ctx.getBuf().length;
       if (evt.name === "session_start") {
         surfaceShell(evt.arguments?.session_id || evt.arguments?.id || "");
       }
@@ -3505,19 +3994,51 @@
         const lbl = toolLabel(evt.name, evt.arguments);
         appendAgentLog(`Tool started: ${evt.name} -> ${lbl}`);
       }
-      const { group, body } = getOrCreateToolGroup(toolStack);
-      const card = document.createElement("div");
-      card.className = "tool-line running";
-      const customIcon = toolIconHtml(evt.name, "run");
-      const iconHtml = customIcon || `<i class="ph ph-circle-notch"></i>`;
-      card.innerHTML = `${iconHtml}<span class="shimmer">${esc(toolLabel(evt.name, evt.arguments))}</span>`;
-      card.dataset.name = evt.name || "";
-      body.appendChild(card);
-      // Reflect the new tool in the head's activity slot, then refresh head
-      // counts. The head stays expanded-on-click only; collapsed visually but
-      // the live activity line is always visible at the top.
-      updateToolGroupActivity(group, evt);
-      updateToolGroupHead(toolStack);
+      
+      // Update our activities state
+      if (row) {
+        if (!row._activities) {
+          row._activities = { writes: [], commands: [], mcp: [] };
+        }
+        const act = row._activities;
+        if (evt.name === "write_file" || evt.name === "edit_file") {
+          const path = evt.arguments?.path || "file";
+          let lines = 0;
+          if (evt.name === "write_file" && evt.arguments?.content) {
+            lines = evt.arguments.content.split("\n").length;
+          }
+          let existing = act.writes.find(w => w.path === path);
+          if (!existing) {
+            act.writes.push({
+              path: path,
+              added: lines,
+              deleted: 0,
+              status: "running",
+              t0: Date.now()
+            });
+          } else {
+            existing.status = "running";
+            if (lines > 0) existing.added = lines;
+          }
+        } else if (evt.name === "run_powershell") {
+          act.commands.push({
+            command: evt.arguments?.command || "",
+            status: "running",
+            t0: Date.now(),
+            duration: ""
+          });
+        } else if (evt.name && evt.name.startsWith("mcp_")) {
+          act.mcp.push({
+            name: evt.name,
+            arguments: evt.arguments,
+            status: "running",
+            t0: Date.now(),
+            duration: ""
+          });
+        }
+        updateRevealerDeck(row);
+      }
+      
       // Update the think line to show what the agent is actually doing
       if (row) {
         const label = toolLabel(evt.name, evt.arguments);
@@ -3549,6 +4070,14 @@
         }
       }
     } else if (evt.type === "tool_result") {
+      osintCardToolResult(row, evt.name, evt.result);
+      if (evt.name === "web_image_search" && evt.result && evt.result.results) {
+        evt.result.results.forEach(r => {
+          if (r.image && r.url) {
+            state.imageUrlToSourceMap.set(r.image, r.url);
+          }
+        });
+      }
       if (evt.name === "run_powershell") {
         const isErr = evt.result && evt.result.error;
         const exitCode = evt.result && evt.result.exit_code !== undefined ? evt.result.exit_code : (isErr ? 1 : 0);
@@ -3557,6 +4086,31 @@
       } else {
         const label = toolResultLabel(evt.name, evt.result);
         appendAgentLog(`Tool finished: ${evt.name} -> ${label}`);
+      }
+      // Mark the matching live activity finished and refresh the deck so it
+      // drops out of the strip above the composer (only in-progress work stays).
+      // The record survives in _activities for the collapsed turn-end history.
+      if (row && row._activities) {
+        const act = row._activities;
+        const st = (evt.result && evt.result.error) ? "err" : "ok";
+        if (evt.name === "write_file" || evt.name === "edit_file") {
+          const path = (evt.result && evt.result.path) || "";
+          const runningWrites = act.writes.filter(x => x.status === "running");
+          const w = runningWrites.reverse().find(x => !path || x.path === path) || runningWrites[0];
+          if (w) {
+            w.status = st;
+            if (evt.result && typeof evt.result.added === "number") w.added = evt.result.added;
+            if (evt.result && typeof evt.result.deleted === "number") w.deleted = evt.result.deleted;
+          }
+        } else if (evt.name === "run_powershell") {
+          const c = act.commands.filter(x => x.status === "running").pop();
+          if (c) { c.status = st; c.duration = fmtToolDuration(c.t0); }
+        } else if (evt.name && evt.name.startsWith("mcp_")) {
+          const runningMcp = act.mcp.filter(x => x.status === "running");
+          const m = runningMcp.reverse().find(x => x.name === evt.name) || runningMcp[0];
+          if (m) { m.status = st; m.duration = fmtToolDuration(m.t0); }
+        }
+        updateRevealerDeck(row);
       }
       const cards = Array.from(toolStack.querySelectorAll(".tool-line.running"));
       const card = cards.reverse().find(c => c.dataset.name === evt.name);
@@ -3567,7 +4121,9 @@
         const customIcon = toolIconHtml(evt.name, isErr ? "err" : "done");
         const iconHtml = customIcon || `<i class="ph ${isErr ? "ph-x-circle" : "ph-check"}"></i>`;
         const label = toolResultLabel(evt.name, evt.result);
-        card.innerHTML = `${iconHtml}<span>${esc(label)}</span>`;
+        const _ms = card.dataset.t0 ? Date.now() - Number(card.dataset.t0) : 0;
+        const _t = _ms > 0 ? (_ms < 1000 ? `${_ms}ms` : `${(_ms / 1000).toFixed(1)}s`) : "";
+        card.innerHTML = `${iconHtml}<span>${esc(label)}</span>${_t ? `<span class="tl-time">${_t}</span>` : ""}`;
         if (!isErr && (evt.name === "edit_file" || evt.name === "write_file")) {
           if (evt.result && evt.result.path) {
             state.touchedFiles.add(evt.result.path);
@@ -3578,7 +4134,7 @@
           if (added > 0 || deleted > 0) {
             const filename = folderLeafName(evt.result.path || "");
             const msg = `<span style="color:#00ff88;font-weight:600;">+${added}</span>, <span style="color:#ff3b30;font-weight:600;">-${deleted}</span> <span style="opacity:0.4;margin:0 4px;">|</span> <span style="font-weight:500;">${esc(filename)}</span>`;
-            toast(msg, "ok", 4000);
+            toast(msg, "ok", 4000, null, true);
           }
           // On mobile: inject a preview card for .html files written by the agent
           const filePath = (evt.result && evt.result.path) || "";
@@ -3678,6 +4234,11 @@
       state.versions.push(evt.version);
       renderVersions();
       setActiveVersion(evt.version.id);
+    } else if (evt.type === "savings") {
+      // Lifetime token totals pushed by the server after a turn — the durable
+      // source of truth for the "saved vs cloud" card. SET (not add) so the
+      // client can never drift or double-count.
+      _applySavings(evt);
     } else if (evt.type === "stats") {
       const tok = evt.eval_count;
       const dur = (evt.eval_duration || 0) / 1e9;
@@ -3710,8 +4271,8 @@
       if (Number.isFinite(promptTok) && promptTok > 0) {
         state.tokPromptTotal += promptTok;
       }
-      // Persist to all-time counters
-      _accumulateAllTime(tok || 0, promptTok || 0);
+      // All-time totals are owned by the server now (see the "savings" event);
+      // the client no longer accumulates them, so it can't drift or double-count.
       renderCostWidget();
       // In agent mode the model may do multiple rounds (tool calls + re-inference).
       // Each round emits stats. Reset the stream start so the next round's
@@ -3745,8 +4306,8 @@
         // Clear streaming estimate since we've committed the fallback
         state._streamOutEstimate = 0;
         state._streamPromptEstimate = 0;
-        // Persist fallback to all-time counters
-        _accumulateAllTime(fallbackTok, 0);
+        // All-time is server-owned (the server applies the same char-estimate
+        // fallback and emits a "savings" event); don't accumulate it here.
         renderTokTotal();
         renderCostWidget();
       }
@@ -3773,11 +4334,22 @@
         const finalBubble = lastRow.querySelector(".bubble.agent");
         if (finalBubble) {
           const { content: finalContent } = splitThinking(full);
+          // Keep interim narration dimmed in the final render too, reusing the
+          // string captured during streaming. If it's no longer a clean prefix
+          // (folded into thinking, or `full` differs from the stream buffer) we
+          // demote nothing — identical to the pre-interim behavior.
+          const interimText = lastRow._interimText || "";
+          let interimHtml = "";
+          let answerText = finalContent;
+          if (interimText.trim() && finalContent.startsWith(interimText)) {
+            interimHtml = `<div class="answer-interim">${renderMarkdown(interimText)}</div>`;
+            answerText = finalContent.slice(interimText.length);
+          }
           if (finalContent.trim()) {
-            const rendered = renderMarkdown(finalContent);
-            if (rendered && rendered.trim()) {
+            const rendered = renderMarkdown(answerText);
+            if ((rendered && rendered.trim()) || interimHtml) {
               finalBubble.classList.remove("hidden");
-              finalBubble.innerHTML = rendered;
+              finalBubble.innerHTML = interimHtml + rendered;
               enhanceCodeBlocks(finalBubble);
               setTimeout(() => scrollToBottom(true), 50);
             } else {
@@ -3807,10 +4379,247 @@
       // Inline SVG flag — no emoji, ever. Model-supplied fields are esc()'d
       // since toast() renders via innerHTML.
       const breachFlag = `<svg class="toast-ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>`;
-      toast(`${breachFlag} Breach — stage ${esc(String(evt.stage))}: ${esc(evt.flag)} (via ${esc(evt.via)})`, "ok", 6000);
+      toast(`${breachFlag} Breach — stage ${esc(String(evt.stage))}: ${esc(evt.flag)} (via ${esc(evt.via)})`, "ok", 6000, null, true);
+    } else if (evt.type === "turn_changes") {
+      renderTurnChanges(row, evt);
+    } else if (evt.type === "plan") {
+      renderPlanPanel(evt.steps || []);
     } else if (evt.type === "error") {
       bubble.innerHTML = `<span style="color: var(--danger)">error: ${esc(evt.error)}</span>`;
     }
+  }
+
+  // ---------- per-turn change rollup + one-click Undo ----------
+  // Rendered from the `turn_changes` event the bridge emits at turn end. The
+  // Undo button reverts every file the turn wrote via /api/undo (backend keeps a
+  // pre-write snapshot journal). Pure frontend otherwise — costs no model tokens.
+  function renderTurnChanges(row, evt) {
+    if (!row || !evt || !Array.isArray(evt.files) || !evt.files.length) return;
+    const col = row.querySelector(".bubble-col");
+    if (!col) return;
+    col.querySelector(".turn-changes")?.remove();
+    const n = evt.files.length;
+    const files = evt.files.map(f => {
+      const tag = f.created ? `<span class="tc-tag tc-new">new</span>`
+                : (f.removed ? `<span class="tc-tag tc-del-tag">deleted</span>` : "");
+      return `<span class="tc-file" title="${esc(f.path || f.name)}"><i class="ph ph-file-text"></i><span class="tc-name">${esc(f.name)}</span>${tag}<span class="tc-stat"><span class="tc-add">+${f.added|0}</span> <span class="tc-del">−${f.deleted|0}</span></span></span>`;
+    }).join("");
+    const bar = document.createElement("div");
+    bar.className = "turn-changes";
+    bar.dataset.turnId = evt.turn_id || "";
+    bar.innerHTML = `
+      <div class="tc-head">
+        <span class="tc-title">${n} file${n === 1 ? "" : "s"} changed <span class="tc-add">+${evt.added | 0}</span> <span class="tc-del">−${evt.deleted | 0}</span></span>
+        <button class="tc-undo" type="button"><i class="ph ph-arrow-counter-clockwise"></i><span>Undo</span></button>
+      </div>
+      <div class="tc-files">${files}</div>`;
+    col.appendChild(bar);
+    // Fade + scroll affordance for long lists: mark the card as scrollable when
+    // the file list overflows, and clear the bottom fade once scrolled to the end.
+    const filesEl = bar.querySelector(".tc-files");
+    const syncFade = () => {
+      const overflow = filesEl.scrollHeight - filesEl.clientHeight > 2;
+      bar.classList.toggle("tc-scroll", overflow);
+      const atEnd = filesEl.scrollTop + filesEl.clientHeight >= filesEl.scrollHeight - 2;
+      bar.classList.toggle("tc-at-end", atEnd);
+    };
+    filesEl.addEventListener("scroll", syncFade, { passive: true });
+    requestAnimationFrame(syncFade);
+    const btn = bar.querySelector(".tc-undo");
+    btn.addEventListener("click", async () => {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.innerHTML = `<i class="ph ph-circle-notch tc-spin"></i><span>Undoing…</span>`;
+      try {
+        const resp = await fetch("/api/undo", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ turn_id: bar.dataset.turnId }),
+        });
+        const r = await resp.json();
+        if (r && r.ok) {
+          bar.classList.add("tc-undone");
+          bar.querySelector(".tc-title").innerHTML = `<i class="ph ph-check"></i> Reverted ${r.restored} file${r.restored === 1 ? "" : "s"}`;
+          btn.remove();
+          try { await loadWorkspace(); renderWorkspace(); } catch {}
+        } else {
+          toast(r && r.error ? r.error : "Undo failed", "err", 4000);
+          btn.disabled = false;
+          btn.innerHTML = `<i class="ph ph-arrow-counter-clockwise"></i><span>Undo</span>`;
+        }
+      } catch (e) {
+        toast("Undo failed: " + (e.message || e), "err", 4000);
+        btn.disabled = false;
+        btn.innerHTML = `<i class="ph ph-arrow-counter-clockwise"></i><span>Undo</span>`;
+      }
+    });
+    scrollToBottom();
+  }
+
+  // ---------- docked task-progress panel ----------
+  // Driven by the `plan` event the update_plan tool emits. A checklist docked
+  // inside the preview body (top-right, over the iframe area) so it doesn't
+  // obscure the preview toolbar, theme buttons, or other top-right controls.
+  // When the preview pane is collapsed, re-parents into the chat column.
+
+  /** Move #plan-panel into the correct container based on preview state. */
+  function _reparentPlan() {
+    const panel = document.getElementById("plan-panel");
+    if (!panel) return;
+    const previewBody = document.getElementById("preview-body");
+    const chatColumn = document.querySelector(".center");
+    const previewCollapsed = app.classList.contains("preview-collapsed");
+    const target = (!previewCollapsed && previewBody) ? previewBody : chatColumn;
+    if (target && panel.parentElement !== target) {
+      panel.style.left = "";
+      panel.style.top = "";
+      panel.style.right = "";
+      target.appendChild(panel);
+      panel.classList.toggle("plan-in-chat", target === chatColumn);
+    }
+  }
+
+  // Watch for preview-collapsed toggling on #app and re-parent the plan panel.
+  {
+    const _planObserver = new MutationObserver(() => _reparentPlan());
+    _planObserver.observe(app, { attributes: true, attributeFilter: ["class"] });
+  }
+
+  function makePanelDraggable(panel) {
+    const head = panel.querySelector(".plan-head");
+    if (!head) return;
+    head.style.cursor = "grab";
+    
+    let isDragging = false;
+    let startX, startY;
+    let initialLeft, initialTop;
+    
+    head.addEventListener("mousedown", (e) => {
+      if (e.target.closest("button") || e.target.closest("i")) return;
+      isDragging = true;
+      head.style.cursor = "grabbing";
+      
+      startX = e.clientX;
+      startY = e.clientY;
+      initialLeft = panel.offsetLeft;
+      initialTop = panel.offsetTop;
+      
+      e.preventDefault();
+      
+      const onMouseMove = (moveEvent) => {
+        if (!isDragging) return;
+        const dx = moveEvent.clientX - startX;
+        const dy = moveEvent.clientY - startY;
+        panel.style.left = `${initialLeft + dx}px`;
+        panel.style.top = `${initialTop + dy}px`;
+        panel.style.right = "auto";
+      };
+      
+      const onMouseUp = () => {
+        isDragging = false;
+        head.style.cursor = "grab";
+        document.removeEventListener("mousemove", onMouseMove);
+        document.removeEventListener("mouseup", onMouseUp);
+      };
+      
+      document.addEventListener("mousemove", onMouseMove);
+      document.addEventListener("mouseup", onMouseUp);
+    });
+    
+    head.addEventListener("touchstart", (e) => {
+      if (e.target.closest("button") || e.target.closest("i")) return;
+      const touch = e.touches[0];
+      isDragging = true;
+      
+      startX = touch.clientX;
+      startY = touch.clientY;
+      initialLeft = panel.offsetLeft;
+      initialTop = panel.offsetTop;
+      
+      const onTouchMove = (moveEvent) => {
+        if (!isDragging) return;
+        const touchMove = moveEvent.touches[0];
+        const dx = touchMove.clientX - startX;
+        const dy = touchMove.clientY - startY;
+        panel.style.left = `${initialLeft + dx}px`;
+        panel.style.top = `${initialTop + dy}px`;
+        panel.style.right = "auto";
+      };
+      
+      const onTouchEnd = () => {
+        isDragging = false;
+        document.removeEventListener("touchmove", onTouchMove);
+        document.removeEventListener("touchend", onTouchEnd);
+      };
+      
+      document.addEventListener("touchmove", onTouchMove, { passive: false });
+      document.addEventListener("touchend", onTouchEnd);
+    });
+  }
+
+  function renderPlanPanel(steps) {
+    let panel = document.getElementById("plan-panel");
+    if (!steps || !steps.length) { if (panel) panel.remove(); return; }
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = "plan-panel";
+      panel.innerHTML = `
+        <div class="plan-head">
+          <span class="plan-title">Plan</span>
+          <span class="plan-count"></span>
+          <button class="plan-min" type="button" title="Collapse"><i class="ph ph-caret-up"></i></button>
+          <button class="plan-close" type="button" title="Dismiss"><i class="ph ph-x"></i></button>
+        </div>
+        <div class="plan-body"></div>`;
+      // Place in the correct container (preview-body or .center).
+      _reparentPlan.panel = panel;          // temp ref for the initial append
+      const previewBody = document.getElementById("preview-body");
+      const chatColumn = document.querySelector(".center");
+      const previewCollapsed = app.classList.contains("preview-collapsed");
+      const target = (!previewCollapsed && previewBody) ? previewBody : chatColumn || document.body;
+      target.appendChild(panel);
+      panel.classList.toggle("plan-in-chat", target === chatColumn);
+
+      panel.querySelector(".plan-min").addEventListener("click", () => panel.classList.toggle("collapsed"));
+      panel.querySelector(".plan-close").addEventListener("click", () => panel.remove());
+      makePanelDraggable(panel);
+      // On a phone the floating checklist would smother the screen — start it
+      // collapsed to a compact "Plan N/N" chip the user can tap open.
+      if (typeof isMobile === "function" && isMobile()) panel.classList.add("collapsed");
+    }
+    const done = steps.filter(s => s.status === "done").length;
+    panel.querySelector(".plan-count").textContent = `${done}/${steps.length}`;
+    panel.classList.toggle("plan-complete", done === steps.length);
+    panel.querySelector(".plan-body").innerHTML = steps.map(s => {
+      const st = s.status === "done" ? "done" : (s.status === "active" ? "active" : "pending");
+      const icon = st === "done" ? `<i class="ph ph-check-circle"></i>`
+        : (st === "active" ? `<i class="ph ph-arrow-right"></i>` : `<i class="ph ph-circle"></i>`);
+      return `<div class="plan-step is-${st}">${icon}<span>${esc(s.title)}</span></div>`;
+    }).join("");
+    // Ensure it's in the right container after an update (e.g. if preview was
+    // toggled between plan events).
+    _reparentPlan();
+  }
+
+  // Collapse the finished work (thinking + tools) under one "Worked for Xs"
+  // line, like the competition. Only when tools actually ran — a pure Q&A turn
+  // keeps its "Thought for Xs". The think-header caret folds both open/closed.
+  function collapseWorkBlock(row) {
+    if (!row) return;
+    const col = row.querySelector(".bubble-col");
+    const think = row.querySelector(".think-container");
+    const group = col && col.querySelector(".tool-group");
+    if (!think || !group) return;
+    const title = think.querySelector(".think-title");
+    const secs = row._workStart ? Math.max(1, Math.round((Date.now() - row._workStart) / 1000)) : 0;
+    if (title && secs > 0) {
+      const fmt = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
+      title.textContent = `Worked for ${fmt}`;
+      title.classList.remove("shimmer");
+    }
+    think.classList.add("has-worklog");
+    group.classList.add("work-hidden");
+    const caret = think.querySelector(".think-caret");
+    if (caret) caret.className = "ph ph-caret-right think-caret";
   }
 
   // ---------- versions / preview ----------
@@ -5137,171 +5946,386 @@
 
   // Pick the right header icon variant for this kind. Destructive kinds get
   // a warning shield; everything else gets the friendly check shield.
-  function approvalHeaderIcon(kind) {
-    if (kind === "delete" || kind === "write_file") {
-      // warning-tone shield — same outline, no checkmark.
-      return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 4 5v6c0 4.5 3.2 8.5 8 10 4.8-1.5 8-5.5 8-10V5z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>';
+  function buildDiffBar(added, deleted) {
+    const total = added + deleted;
+    if (total === 0) {
+      return Array(10).fill('<span class="diff-bar-segment is-gray"></span>').join("");
     }
-    if (kind === "registry") {
-      // Filled warning triangle — heaviest icon in the set, deliberately
-      // distinct from the shield used elsewhere so the registry card reads
-      // as "this is a different category of dangerous" at a glance.
-      return '<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" fill="currentColor" stroke="currentColor"/><line x1="12" y1="9" x2="12" y2="13" stroke="#fff" stroke-width="2"/><line x1="12" y1="17" x2="12.01" y2="17" stroke="#fff" stroke-width="2.5"/></svg>';
+    const greenSegments = Math.max(0, Math.min(10, Math.round((added / total) * 10)));
+    const redSegments = 10 - greenSegments;
+    
+    let html = "";
+    for (let i = 0; i < greenSegments; i++) {
+      html += '<span class="diff-bar-segment is-green"></span>';
     }
-    return APPR_SVG.shield;
+    for (let i = 0; i < redSegments; i++) {
+      html += '<span class="diff-bar-segment is-red"></span>';
+    }
+    return html;
+  }
+
+  function getFileIcon(path) {
+    const ext = String(path || "").split(".").pop().toLowerCase();
+    switch (ext) {
+      case "py": return '<i class="ph ph-file-code" style="color:#ffd43b"></i>';
+      case "html": case "htm": return '<i class="ph ph-file-html" style="color:#e34f26"></i>';
+      case "css": return '<i class="ph ph-file-css" style="color:#1572b6"></i>';
+      case "js": case "jsx": case "ts": case "tsx": return '<i class="ph ph-file-js" style="color:#f7df1e"></i>';
+      case "json": return '<i class="ph ph-braces" style="color:#f9a825"></i>';
+      default: return '<i class="ph ph-file" style="color:var(--fg-muted)"></i>';
+    }
+  }
+
+  // Elapsed since a tool's t0, formatted tight ("820ms" / "3.4s"). Used to
+  // stamp a finished command/tool so history shows its runtime, not "running...".
+  function fmtToolDuration(t0) {
+    if (!t0) return "";
+    const ms = Date.now() - Number(t0);
+    if (ms <= 0) return "";
+    return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+  }
+
+  // A small kill control shown ONLY on the live commands card (live=true) for an
+  // in-progress command. Kills just that command via /api/kill-command; the turn
+  // continues. Not shown on writes/MCP — there's no process to kill there.
+  function killBtnHtml(live) {
+    return live ? '<button class="revealer-card-kill" type="button" title="Kill this command"><i class="ph ph-x"></i></button>' : "";
+  }
+
+  function buildWritesCardHtml(writes, collapsed, live) {
+    if (!writes || !writes.length) return "";
+    const totalAdded = writes.reduce((sum, w) => sum + (w.added || 0), 0);
+    const totalDeleted = writes.reduce((sum, w) => sum + (w.deleted || 0), 0);
+    const fileCount = writes.length;
+    
+    const bodyHtml = writes.map(w => {
+      const filename = w.path.split(/[\/]/).pop();
+      const statusIcon = w.status === "running" ? '<i class="ph ph-circle-notch spinning" style="color:var(--accent)"></i>'
+        : (w.status === "err" ? '<i class="ph ph-x-circle" style="color:var(--danger)"></i>' : '<i class="ph ph-check-circle" style="color:var(--success)"></i>');
+      const diffBar = buildDiffBar(w.added, w.deleted);
+      return `
+        <div class="revealer-row file-row">
+          <span class="file-icon">${getFileIcon(w.path)}</span>
+          <span class="file-name" title="${esc(w.path)}">${esc(filename)}</span>
+          <span class="file-stats">
+            <span class="stat-added">+${w.added}</span>
+            <span class="stat-deleted">-${w.deleted}</span>
+          </span>
+          <div class="diff-bar">
+            ${diffBar}
+          </div>
+          <span class="row-status">${statusIcon}</span>
+          <button class="row-action btn-preview-file" data-path="${esc(w.path)}" title="Diff/Preview"><i class="ph ph-eye"></i></button>
+        </div>
+      `;
+    }).join("");
+    
+    return `
+      <div class="revealer-card writes ${collapsed ? 'collapsed' : ''}" data-card-type="writes">
+        <div class="revealer-card-head">
+          <span class="revealer-card-icon"><i class="ph ph-pencil-simple-line"></i></span>
+          <span class="revealer-card-title">Writing files...</span>
+          <span class="revealer-card-stats">${fileCount} file${fileCount === 1 ? "" : "s"} <span class="stat-added">+${totalAdded}</span> <span class="stat-deleted">-${totalDeleted}</span></span>
+          <span class="grow"></span>
+          <button class="revealer-card-toggle" type="button"><i class="ph ph-caret-down"></i></button>
+        </div>
+        <div class="revealer-card-body">
+          ${bodyHtml}
+        </div>
+      </div>
+    `;
+  }
+
+  function buildCommandsCardHtml(commands, collapsed, live) {
+    if (!commands || !commands.length) return "";
+    const count = commands.length;
+    const bodyHtml = commands.map(c => {
+      const statusIcon = c.status === "running" ? '<i class="ph ph-circle-notch spinning" style="color:var(--accent)"></i>'
+        : (c.status === "err" ? '<i class="ph ph-x-circle" style="color:var(--danger)"></i>' : '<i class="ph ph-check-circle" style="color:var(--success)"></i>');
+      const shortCmd = c.command.length > 60 ? c.command.slice(0, 57) + "..." : c.command;
+      return `
+        <div class="revealer-row command-row">
+          <span class="row-status">${statusIcon}</span>
+          <span class="command-text" title="${esc(c.command)}"><code>${esc(shortCmd)}</code></span>
+          <span class="grow"></span>
+          <span class="row-time">${c.duration || "running..."}</span>
+        </div>
+      `;
+    }).join("");
+    
+    return `
+      <div class="revealer-card commands ${collapsed ? 'collapsed' : ''}" data-card-type="commands">
+        <div class="revealer-card-head">
+          <span class="revealer-card-icon"><i class="ph ph-terminal-window"></i></span>
+          <span class="revealer-card-title">Running shell commands...</span>
+          <span class="revealer-card-stats">${count} command${count === 1 ? "" : "s"}</span>
+          <span class="grow"></span>
+          ${killBtnHtml(live)}
+          <button class="revealer-card-toggle" type="button"><i class="ph ph-caret-down"></i></button>
+        </div>
+        <div class="revealer-card-body">
+          ${bodyHtml}
+        </div>
+      </div>
+    `;
+  }
+
+  function buildMcpCardHtml(mcp, collapsed, live) {
+    if (!mcp || !mcp.length) return "";
+    const count = mcp.length;
+    let serverName = "MCP";
+    if (mcp[0].name.startsWith("mcp_")) {
+      const parts = mcp[0].name.split("_");
+      if (parts.length > 1) serverName = parts[1];
+    }
+    
+    const bodyHtml = mcp.map(m => {
+      const statusIcon = m.status === "running" ? '<i class="ph ph-circle-notch spinning" style="color:var(--accent)"></i>'
+        : (m.status === "err" ? '<i class="ph ph-x-circle" style="color:var(--danger)"></i>' : '<i class="ph ph-check-circle" style="color:var(--success)"></i>');
+      const cleanName = m.name.replace(/^mcp_[^_]+_/, "");
+      return `
+        <div class="revealer-row mcp-row">
+          <span class="row-status">${statusIcon}</span>
+          <span class="mcp-text">${esc(cleanName)}</span>
+          <span class="grow"></span>
+          <span class="row-time">${m.duration || "running..."}</span>
+        </div>
+      `;
+    }).join("");
+    
+    return `
+      <div class="revealer-card mcp ${collapsed ? 'collapsed' : ''}" data-card-type="mcp">
+        <div class="revealer-card-head">
+          <span class="revealer-card-icon"><i class="ph ph-nodes"></i></span>
+          <span class="revealer-card-title">Using MCP tools...</span>
+          <span class="revealer-card-stats">${esc(serverName)} · ${count} tool${count === 1 ? "" : "s"}</span>
+          <span class="grow"></span>
+          <button class="revealer-card-toggle" type="button"><i class="ph ph-caret-down"></i></button>
+        </div>
+        <div class="revealer-card-body">
+          ${bodyHtml}
+        </div>
+      </div>
+    `;
+  }
+
+  function updateRevealerDeck(row) {
+    const deck = $("#revealer-deck");
+    if (!deck) return;
+    
+    const collapsedStates = {};
+    deck.querySelectorAll(".revealer-card").forEach(c => {
+      const type = c.dataset.cardType;
+      if (type) {
+        collapsedStates[type] = c.classList.contains("collapsed");
+      }
+    });
+    
+    const isCollapsed = (type) => {
+      if (collapsedStates[type] !== undefined) return collapsedStates[type];
+      return true; // default minimized!
+    };
+    
+    const activities = row._activities || { writes: [], commands: [], mcp: [] };
+    // The live deck above the composer shows ONLY in-progress work — a finished
+    // command/write/tool drops out the moment its result lands (its record is
+    // kept in _activities and rendered, collapsed, into the chat history by
+    // finalizeToolGroup at turn end). live=true renders the per-card kill button.
+    const running = {
+      writes: activities.writes.filter(w => w.status === "running"),
+      commands: activities.commands.filter(c => c.status === "running"),
+      mcp: activities.mcp.filter(m => m.status === "running"),
+    };
+
+    let html = "";
+    html += buildWritesCardHtml(running.writes, isCollapsed("writes"), true);
+    html += buildCommandsCardHtml(running.commands, isCollapsed("commands"), true);
+    html += buildMcpCardHtml(running.mcp, isCollapsed("mcp"), true);
+
+    deck.querySelectorAll(".revealer-card:not(.permissions):not(.attack-rail):not(.osint-card)").forEach(c => c.remove());
+    if (html) {
+      deck.insertAdjacentHTML("beforeend", html);
+    }
+
+    deck.querySelectorAll(".revealer-card:not(.permissions)").forEach(card => {
+      const head = card.querySelector(".revealer-card-head");
+      head.addEventListener("click", () => card.classList.toggle("collapsed"));
+
+      const killBtn = card.querySelector(".revealer-card-kill");
+      if (killBtn) killBtn.addEventListener("click", (e) => { e.stopPropagation(); killCurrentCommand(); });
+
+      card.querySelectorAll(".btn-preview-file").forEach(btn => {
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const path = btn.dataset.path;
+          if (path) {
+            const root = state.workspace?.folders?.[0] || "";
+            const rel = path.replace(/\\/g, "/").replace(root.replace(/\\/g, "/"), "").replace(/^\//, "");
+            previewWorkspaceSource(root, rel, rel);
+          }
+        });
+      });
+    });
+    if (deck.children.length === 0) deck.innerHTML = "";
+  }
+
+  function renderPermissionsChecklist(a) {
+    const details = a.details || {};
+    const kind = details.kind || "command";
+    let html = "";
+    
+    html += `
+      <div class="permission-item">
+        <span class="permission-item-icon check"><i class="ph ph-check-circle"></i></span>
+        <span class="permission-item-text">Read project files</span>
+      </div>
+    `;
+    
+    html += `
+      <div class="permission-item">
+        <span class="permission-item-icon check"><i class="ph ph-check-circle"></i></span>
+        <span class="permission-item-text">Search code and documentation</span>
+      </div>
+    `;
+
+    if (kind === "write_file" || kind === "edit_file") {
+      const path = details.path || "file";
+      const filename = path.split(/[\/]/).pop();
+      const added = details.added || (a.command ? a.command.split("\n").length : 0);
+      const deleted = details.deleted || 0;
+      html += `
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-warning"></i></span>
+          <span class="permission-item-text">Write to <code>${esc(filename)}</code></span>
+          <span class="permission-item-stats">
+            <span class="stat-added">+${added} LoC</span> / <span class="stat-deleted">-${deleted} LoC</span>
+          </span>
+        </div>
+      `;
+    } else if (kind === "powershell" || kind === "run_powershell" || kind === "command") {
+      const cmd = a.command || "";
+      const shortCmd = cmd.length > 50 ? cmd.slice(0, 47) + "..." : cmd;
+      html += `
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-warning"></i></span>
+          <span class="permission-item-text">Execute command: <code>${esc(shortCmd)}</code></span>
+        </div>
+      `;
+    } else if (kind && kind.startsWith("mcp_")) {
+      const m = kind.match(/^mcp_([^_]+)_(.+)$/);
+      const server = m ? m[1] : "MCP";
+      const tool = m ? m[2] : kind.slice(4);
+      html += `
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-warning"></i></span>
+          <span class="permission-item-text">Use MCP tool <code>${esc(tool)}</code></span>
+          <span class="permission-item-badge">${esc(server)}</span>
+        </div>
+      `;
+    } else {
+      html += `
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-warning"></i></span>
+          <span class="permission-item-text">Execute privileged action: <code>${esc(kind.toUpperCase())}</code></span>
+        </div>
+      `;
+    }
+    return html;
   }
 
   function renderApprovals() {
-    const stack = $("#approval-stack");
-    if (stack) stack.innerHTML = "";
-    const chatInner = $("#chat-inner");
-    if (!chatInner) return;
-    chatInner.querySelectorAll(".approval-row").forEach(n => n.remove());
-
+    const deck = $("#revealer-deck");
+    if (!deck) return;
+    
+    deck.querySelectorAll(".revealer-card.permissions").forEach(c => c.remove());
+    
+    if (state.approvals.size === 0) {
+      if (deck.children.length === 0) deck.innerHTML = "";
+      return;
+    }
+    
     for (const a of state.approvals.values()) {
-      const row = document.createElement("div");
-      row.className = "bubble-row approval-row";
-      row.dataset.approvalId = a.id;
-      const details = a.details || {};
-      const kind = details.kind || "command";
-      const isDesktop = String(kind).startsWith("desktop.") || kind === "ui.action";
-      const isDestructive = ["delete", "write_file", "powershell", "launch"].includes(kind);
-      const meta = APPR_KIND_META[kind] || {};
-      const sub = meta.sub || "The model is requesting permission to run a privileged action.";
-      const info = meta.info || "Read the command preview below before approving. Once approved, the action runs immediately with your user privileges.";
-
-      const detailsHtml = approvalDetailRows(a);
-      const cmdPreview = approvalCommandPreview(a);
-      const headerIcon = approvalHeaderIcon(kind);
-
       const card = document.createElement("div");
-      card.className = "approval inline";
-      if (isDesktop) card.classList.add("kind-desktop");
-      if (isDestructive) card.classList.add("kind-destructive");
-      // The registry kind gets its own strong-warning treatment AND a
-      // hold-to-approve button (wired below). Sits above kind-destructive
-      // in the visual hierarchy.
-      const isRegistry = kind === "registry";
-      if (isRegistry) card.classList.add("kind-registry");
-      // Status pill markup. Default state is "pending" — on click of the
-      // approve/deny buttons we morph the pill in place (`is-pending` →
-      // `is-approved` / `is-denied`) for a brief moment before the card
-      // slides out, so the user sees the decision land instead of the
-      // card just disappearing. Icons use Phosphor classes inline so
-      // they swap with the variant via JS.
-      const pillSvg = {
-        pending:  '<i class="ph-fill ph-clock"></i>',
-        approved: '<i class="ph-fill ph-check-circle"></i>',
-        denied:   '<i class="ph-fill ph-x-circle"></i>',
-        expired:  '<i class="ph-fill ph-hourglass"></i>',
-      };
+      card.className = "revealer-card permissions collapsed";
+      card.dataset.cardType = "permissions";
+      card.dataset.approvalId = a.id;
+      
+      const checklistHtml = renderPermissionsChecklist(a);
+      
       card.innerHTML = `
-        <div class="appr-accent-bar"></div>
-        <div class="appr-head" data-appr-child>
-          <span class="appr-head-icon">${headerIcon}</span>
-          <span class="appr-head-title">${esc(a.title || "Action")}</span>
-          <span class="appr-head-tag">${esc(String(kind).toUpperCase())}</span>
-          <span class="status-pill-soft is-pending" data-status-pill>
-            <span class="pill-dot">${pillSvg.pending}</span>
-            <span class="pill-label">Pending</span>
-          </span>
+        <div class="revealer-card-head">
+          <span class="revealer-card-icon"><i class="ph ph-shield-check"></i></span>
+          <span class="revealer-card-title">This request wants to perform actions</span>
+          <span class="revealer-card-stats">Review and confirm the actions the agent will take.</span>
+          <span class="grow"></span>
+          <div class="perm-head-actions">
+            <button class="perm-quick perm-quick-deny" data-act="deny" type="button" title="Deny">Deny</button>
+            <button class="perm-quick perm-quick-approve" data-act="approve" type="button" title="Approve">Approve</button>
+          </div>
+          <button class="revealer-card-toggle" type="button"><i class="ph ph-caret-down"></i></button>
         </div>
-        <div class="appr-sub" data-appr-child>${esc(sub)}</div>
-        <pre class="appr-cmd" data-appr-child><code>${cmdPreview}</code></pre>
-        ${detailsHtml ? `<div data-appr-child>${detailsHtml}</div>` : ""}
-        <div class="appr-info-line" data-appr-child>
-          <span class="appr-info-icon">${APPR_SVG.info}</span>
-          <span>${esc(info)}</span>
+        <div class="revealer-card-body">
+          <div class="permissions-intro">Review the requested actions:</div>
+          <div class="permissions-checklist">
+            ${checklistHtml}
+          </div>
+          <div class="permissions-options">
+            <label class="permission-option-label">
+              <input type="checkbox" id="perm-allow-shell">
+              <span class="custom-checkbox"></span>
+              <span>Allow shell commands</span>
+            </label>
+            <label class="permission-option-label">
+              <input type="checkbox" id="perm-remember-subfolder">
+              <span class="custom-checkbox"></span>
+              <span>Remember for this subfolder</span>
+            </label>
+          </div>
+          <div class="permissions-actions">
+            <button class="perm-btn perm-btn-cancel" data-act="deny">Deny</button>
+            <button class="perm-btn perm-btn-continue" data-act="approve">Approve</button>
+          </div>
         </div>
-        <div class="appr-actions" data-appr-child>
-          <button class="appr-btn appr-btn-deny" data-act="deny">${APPR_SVG.x}<span>Deny</span></button>
-          <button class="appr-btn appr-btn-approve" data-act="approve">${APPR_SVG.check}<span>Approve</span></button>
-        </div>
-        <details class="appr-advanced" data-appr-child>
-          <summary><span class="appr-advanced-chevron">${APPR_SVG.chevron}</span><span>Advanced</span></summary>
-          <pre class="appr-advanced-body">${esc(a.command || "(no raw command)")}</pre>
-        </details>`;
-      // Morph the status pill in place before the card slides out so the
-      // user sees the decision register. The pill swap is purely cosmetic
-      // (the actual decideApproval() POST + state mutation runs in
-      // parallel) and adds ~280ms of visible feedback.
-      const morphPill = (toState) => {
-        const pill = card.querySelector("[data-status-pill]");
-        if (!pill) return;
-        pill.classList.remove("is-pending", "is-approved", "is-denied", "is-expired");
-        pill.classList.add("is-" + toState);
-        const labelEl = pill.querySelector(".pill-label");
-        const dotEl = pill.querySelector(".pill-dot");
-        if (labelEl) labelEl.textContent = toState.charAt(0).toUpperCase() + toState.slice(1);
-        if (dotEl && pillSvg[toState]) dotEl.innerHTML = pillSvg[toState];
-      };
-      const approveBtn = card.querySelector('[data-act="approve"]');
-      const denyBtn = card.querySelector('[data-act="deny"]');
-      if (isRegistry) {
-        // Hold-to-approve. 2-second hold required; releasing the button or
-        // dragging off cancels and resets the fill. Prevents accidental
-        // enter-key / single-click approvals on a destructive operation.
-        // The .appr-btn-hold class triggers a ::before progress fill in
-        // CSS; the is-holding class enables the 2s width transition.
-        const HOLD_MS = 2000;
-        let holdTimer = null;
-        approveBtn.classList.add("appr-btn-hold");
-        const labelEl = approveBtn.querySelector("span");
-        if (labelEl) labelEl.textContent = "Hold to approve";
-        const cancelHold = () => {
-          if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
-          approveBtn.classList.remove("is-holding");
-        };
-        const startHold = (e) => {
-          e.preventDefault();
-          if (holdTimer) return;
-          approveBtn.classList.add("is-holding");
-          holdTimer = setTimeout(() => {
-            holdTimer = null;
-            approveBtn.classList.remove("is-holding");
-            approveBtn.classList.add("is-armed");
-            morphPill("approved");
-            setTimeout(() => decideApproval(a.id, "approve"), 280);
-          }, HOLD_MS);
-        };
-        approveBtn.addEventListener("pointerdown", startHold);
-        approveBtn.addEventListener("pointerup", cancelHold);
-        approveBtn.addEventListener("pointerleave", cancelHold);
-        approveBtn.addEventListener("pointercancel", cancelHold);
-        // Block plain click + Enter key — they'd skip the hold gate
-        // entirely. The pointerdown path is the only way in.
-        approveBtn.addEventListener("click", (e) => e.preventDefault());
-        approveBtn.addEventListener("keydown", (e) => {
-          if (e.key === "Enter" || e.key === " ") e.preventDefault();
-        });
-      } else {
-        approveBtn.addEventListener("click", () => {
-          morphPill("approved");
-          setTimeout(() => decideApproval(a.id, "approve"), 280);
+      `;
+      
+      const head = card.querySelector(".revealer-card-head");
+      head.addEventListener("click", () => card.classList.toggle("collapsed"));
+      
+      const shellCheckbox = card.querySelector("#perm-allow-shell");
+      if (shellCheckbox) {
+        shellCheckbox.addEventListener("change", (e) => {
+          // Toggle shell auto-approve if needed
         });
       }
-      denyBtn.addEventListener("click", () => {
-        morphPill("denied");
-        setTimeout(() => decideApproval(a.id, "deny"), 280);
-      });
-      row.innerHTML = `
-        <div class="avatar approval-avatar">${APPR_SVG.shield}</div>
-        <div class="bubble-col"></div>`;
-      row.querySelector(".bubble-col").appendChild(card);
-      chatInner.appendChild(row);
-    }
-    if (state.approvals.size > 0) {
-      requestAnimationFrame(() => scrollToBottom(true));
+      const subfolderCheckbox = card.querySelector("#perm-remember-subfolder");
+      if (subfolderCheckbox) {
+        subfolderCheckbox.addEventListener("change", (e) => {
+          // Toggle remember subfolder if needed
+        });
+      }
+      
+      // Bind BOTH the head quick-actions and the body buttons. stopPropagation
+      // keeps a head click from toggling the card's collapse.
+      card.querySelectorAll('[data-act="approve"]').forEach(b => b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        decideApproval(a.id, "approve");
+      }));
+      card.querySelectorAll('[data-act="deny"]').forEach(b => b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        decideApproval(a.id, "deny");
+      }));
+
+      deck.appendChild(card);
     }
   }
 
-  async function decideApproval(id, decision) {
+  async function decideApproval(id, decision, always) {
     state.approvals.delete(id);
     renderApprovals();
     await fetch("/api/approvals/decide", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id, decision }),
+      body: JSON.stringify({ id, decision, always: !!always }),
     });
   }
 
@@ -5656,7 +6680,7 @@
     try {
       await api("/api/system-context", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ md: ta.value }) });
     } catch (e) {
-      alert(`save failed: ${e.message || e}`);
+      toast("Save failed: " + (e.message || e), "err", 4000, "sysctx-save");
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -6484,6 +7508,39 @@
     } catch {}
   }
 
+  // Apply server-authoritative lifetime totals to state + local cache + UI.
+  // The server is the source of truth (survives restarts / localStorage clears);
+  // localStorage is now just an offline cache so the card isn't blank pre-fetch.
+  function _applySavings(obj) {
+    if (!obj) return;
+    const inTok = parseInt(obj.tok_in, 10);
+    const outTok = parseInt(obj.tok_out, 10);
+    if (Number.isFinite(inTok)) state._allTimeTokIn = inTok;
+    if (Number.isFinite(outTok)) state._allTimeTokOut = outTok;
+    if (obj.since) state._savingsSince = obj.since;
+    if (Number.isFinite(parseInt(obj.turns, 10))) state._savingsTurns = parseInt(obj.turns, 10);
+    _persistAllTimeTok();
+    try { if (obj.since) localStorage.setItem("accuretta:savings-since", String(obj.since)); } catch {}
+    renderCostWidget();
+  }
+
+  // Pull the durable lifetime totals from the server. Called on load and as a
+  // fallback; live turns update via the "savings" SSE event.
+  async function _fetchSavings() {
+    try {
+      const r = await fetch("/api/savings");
+      if (!r.ok) return;
+      _applySavings(await r.json());
+    } catch {}
+  }
+
+  // Unix seconds -> "Mon YYYY" for the "since" line ("saving since Mar 2026").
+  function _fmtSince(ts) {
+    if (!ts) return "";
+    const d = new Date(ts * 1000);
+    return isNaN(d.getTime()) ? "" : d.toLocaleDateString("en-US", { month: "short", year: "numeric" });
+  }
+
   // Calculate session-only cost (uses session token counters, not all-time)
   function calcSessionCost(provider) {
     const p = CLOUD_PRICING[provider];
@@ -6521,6 +7578,9 @@
     if (alltimeEl) {
       alltimeEl.textContent = allTimeCost < 0.005 ? "$0.00" : "$" + allTimeCost.toFixed(2);
     }
+    // Since row — the start date makes months of accrual legible.
+    const sinceEl = $("#cost-since");
+    if (sinceEl) sinceEl.textContent = _fmtSince(state._savingsSince) || "—";
   }
 
   // ---------- shareable savings card ----------
@@ -6544,6 +7604,7 @@
     const tokens = _fmtTokensShort((state._allTimeTokIn || 0) + (state._allTimeTokOut || 0));
     const sessions = (state.chats && state.chats.order && state.chats.order.length) || 0;
     const providerLabel = provider ? provider.label : state.costProvider;
+    const sinceStr = _fmtSince(state._savingsSince);
     const wrap = document.createElement("div");
     wrap.style.cssText = "position:fixed;left:-10000px;top:0;z-index:-1;";
     wrap.innerHTML = `
@@ -6560,7 +7621,7 @@
         <div style="flex:1;display:flex;flex-direction:column;justify-content:center;gap:2px;">
           <span style="color:#8A8170;font-size:13px;font-weight:500;letter-spacing:0.18em;text-transform:uppercase;">saved by going local</span>
           <span style="color:#67C28C;font-size:82px;font-weight:500;letter-spacing:-0.035em;line-height:1.05;">${savedStr}</span>
-          <span style="color:#B5AB95;font-size:17px;margin-top:8px;">vs running the same prompts on ${esc(providerLabel)}</span>
+          <span style="color:#B5AB95;font-size:17px;margin-top:8px;">vs running the same prompts on ${esc(providerLabel)}${sinceStr ? ` · since ${esc(sinceStr)}` : ""}</span>
         </div>
         <div style="display:flex;border-top:1px solid #3D372E;padding-top:18px;margin-bottom:20px;">
           <div style="flex:1;"><div style="color:#EAE1D0;font-size:19px;font-weight:500;">${tokens}</div><div style="color:#8A8170;font-size:12px;">tokens run</div></div>
@@ -6642,9 +7703,12 @@
     // Restore persisted provider selection
     const saved = localStorage.getItem("accuretta:cost-provider");
     if (saved && CLOUD_PRICING[saved]) state.costProvider = saved;
-    // Restore all-time persistent token totals
+    // Seed all-time totals from the offline cache for an instant paint, then
+    // reconcile against the server (the durable source of truth) — see
+    // _fetchSavings at the end of this function.
     state._allTimeTokOut = parseInt(localStorage.getItem("accuretta:all-tok-out") || "0", 10) || 0;
     state._allTimeTokIn  = parseInt(localStorage.getItem("accuretta:all-tok-in")  || "0", 10) || 0;
+    state._savingsSince  = parseInt(localStorage.getItem("accuretta:savings-since") || "0", 10) || 0;
     // Collapsible: start minimized to save vertical space; remember the choice.
     const widget = $("#cost-widget");
     const toggle = $("#cost-widget-toggle");
@@ -6672,13 +7736,8 @@
     const shareBtn = $("#cost-share");
     if (shareBtn) shareBtn.addEventListener("click", shareSavingsCard);
     renderCostWidget();
-  }
-
-  // Call after each confirmed token accumulation to update all-time counters
-  function _accumulateAllTime(outTok, inTok) {
-    if (outTok > 0) state._allTimeTokOut += outTok;
-    if (inTok > 0)  state._allTimeTokIn += inTok;
-    _persistAllTimeTok();
+    // Reconcile against the durable server-side totals (overrides the cache).
+    _fetchSavings();
   }
 
   // ---------- mobile preview card ----------
@@ -7354,22 +8413,71 @@
     });
     
     $("#btn-shutdown-save")?.addEventListener("click", async () => {
-      $("#btn-shutdown-save").disabled = true;
-      $("#btn-shutdown-no-save").disabled = true;
-      $("#shutdown-loader").classList.remove("hidden");
+      const btnSave = $("#btn-shutdown-save");
+      const btnNoSave = $("#btn-shutdown-no-save");
+      const loader = $("#shutdown-loader");
+      const actions = $("#shutdown-actions");
+      
+      btnSave.disabled = true;
+      btnNoSave.disabled = true;
+      loader.classList.remove("hidden");
+      
+      // Hide actions menu smoothly
+      if (actions) {
+        actions.style.opacity = "0.3";
+        actions.style.pointerEvents = "none";
+        actions.style.transition = "opacity 0.25s ease";
+      }
+      
+      // Animate text sequence
+      const statusText = loader.querySelector("p");
+      const steps = [
+        "Analyzing session changes...",
+        "Writing memory database...",
+        "Stopping model runner...",
+        "Finalizing shutdown..."
+      ];
+      let stepIdx = 0;
+      const interval = setInterval(() => {
+        if (stepIdx < steps.length - 1) {
+          stepIdx++;
+          if (statusText) {
+            statusText.style.opacity = "0";
+            setTimeout(() => {
+              statusText.textContent = steps[stepIdx];
+              statusText.style.opacity = "1";
+            }, 200);
+          }
+        }
+      }, 1100);
+      
       try {
         await api("/api/shutdown", { method: "POST", body: { save: true, messages: state.messages } });
       } catch (e) {
         console.error("Shutdown save failed", e);
       }
+      
+      clearInterval(interval);
       window.__allowClose = true;
       
-      const loader = $("#shutdown-loader");
+      // Transition to success state
       if (loader) {
-        loader.innerHTML = "<p style='color: var(--ok); font-weight: 500;'>Done! It is now safe to close this window.</p>";
+        loader.style.opacity = "0";
+        setTimeout(() => {
+          loader.innerHTML = `
+            <div class="shutdown-success-icon" style="font-size: 48px; color: var(--success); margin-bottom: 0.5rem; animation: success-bounce 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275) both;">
+              <i class="ph ph-check-circle"></i>
+            </div>
+            <p style='color: var(--success); font-weight: 600; font-size: 1.1em; animation: fade-in-up 0.4s ease both;'>Done! It is now safe to close this window.</p>
+          `;
+          loader.style.opacity = "1";
+        }, 300);
       }
       
-      window.close();
+      // Wait 1.8 seconds so the user can see the checkmark, then close
+      setTimeout(() => {
+        window.close();
+      }, 1800);
     });
 
     window.addEventListener("beforeunload", (e) => {
@@ -8214,6 +9322,11 @@
       if (!content) return;
       
       const isHidden = content.classList.toggle("hidden");
+      // Finalized "Worked for Xs" block: the same caret also folds the tool group.
+      if (container.classList.contains("has-worklog")) {
+        const grp = container.closest(".bubble-col")?.querySelector(".tool-group");
+        if (grp) grp.classList.toggle("work-hidden", isHidden);
+      }
       const caret = thinkHeader.querySelector(".think-caret");
       if (caret) {
         if (isHidden) {
@@ -8249,6 +9362,6 @@
   loadApprovals();
   boot().catch(e => {
     console.error(e);
-    alert("boot error: " + e.message);
+    toast("Boot error: " + (e.message || e), "err", 10000, "boot-error");
   });
 })();

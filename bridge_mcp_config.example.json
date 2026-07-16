@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "osint": {
+      "command": "npx.cmd",
+      "args": ["-y", "osint-mcp-server"],
+      "env": {
+        "SHODAN_API_KEY": "",
+        "VT_API_KEY": "",
+        "ST_API_KEY": "",
+        "CENSYS_API_ID": "",
+        "CENSYS_API_SECRET": ""
+      }
+    }
+  }
+}

@@ -24,7 +24,7 @@
     document.documentElement.setAttribute('data-theme', theme);
   })();
 </script>
-<link rel="stylesheet" href="/app.css?v=7">
+<link rel="stylesheet" href="/app.css?v=14">
 <script src="https://unpkg.com/@phosphor-icons/web"></script>
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer></script>
@@ -70,7 +70,7 @@
         <img class="brand-mark brand-mark-light" src="/logo-mark-light.png" alt="" aria-hidden="true">
         <img class="brand-mark brand-mark-dark" src="/logo-mark-dark.png" alt="" aria-hidden="true">
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.6.2</span>
+        <span class="v" id="brand-v">v0.6.3</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -112,6 +112,7 @@
           <div class="cost-breakdown">
             <div class="cost-row"><span class="cost-row-label">Saved this session</span><span class="cost-row-val" id="cost-session">$0.00</span></div>
             <div class="cost-row"><span class="cost-row-label">All time saved</span><span class="cost-row-val" id="cost-alltime">$0.00</span></div>
+            <div class="cost-row cost-row-since"><span class="cost-row-label">Since</span><span class="cost-row-val" id="cost-since">—</span></div>
           </div>
           <div class="cost-pills">
             <select class="cost-select" id="cost-select">
@@ -220,6 +221,7 @@
 
       <div class="composer-wrap">
         <div class="composer">
+          <div class="revealer-deck" id="revealer-deck"></div>
           <div class="composer-tools">
             <button class="chip" id="mode-ide" data-mode="ide"><i class="ph ph-code"></i>IDE</button>
             <button class="chip" id="mode-agent" data-mode="agent"><i class="ph ph-terminal-window"></i>Agent</button>
@@ -951,7 +953,7 @@
   </div>
 </div>
 
-<script src="/app.js?v=202606231600"></script>
+<script src="/app.js?v=202607122300"></script>
 <script>
   // Splash fade-out timer. Lives inline (not in app.js) so it fires
   // independently of when app.js finishes loading — the splash hides on
