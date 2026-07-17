@@ -24,7 +24,7 @@
     document.documentElement.setAttribute('data-theme', theme);
   })();
 </script>
-<link rel="stylesheet" href="/app.css?v=15">
+<link rel="stylesheet" href="/app.css?v=16">
 <script src="https://unpkg.com/@phosphor-icons/web"></script>
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer></script>
@@ -39,25 +39,6 @@
 </style>
 </head>
 <body>
-
-<!-- ====== SPLASH / INTRO ======
-     Half-second branded intro that covers the first render so the user
-     never sees the unstyled-flash window. Hardcoded dark bg so it looks
-     right before the user's theme has even loaded. JS at the end of body
-     fades it out after the squares finish their wave. -->
-<div class="splash" id="splash" role="status" aria-label="Loading Accuretta">
-  <div class="splash-stack">
-    <div class="splash-row">
-      <img class="splash-logo splash-logo-light" src="/logo-mark-light.png" alt="" aria-hidden="true">
-      <img class="splash-logo splash-logo-dark" src="/logo-mark-dark.png" alt="" aria-hidden="true">
-      <span class="splash-wordmark">accuretta</span>
-    </div>
-    <div class="splash-bars" aria-hidden="true">
-      <span></span><span></span><span></span><span></span>
-      <span></span><span></span><span></span><span></span>
-    </div>
-  </div>
-</div>
 
 <div class="app preview-collapsed" id="app">
 
@@ -955,19 +936,6 @@
 
 <script src="/app.js?v=202607122300"></script>
 <script>
-  // Splash fade-out timer. Lives inline (not in app.js) so it fires
-  // independently of when app.js finishes loading — the splash hides on
-  // a fixed schedule regardless of bridge state. The wave animation is
-  // ~280ms last-square-delay + ~200ms tail; we start the fade right at
-  // the tail so the bars never look stalled, then yank the element from
-  // the DOM after the fade so nothing intercepts clicks behind it.
-  (function () {
-    var s = document.getElementById('splash');
-    if (!s) return;
-    setTimeout(function () { s.classList.add('hide'); }, 480);
-    setTimeout(function () { if (s.parentNode) s.parentNode.removeChild(s); }, 780);
-  })();
-
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {
     var overlay = document.getElementById('setup-overlay');
