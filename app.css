@@ -3929,7 +3929,10 @@ button {
      hidden behind the composer until they crest above its top edge. */
   position: relative;
   z-index: 2;
-  overflow: hidden; /* Clips the revealer deck drawer to the rounded corners of the composer */
+  /* No overflow:hidden here. The @-mention menu is positioned above the composer
+     (bottom: 100% + 6px) and a clip on the composer hides it. The revealer deck
+     already clips itself (its own border-radius + overflow:hidden), so the
+     composer does not need to. */
 }
 
 .composer:focus-within {
