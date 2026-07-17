@@ -2566,6 +2566,32 @@ button {
   color: var(--fg-muted);
 }
 
+/* highlight.js token classes, mapped to the same palette as the built-in
+   highlighter above so both engines look identical across light + dark. Light
+   values here; the dark themes override below. */
+.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-built_in,
+.hljs-name, .hljs-type { color: #B45A2F; font-weight: 600; }
+.hljs-string, .hljs-symbol, .hljs-bullet, .hljs-regexp, .hljs-addition { color: #6A8A3B; }
+.hljs-number { color: #8E72D1; }
+.hljs-comment, .hljs-quote { color: var(--fg-faint); font-style: italic; }
+.hljs-title, .hljs-title.function_, .hljs-title.class_ { color: #2C7CB0; }
+.hljs-variable, .hljs-template-variable { color: #8E72D1; }
+.hljs-attr, .hljs-attribute, .hljs-property, .hljs-selector-attr { color: #C5611C; }
+.hljs-meta, .hljs-meta .hljs-keyword, .hljs-meta .hljs-string { color: #C5611C; }
+.hljs-tag, .hljs-selector-id, .hljs-selector-class, .hljs-selector-pseudo { color: #B45A2F; }
+.hljs-deletion { color: #B4443A; }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }
+.hljs-link { text-decoration: underline; }
+
+:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) :is(.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-built_in, .hljs-name, .hljs-type) { color: #C8A8FF; }
+:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) :is(.hljs-string, .hljs-symbol, .hljs-bullet, .hljs-regexp, .hljs-addition) { color: #B5E29B; }
+:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .hljs-number { color: #F4A261; }
+:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) :is(.hljs-title, .hljs-title.function_, .hljs-title.class_) { color: #7CC0FF; }
+:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) :is(.hljs-variable, .hljs-template-variable) { color: #F4A261; }
+:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) :is(.hljs-attr, .hljs-attribute, .hljs-property, .hljs-selector-attr, .hljs-meta, .hljs-meta .hljs-keyword) { color: #F4B57A; }
+:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) :is(.hljs-tag, .hljs-selector-id, .hljs-selector-class, .hljs-selector-pseudo) { color: #C8A8FF; }
+
 .bubble-meta {
   font-size: 11px;
   letter-spacing: 0;

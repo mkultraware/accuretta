@@ -957,6 +957,33 @@
     return "";
   }
 
+  // Resolve a fence language to a highlight.js language id, or "" if hljs
+  // doesn't know it (in which case we auto-detect instead).
+  function _hljsLang(lang) {
+    const hl = window.hljs;
+    if (!hl || !lang || lang === "text") return "";
+    try { return hl.getLanguage(lang) ? lang : ""; } catch (_) { return ""; }
+  }
+
+  // Highlight a chat code block. Prefers highlight.js — real grammar-based
+  // tokenizing across ~40 languages, plus auto-detection for untagged blocks —
+  // and falls back to the built-in lightweight highlighter when hljs isn't
+  // loaded (offline / CDN blocked). Returns { html, lang }.
+  function highlightForCard(src, lang) {
+    const hl = window.hljs;
+    if (hl) {
+      try {
+        const known = _hljsLang(lang);
+        if (known) return { html: hl.highlight(src, { language: known, ignoreIllegals: true }).value, lang: known };
+        const auto = hl.highlightAuto(src);
+        if (auto && auto.value) return { html: auto.value, lang: auto.language || (lang === "text" ? "" : lang) || "text" };
+      } catch (_) { /* fall through to the built-in highlighter */ }
+    }
+    let l = lang;
+    if (l === "text" || !_isKnownLang(l)) { const d = detectLang(src); if (d) l = d; }
+    return { html: highlightCode(src, l), lang: l };
+  }
+
   // Split highlighted HTML on \n while keeping multi-line token spans
   // (docstrings, block comments) properly closed before the break and
   // reopened on the next line so coloring stays continuous. Returns an
@@ -1004,7 +1031,7 @@
   function wrapCodeLines(html) {
     const lines = [];
     let cur = "";
-    let openTag = null; // current <span ...> tag, if any (our tokens never nest)
+    const stack = []; // open <span ...> tags, outermost first — hljs nests them
     let i = 0;
     const n = html.length;
     while (i < n) {
@@ -1013,26 +1040,26 @@
         const end = html.indexOf(">", i);
         if (end === -1) { cur += html.slice(i); break; }
         const tag = html.slice(i, end + 1);
-        if (tag.startsWith("</span")) openTag = null;
-        else if (tag.startsWith("<span")) openTag = tag;
+        if (/^<\/span/i.test(tag)) stack.pop();
+        else if (/^<span\b/i.test(tag)) stack.push(tag);
         cur += tag;
         i = end + 1;
         continue;
       }
       if (c === "\n") {
-        if (openTag) cur += "</span>";
+        // Close open spans before the break, reopen them after, so multi-line
+        // tokens keep their color and the gutter can index each row.
+        for (let k = stack.length - 1; k >= 0; k--) cur += "</span>";
         lines.push(cur);
-        cur = openTag ? openTag : "";
+        cur = stack.join("");
         i++;
         continue;
       }
       cur += c;
       i++;
     }
-    if (cur.length || lines.length === 0) {
-      if (openTag) cur += "</span>";
-      lines.push(cur);
-    }
+    for (let k = stack.length - 1; k >= 0; k--) cur += "</span>";
+    if (cur.length || lines.length === 0) lines.push(cur);
     // Each line: a row span with optional inner content. Empty lines render
     // as a blank row — we still want a number for them.
     return lines.map(line => `<span class="code-line">${line || "\u200b"}</span>`).join("");
@@ -1545,22 +1572,23 @@
       // block still colorizes — either the model wrote the language on its own
       // first line (```<newline>python), or we sniff it from the code itself.
       if (displayLang === "text") {
+        // Model wrote the language on its own first line (```<newline>python)?
+        // Recognize and strip it. Otherwise leave "text"; highlightForCard's
+        // highlight.js auto-detection figures the language out from the code.
         const bare = src.match(/^[ \t]*([A-Za-z][A-Za-z0-9+#.]*)[ \t]*\r?\n/);
         const first = bare && bare[1].toLowerCase();
         if (first && _isKnownLang(first) && src.slice(bare[0].length).trim()) {
           displayLang = LANG_ALIAS[first] || first;
           src = src.slice(bare[0].length);
-        } else {
-          const sniffed = detectLang(src);
-          if (sniffed) displayLang = sniffed;
         }
       }
       if (displayLang === "diff") {
         const dpm = (infoStr || "").match(/path=([^\s]+)/i);
         return renderDiffCard(src, dpm ? dpm[1] : "");
       }
-      const highlighted = highlightCode(src, displayLang);
-      const lined = wrapCodeLines(highlighted);
+      const hl = highlightForCard(src, displayLang);
+      if (hl.lang) displayLang = hl.lang;
+      const lined = wrapCodeLines(hl.html);
       // Dynamic single-line detection for super compact visual density
       const isSingleLine = src.trim().split('\n').length <= 1;
       const singleClass = isSingleLine ? " single-line" : "";
