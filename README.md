@@ -10,7 +10,7 @@
 
 **A local AI workspace. Your model, your machine, your files.**
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: personal use only](https://img.shields.io/badge/license-personal%20use%20only-B5544A.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Powered by llama.cpp](https://img.shields.io/badge/backend-llama.cpp-orange.svg)](https://github.com/ggml-org/llama.cpp)
 [![Runs local](https://img.shields.io/badge/runs-100%25%20local-brightgreen.svg)](#privacy)
@@ -272,4 +272,6 @@ Personal project. I work on it when I feel like it. Pull requests are welcome, b
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Use it, change it, ship it. The only thing I ask is that you don't pretend you wrote the parts you didn't.
+Free for personal use. Run it, poke at it, build on it for yourself. It's not for commercial use though: if you want it in or for a business, or shipped as part of something you sell, ask me first. And please don't pretend you wrote the parts you didn't.
+
+Formally, it's under the [PolyForm Noncommercial License 1.0.0](LICENSE), a real drafted license that permits any noncommercial use and blocks commercial use.
