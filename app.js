@@ -755,6 +755,23 @@
     sql: new Set(("select from where insert update delete into values set join inner left right outer " +
       "on as group by order having limit offset distinct union all create table drop alter index").split(/\s+/)),
     json: new Set(("true false null").split(/\s+/)),
+    c: new Set(("auto break case char const continue default do double else enum extern float for goto " +
+      "if inline int long register restrict return short signed sizeof static struct switch typedef " +
+      "union unsigned void volatile while sizeof _Bool _Static_assert").split(/\s+/)),
+    cpp: new Set(("alignas alignof auto bool break case catch char class const constexpr const_cast continue " +
+      "decltype default delete do double dynamic_cast else enum explicit extern false float for friend goto if " +
+      "inline int long mutable namespace new noexcept nullptr operator private protected public register " +
+      "reinterpret_cast return short signed sizeof static static_assert static_cast struct switch template this " +
+      "throw true try typedef typeid typename union unsigned using virtual void volatile while").split(/\s+/)),
+    rust: new Set(("as async await break const continue crate dyn else enum extern false fn for if impl in let " +
+      "loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where " +
+      "while box").split(/\s+/)),
+    go: new Set(("break case chan const continue default defer else fallthrough for func go goto if import " +
+      "interface map package range return select struct switch type var true false nil iota").split(/\s+/)),
+    java: new Set(("abstract assert boolean break byte case catch char class const continue default do double " +
+      "else enum extends final finally float for goto if implements import instanceof int interface long native " +
+      "new package private protected public return short static strictfp super switch synchronized this throw " +
+      "throws transient try void volatile while true false null var record sealed").split(/\s+/)),
   };
   // Aliases that map to a base language
   const LANG_ALIAS = {
@@ -764,6 +781,7 @@
     shell: "sh", zsh: "sh", bash: "bash",
     pwsh: "powershell",
     yml: "yaml",
+    "c++": "cpp", cxx: "cpp", cc: "cpp", h: "c", hpp: "cpp", golang: "go", rs: "rust",
   };
   // Comment styles per language (line + optional block)
   const LANG_COMMENTS = {
@@ -905,6 +923,38 @@
       i++;
     }
     return out;
+  }
+
+  // Does the highlighter have a spec for this language (or alias)?
+  function _isKnownLang(l) {
+    const b = LANG_ALIAS[l] || l;
+    return b === "html" || b === "xml" || b === "svg" || b === "css" || b === "yaml" ||
+      !!LANG_KEYWORDS[b] || !!LANG_COMMENTS[b];
+  }
+
+  // Sniff a language for UNTAGGED fences (the model forgot to label the block)
+  // so it still colorizes. Conservative: returns "" when the signal is weak,
+  // which leaves the block as plain text rather than mis-coloring it.
+  function detectLang(code) {
+    const s = String(code || "").slice(0, 4000);
+    const has = re => re.test(s);
+    if (has(/#include\s*[<"]/) || has(/\b(?:struct|enum|union|typedef)\s+\w+\s*\{/) ||
+        has(/\b__(?:le|be)\d+\b/) || has(/\b(?:uint\d+_t|size_t|int|char|void)\s+\**\w+\s*[;(=]/))
+      return has(/\b(?:class|namespace|template|std::)\b|::/) ? "cpp" : "c";
+    if (has(/^\s*def\s+\w+\s*\(/m) || has(/^\s*(?:from\s+[\w.]+\s+)?import\s+\w/m) ||
+        has(/^\s*class\s+\w+\s*[:(]/m) || (has(/\bself\b/) && has(/:\s*$/m)))
+      return "py";
+    if (has(/\bfn\s+\w+\s*\(/) && has(/\blet\s+(?:mut\s+)?\w+/)) return "rust";
+    if (has(/\bpackage\s+\w+/) && has(/\bfunc\s+\w*\s*\(/)) return "go";
+    if (has(/^#!.*\b(?:ba|z|k)?sh\b/m) || has(/^\s*(?:sudo|apt|npm|yarn|git|curl|wget|cd|echo|export|mkdir|chmod)\b/m))
+      return "bash";
+    if (has(/\b(?:Get|Set|New|Remove|Write|Invoke)-\w+\b/) || has(/\$\w+\s*=[^=]/) && has(/\|/)) return "powershell";
+    if (has(/=>/) || has(/\bconsole\.\w+/) || has(/\b(?:const|let|var)\s+\w+\s*=/) || has(/\bfunction\s*\w*\s*\(/))
+      return (has(/:\s*(?:string|number|boolean|any|void)\b/) || has(/\binterface\s+\w+/)) ? "ts" : "js";
+    if (has(/\bSELECT\b[\s\S]*\bFROM\b/i) || has(/\b(?:INSERT\s+INTO|CREATE\s+TABLE|UPDATE\s+\w+\s+SET)\b/i))
+      return "sql";
+    if (has(/^\s*[{[]/) && has(/"[\w-]+"\s*:/)) return "json";
+    return "";
   }
 
   // Split highlighted HTML on \n while keeping multi-line token spans
@@ -1489,15 +1539,30 @@
       // arrives, or when the model emits a bare ``` ``` pair.
       if (!code || !code.trim()) return "";
       const langLabel = (infoStr || "").trim().split(/\s+/)[0] || "";
-      const displayLang = langLabel ? langLabel.toLowerCase() : "text";
+      let displayLang = langLabel ? langLabel.toLowerCase() : "text";
+      let src = code;
+      // Untagged fence: the model didn't label the language. Recover it so the
+      // block still colorizes — either the model wrote the language on its own
+      // first line (```<newline>python), or we sniff it from the code itself.
+      if (displayLang === "text") {
+        const bare = src.match(/^[ \t]*([A-Za-z][A-Za-z0-9+#.]*)[ \t]*\r?\n/);
+        const first = bare && bare[1].toLowerCase();
+        if (first && _isKnownLang(first) && src.slice(bare[0].length).trim()) {
+          displayLang = LANG_ALIAS[first] || first;
+          src = src.slice(bare[0].length);
+        } else {
+          const sniffed = detectLang(src);
+          if (sniffed) displayLang = sniffed;
+        }
+      }
       if (displayLang === "diff") {
         const dpm = (infoStr || "").match(/path=([^\s]+)/i);
-        return renderDiffCard(code, dpm ? dpm[1] : "");
+        return renderDiffCard(src, dpm ? dpm[1] : "");
       }
-      const highlighted = highlightCode(code, displayLang);
+      const highlighted = highlightCode(src, displayLang);
       const lined = wrapCodeLines(highlighted);
       // Dynamic single-line detection for super compact visual density
-      const isSingleLine = code.trim().split('\n').length <= 1;
+      const isSingleLine = src.trim().split('\n').length <= 1;
       const singleClass = isSingleLine ? " single-line" : "";
       
       // Parse path=<filename> from infoStr
