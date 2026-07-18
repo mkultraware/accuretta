@@ -1301,24 +1301,27 @@
       const n = Math.max(del.length, add.length);
       for (let k = 0; k < n; k++) {
         const l = del[k], r = add[k];
-        out.push(
+        // Each visual row is ONE .dl-row element holding both halves, so the
+        // two sides are siblings on the same line and can never stagger,
+        // regardless of scrollbars, zoom, or font metrics in any runtime.
+        out.push(`<div class="dl-row">` +
           (l ? `<div class="dl dl-l dl-del"><span class="dl-g">${l.o}</span><span class="dl-m">−</span><span class="dl-c">${_dc(l.text)}</span></div>`
              : `<div class="dl dl-l dl-empty"></div>`) +
           (r ? `<div class="dl dl-r dl-add"><span class="dl-g">${r.n}</span><span class="dl-m">+</span><span class="dl-c">${_dc(r.text)}</span></div>`
-             : `<div class="dl dl-r dl-empty"></div>`)
-        );
+             : `<div class="dl dl-r dl-empty"></div>`) +
+          `</div>`);
       }
       del = []; add = [];
     };
     for (const r of rows) {
-      if (r.t === "hunk") { flush(); out.push(`<div class="dl dl-hunk dl-span"><span class="dl-c">${esc(r.text)}</span></div>`); continue; }
+      if (r.t === "hunk") { flush(); out.push(`<div class="dl-row dl-hunk-row"><div class="dl dl-hunk"><span class="dl-c">${esc(r.text)}</span></div></div>`); continue; }
       if (r.t === "del") { del.push(r); continue; }
       if (r.t === "add") { add.push(r); continue; }
       flush();
-      out.push(
+      out.push(`<div class="dl-row">` +
         `<div class="dl dl-l"><span class="dl-g">${r.o}</span><span class="dl-m"></span><span class="dl-c">${_dc(r.text)}</span></div>` +
-        `<div class="dl dl-r"><span class="dl-g">${r.n}</span><span class="dl-m"></span><span class="dl-c">${_dc(r.text)}</span></div>`
-      );
+        `<div class="dl dl-r"><span class="dl-g">${r.n}</span><span class="dl-m"></span><span class="dl-c">${_dc(r.text)}</span></div>` +
+        `</div>`);
     }
     flush();
     return out.join("");

@@ -9007,7 +9007,11 @@ body,
 .diff-minus { color: var(--danger); }
 .diff-head .cc-copy { flex: 0 0 auto; }
 
-.diff-split { display: grid; grid-template-columns: 1fr 1fr; }
+.diff-split { display: flex; flex-direction: column; }
+/* Each visual row holds both halves as flex siblings, so left and right are
+   locked to the same line — no grid auto-flow, no per-cell height drift. */
+.dl-row { display: flex; align-items: stretch; }
+.dl-row > .dl { flex: 1 1 0; min-width: 0; }
 .diff-unified { display: none; }
 
 .dl {
@@ -9029,7 +9033,7 @@ body,
 .dl-empty { background: repeating-linear-gradient(45deg, var(--bg-inset), var(--bg-inset) 6px, transparent 6px, transparent 12px); }
 .dl-hunk { background: var(--bg-inset); }
 .dl-hunk .dl-c { color: var(--fg-faint); }
-.dl-span { grid-column: 1 / -1; }
+.dl-hunk-row { background: var(--bg-inset); }
 
 @media (max-width: 600px) {
   .diff-card:not(.only-unified) .diff-split { display: none; }
