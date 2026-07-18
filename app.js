@@ -56,25 +56,9 @@
     const deck = $("#revealer-deck");
     if (!deck) return null;
     
-    let card = deck.querySelector(".revealer-card.notifications");
-    if (!card) {
-      card = document.createElement("div");
-      card.className = "revealer-card notifications";
-      card.dataset.cardType = "notifications";
-      card.innerHTML = `
-        <div class="revealer-card-head">
-          <span class="revealer-card-icon"><i class="ph ph-bell"></i></span>
-          <span class="revealer-card-title">System Status</span>
-          <span class="grow"></span>
-        </div>
-        <div class="revealer-card-body"></div>
-      `;
-      deck.appendChild(card);
-    }
-    
-    const body = card.querySelector(".revealer-card-body");
     const row = document.createElement("div");
-    row.className = `revealer-row notification-row ${kind}`;
+    row.className = `revealer-card notifications ${kind}`;
+    row.dataset.cardType = "notifications";
     
     const iconMap = {
       info: '<i class="ph ph-info" style="color:var(--accent)"></i>',
@@ -89,14 +73,14 @@
       <span class="notification-icon">${iconHtml}</span>
       <span class="notification-text">${msg}</span>
     `;
-    body.appendChild(row);
+    deck.appendChild(row);
     
     setTimeout(() => {
-      row.remove();
-      if (body.children.length === 0) {
-        card.remove();
+      row.classList.add("fade-out");
+      setTimeout(() => {
+        row.remove();
         if (deck.children.length === 0) deck.innerHTML = "";
-      }
+      }, 220);
     }, ms);
     
     return row;
@@ -1297,24 +1281,127 @@
   function renderDiffSplit(rows) {
     const out = [];
     let del = [], add = [];
-    const flush = () => {
-      const n = Math.max(del.length, add.length);
-      for (let k = 0; k < n; k++) {
-        const l = del[k], r = add[k];
-        // Each visual row is ONE .dl-row element holding both halves, so the
-        // two sides are siblings on the same line and can never stagger,
-        // regardless of scrollbars, zoom, or font metrics in any runtime.
-        out.push(`<div class="dl-row">` +
-          (l ? `<div class="dl dl-l dl-del"><span class="dl-g">${l.o}</span><span class="dl-m">−</span><span class="dl-c">${_dc(l.text)}</span></div>`
-             : `<div class="dl dl-l dl-empty"></div>`) +
-          (r ? `<div class="dl dl-r dl-add"><span class="dl-g">${r.n}</span><span class="dl-m">+</span><span class="dl-c">${_dc(r.text)}</span></div>`
-             : `<div class="dl dl-r dl-empty"></div>`) +
-          `</div>`);
+
+    const getSimilarity = (s1, s2) => {
+      const t1 = (s1 || "").trim();
+      const t2 = (s2 || "").trim();
+      if (!t1 && !t2) return 1.0;
+      if (!t1 || !t2) return 0.0;
+      if (t1 === t2) return 1.0;
+
+      const m = t1.length;
+      const n = t2.length;
+      const dp = Array(n + 1).fill(0);
+      for (let j = 0; j <= n; j++) dp[j] = j;
+
+      for (let i = 1; i <= m; i++) {
+        let prev = dp[0];
+        dp[0] = i;
+        for (let j = 1; j <= n; j++) {
+          const temp = dp[j];
+          if (t1[i - 1] === t2[j - 1]) {
+            dp[j] = prev;
+          } else {
+            dp[j] = Math.min(prev + 1, dp[j] + 1, dp[j - 1] + 1);
+          }
+          prev = temp;
+        }
       }
+      return 1.0 - (dp[n] / Math.max(m, n));
+    };
+
+    const renderRow = (l, r) => {
+      return `<div class="dl-row">` +
+        (l ? `<div class="dl dl-l dl-del"><span class="dl-g">${l.o}</span><span class="dl-m">−</span><span class="dl-c">${_dc(l.text)}</span></div>`
+           : `<div class="dl dl-l dl-empty"></div>`) +
+        (r ? `<div class="dl dl-r dl-add"><span class="dl-g">${r.n}</span><span class="dl-m">+</span><span class="dl-c">${_dc(r.text)}</span></div>`
+           : `<div class="dl dl-r dl-empty"></div>`) +
+        `</div>`;
+    };
+
+    const flush = () => {
+      const N = del.length;
+      const M = add.length;
+      if (N === 0 && M === 0) return;
+
+      if (N === 0) {
+        for (let j = 0; j < M; j++) {
+          out.push(renderRow(null, add[j]));
+        }
+        add = [];
+        return;
+      }
+      if (M === 0) {
+        for (let i = 0; i < N; i++) {
+          out.push(renderRow(del[i], null));
+        }
+        del = [];
+        return;
+      }
+
+      // Compute similarity matrix
+      const sim = Array(N).fill(null).map(() => Array(M).fill(0));
+      for (let i = 0; i < N; i++) {
+        for (let j = 0; j < M; j++) {
+          sim[i][j] = getSimilarity(del[i].text, add[j].text);
+        }
+      }
+
+      // Needleman-Wunsch style DP alignment
+      const gapPenalty = -0.2;
+      const dp = Array(N + 1).fill(null).map(() => Array(M + 1).fill(0));
+
+      for (let i = 1; i <= N; i++) dp[i][0] = i * gapPenalty;
+      for (let j = 1; j <= M; j++) dp[0][j] = j * gapPenalty;
+
+      for (let i = 1; i <= N; i++) {
+        for (let j = 1; j <= M; j++) {
+          const s = sim[i - 1][j - 1];
+          const matchScore = s >= 0.45 ? s : -0.5;
+          dp[i][j] = Math.max(
+            dp[i - 1][j - 1] + matchScore,
+            dp[i - 1][j] + gapPenalty,
+            dp[i][j - 1] + gapPenalty
+          );
+        }
+      }
+
+      const alignment = [];
+      let i = N, j = M;
+      while (i > 0 || j > 0) {
+        if (i > 0 && j > 0) {
+          const s = sim[i - 1][j - 1];
+          const matchScore = s >= 0.45 ? s : -0.5;
+          const score = dp[i][j];
+          if (Math.abs(score - (dp[i - 1][j - 1] + matchScore)) < 1e-9) {
+            alignment.push({ l: del[i - 1], r: add[j - 1] });
+            i--; j--;
+            continue;
+          }
+        }
+        if (i > 0 && Math.abs(dp[i][j] - (dp[i - 1][j] + gapPenalty)) < 1e-9) {
+          alignment.push({ l: del[i - 1], r: null });
+          i--;
+        } else {
+          alignment.push({ l: null, r: add[j - 1] });
+          j--;
+        }
+      }
+
+      alignment.reverse();
+      for (const cell of alignment) {
+        out.push(renderRow(cell.l, cell.r));
+      }
+
       del = []; add = [];
     };
+
     for (const r of rows) {
-      if (r.t === "hunk") { flush(); out.push(`<div class="dl-row dl-hunk-row"><div class="dl dl-hunk"><span class="dl-c">${esc(r.text)}</span></div></div>`); continue; }
+      if (r.t === "hunk") {
+        flush();
+        out.push(`<div class="dl-row dl-hunk-row"><div class="dl dl-hunk"><span class="dl-c">${esc(r.text)}</span></div></div>`);
+        continue;
+      }
       if (r.t === "del") { del.push(r); continue; }
       if (r.t === "add") { add.push(r); continue; }
       flush();

@@ -178,25 +178,191 @@ def _build_splash_html() -> str:
     pal = _splash_palette(theme)
     logo = _logo_data_uri(theme)
     accent = pal["accent"]
-    glow = accent + "55" if accent.startswith("#") and len(accent) == 7 else accent
+    
+    is_light = theme in _LIGHT_THEMES
+    grid_color = "rgba(0, 0, 0, 0.02)" if is_light else "rgba(255, 255, 255, 0.012)"
+    
+    if accent.startswith("#") and len(accent) == 7:
+        glow_color = accent + "44"
+        glow_color_faint = accent + "18"
+    else:
+        glow_color = "rgba(56, 189, 248, 0.25)"
+        glow_color_faint = "rgba(56, 189, 248, 0.1)"
+        
+    loader_track_bg = "rgba(0, 0, 0, 0.05)" if is_light else "rgba(255, 255, 255, 0.06)"
+    
     logo_html = (
-        f'<img src="{logo}" alt="" style="width:76px;height:76px;object-fit:contain;'
-        f'filter:drop-shadow(0 0 22px {glow});animation:breathe 2.8s ease-in-out infinite">'
+        f'<div class="logo-wrapper">'
+        f'<div class="logo-ring-outer"></div>'
+        f'<div class="logo-ring-inner"></div>'
+        f'<img src="{logo}" class="logo-img" alt="">'
+        f'</div>'
         if logo else ""
     )
-    squares = "".join(
-        f'<span class="sq" style="animation-delay:{i * 90}ms"></span>' for i in range(8)
-    )
+    
     return f"""<!doctype html><html><head><meta charset="utf-8"></head>
-<body style="margin:0;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:{pal['bg']};color:{pal['fg']};font-family:system-ui,-apple-system,'Segoe UI',sans-serif;user-select:none">
-  {logo_html}
-  <div style="margin-top:20px;font-size:30px;font-weight:700;letter-spacing:.01em">accuretta</div>
-  <div style="margin-top:8px;font-size:13px;color:{pal['muted']}">starting your engine…</div>
-  <div style="margin-top:24px;display:flex;gap:7px">{squares}</div>
+<body style="margin:0;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:{pal['bg']};color:{pal['fg']};font-family:system-ui,-apple-system,'Segoe UI',sans-serif;user-select:none;overflow:hidden;position:relative">
+  <div class="grid"></div>
+  <div class="content">
+    {logo_html}
+    <h1 class="title">accuretta</h1>
+    <p class="subtitle">starting your engine…</p>
+    <div class="loader-track">
+      <div class="loader-bar"></div>
+    </div>
+  </div>
   <style>
-    @keyframes breathe {{0%,100%{{transform:scale(1);opacity:.9}}50%{{transform:scale(1.05);opacity:1}}}}
-    @keyframes pulse {{0%,100%{{opacity:.2;transform:scale(.82)}}35%{{opacity:1;transform:scale(1.15)}}}}
-    .sq{{width:12px;height:12px;border-radius:2px;background:{accent};opacity:0;animation:pulse 1.5s cubic-bezier(.2,.8,.2,1) infinite}}
+    .grid {{
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background-image: 
+        radial-gradient(circle at center, transparent 30%, {pal['bg']} 85%),
+        linear-gradient({grid_color} 1px, transparent 1px),
+        linear-gradient(90deg, {grid_color} 1px, transparent 1px);
+      background-size: 100% 100%, 36px 36px, 36px 36px;
+      background-position: center;
+      z-index: 1;
+      pointer-events: none;
+    }}
+    .content {{
+      position: relative;
+      z-index: 2;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }}
+    .logo-wrapper {{
+      position: relative;
+      width: 130px;
+      height: 130px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 20px;
+      animation: logo-reveal 1.2s cubic-bezier(0.19, 1, 0.22, 1) both;
+    }}
+    .logo-ring-inner {{
+      position: absolute;
+      width: 96px;
+      height: 96px;
+      border-radius: 50%;
+      border: 2px solid transparent;
+      border-top-color: {accent};
+      border-bottom-color: {accent};
+      opacity: 0.35;
+      animation: spin-clockwise 2.8s linear infinite;
+    }}
+    .logo-ring-outer {{
+      position: absolute;
+      width: 122px;
+      height: 122px;
+      border-radius: 50%;
+      border: 1px dashed {accent};
+      opacity: 0.12;
+      animation: spin-counter-clockwise 10s linear infinite;
+    }}
+    .logo-img {{
+      width: 60px;
+      height: 60px;
+      object-fit: contain;
+      z-index: 3;
+      filter: drop-shadow(0 0 16px {glow_color});
+      animation: breathe 3s ease-in-out infinite;
+    }}
+    .title {{
+      margin: 16px 0 0 0;
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: 0.22em;
+      text-indent: 0.22em; /* offset letter-spacing on last char */
+      text-transform: lowercase;
+      text-align: center;
+      opacity: 0;
+      animation: title-reveal 1.4s cubic-bezier(0.19, 1, 0.22, 1) 0.25s both;
+    }}
+    .subtitle {{
+      margin: 8px 0 0 0;
+      font-size: 13px;
+      color: {pal['muted']};
+      letter-spacing: 0.05em;
+      text-align: center;
+      opacity: 0;
+      animation: fade-in 1s ease-out 0.6s both;
+    }}
+    .loader-track {{
+      margin-top: 24px;
+      width: 140px;
+      height: 2px;
+      background: {loader_track_bg};
+      border-radius: 1px;
+      overflow: hidden;
+      position: relative;
+      opacity: 0;
+      animation: fade-in 1s ease-out 0.8s both;
+    }}
+    .loader-bar {{
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      width: 50px;
+      background: linear-gradient(90deg, transparent, {accent}, transparent);
+      animation: loading-slide 1.6s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+    }}
+    @keyframes spin-clockwise {{
+      0% {{ transform: rotate(0deg); }}
+      100% {{ transform: rotate(360deg); }}
+    }}
+    @keyframes spin-counter-clockwise {{
+      0% {{ transform: rotate(360deg); }}
+      100% {{ transform: rotate(0deg); }}
+    }}
+    @keyframes logo-reveal {{
+      0% {{
+        transform: scale(0.85);
+        opacity: 0;
+      }}
+      100% {{
+        transform: scale(1);
+        opacity: 1;
+      }}
+    }}
+    @keyframes breathe {{
+      0%, 100% {{ transform: scale(1); opacity: 0.95; }}
+      50% {{ transform: scale(1.05); opacity: 1; }}
+    }}
+    @keyframes title-reveal {{
+      0% {{
+        letter-spacing: 0.1em;
+        text-indent: 0.1em;
+        opacity: 0;
+      }}
+      100% {{
+        letter-spacing: 0.22em;
+        text-indent: 0.22em;
+        opacity: 1;
+      }}
+    }}
+    @keyframes loading-slide {{
+      0% {{
+        left: -50px;
+      }}
+      100% {{
+        left: 140px;
+      }}
+    }}
+    @keyframes fade-in {{
+      0% {{
+        opacity: 0;
+      }}
+      100% {{
+        opacity: 1;
+      }}
+    }}
   </style>
 </body></html>"""
 

@@ -10643,12 +10643,44 @@ body,
 /* ====== DECK NOTIFICATIONS CARD & TOAST STYLIZATION ====== */
 
 .revealer-card.notifications {
-  border-bottom: 1px solid var(--border-subtle);
-}
-
-.notification-row {
+  display: flex;
   align-items: center;
   gap: 10px;
+  padding: 8px 12px;
+  height: 32px;
+  background: var(--bg-sunken);
+  border-bottom: 1px solid var(--border-subtle);
+  box-sizing: border-box;
+  overflow: hidden;
+  animation: toast-slide-in 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
+  transition: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.revealer-card.notifications.fade-out {
+  opacity: 0;
+  transform: translateY(-8px);
+  height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  border-bottom-color: transparent;
+  pointer-events: none;
+}
+
+@keyframes toast-slide-in {
+  from {
+    height: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    height: 32px;
+    padding-top: 8px;
+    padding-bottom: 8px;
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .notification-dot {
