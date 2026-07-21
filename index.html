@@ -51,7 +51,7 @@
         <img class="brand-mark brand-mark-light" src="/logo-mark-light.png" alt="" aria-hidden="true">
         <img class="brand-mark brand-mark-dark" src="/logo-mark-dark.png" alt="" aria-hidden="true">
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.6.6</span>
+        <span class="v" id="brand-v">v0.6.7</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -163,6 +163,7 @@
         <span id="chat-meta">local</span>
       </div>
       <div class="actions">
+        <button class="iconbtn" id="btn-toggle-plan" title="Plan" aria-pressed="false"><i class="ph ph-list-checks"></i></button>
         <button class="iconbtn" id="btn-session-desktop" title="Desktop automation for this chat only" hidden><i class="ph ph-desktop"></i></button>
         <button class="iconbtn" id="btn-cmd-history" title="PowerShell command history"><i class="ph ph-terminal-window"></i></button>
         <button class="iconbtn" id="btn-palette" title="Switch session (⌘K / Ctrl+K)"><i class="ph ph-magnifying-glass"></i></button>
@@ -411,24 +412,53 @@
     <button class="iconbtn" id="btn-close-recon"><i class="ph ph-x"></i></button>
   </div>
   <div class="modal-body">
-    <div id="recon-step-auth">
+    <div id="recon-panel">
       <div class="recon-disclaimer">
         <i class="ph ph-warning"></i>
-        <div><strong>Authorized testing only.</strong> Run reconnaissance only against systems you own or have explicit written permission to test. Unauthorized scanning may be illegal where you are. You alone are responsible for how these tools are used and for the consequences of running them.</div>
+        <div><strong>Authorized testing only.</strong> Test only systems you own or have explicit written permission to test. Unauthorized scanning may be illegal where you are. You alone are responsible for how these tools are used and for the consequences.</div>
       </div>
-      <p class="recon-q">Do you have explicit authorization to test this target?</p>
-      <div class="recon-actions">
-        <button class="btn" id="recon-auth-no">No, cancel</button>
-        <button class="btn accent" id="recon-auth-yes">Yes, I'm authorized</button>
-      </div>
-    </div>
-    <div id="recon-step-target" class="hidden">
+
       <label class="recon-label" for="recon-target-input">Target domain or host</label>
       <input type="text" id="recon-target-input" class="recon-input" placeholder="example.com" autocomplete="off" spellcheck="false">
-      <p class="recon-hint">A bare domain or hostname. The model will run a stealth port scan, TLS audit, HTTP fingerprint, passive subdomain enumeration and DNS recon, then summarize the findings.</p>
+
+      <label class="recon-check">
+        <input type="checkbox" id="recon-auth-check">
+        <span class="custom-checkbox"></span>
+        <span>I own this target or have written authorization to test it.</span>
+      </label>
+
+      <label class="recon-label">Scope <span class="recon-opt">optional</span></label>
+      <input type="text" id="recon-scope-in" class="recon-input" placeholder="in scope: hosts / IPs / CIDRs, comma-separated" autocomplete="off" spellcheck="false">
+      <input type="text" id="recon-scope-out" class="recon-input" placeholder="out of scope: hosts to leave alone" autocomplete="off" spellcheck="false">
+
+      <label class="recon-label">Objective <span class="recon-opt">optional</span></label>
+      <div class="recon-chips" id="recon-objective-chips">
+        <button type="button" class="recon-chip" data-val="Map the attack surface and report findings.">Recon only</button>
+        <button type="button" class="recon-chip" data-val="Find a way in and prove access.">Find a way in</button>
+        <button type="button" class="recon-chip" data-val="Test a specific vulnerability class.">Specific vuln</button>
+        <button type="button" class="recon-chip" data-val="Prove a data-access / exfil path.">Prove data access</button>
+      </div>
+      <input type="text" id="recon-objective-text" class="recon-input" placeholder="what does &quot;done&quot; look like?" autocomplete="off">
+
+      <label class="recon-label">Constraints <span class="recon-opt">optional</span></label>
+      <div class="recon-chips" id="recon-constraint-chips">
+        <button type="button" class="recon-chip" data-group="noise" data-val="stay quiet / low-footprint">Quiet</button>
+        <button type="button" class="recon-chip" data-group="noise" data-val="loud is OK">Loud OK</button>
+        <button type="button" class="recon-chip" data-group="env" data-val="production, extra care">Prod</button>
+        <button type="button" class="recon-chip" data-group="env" data-val="staging / non-prod">Staging</button>
+        <button type="button" class="recon-chip" data-group="time" data-val="quick pass">Quick</button>
+        <button type="button" class="recon-chip" data-group="time" data-val="thorough, take the time">Thorough</button>
+      </div>
+      <input type="text" id="recon-constraint-text" class="recon-input" placeholder="time budget or other limits" autocomplete="off">
+
+      <div id="recon-blank-notice" class="recon-notice hidden">
+        <i class="ph ph-info"></i>
+        <span>With scope, objective, and constraints left blank, the run targets wider: it sends more requests to more surface, takes longer, and may touch hosts you did not intend.</span>
+      </div>
+
       <div class="recon-actions">
-        <button class="btn" id="recon-back">Back</button>
-        <button class="btn accent" id="recon-go">Run recon</button>
+        <button class="btn" id="recon-cancel">Cancel</button>
+        <button class="btn accent" id="recon-go" disabled>Run</button>
       </div>
     </div>
   </div>
@@ -767,6 +797,13 @@
     <div class="form-row inline">
       <label>Enable red team tools</label>
       <div class="sw" id="sw-red-team-enabled"></div>
+    </div>
+    <div class="form-row inline">
+      <label>Force exploit phase</label>
+      <div class="sw" id="sw-rt-force-exploit"></div>
+    </div>
+    <div class="form-row">
+      <span class="hint">skips the recon-to-exploit gate: offers the break-in tools (http_request, sql_injection, jwt_tool, fuzz, batch_probe, tcp_send, auth spray) from the first turn instead of waiting for a validate_finding confirm. use when the model won't validate on its own. adds ~2,200 tokens per turn while on.</span>
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">

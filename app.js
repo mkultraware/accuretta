@@ -3443,6 +3443,7 @@
         images: (images || []).map(x => x.dataUrl),
         regenerate,
         invisible: !!(opts && opts.invisible),
+        mission: (opts && opts.mission) || undefined,
       }),
       signal,
     });
@@ -3726,20 +3727,55 @@
     { label: "Pivot",  tech: "T1190", icon: "ph-path" },
     { label: "RCE",    tech: "T1059", icon: "ph-terminal-window" },
   ];
+  // Mirrors the backend _RT_EXPLOIT_TOOL_NAMES (bridge.py). These are the active
+  // break-in primitives, so they DO drive the attack rail when they run — even
+  // recon_auth_spray, which is recon_-prefixed but is really an attack.
+  const RT_EXPLOIT_TOOLS = new Set([
+    "http_request", "recon_auth_spray", "jwt_tool", "sql_injection",
+    "fuzz", "batch_probe", "tcp_send",
+  ]);
+  function isExploitTool(name) { return RT_EXPLOIT_TOOLS.has(name); }
   function isRedTeamTool(name) {
-    return !!name && (name.startsWith("recon_") || name === "http_request" || name === "encode_decode");
+    return !!name && (name.startsWith("recon_") || name === "encode_decode" || isExploitTool(name));
+  }
+  // Short path helper: strip scheme+host, keep path+query, cap length.
+  function arPath(u, cap = 40) {
+    u = String(u || "");
+    u = u.replace(/^https?:\/\/[^/]+/i, "") || u;
+    return u.length > cap ? u.slice(0, cap) + "…" : u;
   }
   function attackActivitySummary(name, args) {
     args = args || {};
     if (name === "http_request") {
       const m = (args.method || "GET").toUpperCase();
-      let u = String(args.url || args.target || "");
-      u = u.replace(/^https?:\/\/[^/]+/i, "") || u; // keep path+query when possible
-      if (u.length > 44) u = u.slice(0, 44) + "…";
-      return `http_request → ${m} ${u || "/"}`;
+      return `http_request → ${m} ${arPath(args.url || args.target, 44) || "/"}`;
     }
     if (name === "encode_decode") {
       return `encode_decode → ${args.scheme || "base64"} ${args.operation || "encode"}`;
+    }
+    if (name === "sql_injection") {
+      const p = args.param ? `${args.param} @ ` : "";
+      return `sql_injection → ${p}${arPath(args.url) || "?"}`;
+    }
+    if (name === "fuzz") {
+      const p = args.param ? `${args.param} ` : "";
+      return `fuzz → ${p}${arPath(args.url) || "FUZZ"}`;
+    }
+    if (name === "jwt_tool") {
+      return `jwt_tool → ${args.operation || "decode"}`;
+    }
+    if (name === "batch_probe") {
+      const n = Array.isArray(args.targets) ? args.targets.length : 0;
+      const cls = args.probe || (Array.isArray(args.payloads) ? "custom" : "probe");
+      return `batch_probe → ${cls}${n ? ` ×${n}` : ""}`;
+    }
+    if (name === "tcp_send") {
+      const port = args.port ? `:${args.port}` : "";
+      return `tcp_send → ${args.host || args.target || ""}${port}`;
+    }
+    if (name === "recon_auth_spray") {
+      const m = args.mode ? `${args.mode} ` : "";
+      return `auth_spray → ${m}${arPath(args.url || args.target) || String(args.url || args.target || "")}`;
     }
     if (name && name.startsWith("recon_")) {
       return `${name} → ${args.url || args.target || args.domain || args.host || ""}`;
@@ -3866,11 +3902,14 @@
   }
   function attackRailToolStart(row, name, args) {
     // The kill-chain visual (Recon -> Access -> Pivot -> RCE) is for an actual
-    // break-in, not passive recon/OSINT. Recon tools alone must NOT summon it —
-    // they render in the normal tool timeline. It appears only once exploitation
-    // begins (http_request / encode_decode), or when a breach lands on a chain
-    // that's already open (see attackRailBreach).
-    if (!isRedTeamTool(name) || name.startsWith("recon_")) return;
+    // break-in, not passive recon/OSINT. Passive recon tools alone must NOT
+    // summon it — they render in the OSINT card / tool timeline. It appears once
+    // exploitation begins: an exploit-set tool fires (http_request, sql_injection,
+    // jwt_tool, fuzz, batch_probe, tcp_send, auth spray), encode_decode runs, or a
+    // breach lands on a chain that's already open (see attackRailBreach). Note
+    // auth spray is recon_-prefixed but is an exploit tool, so it must pass here.
+    if (!isRedTeamTool(name)) return;
+    if (name.startsWith("recon_") && !isExploitTool(name)) return;
     const rail = ensureAttackRail(row);
     if (!rail) return;
     setAttackActivity(rail, name, args);
@@ -3897,6 +3936,31 @@
     rail.dataset.active = s < 3 ? String(s + 1) : "-1";
     if (s >= 3) rail.querySelector(".ar-pulse")?.classList.remove("live");
     renderRail(rail);
+  }
+
+  // ---------- recon -> exploit phase marker (subtle) ----------
+  // When a finding is confirmed (validate_finding) or the override forces it,
+  // the backend unlocks the exploit-tool subset and emits rt_phase. We flag the
+  // moment quietly on whichever recon card is already on screen — no new card,
+  // no red theatrics. The attack rail still only lights on real exploitation or
+  // a FLAG capture. Pure frontend, costs no model tokens.
+  function rtPhaseMarker(row, via) {
+    const deck = document.getElementById("revealer-deck");
+    const card = (row && (row.querySelector(".osint-card") || row.querySelector(".attack-rail")))
+      || deck?.querySelector(".osint-card") || deck?.querySelector(".attack-rail");
+    const label = via === "validate_finding" ? "exploit unlocked · finding confirmed" : "exploit unlocked";
+    if (card) {
+      if (card.dataset.rtPhase === "exploit") return;  // once per run
+      card.dataset.rtPhase = "exploit";
+      const head = card.querySelector(".oc-head") || card.querySelector(".ar-head");
+      if (head && !head.querySelector(".rt-phase-badge")) {
+        const b = document.createElement("span");
+        b.className = "rt-phase-badge";
+        b.innerHTML = `<i class="ph ph-lock-key-open"></i> ${esc(label)}`;
+        head.appendChild(b);
+      }
+    }
+    appendAgentLog(`Phase: exploit unlocked (${via || "manual"})`);
   }
 
   // ---------- OSINT recon card (passive intel gathering) ----------
@@ -3967,6 +4031,19 @@
     }
     return card;
   }
+  // What sub-mode a recon tool is running, so the activity line says what's
+  // actually happening (a zone transfer reads very differently from a lookup).
+  // Mirrors the modes/params added to the recon tools in bridge.py.
+  function reconModeLabel(name, args) {
+    args = args || {};
+    if (args.mode) return " · " + String(args.mode);
+    if (name === "recon_injection_probe" && Array.isArray(args.checks) && args.checks.length) {
+      return " · " + args.checks.join("+").slice(0, 24);
+    }
+    if (name === "recon_check_exposure" && (args.check_s3 || args.buckets)) return " · s3";
+    if (name === "recon_dns" && args.loud) return " · axfr";
+    return "";
+  }
   function osintCardToolStart(row, name, args) {
     const cat = osintCatForTool(name);
     if (!cat) return;
@@ -3980,7 +4057,8 @@
     const act = card.querySelector(".oc-activity");
     if (act) {
       const tgt = String((args && (args.url || args.target || args.domain || args.host || args.query)) || "").replace(/^https?:\/\//, "");
-      const clean = name.startsWith("mcp_osint") ? name.replace(/^mcp_osint_?/, "osint · ") : name;
+      const base = name.startsWith("mcp_osint") ? name.replace(/^mcp_osint_?/, "osint · ") : name;
+      const clean = base + reconModeLabel(name, args);
       act.textContent = tgt ? `${clean} → ${tgt.slice(0, 40)}` : `${clean}…`;
     }
   }
@@ -4563,6 +4641,9 @@
       // since toast() renders via innerHTML.
       const breachFlag = `<svg class="toast-ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>`;
       toast(`${breachFlag} Breach — stage ${esc(String(evt.stage))}: ${esc(evt.flag)} (via ${esc(evt.via)})`, "ok", 6000, null, true);
+    } else if (evt.type === "rt_phase") {
+      // Recon -> exploit gate opened. Subtle marker only (see rtPhaseMarker).
+      rtPhaseMarker(row, evt.via);
     } else if (evt.type === "turn_changes") {
       renderTurnChanges(row, evt);
     } else if (evt.type === "plan") {
@@ -4644,27 +4725,28 @@
   // obscure the preview toolbar, theme buttons, or other top-right controls.
   // When the preview pane is collapsed, re-parents into the chat column.
 
-  /** Move #plan-panel into the correct container based on preview state. */
+  /** Keep #plan-panel anchored in the chat column (never the preview). The
+   *  topbar Plan button toggles its visibility now, so it no longer moves into
+   *  the previewer. */
   function _reparentPlan() {
     const panel = document.getElementById("plan-panel");
     if (!panel) return;
-    const previewBody = document.getElementById("preview-body");
     const chatColumn = document.querySelector(".center");
-    const previewCollapsed = app.classList.contains("preview-collapsed");
-    const target = (!previewCollapsed && previewBody) ? previewBody : chatColumn;
-    if (target && panel.parentElement !== target) {
+    if (chatColumn && panel.parentElement !== chatColumn) {
       panel.style.left = "";
       panel.style.top = "";
       panel.style.right = "";
-      target.appendChild(panel);
-      panel.classList.toggle("plan-in-chat", target === chatColumn);
+      chatColumn.appendChild(panel);
     }
+    panel.classList.add("plan-in-chat");
   }
 
-  // Watch for preview-collapsed toggling on #app and re-parent the plan panel.
-  {
-    const _planObserver = new MutationObserver(() => _reparentPlan());
-    _planObserver.observe(app, { attributes: true, attributeFilter: ["class"] });
+  // Reflect the plan panel's presence/visibility on the topbar toggle button.
+  function setPlanBtn(active) {
+    const btn = document.getElementById("btn-toggle-plan");
+    if (!btn) return;
+    btn.classList.toggle("active", !!active);
+    btn.setAttribute("aria-pressed", active ? "true" : "false");
   }
 
   function makePanelDraggable(panel) {
@@ -4741,7 +4823,7 @@
 
   function renderPlanPanel(steps) {
     let panel = document.getElementById("plan-panel");
-    if (!steps || !steps.length) { if (panel) panel.remove(); return; }
+    if (!steps || !steps.length) { if (panel) panel.remove(); setPlanBtn(false); return; }
     if (!panel) {
       panel = document.createElement("div");
       panel.id = "plan-panel";
@@ -4750,24 +4832,21 @@
           <span class="plan-title">Plan</span>
           <span class="plan-count"></span>
           <button class="plan-min" type="button" title="Collapse"><i class="ph ph-caret-up"></i></button>
-          <button class="plan-close" type="button" title="Dismiss"><i class="ph ph-x"></i></button>
+          <button class="plan-close" type="button" title="Hide"><i class="ph ph-x"></i></button>
         </div>
         <div class="plan-body"></div>`;
-      // Place in the correct container (preview-body or .center).
-      _reparentPlan.panel = panel;          // temp ref for the initial append
-      const previewBody = document.getElementById("preview-body");
-      const chatColumn = document.querySelector(".center");
-      const previewCollapsed = app.classList.contains("preview-collapsed");
-      const target = (!previewCollapsed && previewBody) ? previewBody : chatColumn || document.body;
-      target.appendChild(panel);
-      panel.classList.toggle("plan-in-chat", target === chatColumn);
+      (document.querySelector(".center") || document.body).appendChild(panel);
+      panel.classList.add("plan-in-chat");
 
       panel.querySelector(".plan-min").addEventListener("click", () => panel.classList.toggle("collapsed"));
-      panel.querySelector(".plan-close").addEventListener("click", () => panel.remove());
+      // Close hides (not removes) so the topbar Plan button can bring it back
+      // within the same turn.
+      panel.querySelector(".plan-close").addEventListener("click", () => { panel.classList.add("plan-hidden"); setPlanBtn(false); });
       makePanelDraggable(panel);
       // On a phone the floating checklist would smother the screen — start it
       // collapsed to a compact "Plan N/N" chip the user can tap open.
       if (typeof isMobile === "function" && isMobile()) panel.classList.add("collapsed");
+      setPlanBtn(true);   // auto-pop on first plan of the turn
     }
     const done = steps.filter(s => s.status === "done").length;
     panel.querySelector(".plan-count").textContent = `${done}/${steps.length}`;
@@ -5944,191 +6023,6 @@
     renderWorkspace();
   }
 
-  // ---------- approvals ----------
-  // Inline SVG icons used inside approval cards. Kept tiny and self-contained
-  // so the approval system has no Phosphor-icon-font dependency — even if that
-  // font fails to load, the card still reads clearly.
-  const APPR_SVG = {
-    shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 4 5v6c0 4.5 3.2 8.5 8 10 4.8-1.5 8-5.5 8-10V5z"/><path d="m9 12 2 2 4-4"/></svg>',
-    file:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="14 3 14 9 20 9"/></svg>',
-    hash:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></svg>',
-    pencil: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
-    folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
-    trash:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6 17.5 20a2 2 0 0 1-2 1.8h-7a2 2 0 0 1-2-1.8L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/></svg>',
-    monitor:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>',
-    cursor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 3 7 19 2.5-8.5L21 11z"/></svg>',
-    keyboard:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>',
-    text:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>',
-    play:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="5 3 19 12 5 21 5 3"/></svg>',
-    terminal:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>',
-    globe:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>',
-    info:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
-    check:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>',
-    x:      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
-    chevron:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>',
-  };
-
-  // Per-kind metadata: header subtitle (what the action does in plain English)
-  // and the body of the "What does this mean?" info bubble. Centralized so the
-  // wording stays consistent across kinds.
-  const APPR_KIND_META = {
-    write_file:        { sub: "The model wants to write to a file on your system.",        info: "This will create or update the file at the specified location with the provided content." },
-    edit_file:         { sub: "The model wants to edit a file on your system.",            info: "This will apply the listed search-and-replace edits in place. The previous content is captured in version history." },
-    delete:            { sub: "The model wants to delete something from your filesystem.", info: "This is permanent — once approved, the file or folder cannot be restored from inside Accuretta." },
-    powershell:        { sub: "The model wants to run a PowerShell command on your machine.", info: "PowerShell commands run with your current user privileges. Read the command below carefully before approving." },
-    launch:            { sub: "The model wants to launch a program.",                       info: "This starts the program with your user privileges. Once running, it can do anything you can do." },
-    network_snapshot:  { sub: "The model wants to read your active network connections.",   info: "Read-only: no packets are sent. The model will see open ports, owning processes, and your DNS cache." },
-    "desktop.launch":  { sub: "The model wants to launch a desktop app.",                    info: "Only allowlisted apps (Settings → Desktop) can be launched this way." },
-    "desktop.focus":   { sub: "The model wants to bring a window to the foreground.",        info: "Switches focus to the chosen window. No keystrokes or clicks are sent." },
-    "desktop.click":   { sub: "The model wants to click somewhere on your screen.",          info: "Sends a real mouse click at the chosen coordinates. Verify the target is what you expect." },
-    "desktop.type":    { sub: "The model wants to type text into the active window.",        info: "Sends keystrokes to whatever window currently has focus. Don't approve if a sensitive prompt is open." },
-    "desktop.keys":    { sub: "The model wants to press a keyboard shortcut.",               info: "Sends a key combination to the focused window." },
-    "desktop.close":   { sub: "The model wants to close a window.",                          info: "Sends a close signal to the chosen window. Unsaved work in that app may be lost." },
-    "scan_apk":        { sub: "The model wants to run an APK security scan.",                info: "Read-only — parses the APK and looks for hardcoded secrets, dangerous permissions, and risky exports." },
-    "decompile_apk":   { sub: "The model wants to decompile an APK to Java sources.",        info: "Writes the JADX output into a sandbox subfolder next to the APK. Long-running on big APKs." },
-    "ghidra_analyze":  { sub: "The model wants to analyze a native binary with Ghidra.",     info: "Runs Ghidra in-process — first call boots the JVM (~10s) and runs auto-analysis (~30s). Read-only on disk." },
-    binwalk_scan:      { sub: "The model wants to scan a firmware blob for embedded files.", info: "Read-only — pattern-matches known headers (squashfs, jffs2, gzip, ELF, etc.) and reports offsets." },
-    extract_archive:   { sub: "The model wants to extract an archive.",                      info: "Writes the unpacked tree into a sandbox subfolder next to the archive." },
-    extract_squashfs:  { sub: "The model wants to extract a squashfs image.",                info: "Writes the unpacked filesystem into a sandbox subfolder next to the image." },
-    carve_file:        { sub: "The model wants to carve a region out of a file.",            info: "Reads the requested byte range and writes it as a new file in the workspace." },
-    registry:          { sub: "The model wants to MODIFY THE WINDOWS REGISTRY (user hive).", info: "Registry edits change how Windows and installed apps behave for your user account. They're not file-level — there's no undo. System hives (HKLM / HKCR / HKU) are hard-blocked at the bridge and never reach this card; only HKCU / HKCC writes can ask. Hold the Approve button for 2 seconds to confirm." },
-  };
-
-  // Build a friendly, language-style command preview from kind + details. We
-  // intentionally don't surface the raw PowerShell / shell command in the main
-  // body — that lives in the Advanced details expander. Reading
-  // `write_file(path="...", content=<15 bytes>)` is more honest about what's
-  // about to happen than `Set-Content -Path "..." -Value <15 chars>`.
-  function approvalCommandPreview(a) {
-    const d = a.details || {};
-    const kind = d.kind || "";
-    const fmtArgs = (args) => args.map(([k, v]) => `<span class="appr-cmd-arg">${esc(k)}</span>=<span class="appr-cmd-val">${esc(v)}</span>`).join(",\n  ");
-    const buildCall = (fn, args) => {
-      if (!args.length) return `<span class="appr-cmd-fn">${esc(fn)}</span>()`;
-      return `<span class="appr-cmd-fn">${esc(fn)}</span>(\n  ${fmtArgs(args)}\n)`;
-    };
-    const q = (s) => `"${String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-    if (kind === "write_file") {
-      return buildCall("write_file", [
-        ["path", q(d.path || "")],
-        ["content", `<${(d.bytes || 0).toLocaleString()} bytes>`],
-      ]);
-    }
-    if (kind === "edit_file") {
-      const args = [["path", q(d.path || "")], ["edits", String(d.edits || 0)]];
-      if (d.preview) args.push(["preview", q(String(d.preview).slice(0, 80).replace(/\n/g, "\\n"))]);
-      return buildCall("edit_file", args);
-    }
-    if (kind === "delete") {
-      return buildCall("delete_file", [
-        ["path", q(d.path || "")],
-        ["target", d.dir ? "directory" : "file"],
-      ]);
-    }
-    if (kind === "launch") {
-      return buildCall("open_program", [["path", q(d.path || "")]]);
-    }
-    if (kind === "powershell") {
-      // PowerShell is the only kind where the raw command IS the most honest
-      // preview. Show it verbatim, line-wrapped.
-      return `<span class="appr-cmd-shell">${esc(a.command || "")}</span>`;
-    }
-    if (kind === "registry") {
-      // Same reasoning as powershell — the raw command IS the truth, and
-      // hiding it behind a synthetic call would be misleading for the one
-      // approval where reading every character matters most.
-      return `<span class="appr-cmd-shell">${esc(a.command || "")}</span>`;
-    }
-    if (kind === "network_snapshot") {
-      return buildCall("network_snapshot", []);
-    }
-    if (kind === "desktop.launch")  return buildCall("desktop_launch_app",   [["target", q(d.target || "")]]);
-    if (kind === "desktop.focus")   return buildCall("desktop_focus_window", [["title", q(d.title || "")]]);
-    if (kind === "desktop.click")   return buildCall("desktop_click",        [["x", String(d.x ?? "?")], ["y", String(d.y ?? "?")], ["button", q(d.button || "left")]]);
-    if (kind === "desktop.type")    return buildCall("desktop_type_text",    [["chars", String(d.length ?? (d.text || "").length)]]);
-    if (kind === "desktop.keys")    return buildCall("desktop_press_keys",   [["combo", q(d.combo || "")]]);
-    if (kind === "desktop.close")   return buildCall("desktop_close_window", [["title", q(d.title || "")]]);
-    if (kind === "scan_apk")        return buildCall("scan_apk",      [["path", q(d.path || "")]]);
-    if (kind === "decompile_apk")   return buildCall("decompile_apk", [["path", q(d.path || "")]]);
-    if (kind === "ghidra_analyze")  return buildCall("ghidra_analyze",[["path", q(d.path || "")]]);
-    if (kind === "binwalk_scan")    return buildCall("binwalk_scan",  [["path", q(d.path || "")]]);
-    if (kind === "extract_archive") return buildCall("extract_archive",[["path", q(d.path || "")]]);
-    if (kind === "extract_squashfs")return buildCall("extract_squashfs",[["path", q(d.path || "")]]);
-    if (kind === "carve_file")      return buildCall("carve_file",    [["path", q(d.path || "")]]);
-    // Generic fallback: dump the raw command verbatim.
-    return `<span class="appr-cmd-shell">${esc(a.command || kind || "")}</span>`;
-  }
-
-  // Build the structured DETAILS rows for the new card — icon + label + value.
-  // Compact: only the fields that matter for the kind. Returns "" if there's
-  // nothing meaningful to show, which lets the card hide the section entirely.
-  function approvalDetailRows(a) {
-    const d = a.details || {};
-    const kind = d.kind || "";
-    const rows = [];
-    const row = (icon, k, v) => rows.push({ icon, k, v: String(v) });
-    if (kind === "write_file") {
-      row(APPR_SVG.file, "Path", d.path || "?");
-      row(APPR_SVG.hash, "Size", (d.bytes || 0).toLocaleString() + " bytes");
-      row(APPR_SVG.pencil, "Overwrite", "Yes, if exists");
-    } else if (kind === "edit_file") {
-      row(APPR_SVG.file, "Path", d.path || "?");
-      row(APPR_SVG.pencil, "Edits", String(d.edits || "?"));
-      if (d.preview) row(APPR_SVG.text, "Preview", String(d.preview).slice(0, 120).replace(/\n/g, " "));
-    } else if (kind === "delete") {
-      row(d.dir ? APPR_SVG.folder : APPR_SVG.file, "Path", d.path || "?");
-      row(APPR_SVG.trash, "Target", d.dir ? "Directory" : "File");
-      row(APPR_SVG.info, "Reversible", "No — permanent");
-    } else if (kind === "launch") {
-      row(APPR_SVG.play, "Launches", d.path || "?");
-    } else if (kind === "powershell") {
-      row(APPR_SVG.terminal, "Shell", "PowerShell");
-      row(APPR_SVG.info, "Read the command below", "before approving");
-    } else if (kind === "registry") {
-      // Surface every hive being touched as its own row so the user can
-      // scan the targets at a glance. System hives never reach this card
-      // (bridge refuses them), so everything here is HKCU/HKCC scope.
-      const targets = Array.isArray(d.targets) ? d.targets : [];
-      if (targets.length === 0) row(APPR_SVG.hash, "Target", "(unknown — opaque .reg import?)");
-      else for (const t of targets) row(APPR_SVG.hash, "Key", t);
-      row(APPR_SVG.info, "Scope", "User hive (HKCU / HKCC) — no system damage possible");
-      row(APPR_SVG.info, "Reversible", "No undo — registry edits are immediate");
-    } else if (kind === "network_snapshot") {
-      row(APPR_SVG.globe, "Reads", "Active TCP/UDP + DNS cache");
-      row(APPR_SVG.info, "Admin", "Not required");
-      row(APPR_SVG.info, "Network", "Read-only — no packets sent");
-    } else if (kind === "desktop.launch") {
-      row(APPR_SVG.play, "Launches", d.target || "?");
-      row(APPR_SVG.info, "Allowlist", "Passed");
-    } else if (kind === "desktop.focus") {
-      row(APPR_SVG.monitor, "Focus", d.title || "?");
-    } else if (kind === "desktop.click") {
-      row(APPR_SVG.cursor, "At", `${d.x ?? "?"}, ${d.y ?? "?"}`);
-      row(APPR_SVG.cursor, "Button", d.button || "left");
-      if (d.clicks) row(APPR_SVG.hash, "Count", String(d.clicks));
-    } else if (kind === "desktop.type") {
-      row(APPR_SVG.keyboard, "Length", `${d.length ?? (d.text || "").length} chars`);
-      if (d.text) row(APPR_SVG.text, "Preview", d.text.slice(0, 80) + ((d.text || "").length > 80 ? "…" : ""));
-    } else if (kind === "desktop.keys") {
-      row(APPR_SVG.keyboard, "Combo", d.combo || "?");
-    } else if (kind === "desktop.close") {
-      row(APPR_SVG.monitor, "Closes", d.title || "?");
-    } else if (kind === "scan_apk" || kind === "decompile_apk" || kind === "ghidra_analyze" || kind === "binwalk_scan" || kind === "extract_archive" || kind === "extract_squashfs" || kind === "carve_file") {
-      if (d.path) row(APPR_SVG.file, "Path", d.path);
-    } else {
-      // Generic: surface any path / target field if present.
-      if (d.path)   row(APPR_SVG.file,   "Path",   d.path);
-      if (d.target) row(APPR_SVG.play,   "Target", d.target);
-      if (d.title)  row(APPR_SVG.monitor, "Window", d.title);
-    }
-    if (!rows.length) return "";
-    return `<div class="appr-details">${rows.map(r =>
-      `<div class="appr-detail-row"><span class="appr-detail-icon">${r.icon}</span><span class="appr-detail-key">${esc(r.k)}</span><span class="appr-detail-val">${esc(r.v)}</span></div>`
-    ).join("")}</div>`;
-  }
-
-  // Pick the right header icon variant for this kind. Destructive kinds get
-  // a warning shield; everything else gets the friendly check shield.
   function buildDiffBar(added, deleted) {
     const total = added + deleted;
     if (total === 0) {
@@ -6393,6 +6287,22 @@
           <span class="permission-item-icon warning"><i class="ph ph-warning"></i></span>
           <span class="permission-item-text">Execute command: <code>${esc(shortCmd)}</code></span>
         </div>
+      `;
+    } else if (kind === "recon_s3") {
+      // Third-party touch (AWS S3, outside the target): make that explicit so
+      // the user can decline if probing AWS is out of scope.
+      const bl = Array.isArray(details.buckets) ? details.buckets : [];
+      const sample = bl.slice(0, 4).join(", ") + (bl.length > 4 ? "…" : "");
+      html += `
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-globe-hemisphere-west"></i></span>
+          <span class="permission-item-text">Probe <strong>public AWS S3 buckets</strong> — a third party outside <code>${esc(details.host || "the target")}</code></span>
+          <span class="permission-item-badge">read-only</span>
+        </div>
+        ${bl.length ? `<div class="permission-item">
+          <span class="permission-item-icon check"><i class="ph ph-list-magnifying-glass"></i></span>
+          <span class="permission-item-text">${bl.length} candidate bucket${bl.length === 1 ? "" : "s"}: <code>${esc(sample)}</code></span>
+        </div>` : ""}
       `;
     } else if (kind && kind.startsWith("mcp_")) {
       const m = kind.match(/^mcp_([^_]+)_(.+)$/);
@@ -7192,6 +7102,7 @@
     // desktop automation
     $("#sw-desktop-enabled")?.classList.toggle("on", !!s.desktop_enabled);
     $("#sw-red-team-enabled")?.classList.toggle("on", !!s.red_team_enabled);
+    $("#sw-rt-force-exploit")?.classList.toggle("on", !!s.rt_force_exploit);
     $("#sw-discord-enabled")?.classList.toggle("on", !!s.discord_enabled);
     fill("#set-discord-token", s.discord_bot_token || "");
     fill("#set-discord-owner", s.discord_owner_id || "");
@@ -7275,6 +7186,7 @@
       allow_web_preview: $("#sw-web").classList.contains("on"),
       desktop_enabled: $("#sw-desktop-enabled")?.classList.contains("on") || false,
       red_team_enabled: $("#sw-red-team-enabled")?.classList.contains("on") || false,
+      rt_force_exploit: $("#sw-rt-force-exploit")?.classList.contains("on") || false,
       discord_enabled: $("#sw-discord-enabled")?.classList.contains("on") || false,
       discord_bot_token: ($("#set-discord-token")?.value || "").trim(),
       discord_owner_id: ($("#set-discord-owner")?.value || "").trim(),
@@ -8572,6 +8484,14 @@
     $("#btn-close-settings").addEventListener("click", closeSettings);
     $("#drawer-scrim").addEventListener("click", closeSettings);
     $("#btn-cmd-history")?.addEventListener("click", openCmdHistory);
+    // Topbar Plan toggle: show/hide the plan panel. Auto-pops when the model
+    // starts planning; this lets the user bring it back or tuck it away.
+    $("#btn-toggle-plan")?.addEventListener("click", () => {
+      const panel = document.getElementById("plan-panel");
+      if (!panel) { toast("No active plan yet.", "info", 1600); return; }
+      const hidden = panel.classList.toggle("plan-hidden");
+      setPlanBtn(!hidden);
+    });
     $("#btn-close-cmd-history")?.addEventListener("click", closeCmdHistory);
     $("#cmd-history-scrim")?.addEventListener("click", closeCmdHistory);
     $("#btn-cmd-history-refresh")?.addEventListener("click", loadCmdHistory);
@@ -8692,6 +8612,12 @@
       e.currentTarget.classList.toggle("on");
       saveSettings({ red_team_enabled: e.currentTarget.classList.contains("on") });
       toast("red team setting saved", "ok", 1500);
+    });
+    $("#sw-rt-force-exploit")?.addEventListener("click", (e) => {
+      e.currentTarget.classList.toggle("on");
+      const on = e.currentTarget.classList.contains("on");
+      saveSettings({ rt_force_exploit: on });
+      toast(on ? "exploit phase forced on" : "exploit phase gate restored", "ok", 1600);
     });
     $("#btn-sandbox-setup")?.addEventListener("click", async (e) => {
       const reinstall = e.currentTarget.dataset.reinstall === "1";
@@ -9005,6 +8931,20 @@
       $("#recon-scrim")?.classList.remove("open");
       $("#recon-modal")?.classList.remove("open");
     };
+    // Submit stays disabled until the authorization box is ticked AND a target
+    // is entered (btn.disabled idiom). Also toggles the wider-targeting notice
+    // whenever scope / objective / constraints are left blank.
+    const reconScopeVal = () => [($("#recon-scope-in")?.value || "").trim(),
+                                 ($("#recon-scope-out")?.value || "").trim()].filter(Boolean).join(" ");
+    const reconConstraintVal = () => document.querySelectorAll("#recon-constraint-chips .recon-chip.active").length
+      || ($("#recon-constraint-text")?.value || "").trim();
+    const reconGate = () => {
+      const authed = !!$("#recon-auth-check")?.checked;
+      const hasTarget = !!($("#recon-target-input")?.value || "").trim();
+      const go = $("#recon-go"); if (go) go.disabled = !(authed && hasTarget);
+      const anyBlank = !reconScopeVal() || !($("#recon-objective-text")?.value || "").trim() || !reconConstraintVal();
+      $("#recon-blank-notice")?.classList.toggle("hidden", !anyBlank);
+    };
     const reconOpen = (objective) => {
       if (!state.settings || !state.settings.red_team_enabled) {
         toast("Enable Red team tools in Settings first.", "warn", 3000);
@@ -9013,22 +8953,33 @@
       reconObjective = objective || "recon";
       const access = reconObjective === "gain_access";
       const h3 = $("#recon-modal h3"); if (h3) h3.textContent = access ? "Authorized pentest" : "Authorized recon";
-      const go = $("#recon-go"); if (go) go.textContent = access ? "Find a way in" : "Run recon";
-      const hint = $("#recon-step-target .recon-hint");
-      if (hint) hint.textContent = access
-        ? "The model chains recon, exposure checks, weakness identification and access attempts (default creds, exposed services), captures proof, then reports. Only run against systems you are authorized to test."
-        : "A bare domain or hostname. The model runs a stealth port scan, TLS audit, HTTP fingerprint, passive subdomain enumeration and DNS recon, then summarizes.";
-      $("#recon-step-auth")?.classList.remove("hidden");
-      $("#recon-step-target")?.classList.add("hidden");
-      const inp = $("#recon-target-input"); if (inp) inp.value = "";
+      const go = $("#recon-go"); if (go) { go.textContent = access ? "Find a way in" : "Run recon"; go.disabled = true; }
+      ["#recon-target-input", "#recon-scope-in", "#recon-scope-out", "#recon-objective-text", "#recon-constraint-text"]
+        .forEach(s => { const el = $(s); if (el) el.value = ""; });
+      const chk = $("#recon-auth-check"); if (chk) chk.checked = false;
+      document.querySelectorAll("#recon-objective-chips .recon-chip, #recon-constraint-chips .recon-chip")
+        .forEach(c => c.classList.remove("active"));
+      reconGate();
       $("#recon-scrim")?.classList.add("open");
       $("#recon-modal")?.classList.add("open");
+      setTimeout(() => $("#recon-target-input")?.focus(), 50);
     };
     const reconRun = () => {
+      if (!$("#recon-auth-check")?.checked) { toast("Confirm authorization first.", "warn", 2200); return; }
       const raw = ($("#recon-target-input")?.value || "").trim();
       if (!raw) { toast("Enter a target first.", "warn", 2200); return; }
       const target = raw.replace(/^https?:\/\//i, "").replace(/\/.*$/, "").replace(/\s+/g, "").trim();
       if (!target) { toast("That doesn't look like a domain.", "warn", 2200); return; }
+      // Collect the scope/auth panel into a mission the bridge seeds via
+      // _rt_mission_seed / _rt_mission_note (flows into the sysprompt).
+      const scIn = ($("#recon-scope-in")?.value || "").trim();
+      const scOut = ($("#recon-scope-out")?.value || "").trim();
+      const scope = [scIn ? `in: ${scIn}` : "", scOut ? `out: ${scOut}` : ""].filter(Boolean).join(" | ");
+      const objective = ($("#recon-objective-text")?.value || "").trim();
+      const conChips = Array.from(document.querySelectorAll("#recon-constraint-chips .recon-chip.active")).map(c => c.dataset.val);
+      const conText = ($("#recon-constraint-text")?.value || "").trim();
+      const constraints = [...conChips, conText].filter(Boolean).join("; ");
+      const mission = { target, scope, objective, constraints };
       reconClose();
       const reconTmpl =
         `Authorized reconnaissance on ${target}. I have confirmed I am authorized to test this target. ` +
@@ -9051,7 +9002,7 @@
         `6) PROVE IT — for every confirmed access or extracted secret, re-send the winning request with save_evidence set (archives request+response with a sha256), or use recon_capture_evidence.\n` +
         `STEALTH — a signature IDS matches the raw request text, so to stay quiet keep recon low-footprint (quiet=true) and obfuscate payloads (url-encode via encode_decode, vary keyword case, use alternate separators); the server still decodes and executes them while the signature misses.\n` +
         `Only stop when you have genuinely exhausted the scope — every endpoint tested, every real finding taken to its depth. Then write a report: Executive summary (did you get in, how deep, what you reached), What's broken (each finding with severity + evidence), Loot (data, secrets, and credentials extracted), Recommendations. Never claim access or a finding you did not verify with a tool result or a captured artifact — but do not leave a real avenue unexplored. Be factual AND thorough. Once you deliver that report the engagement is CLOSED: treat any later message as a debrief — answer it directly and conversationally, and do NOT run recon or exploit tools again unless the user explicitly tells you to resume or keep testing.`;
-      send({ prompt: reconObjective === "gain_access" ? accessTmpl : reconTmpl, invisible: true });
+      send({ prompt: reconObjective === "gain_access" ? accessTmpl : reconTmpl, invisible: true, mission });
     };
     $("#quick-recon-target")?.addEventListener("click", () => {
       $("#toolbar-overflow-menu")?.classList.remove("open");
@@ -9063,21 +9014,36 @@
       $("#btn-toolbar-overflow")?.classList.remove("open");
       reconOpen("gain_access");
     });
-    $("#recon-auth-no")?.addEventListener("click", reconClose);
+    $("#recon-cancel")?.addEventListener("click", reconClose);
     $("#btn-close-recon")?.addEventListener("click", reconClose);
     $("#recon-scrim")?.addEventListener("click", reconClose);
-    $("#recon-auth-yes")?.addEventListener("click", () => {
-      $("#recon-step-auth")?.classList.add("hidden");
-      $("#recon-step-target")?.classList.remove("hidden");
-      setTimeout(() => $("#recon-target-input")?.focus(), 50);
+    $("#recon-auth-check")?.addEventListener("change", reconGate);
+    // Re-gate on any input so the button state + wider-targeting notice stay live.
+    ["#recon-target-input", "#recon-scope-in", "#recon-scope-out", "#recon-objective-text", "#recon-constraint-text"]
+      .forEach(s => $(s)?.addEventListener("input", reconGate));
+    // Objective chips are a quick-fill for the free-text objective (single pick).
+    document.querySelectorAll("#recon-objective-chips .recon-chip").forEach(chip => {
+      chip.addEventListener("click", () => {
+        const on = chip.classList.contains("active");
+        chip.parentElement.querySelectorAll(".recon-chip").forEach(c => c.classList.remove("active"));
+        if (!on) { chip.classList.add("active"); const t = $("#recon-objective-text"); if (t) t.value = chip.dataset.val; }
+        else { const t = $("#recon-objective-text"); if (t) t.value = ""; }
+        reconGate();
+      });
     });
-    $("#recon-back")?.addEventListener("click", () => {
-      $("#recon-step-target")?.classList.add("hidden");
-      $("#recon-step-auth")?.classList.remove("hidden");
+    // Constraint chips: multi-select, but single choice within each group.
+    document.querySelectorAll("#recon-constraint-chips .recon-chip").forEach(chip => {
+      chip.addEventListener("click", () => {
+        const was = chip.classList.contains("active");
+        const grp = chip.dataset.group;
+        if (grp) chip.parentElement.querySelectorAll(`.recon-chip[data-group="${grp}"]`).forEach(c => c.classList.remove("active"));
+        chip.classList.toggle("active", !was);
+        reconGate();
+      });
     });
     $("#recon-go")?.addEventListener("click", reconRun);
     $("#recon-target-input")?.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") { e.preventDefault(); reconRun(); }
+      if (e.key === "Enter" && !$("#recon-go")?.disabled) { e.preventDefault(); reconRun(); }
     });
 
     // preview: screenshot the iframe to PNG

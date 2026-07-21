@@ -33,6 +33,7 @@ import webbrowser
 import base64 as _b64
 import io as _io
 import socket
+import struct
 import ssl
 import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -1039,7 +1040,7 @@ def _rt_mission_seed(chat: dict, user_text: str) -> bool:
         return False
     m = chat.get("mission")
     if not isinstance(m, dict):
-        m = {"target": "", "scope": "", "objective": "", "facts": [], "ts": int(time.time())}
+        m = {"target": "", "scope": "", "objective": "", "facts": [], "phase": "recon", "ts": int(time.time())}
     if m.get("objective"):
         return False
     m["objective"] = obj[:300]
@@ -1047,18 +1048,23 @@ def _rt_mission_seed(chat: dict, user_text: str) -> bool:
     return True
 
 
-def _rt_mission_note(chat: dict, target: str = "", fact: str = "") -> bool:
-    """Set the target if not yet known and append a deduped, capped fact.
-    Returns True if the mission changed. Same cap idiom as pins."""
+def _rt_mission_note(chat: dict, target: str = "", fact: str = "", scope: str = "") -> bool:
+    """Set the target if not yet known, set an explicit scope, and append a
+    deduped, capped fact. Returns True if the mission changed. Same cap idiom as
+    pins."""
     m = chat.get("mission")
     if not isinstance(m, dict):
-        m = {"target": "", "scope": "", "objective": "", "facts": [], "ts": int(time.time())}
+        m = {"target": "", "scope": "", "objective": "", "facts": [], "phase": "recon", "ts": int(time.time())}
     changed = False
     if target and not m.get("target"):
         m["target"] = target[:120]
         # In-scope defaults to the confirmed target host when nothing else is known.
         if not m.get("scope"):
             m["scope"] = target[:120]
+        changed = True
+    if scope:
+        # Explicit scope from the panel overrides the target-derived default.
+        m["scope"] = scope[:200]
         changed = True
     if fact:
         fact = fact.strip()[:200]
@@ -1070,6 +1076,59 @@ def _rt_mission_note(chat: dict, target: str = "", fact: str = "") -> bool:
     if changed:
         chat["mission"] = m
     return changed
+
+
+def _rt_mission_set_phase(chat: dict, phase: str) -> bool:
+    """Advance the mission phase (recon -> exploit). Returns True if it changed.
+    Creates the holder if absent so the flip survives even before a target or
+    objective was recorded (e.g. a lone validate_finding confirm)."""
+    m = chat.get("mission")
+    if not isinstance(m, dict):
+        m = {"target": "", "scope": "", "objective": "", "facts": [], "phase": "recon", "ts": int(time.time())}
+    if m.get("phase") == phase:
+        chat["mission"] = m
+        return False
+    m["phase"] = phase
+    chat["mission"] = m
+    return True
+
+
+def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
+    """Seed the mission from the scope/auth panel (Step 3). Objective flows
+    through _rt_mission_seed, target/scope through _rt_mission_note, constraints
+    as an established fact so _rt_mission_render carries them into the sysprompt.
+    Only fills what the panel provided; returns True if anything changed."""
+    changed = False
+    obj = str(panel.get("objective") or "").strip()
+    if obj and _rt_mission_seed(chat, obj):
+        changed = True
+    target = str(panel.get("target") or "").strip()
+    if target and _rt_mission_note(chat, target=target):
+        changed = True
+    scope = str(panel.get("scope") or "").strip()
+    if scope and _rt_mission_note(chat, scope=scope):
+        changed = True
+    constraints = str(panel.get("constraints") or "").strip()
+    if constraints and _rt_mission_note(chat, fact="constraints: " + constraints):
+        changed = True
+    return changed
+
+
+def _rt_incl_exploit_for(chat: dict | None, settings: dict | None = None) -> bool:
+    """Whether tools_for_llama should expose the exploit subset for `chat`.
+
+    The suite splits into an always-on recon set and a heavier exploit set
+    (_RT_EXPLOIT_TOOL_NAMES) that stays OUT of the spec until the mission reaches
+    the exploit phase — set by a validate_finding confirm or forced by the
+    rt_force_exploit override. When red-team mission tracking is off there is no
+    phase to reach, so nothing is gated (preserves pre-split behavior)."""
+    s = settings or get_settings()
+    if not (s.get("red_team_enabled") and s.get("rt_mission_state", True)):
+        return True
+    if s.get("rt_force_exploit"):
+        return True
+    m = chat.get("mission") if isinstance(chat, dict) else None
+    return bool(isinstance(m, dict) and m.get("phase") == "exploit")
 
 
 def _rt_mission_render(chat: dict, budget_chars: int | None = None) -> str:
@@ -8151,9 +8210,86 @@ def tool_recon_tls_audit(args: dict) -> dict:
     }
 
 
+def _hget(headers: dict, name: str) -> str:
+    """Case-insensitive header lookup. '' if absent."""
+    name = name.lower()
+    for k, v in (headers or {}).items():
+        if k.lower() == name:
+            return v
+    return ""
+
+
+def _recon_waf_classify(url, final_url, status, headers, body) -> dict:
+    """Classify WAF/CDN block signatures from headers, cookies, and body.
+    Read-only interpretation of a response already fetched. {severity, evidence}."""
+    bl = (body or "").lower()
+    cookies = _hget(headers, "set-cookie").lower()
+    server = _hget(headers, "server").lower()
+    def hh(n):
+        return bool(_hget(headers, n))
+    checks = [
+        ("Cloudflare", hh("cf-ray") or "cloudflare" in server or "cloudflare" in bl or "__cf" in cookies),
+        ("Akamai", "akamaighost" in server or hh("x-akamai-transformed")),
+        ("Sucuri", hh("x-sucuri-id") or "sucuri" in bl),
+        ("Imperva Incapsula", hh("x-iinfo") or "incap_ses" in cookies or "incapsula incident id" in bl),
+        ("F5 BIG-IP", "bigipserver" in cookies or "the requested url was rejected" in bl),
+        ("AWS WAF", "aws-waf-token" in cookies or "awswaf" in cookies),
+        ("ModSecurity", "mod_security" in server or "mod_security" in bl or (status == 406 and "not acceptable" in bl)),
+        ("Wordfence", "wordfence" in bl),
+        ("Fastly", "fastly" in server or "fastly" in _hget(headers, "x-served-by").lower()),
+    ]
+    vendors = [name for name, ok in checks if ok]
+    blocked = status in (403, 406, 429, 503) or _recon_classify_body(status, headers, body) == "waf_challenge"
+    if vendors:
+        ev = f"WAF/CDN detected: {', '.join(vendors)}" + (f" (blocking response {status})" if blocked else "")
+    elif blocked:
+        vendors = ["unknown"]
+        ev = f"generic block/challenge response ({status}): a WAF may be present but unfingerprinted"
+    else:
+        ev = "no WAF/CDN fingerprint on this response"
+    return {"url": url, "final_url": final_url, "status": status, "mode": "waf",
+            "waf_detected": bool(vendors), "vendors": vendors, "blocked": blocked,
+            "severity": "info", "evidence": ev}
+
+
+_SEC_HEADERS = [
+    ("Strict-Transport-Security", "HSTS"), ("Content-Security-Policy", "CSP"),
+    ("X-Frame-Options", "X-Frame-Options"), ("X-Content-Type-Options", "X-Content-Type-Options"),
+    ("Referrer-Policy", "Referrer-Policy"), ("Permissions-Policy", "Permissions-Policy"),
+]
+
+
+def _recon_grade_security_headers(url, final_url, status, headers) -> dict:
+    """Grade the standard security response headers already fetched. A..F by count
+    present, with weak-value notes. {severity, evidence}."""
+    present, missing, weak = {}, [], []
+    for hname, label in _SEC_HEADERS:
+        v = _hget(headers, hname)
+        if v:
+            present[label] = v[:120]
+        else:
+            missing.append(label)
+    csp = _hget(headers, "content-security-policy").lower()
+    if csp and ("unsafe-inline" in csp or "unsafe-eval" in csp):
+        weak.append("CSP allows unsafe-inline/unsafe-eval")
+    xcto = _hget(headers, "x-content-type-options").lower()
+    if xcto and "nosniff" not in xcto:
+        weak.append("X-Content-Type-Options is not nosniff")
+    n = len(present)
+    grade = ["F", "E", "D", "C", "B", "A"][min(n, 5)]
+    sev = "info" if n >= 5 else ("low" if n >= 3 else "medium")
+    ev = f"{n}/6 security headers present" + (f"; missing: {', '.join(missing)}" if missing else "")
+    if weak:
+        ev += f"; weak: {', '.join(weak)}"
+    return {"url": url, "final_url": final_url, "status": status, "mode": "security_headers",
+            "grade": grade, "present": present, "missing": missing, "weak": weak,
+            "severity": sev, "evidence": ev}
+
+
 def tool_recon_http_fingerprint(args: dict) -> dict:
     """Fetch a URL and fingerprint the server: status, redirect chain, Server /
-    X-Powered-By, page title, notable headers, and cookies. Read-only."""
+    X-Powered-By, page title, notable headers, and cookies. Read-only. mode=waf
+    classifies block signatures; mode=security_headers grades CSP/HSTS/etc."""
     url = (args.get("url") or args.get("target") or "").strip()
     if not url:
         return {"error": "url required"}
@@ -8195,6 +8331,12 @@ def tool_recon_http_fingerprint(args: dict) -> dict:
             break
         except Exception as e:
             return {"error": f"request failed: {e}", "url": cur}
+
+    mode = (args.get("mode") or "").lower().strip()
+    if mode == "waf":
+        return _recon_waf_classify(url, cur, status, final_headers, body)
+    if mode in ("security_headers", "sec_headers", "headers"):
+        return _recon_grade_security_headers(url, cur, status, final_headers)
 
     title = ""
     m = re.search(r"<title[^>]*>(.*?)</title>", body, re.IGNORECASE | re.DOTALL)
@@ -8245,12 +8387,154 @@ def tool_recon_subdomains(args: dict) -> dict:
     }
 
 
+def _recon_dns_email_auth(domain: str) -> dict:
+    """Parse SPF + DMARC (+ a couple of common DKIM selectors) into a spoofing
+    posture verdict. All read-only DoH lookups. {severity, evidence, ...}."""
+    txt = []
+    try:
+        txt = _recon_http_doh(domain, "TXT")
+    except Exception:
+        pass
+    spf = next((t for t in txt if t.lower().startswith("v=spf1")), "")
+    spf_all = ""
+    for tok in spf.split():
+        if tok.lower().endswith("all") and tok[:1] in "-~?+":
+            spf_all = tok
+    dmarc = ""
+    try:
+        dmarc = next((t for t in _recon_http_doh("_dmarc." + domain, "TXT")
+                      if t.lower().startswith("v=dmarc1")), "")
+    except Exception:
+        pass
+    m = re.search(r"\bp\s*=\s*(none|quarantine|reject)", dmarc, re.I)
+    dmarc_p = (m.group(1).lower() if m else "")
+    dkim = []
+    for sel in ("default", "google", "selector1", "selector2", "k1", "mail"):
+        try:
+            rec = _recon_http_doh(f"{sel}._domainkey.{domain}", "TXT")
+            if any("v=dkim1" in r.lower() or "k=rsa" in r.lower() or "p=" in r.lower() for r in rec):
+                dkim.append(sel)
+        except Exception:
+            continue
+    # Posture: no SPF/DMARC = trivially spoofable; enforcing both = strong.
+    hard_spf = spf_all in ("-all", "~all")
+    if not spf and not dmarc:
+        sev, verdict = "high", "no SPF and no DMARC: domain is trivially spoofable"
+    elif dmarc_p == "reject" and hard_spf:
+        sev, verdict = "info", "DMARC p=reject with SPF enforcement: strong anti-spoofing"
+    elif dmarc_p in ("reject", "quarantine"):
+        sev, verdict = "low", f"DMARC p={dmarc_p} present; check SPF strictness ({spf_all or 'no all'})"
+    else:
+        sev, verdict = "medium", "SPF and/or DMARC present but not enforcing (p=none / soft ~all / no all)"
+    return {"domain": domain, "mode": "email_auth", "severity": sev, "evidence": verdict,
+            "spf": spf or "(none)", "spf_all": spf_all or "(none)",
+            "dmarc": dmarc or "(none)", "dmarc_policy": dmarc_p or "(none)",
+            "dkim_selectors_found": dkim, "source": "DNS-over-HTTPS (dns.google)"}
+
+
+def _dns_build_query(qname: str, qtype: int) -> bytes:
+    """Minimal DNS query message (no EDNS, RD off). For the TCP AXFR probe."""
+    tid = random.randint(0, 0xFFFF)
+    header = struct.pack(">HHHHHH", tid, 0x0000, 1, 0, 0, 0)
+    labels = b"".join(bytes([len(l)]) + l.encode("ascii", "ignore")
+                      for l in qname.rstrip(".").split(".") if l) + b"\x00"
+    return header + labels + struct.pack(">HH", qtype, 1)
+
+
+def _recon_dns_axfr(domain: str, timeout: float) -> dict:
+    """Attempt a zone transfer (AXFR) against each authoritative NS over TCP/53.
+    LOUD and active — a direct connection to the target's nameservers — so it is
+    gated behind loud=true by the caller. {severity, evidence, ...}."""
+    try:
+        nslist = [n.rstrip(".") for n in _recon_http_doh(domain, "NS")][:6]
+    except Exception:
+        nslist = []
+    if not nslist:
+        return {"domain": domain, "mode": "axfr", "severity": "info",
+                "evidence": "no NS records found to try", "nameservers": []}
+    results, allowed = [], []
+    for ns in nslist:
+        ip = ""
+        try:
+            a = _recon_http_doh(ns, "A")
+            ip = a[0] if a else ""
+        except Exception:
+            pass
+        if not ip:
+            results.append({"ns": ns, "result": "unresolved"}); continue
+        msg = _dns_build_query(domain, 252)  # 252 = AXFR
+        buf, rcode, answers = b"", None, 0
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((ip, 53))
+            s.sendall(struct.pack(">H", len(msg)) + msg)
+            while len(buf) < 262144:
+                try:
+                    chunk = s.recv(8192)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+        except Exception as e:
+            results.append({"ns": ns, "ip": ip, "result": f"connect/send failed: {e}"}); continue
+        finally:
+            try: s.close()
+            except Exception: pass
+        i = 0
+        while i + 2 <= len(buf):
+            mlen = struct.unpack(">H", buf[i:i+2])[0]; i += 2
+            m = buf[i:i+mlen]; i += mlen
+            if len(m) < 12:
+                break
+            h = struct.unpack(">HHHHHH", m[:12])
+            if rcode is None:
+                rcode = h[1] & 0x0F
+            answers += h[3]
+        if rcode == 0 and answers > 1:
+            results.append({"ns": ns, "ip": ip, "result": "TRANSFER ALLOWED", "records": answers})
+            allowed.append(ns)
+        elif rcode == 5:
+            results.append({"ns": ns, "ip": ip, "result": "refused"})
+        else:
+            results.append({"ns": ns, "ip": ip, "result": f"no transfer (rcode={rcode}, answers={answers})"})
+    if allowed:
+        return {"domain": domain, "mode": "axfr", "severity": "high",
+                "evidence": f"zone transfer allowed by {', '.join(allowed)}: full DNS zone disclosed",
+                "nameservers": nslist, "results": results}
+    return {"domain": domain, "mode": "axfr", "severity": "info",
+            "evidence": "no nameserver allowed a zone transfer",
+            "nameservers": nslist, "results": results}
+
+
 def tool_recon_dns(args: dict) -> dict:
-    """Enumerate DNS records (A, AAAA, MX, NS, TXT, SOA, CNAME) via
-    DNS-over-HTTPS. Read-only."""
+    """Enumerate DNS records (A, AAAA, MX, NS, TXT, SOA, CNAME) via DoH, or run a
+    focused mode: email_auth (SPF/DMARC/DKIM posture), caa, axfr (zone transfer;
+    loud). Read-only except axfr. See tool_recon_dns schema for modes."""
     domain = _recon_clean_host(args.get("domain") or args.get("target") or "")
     if not domain:
         return {"error": "domain required"}
+    mode = (args.get("mode") or "").lower().strip()
+    if mode == "email_auth":
+        return _recon_dns_email_auth(domain)
+    if mode == "caa":
+        try:
+            caa = _recon_http_doh(domain, "CAA")
+        except Exception as e:
+            return {"error": f"CAA lookup failed: {e}", "domain": domain}
+        return {"domain": domain, "mode": "caa", "count": len(caa),
+                "caa": caa or [], "severity": "info",
+                "evidence": ("issuance restricted to: " + ", ".join(caa)) if caa
+                            else "no CAA record: any CA may issue certs for this domain",
+                "source": "DNS-over-HTTPS (dns.google)"}
+    if mode == "axfr":
+        if not args.get("loud"):
+            return {"domain": domain, "mode": "axfr", "severity": "info",
+                    "note": "AXFR is a LOUD active probe (direct TCP to the target's nameservers). "
+                            "Re-run with loud=true to proceed."}
+        timeout = max(3.0, min(float(args.get("timeout") or 6.0), 15.0))
+        return _recon_dns_axfr(domain, timeout)
     records = {}
     for rtype in ("A", "AAAA", "MX", "NS", "TXT", "SOA", "CNAME"):
         try:
@@ -8268,14 +8552,28 @@ _RECON_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 
-def _recon_fetch(url: str, timeout: float = 8.0, max_bytes: int = 8000) -> dict:
+class _ReconNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def _recon_fetch(url: str, timeout: float = 8.0, max_bytes: int = 8000,
+                 extra_headers: dict | None = None, follow: bool = True) -> dict:
     """Single GET (TLS verification off so self-signed targets still respond).
-    Returns {status, headers, body, url} or {error, url}."""
+    extra_headers override/add request headers (e.g. a Host override for vhost
+    fuzzing). follow=False stops at the first 3xx so the caller can read the
+    Location header (open-redirect / CRLF checks). {status, headers, body, url}."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    req = urllib.request.Request(url, headers={"User-Agent": _RECON_UA})
-    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+    hdrs = {"User-Agent": _RECON_UA}
+    if extra_headers:
+        hdrs.update(extra_headers)
+    req = urllib.request.Request(url, headers=hdrs)
+    _handlers = [urllib.request.HTTPSHandler(context=ctx)]
+    if not follow:
+        _handlers.insert(0, _ReconNoRedirect())
+    opener = urllib.request.build_opener(*_handlers)
     try:
         resp = opener.open(req, timeout=timeout)
         body = resp.read(max_bytes).decode("utf-8", "replace")
@@ -8366,17 +8664,91 @@ def _recon_same_as_baseline(r, baseline):
     return r.get("status") == baseline.get("status") and abs(len(body) - baseline.get("size", 0)) < 64
 
 
+# API-surface discovery: swagger/openapi/graphql/.well-known.
+_RECON_API_PATHS = [
+    "swagger.json", "swagger.yaml", "swagger-ui/", "swagger-ui.html", "api-docs",
+    "v2/api-docs", "v3/api-docs", "openapi.json", "openapi.yaml", "api/swagger.json",
+    "graphql", "graphiql", "api/graphql", "playground", "redoc", "docs", "api/docs",
+    "wp-json/", "rest/", "api/", "api/v1/", "api/v2/",
+    ".well-known/openid-configuration", ".well-known/oauth-authorization-server",
+    ".well-known/security.txt",
+]
+# Backup/temp suffix variants of common filenames (editor swap files, archives).
+_RECON_BACKUP_SUFFIXES = ["~", ".bak", ".old", ".orig", ".save", ".swp", ".copy",
+                          ".1", ".backup", ".tmp", ".zip", ".tar.gz", ".sql"]
+_RECON_BACKUP_SEEDS = ["index.php", "index.html", "config.php", "app.js", "web.config",
+                       "wp-config.php", "database", "backup", "db", "site", "www",
+                       "main.js", "style.css"]
+# Virtual-host names to fuzz via the Host header.
+_RECON_VHOST_WORDS = ["admin", "internal", "intranet", "staging", "stage", "dev",
+    "test", "qa", "uat", "api", "portal", "dashboard", "beta", "preprod", "corp",
+    "vpn", "git", "jenkins", "jira", "grafana", "kibana", "backup", "old", "legacy",
+    "private", "db", "monitor", "status"]
+
+
+def _recon_backup_wordlist() -> list:
+    return list(dict.fromkeys(s + suf for s in _RECON_BACKUP_SEEDS for suf in _RECON_BACKUP_SUFFIXES))
+
+
+def _recon_vhost_fuzz(base: str, args: dict, timeout: float) -> dict:
+    """Fuzz the Host header against the base IP/host and report vhosts whose
+    response DIFFERS from the default-Host baseline (a distinct virtual host)."""
+    parsed = urllib.parse.urlparse(base)
+    host = parsed.hostname or ""
+    parts = host.split(".")
+    domain = ".".join(parts[-2:]) if len(parts) >= 2 else host
+    words = args.get("wordlist") or list(_RECON_VHOST_WORDS)
+    candidates = [w if "." in w else f"{w}.{domain}" for w in words]
+    baseline = _recon_fetch(base, timeout, max_bytes=6000)
+    b_status, b_size = baseline.get("status"), len(baseline.get("body", "") or "")
+    concurrency = max(1, min(int(args.get("concurrency") or 6), 20))
+    jitter_ms = max(0, min(int(args.get("jitter_ms") or 60), 1000))
+
+    def probe(vhost):
+        if jitter_ms:
+            time.sleep(random.uniform(0, jitter_ms / 1000.0))
+        r = _recon_fetch(base, timeout, max_bytes=6000, extra_headers={"Host": vhost})
+        st = r.get("status")
+        if not st or "body" not in r:
+            return None
+        if _recon_classify_body(st, r.get("headers"), r.get("body")) == "waf_challenge":
+            return None
+        size = len(r.get("body", "") or "")
+        if st != b_status or abs(size - b_size) > 64:
+            title = ""
+            m = re.search(r"<title[^>]*>(.*?)</title>", r.get("body", ""), re.IGNORECASE | re.DOTALL)
+            if m:
+                title = re.sub(r"\s+", " ", m.group(1)).strip()[:80]
+            return {"vhost": vhost, "status": st, "size": size, "title": title}
+        return None
+
+    found = []
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="recon-vhost") as ex:
+        for r in ex.map(probe, candidates):
+            if r:
+                found.append(r)
+    found.sort(key=lambda x: (x["status"], x["vhost"]))
+    return {"base": base, "mode": "vhost", "baseline_status": b_status, "baseline_size": b_size,
+            "tested": len(candidates), "found_count": len(found), "found": found,
+            "note": "Host-header vhost fuzz: responses that DIFFER from the default-Host baseline. "
+                    "A hit is a distinct virtual host served off this IP."}
+
+
 def tool_recon_content_discovery(args: dict) -> dict:
     """AUTHORIZED RECON. Probe a base URL for a high-value path list. Establishes
     a catch-all baseline first (random path) so SPA/WAF sites that return 200 for
     everything don't produce false positives — only responses that DIFFER from
-    the baseline (and aren't WAF challenges) are reported. Read-only."""
+    the baseline (and aren't WAF challenges) are reported. Read-only. mode=api,
+    backup, or vhost swap the wordlist/technique; default is the general list."""
     base = (args.get("url") or args.get("target") or "").strip()
     if not base:
         return {"error": "url required"}
     base = _recon_prep_url(base)
     base = base.rstrip("/") + "/"
     timeout = max(2.0, min(float(args.get("timeout") or 6.0), 15.0))
+    mode = (args.get("mode") or "").lower().strip()
+    if mode == "vhost":
+        return _recon_vhost_fuzz(base, args, timeout)
     # Quiet mode: a small, highest-signal path set + low concurrency. A content
     # IDS scores REQUESTS (not timing), so a smaller footprint = fewer chances to
     # trip the "active scanning" signature. This is the stealth lever that
@@ -8386,7 +8758,13 @@ def tool_recon_content_discovery(args: dict) -> dict:
         concurrency = 2
         jitter_ms = max(200, min(int(args.get("jitter_ms") or 200), 1000))
     else:
-        paths = args.get("wordlist") or list(_RECON_COMMON_PATHS)
+        if mode == "api":
+            default_paths = list(_RECON_API_PATHS)
+        elif mode == "backup":
+            default_paths = _recon_backup_wordlist()
+        else:
+            default_paths = list(_RECON_COMMON_PATHS)
+        paths = args.get("wordlist") or default_paths
         concurrency = max(1, min(int(args.get("concurrency") or 6), 20))
         jitter_ms = max(0, min(int(args.get("jitter_ms") or 60), 1000))
     random.shuffle(paths)
@@ -8419,16 +8797,61 @@ def tool_recon_content_discovery(args: dict) -> dict:
         note += " NOTE: site returns 200 for unknown paths (SPA/catch-all) — a bare 200 is NOT proof a path exists."
     if baseline["classification"] == "waf_challenge":
         note += " A WAF/Cloudflare challenge is active; results may be filtered."
-    return {"base": base, "tested": len(paths), "found_count": len(found),
+    return {"base": base, "mode": mode or "paths", "tested": len(paths), "found_count": len(found),
             "catchall_detected": baseline["is_catchall"],
             "waf_detected": baseline["classification"] == "waf_challenge",
             "found": found, "note": note}
 
 
+def _recon_s3_candidates(host: str) -> list:
+    """Derive candidate public-bucket names from a target host."""
+    parts = (host or "").split(".")
+    name = parts[-2] if len(parts) >= 2 else (host or "")
+    name = name.replace("_", "-")
+    cands = [name, f"{name}-assets", f"{name}-backup", f"{name}-backups", f"{name}-media",
+             f"{name}-static", f"{name}-dev", f"{name}-prod", f"assets-{name}",
+             f"{name}-uploads", f"{name}-data", (host or "").replace(".", "-")]
+    return list(dict.fromkeys(c for c in cands if c))
+
+
+def _recon_check_s3(host: str, explicit: list | None) -> dict:
+    """Check candidate AWS S3 buckets for public listing. TOUCHES A THIRD PARTY
+    (Amazon S3, outside the target), so it asks for approval first via an
+    approval card. Read-only listing probes. {findings:[{severity,evidence}]}."""
+    buckets = [b for b in (explicit or _recon_s3_candidates(host)) if b][:16]
+    if not buckets:
+        return {"third_party": "aws-s3", "checked": 0, "findings": []}
+    dec = request_approval(
+        "Public S3 bucket check (third party: AWS)",
+        "GET https://<bucket>.s3.amazonaws.com/ for: " + ", ".join(buckets[:8])
+        + ("…" if len(buckets) > 8 else ""),
+        {"kind": "recon_s3", "third_party": "aws-s3", "buckets": buckets, "host": host},
+        timeout_s=300,
+    )
+    if dec.get("decision") != "approve":
+        return {"third_party": "aws-s3", "skipped": True, "candidates": buckets,
+                "reason": "user declined the third-party AWS S3 check"}
+    findings = []
+    for b in buckets:
+        r = _recon_fetch(f"https://{b}.s3.amazonaws.com/?list-type=2", timeout=6.0, max_bytes=4000)
+        body, st = r.get("body", "") or "", r.get("status")
+        if st == 200 and "<ListBucketResult" in body:
+            keys = re.findall(r"<Key>([^<]+)</Key>", body)
+            findings.append({"severity": "high", "issue": f"public S3 bucket: {b}",
+                             "evidence": f"listable ({len(keys)} keys shown)",
+                             "bucket": b, "third_party": "aws-s3"})
+        elif st == 403 and "AccessDenied" in body:
+            findings.append({"severity": "info", "issue": f"private S3 bucket exists: {b}",
+                             "evidence": "AccessDenied (bucket exists, listing denied)",
+                             "bucket": b, "third_party": "aws-s3"})
+    return {"third_party": "aws-s3", "checked": len(buckets), "findings": findings}
+
+
 def tool_recon_check_exposure(args: dict) -> dict:
     """AUTHORIZED RECON. Targeted check for high-signal exposures and interprets
-    them: readable .git, .env secrets, directory listing, Spring actuator,
-    Apache server-status. Returns findings with severity + evidence. Read-only."""
+    them: readable .git/.svn, .env secrets, web.config, WEB-INF/web.xml, phpinfo,
+    directory listing, Spring actuator, Apache server-status, security.txt, and
+    (opt-in, third-party) public S3 buckets. Findings carry severity + evidence."""
     base = (args.get("url") or args.get("target") or "").strip()
     if not base:
         return {"error": "url required"}
@@ -8492,6 +8915,47 @@ def tool_recon_check_exposure(args: dict) -> dict:
         findings.append({"severity": "low", "issue": "exposed .DS_Store",
                          "evidence": "Bud1 magic present",
                          "impact": "directory/file names enumerable."})
+    # .svn metadata — source/history disclosure (new SVN uses wc.db SQLite)
+    r = _recon_fetch(urllib.parse.urljoin(base, ".svn/wc.db"), timeout, max_bytes=64)
+    if r.get("status") == 200 and r.get("body", "").startswith("SQLite format 3"):
+        findings.append({"severity": "high", "issue": "exposed .svn/wc.db",
+                         "evidence": "SQLite working-copy DB served",
+                         "impact": "source tree and history reconstructable."})
+    # web.config — IIS config / connection strings
+    r = _recon_fetch(urllib.parse.urljoin(base, "web.config"), timeout, max_bytes=4000)
+    if real(r) and re.search(r"<configuration[>\s]", r.get("body", ""), re.IGNORECASE):
+        findings.append({"severity": "high", "issue": "exposed web.config",
+                         "evidence": "<configuration> XML served",
+                         "impact": "IIS config, connection strings, app settings disclosed."})
+    # WEB-INF/web.xml — Java servlet descriptor
+    r = _recon_fetch(urllib.parse.urljoin(base, "WEB-INF/web.xml"), timeout, max_bytes=4000)
+    if real(r) and re.search(r"<web-app[>\s]", r.get("body", ""), re.IGNORECASE):
+        findings.append({"severity": "high", "issue": "exposed WEB-INF/web.xml",
+                         "evidence": "<web-app> descriptor served",
+                         "impact": "servlet mappings and framework internals disclosed."})
+    # phpinfo — full PHP environment disclosure
+    for _p in ("phpinfo.php", "info.php"):
+        r = _recon_fetch(urllib.parse.urljoin(base, _p), timeout, max_bytes=6000)
+        if r.get("status") == 200 and "phpinfo()" in r.get("body", "") and "PHP Version" in r.get("body", ""):
+            findings.append({"severity": "medium", "issue": f"exposed {_p} (phpinfo)",
+                             "evidence": "phpinfo() output served",
+                             "impact": "PHP env, absolute paths, loaded modules disclosed."})
+            break
+    # security.txt — informational (published disclosure policy)
+    r = _recon_fetch(urllib.parse.urljoin(base, ".well-known/security.txt"), timeout, max_bytes=2000)
+    if real(r) and re.search(r"(?im)^\s*contact\s*:", r.get("body", "")):
+        _c = re.search(r"(?im)^\s*contact\s*:\s*(.+)$", r.get("body", ""))
+        findings.append({"severity": "info", "issue": "security.txt present",
+                         "evidence": (_c.group(1).strip()[:80] if _c else "contact listed"),
+                         "impact": "disclosure policy published (informational)."})
+    # public S3 buckets — opt-in, third-party (asks for approval inside).
+    if args.get("check_s3") or args.get("buckets"):
+        _s3 = _recon_check_s3(urllib.parse.urlparse(base).hostname or base, args.get("buckets"))
+        if _s3.get("findings"):
+            findings.extend(_s3["findings"])
+        elif _s3.get("skipped"):
+            findings.append({"severity": "info", "issue": "S3 check skipped",
+                             "evidence": _s3.get("reason", "declined")})
 
     note = "validated exposures only (content-checked, baseline-diffed)."
     if baseline["is_catchall"]:
@@ -8631,6 +9095,20 @@ def tool_recon_injection_probe(args: dict) -> dict:
     marker = "acc" + "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(6))
     xss_payload = f"{marker}<svg/onload=1>"
     findings = []
+    # Which checks to run. Default battery keeps the pre-existing behavior; a
+    # `checks` list narrows/extends it. All benign, in-band (one request each).
+    _valid = {"xss", "sqli", "ssti", "path_traversal", "open_redirect", "crlf"}
+    _alias = {"lfi": "path_traversal", "traversal": "path_traversal", "redirect": "open_redirect",
+              "open-redirect": "open_redirect", "sql": "sqli", "template": "ssti"}
+    _req = args.get("checks")
+    if isinstance(_req, str):
+        _req = [_req]
+    if _req:
+        checks = {_alias.get(str(c).lower().strip(), str(c).lower().strip()) for c in _req} & _valid
+    else:
+        checks = set()
+    if not checks:
+        checks = {"xss", "sqli", "ssti", "path_traversal"}
 
     def build(param, value):
         newqs = dict(qs)
@@ -8638,43 +9116,64 @@ def tool_recon_injection_probe(args: dict) -> dict:
         return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(newqs)))
 
     for param in names:
-        # reflected XSS
-        r = _recon_fetch(build(param, xss_payload), timeout=timeout, max_bytes=20000)
-        if "body" in r and xss_payload in r["body"]:
-            findings.append({"param": param, "type": "reflected XSS",
-                             "severity": "high", "evidence": "payload reflected unencoded"})
-        elif "body" in r and marker in r["body"]:
-            findings.append({"param": param, "type": "reflection (encoded)",
-                             "severity": "info", "evidence": "marker reflected but encoded/sanitized"})
-        # error-based SQLi
-        r2 = _recon_fetch(build(param, "'\""), timeout=timeout, max_bytes=20000)
-        body_l = (r2.get("body") or "").lower()
-        hit = next((sig for sig in _RECON_SQL_ERRORS if sig in body_l), None)
-        if hit:
-            findings.append({"param": param, "type": "error-based SQLi",
-                             "severity": "high", "evidence": f"SQL error signature: '{hit}'"})
-        # SSTI: a distinctive arithmetic marker (1337*1337 = 1787569) that only
-        # appears if the value is evaluated as a template. Try the common engine
-        # syntaxes; require the RESULT present and the raw expression absent.
-        for probe_val, engine in (("{{1337*1337}}", "jinja/twig"),
-                                  ("${1337*1337}", "el/freemarker/spel"),
-                                  ("<%= 1337*1337 %>", "erb/ejs")):
-            rs = _recon_fetch(build(param, probe_val), timeout=timeout, max_bytes=20000)
-            rb = rs.get("body") or ""
-            if "1787569" in rb and probe_val not in rb:
-                findings.append({"param": param, "type": "server-side template injection (SSTI)",
-                                 "severity": "critical",
-                                 "evidence": f"{probe_val} evaluated to 1787569 ({engine})"})
-                break
-        # path traversal / LFI: a classic /etc/passwd read
-        rl = _recon_fetch(build(param, "../../../../../../etc/passwd"), timeout=timeout, max_bytes=20000)
-        if re.search(r"root:.*:0:0:", rl.get("body") or ""):
-            findings.append({"param": param, "type": "path traversal / LFI",
-                             "severity": "high", "evidence": "/etc/passwd contents returned"})
+        if "xss" in checks:
+            r = _recon_fetch(build(param, xss_payload), timeout=timeout, max_bytes=20000)
+            if "body" in r and xss_payload in r["body"]:
+                findings.append({"param": param, "type": "reflected XSS",
+                                 "severity": "high", "evidence": "payload reflected unencoded"})
+            elif "body" in r and marker in r["body"]:
+                findings.append({"param": param, "type": "reflection (encoded)",
+                                 "severity": "info", "evidence": "marker reflected but encoded/sanitized"})
+        if "sqli" in checks:
+            r2 = _recon_fetch(build(param, "'\""), timeout=timeout, max_bytes=20000)
+            body_l = (r2.get("body") or "").lower()
+            hit = next((sig for sig in _RECON_SQL_ERRORS if sig in body_l), None)
+            if hit:
+                findings.append({"param": param, "type": "error-based SQLi",
+                                 "severity": "high", "evidence": f"SQL error signature: '{hit}'"})
+        if "ssti" in checks:
+            # A distinctive arithmetic marker (1337*1337 = 1787569) that only
+            # appears if the value is evaluated as a template. Require the RESULT
+            # present and the raw expression absent.
+            for probe_val, engine in (("{{1337*1337}}", "jinja/twig"),
+                                      ("${1337*1337}", "el/freemarker/spel"),
+                                      ("<%= 1337*1337 %>", "erb/ejs")):
+                rs = _recon_fetch(build(param, probe_val), timeout=timeout, max_bytes=20000)
+                rb = rs.get("body") or ""
+                if "1787569" in rb and probe_val not in rb:
+                    findings.append({"param": param, "type": "server-side template injection (SSTI)",
+                                     "severity": "critical",
+                                     "evidence": f"{probe_val} evaluated to 1787569 ({engine})"})
+                    break
+        if "path_traversal" in checks:
+            rl = _recon_fetch(build(param, "../../../../../../etc/passwd"), timeout=timeout, max_bytes=20000)
+            if re.search(r"root:.*:0:0:", rl.get("body") or ""):
+                findings.append({"param": param, "type": "path traversal / LFI",
+                                 "severity": "high", "evidence": "/etc/passwd contents returned"})
+        if "open_redirect" in checks:
+            # Inject an absolute URL to a benign marker host; a vulnerable app
+            # 30x's to it (Location) or drops it into a client-side redirect.
+            om = "https://accuretta-redir.example/oob"
+            rr = _recon_fetch(build(param, om), timeout=timeout, max_bytes=4000, follow=False)
+            loc = _hget(rr.get("headers", {}), "location")
+            if rr.get("status") in (301, 302, 303, 307, 308) and loc.startswith("https://accuretta-redir.example"):
+                findings.append({"param": param, "type": "open redirect",
+                                 "severity": "medium", "evidence": f"Location redirect to injected URL: {loc[:80]}"})
+            elif om in (rr.get("body") or "") and re.search(r"(meta[^>]+refresh|location\s*=)", (rr.get("body") or "").lower()):
+                findings.append({"param": param, "type": "open redirect (client-side)",
+                                 "severity": "low", "evidence": "injected URL reflected into a client-side redirect"})
+        if "crlf" in checks:
+            # Smuggle a header via CRLF; if the app reflects it into the response
+            # header set, header injection / response splitting is possible.
+            cr = _recon_fetch(build(param, "\r\nX-Acc-Inj: " + marker), timeout=timeout, max_bytes=1000, follow=False)
+            if _hget(cr.get("headers", {}), "x-acc-inj"):
+                findings.append({"param": param, "type": "CRLF header injection",
+                                 "severity": "high", "evidence": "injected X-Acc-Inj header appeared in the response"})
 
-    return {"url": url, "tested_params": names, "finding_count": len(findings),
+    return {"url": url, "checks": sorted(checks), "tested_params": names,
+            "finding_count": len(findings),
             "findings": findings or [{"type": "none", "severity": "info",
-                                       "note": "no reflected XSS or SQL errors observed"}]}
+                                       "note": "no injection signatures observed for the selected checks"}]}
 
 
 def _recon_tcp_cmd(host: str, port: int, payload: bytes, timeout: float = 4.0) -> bytes:
@@ -9140,7 +9639,11 @@ def tool_encode_decode(args: dict) -> dict:
     # Forgive the common synonyms small models invent.
     scheme = {"b64": "base64", "base-64": "base64", "b64url": "base64url",
               "base64-url": "base64url", "urlsafe": "base64url", "percent": "url",
-              "urlencode": "url", "url-encode": "url", "urlencoded": "url"}.get(scheme, scheme)
+              "urlencode": "url", "url-encode": "url", "urlencoded": "url",
+              "htmlentities": "html", "html-entities": "html", "htmlescape": "html",
+              "rot-13": "rot13", "rot": "rot13", "unicode-escape": "unicode",
+              "gzip": "gzip-b64", "gzipb64": "gzip-b64", "gzip_b64": "gzip-b64",
+              "gzip-base64": "gzip-b64"}.get(scheme, scheme)
     op = {"enc": "encode", "dec": "decode"}.get(op, op)
 
     def _b64_decode(s: str) -> str:
@@ -9167,6 +9670,33 @@ def tool_encode_decode(args: dict) -> dict:
                 return {"scheme": "hex", "operation": "decode",
                         "result": bytes.fromhex("".join(text.split())).decode("utf-8", "replace")}
             return {"scheme": "hex", "operation": "encode", "result": text.encode("utf-8").hex()}
+        if scheme == "html":
+            import html as _html
+            if op == "decode":
+                return {"scheme": "html", "operation": "decode", "result": _html.unescape(text)}
+            return {"scheme": "html", "operation": "encode", "result": _html.escape(text, quote=True)}
+        if scheme == "rot13":
+            # Self-inverse; letters only, everything else passes through.
+            import codecs
+            return {"scheme": "rot13", "operation": op, "result": codecs.encode(text, "rot_13")}
+        if scheme == "unicode":
+            if op == "decode":
+                s = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
+                s = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), s)
+                return {"scheme": "unicode", "operation": "decode", "result": s}
+            return {"scheme": "unicode", "operation": "encode",
+                    "result": "".join("\\u%04x" % ord(c) for c in text)}
+        if scheme == "gzip-b64":
+            import gzip
+            if op == "decode":
+                packed = "".join(text.split()).replace("-", "+").replace("_", "/")
+                raw = base64.b64decode(packed + "=" * (-len(packed) % 4))
+                return {"scheme": "gzip-b64", "operation": "decode",
+                        "result": gzip.decompress(raw).decode("utf-8", "replace")}
+            comp = gzip.compress(text.encode("utf-8"))
+            return {"scheme": "gzip-b64", "operation": "encode",
+                    "result": base64.b64encode(comp).decode("ascii"),
+                    "base64url": base64.urlsafe_b64encode(comp).decode("ascii")}
         if scheme == "jwt":
             # Always a decode: split header.payload.signature and decode the two
             # base64url JSON segments. Signature is shown but NOT verified — the
@@ -9182,7 +9712,8 @@ def tool_encode_decode(args: dict) -> dict:
                     "header": _seg(parts[0]), "payload": _seg(parts[1]),
                     "signature": parts[2] if len(parts) > 2 else "",
                     "note": "signature NOT verified — inspect/forge only"}
-        return {"error": f"unknown scheme '{scheme}' — use base64, base64url, url, hex, or jwt"}
+        return {"error": f"unknown scheme '{scheme}' — use base64, base64url, url, hex, "
+                          "html, unicode, rot13, gzip-b64, or jwt"}
     except Exception as e:
         return {"error": f"{scheme} {op} failed: {e}", "input_preview": text[:120]}
 
@@ -10499,22 +11030,22 @@ TOOLS: dict[str, dict] = {
         "fn": tool_audit_http_headers,
     },
     "recon_port_scan": {
-        "description": "AUTHORIZED RECON ONLY. Stealthy TCP-connect port scan (capped concurrency, randomized order, jitter — quieter than nmap). Read-only. Use only against targets you are authorized to test.",
+        "description": "AUTHORIZED RECON ONLY. Stealthy TCP-connect port scan (capped concurrency, randomized order, jitter; quieter than nmap). Read-only.",
         "parameters": {
             "type": "object",
             "properties": {
                 "host": {"type": "string", "description": "Target hostname or IP."},
                 "ports": {"type": "array", "items": {"type": "integer"}, "description": "Optional explicit port list. Default = ~50 common ports."},
                 "timeout": {"type": "number", "description": "Per-port connect timeout seconds (default 1.5)."},
-                "concurrency": {"type": "integer", "description": "Max simultaneous probes (default 8, max 32). Lower = stealthier."},
-                "jitter_ms": {"type": "integer", "description": "Random delay before each probe in ms (default 40)."}
+                "concurrency": {"type": "integer", "description": "Max simultaneous probes (default 8, max 32)."},
+                "jitter_ms": {"type": "integer", "description": "Delay before each probe in ms (default 40)."}
             },
             "required": ["host"],
         },
         "fn": tool_recon_port_scan,
     },
     "recon_tls_audit": {
-        "description": "AUTHORIZED RECON ONLY. Inspect a host's TLS: protocol, cipher, certificate subject/issuer/SANs/expiry, validation status. Flags weak protocols and expired/self-signed certs. Read-only.",
+        "description": "AUTHORIZED RECON ONLY. Inspect a host's TLS: protocol, cipher, cert subject/issuer/SANs/expiry, validation status. Flags weak protocols and expired/self-signed certs. Read-only.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -10526,40 +11057,41 @@ TOOLS: dict[str, dict] = {
         "fn": tool_recon_tls_audit,
     },
     "recon_http_fingerprint": {
-        "description": "AUTHORIZED RECON ONLY. Fetch a URL and fingerprint the server: status, redirect chain, Server/X-Powered-By, page title, notable headers, cookies. Read-only.",
+        "description": "AUTHORIZED RECON ONLY. Fetch a URL and fingerprint the server: status, redirects, Server/X-Powered-By, title, headers, cookies. mode=waf classifies blocks; mode=security_headers grades CSP/HSTS/etc. Read-only.",
         "parameters": {
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "Target URL (scheme optional; defaults to https)."}
+                "url": {"type": "string", "description": "Target URL (scheme optional; defaults to https)."},
+                "mode": {"type": "string", "description": "waf | security_headers. Omit for a full fingerprint."},
             },
             "required": ["url"],
         },
         "fn": tool_recon_http_fingerprint,
     },
     "http_request": {
-        "description": "AUTHORIZED PENTEST. Send an arbitrary HTTP request (method, url, headers, cookies, body) and get back status, ALL response headers (every Set-Cookie preserved in 'set_cookie'), and body — the curl/Burp Repeater primitive for actually exploiting a finding: read a Set-Cookie then flip+replay it, aim an SSRF url param, POST an SSTI/injection payload. Wears a rotating real-browser identity (blends in). Every status is returned (a 403/500 body is signal, not an error). host:port and http:// targets are fine. Pass save_evidence to persist the exploit request+response as a proof artifact; pass session to carry cookies across calls.",
+        "description": "AUTHORIZED PENTEST. Send an arbitrary HTTP request (method, url, headers, cookies, body); returns status, ALL response headers (every Set-Cookie in 'set_cookie'), and body. The curl/Burp Repeater primitive for exploiting a finding: flip+replay a Set-Cookie, aim an SSRF param, POST an injection payload. Rotating real-browser identity; every status returned (a 403/500 body is signal). host:port and http:// are fine. save_evidence persists the request+response as proof; session carries cookies across calls.",
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "Target URL. Scheme optional (defaults to http://). host:port is fine."},
-                "method": {"type": "string", "description": "GET, POST, PUT, DELETE, etc. Defaults to POST if a body is given, else GET."},
-                "headers": {"type": "object", "description": "Optional request headers as a name->value map."},
-                "cookies": {"type": "object", "description": "Optional cookies as a name->value map (folded into a Cookie header)."},
-                "body": {"type": "string", "description": "Optional raw request body (e.g. form-encoded 'a=1&b=2' or JSON)."},
-                "session": {"type": "string", "description": "Optional session name. Reuses cookies captured under this name and remembers new Set-Cookies — for multi-step auth flows."},
-                "save_evidence": {"type": "string", "description": "Optional label. Persists this exact request+response to recon_evidence/ (returns evidence_saved path + evidence_sha256) — verifiable proof of a breach."},
+                "method": {"type": "string", "description": "GET/POST/PUT/DELETE/etc. Default POST if a body is given, else GET."},
+                "headers": {"type": "object", "description": "Request headers as a name->value map."},
+                "cookies": {"type": "object", "description": "Cookies as a name->value map (folded into Cookie)."},
+                "body": {"type": "string", "description": "Raw request body (form-encoded 'a=1&b=2' or JSON)."},
+                "session": {"type": "string", "description": "Session name: reuse captured cookies and remember new Set-Cookies (multi-step auth)."},
+                "save_evidence": {"type": "string", "description": "Label: persist this request+response to recon_evidence/ (returns path + sha256) as proof."},
             },
             "required": ["url"],
         },
         "fn": tool_http_request,
     },
     "encode_decode": {
-        "description": "AUTHORIZED PENTEST. Encode/decode a string (base64, base64url, url, hex, or jwt) — the Burp Decoder equivalent. Use it to inspect and FORGE tokens (decode an unsigned session cookie, flip a field like role=admin, re-encode it) instead of doing base64 by hand. base64 encode returns BOTH standard and url-safe forms.",
+        "description": "AUTHORIZED PENTEST. Encode/decode a string (Burp Decoder equivalent) to inspect/forge tokens instead of doing it by hand. No I/O.",
         "parameters": {
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "The string to transform (e.g. a cookie value or a JSON payload)."},
-                "scheme": {"type": "string", "description": "base64 | base64url | url | hex | jwt. Default base64."},
+                "text": {"type": "string", "description": "String to transform (e.g. a cookie or JSON payload)."},
+                "scheme": {"type": "string", "description": "base64 | base64url | url | hex | html | unicode | rot13 | gzip-b64 | jwt. Default base64; base64 encode returns both alphabets."},
                 "operation": {"type": "string", "description": "encode | decode. Default encode. (jwt is always decode.)"},
             },
             "required": ["text"],
@@ -10567,13 +11099,13 @@ TOOLS: dict[str, dict] = {
         "fn": tool_encode_decode,
     },
     "jwt_tool": {
-        "description": "AUTHORIZED PENTEST. Decode, forge (sign), or crack a JSON Web Token. operation=decode inspects header+payload; operation=sign builds a signed token from a JSON payload + secret + alg (HS256/384/512 or 'none' for the alg-confusion downgrade); operation=crack brute-forces the HMAC secret against a built-in weak list + your wordlist. The core of modern auth attacks (alg:none, weak-secret forgery, claim tampering).",
+        "description": "AUTHORIZED PENTEST. Decode, forge (sign), or crack a JSON Web Token. decode inspects header+payload; sign builds a signed token from payload + secret + alg (HS256/384/512, or 'none' for alg-confusion); crack brute-forces the HMAC secret against a weak list + your wordlist. Core of modern auth attacks (alg:none, weak-secret forgery, claim tampering).",
         "parameters": {
             "type": "object",
             "properties": {
                 "operation": {"type": "string", "description": "decode | sign | crack. Default decode."},
                 "token": {"type": "string", "description": "The JWT (for decode/crack)."},
-                "payload": {"type": "object", "description": "Claims to sign (for operation=sign), e.g. {\"user\":\"admin\",\"role\":\"admin\"}."},
+                "payload": {"type": "object", "description": "Claims to sign (operation=sign), e.g. {\"role\":\"admin\"}."},
                 "secret": {"type": "string", "description": "HMAC secret (for sign; omit for alg=none)."},
                 "alg": {"type": "string", "description": "HS256 | HS384 | HS512 | none. Default HS256."},
                 "wordlist": {"type": "array", "items": {"type": "string"}, "description": "Extra candidate secrets to try (for crack)."},
@@ -10583,7 +11115,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_jwt_tool,
     },
     "sql_injection": {
-        "description": "AUTHORIZED PENTEST. Semi-automated SQL injection on a GET query parameter (sqlmap-lite): detects error/boolean injectability, auto-finds the UNION column count, and — with `extract` (a SELECT list like 'flag FROM secrets' or 'name FROM sqlite_master') — builds the padded UNION payload and dumps the rows. Handles the mechanical UNION assembly so you only decide WHAT to pull.",
+        "description": "AUTHORIZED PENTEST. Semi-automated SQL injection on a GET query param (sqlmap-lite): detects error/boolean injectability, auto-finds the UNION column count, and with `extract` (a SELECT list like 'name FROM sqlite_master') builds the padded UNION payload and dumps rows. You only decide WHAT to pull.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -10596,7 +11128,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_sql_injection,
     },
     "fuzz": {
-        "description": "AUTHORIZED PENTEST. Iterate a request parameter over many values and report which responses DIFFER from the norm — the primitive for enumeration/IDOR (find the object id that leaks), id/endpoint brute forcing, access checks. Put FUZZ in the url or pass `param`; give `values` (list) or `range`=[start,end]. Returns the outliers so the interesting one is obvious.",
+        "description": "AUTHORIZED PENTEST. Iterate a request param over many values and report which responses DIFFER from the norm: the primitive for enumeration/IDOR, id/endpoint brute forcing, access checks. Put FUZZ in the url or pass `param`; give `values` or `range`=[start,end]. Returns the outliers.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -10610,7 +11142,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_fuzz,
     },
     "validate_finding": {
-        "description": "AUTHORIZED PENTEST. Sanity-check a suspected finding before reporting it, to avoid false positives on decoys/catch-all/WAF pages. Diffs the url against a random-path baseline, classifies the response, and flags placeholder/decoy markers (example.invalid, 'placeholder', 'nothing sensitive', …). Returns likely_real + reasons so you don't report a honeypot.",
+        "description": "AUTHORIZED PENTEST. Sanity-check a suspected finding before reporting, to avoid false positives on decoy/catch-all/WAF pages. Diffs the url against a random-path baseline, classifies the response, flags placeholder/decoy markers. Returns likely_real + reasons so you don't report a honeypot.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -10621,7 +11153,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_validate_finding,
     },
     "batch_probe": {
-        "description": "AUTHORIZED PENTEST. Fire one payload set at EVERY parameter of MANY endpoints in a single call — 'try this against every parameterized endpoint' — instead of N×M manual http_request calls. Give `targets` (list of URLs with query params) and either `probe` (sqli|ssti|lfi|cmdi|xss) or your own `payloads`. Returns which endpoint+param+payload combos fired a signature (SQL error, template eval, /etc/passwd read, shell exec, reflection). Follow a hit up with sql_injection / http_request / fuzz.",
+        "description": "AUTHORIZED PENTEST. Fire one payload set at EVERY parameter of MANY endpoints in one call, instead of N×M manual http_request calls. Give `targets` (URLs with query params) and either `probe` (sqli|ssti|lfi|cmdi|xss) or your own `payloads`. Returns which endpoint+param+payload combos fired a signature (SQL error, template eval, /etc/passwd, shell exec, reflection). Follow a hit with sql_injection / http_request / fuzz.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -10634,7 +11166,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_batch_probe,
     },
     "scan_js_secrets": {
-        "description": "AUTHORIZED PENTEST. Fetch a page + its inline/linked JavaScript and hunt for hardcoded secrets: cloud keys (AWS/Google/Stripe/Slack/GitHub/SendGrid/Twilio), JWTs, Firebase/Supabase endpoints, private keys, basic-auth URLs, and generic apiKey/secret/token='...' assignments. The 'scrape the front-end for keys' primitive. Read-only.",
+        "description": "AUTHORIZED PENTEST. Fetch a page + its inline/linked JavaScript and hunt for hardcoded secrets: cloud keys (AWS/Google/Stripe/Slack/GitHub/etc.), JWTs, Firebase/Supabase endpoints, private keys, basic-auth URLs, generic apiKey/secret/token assignments. Read-only.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -10645,7 +11177,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_scan_js_secrets,
     },
     "cors_probe": {
-        "description": "AUTHORIZED PENTEST. Test a URL for CORS misconfiguration — sends crafted Origin headers and checks whether the server reflects the origin into Access-Control-Allow-Origin, especially with Allow-Credentials:true (lets an attacker site read authenticated responses). Also flags 'null' origin and wildcard acceptance. Read-only.",
+        "description": "AUTHORIZED PENTEST. Test a URL for CORS misconfiguration: sends crafted Origin headers and checks whether the server reflects the origin into Access-Control-Allow-Origin, especially with Allow-Credentials:true. Also flags 'null' origin and wildcard. Read-only.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -10656,7 +11188,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_cors_probe,
     },
     "tcp_send": {
-        "description": "AUTHORIZED PENTEST. Raw TCP: connect to host:port, send data, read the response within a window. Not a browser (bytes only, no JS/rendering). For non-HTTP services (redis, memcached, SMTP) or to submit a URL to a CTF / report-to-admin bot and read the console.log/output it pipes back. Set read_timeout high (e.g. 15) for a visit-and-wait bot. Optional tls.",
+        "description": "AUTHORIZED PENTEST. Raw TCP: connect to host:port, send data, read the response within a window (bytes only, no JS/rendering). For non-HTTP services (redis, memcached, SMTP) or to submit a URL to a CTF / report-to-admin bot and read what it pipes back. Set read_timeout high (~15) for a visit-and-wait bot. Optional tls.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -10671,7 +11203,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_tcp_send,
     },
     "recon_subdomains": {
-        "description": "AUTHORIZED RECON ONLY. Passive subdomain enumeration via certificate transparency logs (crt.sh). No active brute-forcing. Read-only.",
+        "description": "AUTHORIZED RECON ONLY. Passive subdomain enumeration via certificate transparency logs (crt.sh). Read-only.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -10682,44 +11214,49 @@ TOOLS: dict[str, dict] = {
         "fn": tool_recon_subdomains,
     },
     "recon_dns": {
-        "description": "AUTHORIZED RECON ONLY. Enumerate DNS records (A, AAAA, MX, NS, TXT, SOA, CNAME) via DNS-over-HTTPS. Read-only.",
+        "description": "AUTHORIZED RECON. Enumerate standard DNS records (A/MX/NS/TXT/SOA/CNAME) via DoH, or a mode. Read-only except axfr.",
         "parameters": {
             "type": "object",
             "properties": {
-                "domain": {"type": "string", "description": "Domain to enumerate, e.g. example.com."}
+                "domain": {"type": "string", "description": "Domain, e.g. example.com."},
+                "mode": {"type": "string", "description": "email_auth (SPF/DMARC/DKIM verdict), caa, or axfr (zone transfer, needs loud). Omit = records."},
+                "loud": {"type": "boolean", "description": "Set true to run axfr (a loud probe to the target's NS)."},
             },
             "required": ["domain"],
         },
         "fn": tool_recon_dns,
     },
     "recon_content_discovery": {
-        "description": "AUTHORIZED RECON ONLY. Probe a base URL for a high-value path list (admin panels, config/backup files, VCS dirs, API docs). Reports non-404 paths that differ from the catch-all baseline. Read-only. NOTE: a content IDS scores REQUESTS, not timing — to stay quiet against detection use quiet=true (a small high-signal set, ~10 requests) rather than relying on jitter.",
+        "description": "AUTHORIZED RECON. Probe a base URL for high-value paths, diffing against a catch-all baseline so SPA/WAF 200s aren't false positives. mode=api, backup, or vhost (Host-header fuzz); omit for the general list. quiet=true sends ~10 paths. Read-only.",
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "Base URL or host."},
-                "wordlist": {"type": "array", "items": {"type": "string"}, "description": "Optional custom path list. Default = built-in high-value paths."},
-                "quiet": {"type": "boolean", "description": "Low-footprint sweep: ~10 highest-signal paths at low concurrency. Fewer requests = fewer detection triggers."},
+                "mode": {"type": "string", "description": "api (swagger/openapi/graphql) | backup (suffix variants) | vhost. Omit = general paths."},
+                "wordlist": {"type": "array", "items": {"type": "string"}, "description": "Custom list (paths, or vhost names when mode=vhost)."},
+                "quiet": {"type": "boolean", "description": "Low-footprint sweep: ~10 top paths, low concurrency."},
                 "concurrency": {"type": "integer", "description": "Max simultaneous requests (default 6, max 20)."},
-                "jitter_ms": {"type": "integer", "description": "Delay before each request in ms — rate-limiting/politeness, NOT IDS evasion."}
+                "jitter_ms": {"type": "integer", "description": "Delay before each request in ms."}
             },
             "required": ["url"],
         },
         "fn": tool_recon_content_discovery,
     },
     "recon_check_exposure": {
-        "description": "AUTHORIZED RECON ONLY. Targeted check for high-signal exposures and interprets them: readable .git, .env secrets, directory listing, Spring actuator, Apache server-status. Returns findings with severity + evidence. Read-only.",
+        "description": "AUTHORIZED RECON. Validated checks for high-signal exposures (VCS dirs, config/secret files, phpinfo, actuator, dir listing, security.txt), content-checked and baseline-diffed. check_s3=true also probes public S3 buckets (third-party AWS; approval-gated).",
         "parameters": {
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "Base URL or host to check."}
+                "url": {"type": "string", "description": "Base URL or host to check."},
+                "check_s3": {"type": "boolean", "description": "Also test candidate public S3 buckets (touches AWS; asks approval)."},
+                "buckets": {"type": "array", "items": {"type": "string"}, "description": "Explicit S3 bucket names instead of derived guesses."},
             },
             "required": ["url"],
         },
         "fn": tool_recon_check_exposure,
     },
     "recon_subdomain_takeover": {
-        "description": "AUTHORIZED RECON ONLY. Check subdomains for dangling-CNAME takeover by matching orphaned-service fingerprints (S3, GitHub Pages, Heroku, etc.). Read-only — does not claim anything.",
+        "description": "AUTHORIZED RECON ONLY. Check subdomains for dangling-CNAME takeover by matching orphaned-service fingerprints (S3, GitHub Pages, Heroku, etc.). Read-only.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -10731,7 +11268,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_recon_subdomain_takeover,
     },
     "recon_cve_match": {
-        "description": "AUTHORIZED RECON ONLY. Map a component + version to known CVEs via OSV.dev. Best for OSS packages (npm, PyPI, Go, Maven). Feed it components found in exposed package.json / requirements / JS libs.",
+        "description": "AUTHORIZED RECON ONLY. Map a component + version to known CVEs via OSV.dev. Best for OSS packages (npm, PyPI, Go, Maven). Feed it components from exposed package.json / requirements / JS libs.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -10744,19 +11281,20 @@ TOOLS: dict[str, dict] = {
         "fn": tool_recon_cve_match,
     },
     "recon_injection_probe": {
-        "description": "AUTHORIZED RECON ONLY. Non-destructive injection detection on URL query parameters: reflected XSS and error-based SQLi. Sends only benign probes (a marker and a quote). Read-only intent.",
+        "description": "AUTHORIZED RECON ONLY. Non-destructive injection detection on query params; benign in-band probes. Default = XSS + error SQLi + SSTI + path traversal; `checks` narrows/adds open_redirect, crlf.",
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "URL including query string, e.g. https://site/search?q=test"},
-                "params": {"type": "array", "items": {"type": "string"}, "description": "Optional explicit param names to test; default = params parsed from the URL."}
+                "params": {"type": "array", "items": {"type": "string"}, "description": "Explicit param names; default = params in the URL."},
+                "checks": {"type": "array", "items": {"type": "string"}, "description": "Subset of xss, sqli, ssti, path_traversal, open_redirect, crlf. Omit = the default four."},
             },
             "required": ["url"],
         },
         "fn": tool_recon_injection_probe,
     },
     "recon_open_services": {
-        "description": "AUTHORIZED RECON ONLY. Check for UNAUTHENTICATED data services exposed on the network (Redis, Elasticsearch, Docker API, Memcached). A live unauth hit is often a direct way in. Read-only probes.",
+        "description": "AUTHORIZED RECON ONLY. Check for UNAUTHENTICATED data services exposed on the network (Redis, Elasticsearch, Docker API, Memcached); a live unauth hit is often a direct way in. Read-only.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -10773,13 +11311,13 @@ TOOLS: dict[str, dict] = {
             "properties": {
                 "url": {"type": "string", "description": "Login URL (basic-auth resource, or form POST endpoint)."},
                 "mode": {"type": "string", "description": "'basic' (HTTP Basic) or 'form' (POST). Default basic."},
-                "usernames": {"type": "array", "items": {"type": "string"}, "description": "Usernames to try. Omit to use the built-in default-cred list."},
-                "passwords": {"type": "array", "items": {"type": "string"}, "description": "Passwords to try against each username."},
+                "usernames": {"type": "array", "items": {"type": "string"}, "description": "Usernames; omit for the built-in default-cred list."},
+                "passwords": {"type": "array", "items": {"type": "string"}, "description": "Passwords to try per username."},
                 "user_field": {"type": "string", "description": "Form mode: username field name (default 'username')."},
                 "pass_field": {"type": "string", "description": "Form mode: password field name (default 'password')."},
                 "success_marker": {"type": "string", "description": "Form mode: body string present ONLY on success."},
                 "fail_marker": {"type": "string", "description": "Form mode: body string present ONLY on failure."},
-                "delay": {"type": "number", "description": "Seconds between attempts (default 0.4). Higher = stealthier, lockout-safer."},
+                "delay": {"type": "number", "description": "Seconds between attempts (default 0.4; higher = stealthier)."},
                 "max_attempts": {"type": "integer", "description": "Hard cap on total attempts (default 120, max 300)."}
             },
             "required": ["url"],
@@ -10787,7 +11325,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_recon_auth_spray,
     },
     "recon_capture_evidence": {
-        "description": "AUTHORIZED RECON. Fetch a URL and store the response as a proof artifact under data/recon_evidence/ with a sha256 + snippet. Use to capture evidence of access (dumped file, admin page, authed response) so the report cites a real artifact.",
+        "description": "AUTHORIZED RECON. Fetch a URL and store the response as a proof artifact (sha256 + snippet) under data/recon_evidence/, so the report cites a real artifact of access.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -11996,45 +12534,70 @@ def compress_tool_result(name: str, result: Any, cap: int) -> str:
 
 # Red-team recon suite — gated behind `red_team_enabled` so a normal coding
 # turn doesn't carry ~13 tools it will never call (real token cost every turn).
-_RED_TEAM_TOOL_NAMES = {
+# The heavier "break-in" primitives. Held OUT of the tools spec until a run
+# reaches the exploit phase (a validate_finding confirm, or the manual override
+# rt_force_exploit), so a recon turn never pays their token cost. See
+# _rt_incl_exploit_for / _active_tools. Every name here must stay a real breach
+# tool — the recon set below is what's always on when red_team_enabled.
+_RT_EXPLOIT_TOOL_NAMES = {
+    # Active exploitation primitive — lets the flow actually breach, not just
+    # flag suspicion.
+    "http_request",
+    # JWT decode/forge/crack — modern auth attacks (alg:none, weak-secret).
+    "jwt_tool",
+    # sqlmap-lite and param fuzzer/enumerator.
+    "sql_injection",
+    "fuzz",
+    # one payload set -> every parameterized endpoint at once.
+    "batch_probe",
+    # credential spray / default-cred test against a login.
+    "recon_auth_spray",
+    # raw TCP for non-HTTP services and report-to-admin/CTF bots.
+    "tcp_send",
+}
+# Always-on recon/analysis set when red_team_enabled. Passive-to-benign probes,
+# the finding validator (which flips the phase), the Burp-Decoder encoder, and
+# front-end/CORS scanners — the model needs these to FIND something worth the
+# exploit set, so they carry every red-team turn.
+_RT_RECON_TOOL_NAMES = {
     "recon_dns", "recon_subdomains", "recon_tls_audit", "recon_http_fingerprint",
     "recon_port_scan", "recon_content_discovery", "recon_check_exposure",
     "recon_subdomain_takeover", "recon_cve_match", "recon_injection_probe",
-    "recon_open_services", "recon_auth_spray", "recon_capture_evidence",
-    # Active exploitation primitive — lets the flow actually breach, not just
-    # flag suspicion. Gated with the rest of the suite.
-    "http_request",
-    # Token encoder/decoder (Burp Decoder equivalent) — lets a model forge a
-    # cookie/JWT without hand-computing base64. Gated with the suite.
+    "recon_open_services", "recon_capture_evidence",
+    # Token encoder/decoder (Burp Decoder equivalent) — inspect/forge a token
+    # without hand-computing base64. Benign on its own; stays in recon.
     "encode_decode",
-    # JWT decode/forge/crack — modern auth attacks (alg:none, weak-secret).
-    "jwt_tool",
-    # sqlmap-lite, param fuzzer/enumerator, and finding validator — so a miss
-    # is a model decision, not a missing capability.
-    "sql_injection",
-    "fuzz",
+    # Finding validator — the recon->exploit trigger; obviously always on.
     "validate_finding",
-    # one payload set -> every parameterized endpoint at once
-    "batch_probe",
-    # front-end secret hunting + CORS misconfig testing
+    # front-end secret hunting + CORS misconfig testing.
     "scan_js_secrets",
     "cors_probe",
-    # raw TCP for non-HTTP services and report-to-admin/CTF bots
-    "tcp_send",
 }
+# Full suite = recon + exploit. Existing call sites (whole-suite tool gating in
+# _active_tools, mission-target detection at tool-result time) key off this
+# union; the split above only drives per-phase gating.
+_RED_TEAM_TOOL_NAMES = _RT_RECON_TOOL_NAMES | _RT_EXPLOIT_TOOL_NAMES
 
 
-def _active_tools() -> dict:
+def _active_tools(include_exploit: bool = True) -> dict:
     """Return TOOLS filtered by current settings — desktop tools only show when
     desktop automation is enabled, and the red-team recon suite only when red
     team mode is on, so a normal coding turn carries neither (and pays no token
-    cost for tools it can't or won't use)."""
+    cost for tools it can't or won't use).
+
+    include_exploit=False additionally drops the heavier exploit subset
+    (_RT_EXPLOIT_TOOL_NAMES) while the red-team mission is still in the recon
+    phase, so a recon turn stays cheaper. Defaults True so any caller that does
+    not thread a phase keeps the full suite (fails open on tokens, never hides a
+    tool the model might legitimately reach)."""
     s = get_settings()
     excluded: set[str] = set()
     if not s.get("desktop_enabled"):
         excluded |= _DESKTOP_TOOL_NAMES
     if not s.get("red_team_enabled"):
         excluded |= _RED_TEAM_TOOL_NAMES
+    elif not include_exploit:
+        excluded |= _RT_EXPLOIT_TOOL_NAMES
     # The sandbox tool is only useful once the guest is provisioned; don't pay
     # its token cost (or tempt the model to call it) before then.
     if not _sandbox_ready_cached():
@@ -12044,11 +12607,12 @@ def _active_tools() -> dict:
     return {k: v for k, v in TOOLS.items() if k not in excluded}
 
 
-def tools_for_llama() -> list[dict]:
+def tools_for_llama(include_exploit: bool = True) -> list[dict]:
     """Tool spec for llama-server's OpenAI-compatible /v1/chat/completions.
-    Same shape as OpenAI function calling."""
+    Same shape as OpenAI function calling. include_exploit is threaded straight
+    to _active_tools for red-team phase gating."""
     out = []
-    for name, t in _active_tools().items():
+    for name, t in _active_tools(include_exploit).items():
         out.append({
             "type": "function",
             "function": {
@@ -12186,7 +12750,8 @@ def _resolve_tool_name(name: str) -> str:
 # (typical pattern: misreads a truncated response as a transient failure
 # and retries 20+ times). threading.local keeps concurrent chats isolated.
 _tool_call_history = threading.local()
-TOOL_REPEAT_LIMIT = 3  # 4th identical call gets refused with a clear hint.
+TOOL_REPEAT_LIMIT = 3       # 4th SAME-RESULT call in a row gets refused.
+TOOL_REPEAT_HARD_LIMIT = 20  # absolute backstop for wobbly-output tools (below max_tool_rounds).
 
 # Per-turn context — chat_id and other thread-local state that needs to be
 # reachable from deep inside tool implementations without threading them
@@ -12228,15 +12793,41 @@ def _get_current_chat() -> str:
     return getattr(_chat_ctx, "chat_id", "") or ""
 
 
-def _record_tool_call(canon: str, args: dict) -> int:
-    """Records (canon, args) under a per-thread counter. Returns the new count."""
-    sig = canon + ":" + json.dumps(args or {}, sort_keys=True, default=str)
+def _tool_call_sig(canon: str, args: dict) -> str:
+    return canon + ":" + json.dumps(args or {}, sort_keys=True, default=str)
+
+
+def _tool_repeat_state(sig: str) -> tuple[int, int]:
+    """(consecutive same-result streak, absolute total) for this signature."""
+    rec = (getattr(_tool_call_history, "calls", None) or {}).get(sig)
+    return (rec.get("streak", 0), rec.get("total", 0)) if rec else (0, 0)
+
+
+def _record_tool_result(sig: str, result) -> None:
+    """Update loop-breaker bookkeeping AFTER a tool runs. A result that DIFFERS
+    from the last one for this signature means the underlying state moved (a file
+    was edited, tests now pass, a page changed, a session produced new output) —
+    real progress — so the consecutive-stuck streak resets to 1. Only a call that
+    returns the SAME result over and over grows the streak toward the limit. This
+    is what lets a model legitimately re-read a file it just edited or re-run a
+    check after a fix without being falsely blocked. `total` is a high absolute
+    backstop for tools whose output wobbles every call (timestamps, ids)."""
     history = getattr(_tool_call_history, "calls", None)
     if history is None:
         history = {}
         _tool_call_history.calls = history
-    history[sig] = history.get(sig, 0) + 1
-    return history[sig]
+    try:
+        fp = hash(json.dumps(result, sort_keys=True, default=str)[:200000])
+    except Exception:
+        fp = None
+    rec = history.get(sig) or {"streak": 0, "total": 0, "fp": None}
+    rec["total"] += 1
+    if fp is not None and rec.get("fp") == fp:
+        rec["streak"] += 1
+    else:
+        rec["streak"] = 1
+        rec["fp"] = fp
+    history[sig] = rec
 
 
 def invoke_tool(name: str, args: dict) -> dict:
@@ -12245,38 +12836,45 @@ def invoke_tool(name: str, args: dict) -> dict:
     if not t:
         # Surface the available names so a repair-retry round can fix a typo.
         return {"error": f"unknown tool: {name}", "available": sorted(TOOLS.keys())}
-    # Loop-breaker. The 4th identical call (same tool, same args) within a
-    # single turn returns a refusal explaining WHY retrying won't help. This
-    # is the backstop for any tool where the model gets stuck in a "must
-    # have been a glitch, try again" pattern — read_file truncation is the
-    # most common trigger but it can happen on list_directory, etc. too.
-    count = _record_tool_call(canon, args or {})
-    # Session tools are stateful — the same args legitimately return DIFFERENT
-    # output as the live process runs (the model polls session_read to wait for
-    # more), so the "identical call = stuck loop" guard must not apply to them.
-    if count > TOOL_REPEAT_LIMIT and not canon.startswith("session_"):
+    # Loop-breaker (result-aware). Refuse only when the SAME call has returned the
+    # SAME result TOOL_REPEAT_LIMIT times running — genuinely stuck, nothing
+    # moving. A changed result resets the streak (see _record_tool_result), so a
+    # model that re-reads a file it just edited, re-runs a check after a fix, or
+    # re-calls the same args because state actually moved is NOT blocked — that was
+    # the false-positive we kept hitting. `total` is a high absolute backstop for
+    # tools whose output wobbles every call. Session tools poll live state and are
+    # fully exempt.
+    sig = _tool_call_sig(canon, args or {})
+    streak, total = _tool_repeat_state(sig)
+    if not canon.startswith("session_") and (streak >= TOOL_REPEAT_LIMIT or total >= TOOL_REPEAT_HARD_LIMIT):
+        n = max(streak, total)
+        stuck = streak >= TOOL_REPEAT_LIMIT
         suggestions = []
         if canon == "read_file":
             suggestions.append("for large files, use `offset` to read the next chunk (see the `hint` field in the truncated response)")
         if canon == "list_directory":
             suggestions.append("if you need a deeper level, pass the subdirectory as `path`")
         suggestion_blob = (". " + "; ".join(suggestions)) if suggestions else ""
+        reason = ("returned the SAME result" if stuck else "been called")
         return {
             "error": (
-                f"refused: {canon} has been called {count} times this turn with the "
-                f"SAME arguments. Tool outputs are deterministic — repeating won't get "
-                f"different bytes back. Either change the arguments{suggestion_blob}, or "
-                f"end the turn and tell the user what you found so far."
+                f"refused: {canon} has {reason} {n} times this turn with the SAME "
+                f"arguments and nothing changed. Repeating won't help — change the "
+                f"arguments{suggestion_blob}, do something that actually moves the state "
+                f"(edit the file, apply the fix, then re-check), or end the turn and "
+                f"tell the user what you found so far."
             ),
-            "repeat_count": count,
+            "repeat_count": n,
             "tool": canon,
             "loop_breaker": True,
         }
     try:
-        return t["fn"](args or {})
+        result = t["fn"](args or {})
     except Exception as e:
         traceback.print_exc()
-        return {"error": str(e)}
+        result = {"error": str(e)}
+    _record_tool_result(sig, result)
+    return result
 
 
 # ---- tool-call parsing (fallback for models w/o native tools) -------------
@@ -13045,7 +13643,8 @@ def _estimate_context_tokens(chat_id: str) -> int:
     exact = _llama_tokenize(joined)
     total = exact if exact is not None else int(len(joined) / CHARS_PER_TOKEN)
     try:
-        total += _tools_spec_overhead_tokens(json.dumps(tools_for_llama(), ensure_ascii=False))
+        total += _tools_spec_overhead_tokens(json.dumps(
+            tools_for_llama(_rt_incl_exploit_for(chat, get_settings())), ensure_ascii=False))
     except Exception:
         pass
     total += img_count * 600  # vision tokens, matching _count_msg_tokens
@@ -13500,9 +14099,9 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
 
     _chat_emitters[chat_id] = emit
     cancel_ev = _register_cancel(chat_id)
-    # Fresh tool-call counter for this turn. The counter is checked by
-    # invoke_tool and trips when the same call repeats 4+ times — see
-    # _record_tool_call / TOOL_REPEAT_LIMIT for the loop-breaker logic.
+    # Fresh tool-call history for this turn. invoke_tool trips the loop-breaker
+    # only when the same call returns the SAME result TOOL_REPEAT_LIMIT times in a
+    # row — see _record_tool_result / _tool_repeat_state for the logic.
     _reset_tool_call_history()
     # Stash chat_id thread-locally so deep tool callers (e.g. _run_powershell
     # logging into cmd_history.jsonl) can tag entries with the originating
@@ -13574,10 +14173,14 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # server rejects with "exceeds context size". Use /tokenize for
             # an exact count (cached per spec) so the trimmer's budget reflects
             # what actually gets sent.
+            # Red-team phase gate, recomputed each round so a mid-turn
+            # validate_finding confirm (which flips _rt_chat's mission to the
+            # exploit phase below) widens the tools spec on the very next round.
+            _rt_incl_exploit = _rt_incl_exploit_for(_rt_chat, settings)
             tools_overhead = 0
             if use_tools and native_tools:
                 try:
-                    _tools_json = json.dumps(tools_for_llama(), ensure_ascii=False)
+                    _tools_json = json.dumps(tools_for_llama(_rt_incl_exploit), ensure_ascii=False)
                     tools_overhead = _tools_spec_overhead_tokens(_tools_json)
                 except Exception:
                     tools_overhead = 4096  # conservative fallback
@@ -13662,7 +14265,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # of these literal markers appears, instead of running to n_ctx.
             payload["stop"] = list(_TURN_BOUNDARY_STOPS)
             if use_tools and native_tools:
-                payload["tools"] = tools_for_llama()
+                payload["tools"] = tools_for_llama(_rt_incl_exploit)
                 payload["tool_choice"] = "auto"
 
             # Open the stream. If the prompt overflows n_ctx (--no-context-shift
@@ -14082,6 +14685,16 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     _t = _rt_target_from_args(name, args)
                     if _t and _rt_mission_note(_rt_chat, target=_t):
                         _rt_dirty = True
+                # Recon -> exploit: a validate_finding confirm (likely_real) means
+                # there is a real finding to breach, so unlock the heavier exploit
+                # subset for the rest of the run. The rt_phase event lets the UI
+                # show a subtle "exploit unlocked" marker (no attack-rail
+                # theatrics — those stay reserved for real exploitation / FLAGs).
+                if (_rt_on and name == "validate_finding"
+                        and isinstance(result, dict) and result.get("likely_real")):
+                    if _rt_mission_set_phase(_rt_chat, "exploit"):
+                        _rt_dirty = True
+                        emit({"type": "rt_phase", "phase": "exploit", "via": "validate_finding"})
                 # analysis tools produce large structured output (string lists,
                 # grep hit lists, disasm listings). Cap looser so the model can
                 # actually reason over the output. Chatty tools stay tight.
@@ -16298,7 +16911,13 @@ class Handler(BaseHTTPRequestHandler):
         # run_chat_turn's snapshot + persistence see it. See _rt_mission_*.
         if get_settings().get("red_team_enabled") and get_settings().get("rt_mission_state", True):
             try:
+                # Scope/auth panel data (Step 3) applied first so its explicit
+                # objective wins over the auto-seed from the run instruction.
+                _panel = body.get("mission")
+                _dirty = _rt_mission_apply_panel(chat, _panel) if isinstance(_panel, dict) else False
                 if _rt_mission_seed(chat, user_text):
+                    _dirty = True
+                if _dirty:
                     save_json(CHATS_FILE, chats)
             except Exception:
                 traceback.print_exc()
@@ -18237,15 +18856,22 @@ def _discord_start() -> None:
 
     intents = discord.Intents.default()
     intents.message_content = True  # requires Message Content Intent in the dev portal
+    intents.reactions = True        # ✅/❌ approval taps (in default already; explicit to be sure)
     client = discord.Client(intents=intents)
     _discord_state["client"] = client
     _discord_state["running"] = True
+    _discord_state["approval_listener_started"] = False   # reset per bot start
 
     @client.event
     async def on_ready():
         _discord_state["loop"] = client.loop
         print(f"[discord] connected as {client.user}. obeying owner id {owner_id}.", flush=True)
-        threading.Thread(target=_discord_approval_listener, args=(client,), daemon=True).start()
+        # on_ready fires again on every reconnect/resume — start the approval
+        # listener ONCE per bot run, or each reconnect stacks another listener
+        # thread and every approval gets DM'd multiple times.
+        if not _discord_state.get("approval_listener_started"):
+            _discord_state["approval_listener_started"] = True
+            threading.Thread(target=_discord_approval_listener, args=(client,), daemon=True).start()
 
     @client.event
     async def on_message(message):
@@ -18287,21 +18913,39 @@ def _discord_start() -> None:
         try:
             if str(payload.user_id) != owner_id:
                 return  # only the owner resolves approvals
+            emoji = str(payload.emoji)
+            is_yes, is_no = ("✅" in emoji), ("❌" in emoji)
+            if not (is_yes or is_no):
+                return
             with _discord_approvals_lock:
                 aid = _discord_approvals.get(payload.message_id)
-            emoji = str(payload.emoji)
+            # message_author_id is on the raw payload (discord.py 2.4+); lets us
+            # tell "stale approval prompt of ours" from "some other message".
+            own_msg = bool(client.user) and getattr(payload, "message_author_id", None) == client.user.id
             print(f"[discord] reaction user={payload.user_id} msg={payload.message_id} "
-                  f"emoji={emoji!r} matched_approval={aid}", flush=True)
+                  f"emoji={emoji!r} matched_approval={aid} own_msg={own_msg}", flush=True)
+
+            async def _reply(text):
+                try:
+                    owner = await client.fetch_user(int(owner_id))
+                    ch = owner.dm_channel or await owner.create_dm()
+                    await ch.send(text)
+                except Exception as _e:
+                    print(f"[discord] reaction reply failed: {_e}", flush=True)
+
             if not aid:
+                # No live approval for this message. Only speak up if it's clearly
+                # one of our own (stale) prompts, so a restart / timeout stops being
+                # a silent dead end instead of nagging on unrelated reactions.
+                if own_msg:
+                    await _reply("that approval is no longer active — the bridge restarted or it timed out. "
+                                 "re-run the action to get a fresh prompt.")
                 return
-            if "✅" in emoji:
-                decide_approval(aid, "approve")
-            elif "❌" in emoji:
-                decide_approval(aid, "deny")
-            else:
-                return
+            ok = decide_approval(aid, "approve" if is_yes else "deny")
             with _discord_approvals_lock:
                 _discord_approvals.pop(payload.message_id, None)
+            await _reply(("✅ approved — continuing." if is_yes else "❌ denied.") if ok
+                         else "that approval already resolved or expired.")
         except Exception as e:
             print(f"[discord] reaction error: {e}", flush=True)
 

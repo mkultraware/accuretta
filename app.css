@@ -1177,6 +1177,24 @@ button {
   0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 50%, transparent); }
   70%, 100% { box-shadow: 0 0 0 6px transparent; }
 }
+/* recon -> exploit phase marker: subtle chip appended to a recon card head when
+   the exploit gate opens. Cool accent, no red — the red rail stays for real
+   exploitation / FLAGs. */
+.rt-phase-badge {
+  margin-left: auto;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: 999px;
+  font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--accent);
+  background: var(--accent-subtle);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  white-space: nowrap;
+  animation: rt-phase-in .35s ease;
+}
+.rt-phase-badge .ph { font-size: 12px; }
+/* When both live status and the badge sit in the head, don't fight for margin. */
+.oc-head .oc-live + .rt-phase-badge, .ar-head .rt-phase-badge { margin-left: 8px; }
+@keyframes rt-phase-in { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
 .osint-card .oc-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 2px 12px 4px; }
 .osint-card .oc-cat {
   display: flex; align-items: center; gap: 9px; min-width: 0;
@@ -1580,8 +1598,39 @@ button {
   color: var(--fg);
 }
 .recon-input:focus { outline: none; border-color: var(--accent); }
+.recon-input + .recon-input { margin-top: 8px; }
 .recon-hint { font-size: 12px; color: var(--fg-subtle); line-height: 1.5; margin: 8px 0 16px; }
 .recon-actions { display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap; }
+#recon-panel .recon-label { margin-top: 16px; }
+#recon-panel > .recon-disclaimer + .recon-label,
+#recon-panel .recon-label:first-of-type { margin-top: 0; }
+.recon-opt { font-weight: 400; color: var(--fg-subtle); text-transform: none; letter-spacing: 0; }
+/* required authorization checkbox */
+.recon-check { display: flex; align-items: flex-start; gap: 9px; margin: 12px 0 4px; font-size: 13px; color: var(--fg); line-height: 1.45; cursor: pointer; }
+.recon-check input { position: absolute; opacity: 0; width: 0; height: 0; }
+.recon-check .custom-checkbox { margin-top: 1px; }
+.recon-check:hover .custom-checkbox { border-color: var(--accent); }
+.recon-check input:checked ~ .custom-checkbox { background: var(--accent); border-color: var(--accent); }
+.recon-check input:checked ~ .custom-checkbox::after { display: block; }
+.recon-check input:focus-visible ~ .custom-checkbox { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* preset chips (objective / constraints) */
+.recon-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.recon-chip {
+  padding: 5px 10px; border-radius: 999px; font-size: 12px; cursor: pointer;
+  border: 1px solid var(--border-strong); background: var(--bg-raised); color: var(--fg-muted);
+  transition: border-color .15s ease, background .15s ease, color .15s ease;
+}
+.recon-chip:hover { border-color: var(--accent); color: var(--fg); }
+.recon-chip.active { background: var(--accent-subtle); border-color: color-mix(in srgb, var(--accent) 55%, transparent); color: var(--accent); font-weight: 600; }
+/* wider-targeting notice when optional fields are blank */
+.recon-notice {
+  display: flex; gap: 8px; align-items: flex-start; margin: 14px 0 4px; padding: 9px 11px;
+  border-radius: 8px; font-size: 12px; line-height: 1.5; color: var(--fg-muted);
+  background: color-mix(in srgb, var(--warning) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 28%, transparent);
+}
+.recon-notice i { color: var(--warning); font-size: 15px; flex-shrink: 0; margin-top: 1px; }
+.recon-notice.hidden { display: none; }
 
 .modal-head {
   display: flex;
@@ -1866,6 +1915,10 @@ button {
   align-items: center;
   gap: 2px;
 }
+/* Plan toggle sits with the topbar actions but nudged left of the cluster, so
+   it reads as closer to the centre. Active = the plan panel is on screen. */
+#btn-toggle-plan { margin-right: 14px; }
+#plan-panel.plan-hidden { display: none; }
 
 .iconbtn {
   width: 26px;
@@ -6207,11 +6260,13 @@ body.is-mobile {
     bottom: 0;
   }
 
-  /* collapse theme, preview, desktop automation, and command history on mobile */
+  /* collapse theme, preview, desktop automation, command history, and the plan
+     toggle on mobile (same rule as the other desktop-only topbar actions) */
   #btn-theme,
   #btn-toggle-preview,
   #btn-session-desktop,
-  #btn-cmd-history {
+  #btn-cmd-history,
+  #btn-toggle-plan {
     display: none !important;
   }
 
