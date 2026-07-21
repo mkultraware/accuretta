@@ -10871,45 +10871,80 @@ body,
   max-width: 100%;
 }
 
-/* Attack Rail Compaction inside Deck */
+/* ---- Attack chain: sleek, thin, inline stepper (in-deck) ----
+   Nodes go inline (dot + label on one line) so the stage track is a single
+   ~18px row instead of a stacked column; the ACTIVE pill is dropped (redundant
+   with the active-dot glow); state changes and the pulse are eased so it reads
+   smooth rather than strobing. Roughly 40% shorter than the old card. */
+#revealer-deck .attack-rail {
+  padding: 6px 12px 5px;
+}
 #revealer-deck .attack-rail .ar-head {
-  margin-bottom: 4px;
+  margin-bottom: 5px;
 }
 #revealer-deck .attack-rail .ar-track {
-  gap: 2px;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
 }
 #revealer-deck .attack-rail .ar-node {
-  width: 54px;
-  gap: 3px;
+  width: auto;
+  flex: 0 0 auto;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
 }
 #revealer-deck .attack-rail .ar-dot {
-  width: 24px;
-  height: 24px;
+  width: 18px;
+  height: 18px;
   border-width: 1px;
+  transition: background .35s ease, border-color .35s ease, color .35s ease, box-shadow .35s ease;
 }
-#revealer-deck .attack-rail .ar-dot i {
+#revealer-deck .attack-rail .ar-dot i { font-size: 9px; }
+#revealer-deck .attack-rail .ar-label {
+  font-size: 10px;
+  white-space: nowrap;
+  transition: color .35s ease;
+}
+#revealer-deck .attack-rail .ar-active-badge { display: none; }
+#revealer-deck .attack-rail .ar-seg {
+  flex: 1;
+  align-self: center;
+  margin: 0;
+  height: 2px;
+  transition: background .4s ease;
+}
+/* softer active-dot pulse — a gentle breathing ring, not a strobe */
+#revealer-deck .attack-rail .ar-node.is-active .ar-dot {
+  box-shadow: 0 0 0 3px var(--accent-subtle);
+  animation: ar-glow-soft 2.2s ease-in-out infinite;
+}
+@keyframes ar-glow-soft {
+  0%, 100% { box-shadow: 0 0 0 3px var(--accent-subtle); }
+  50%      { box-shadow: 0 0 0 4px var(--accent-subtle), 0 0 12px -4px var(--accent); }
+}
+#revealer-deck .attack-rail .ar-pulse { width: 5px; height: 5px; }
+#revealer-deck .attack-rail .ar-activity-text { font-size: 10px; }
+#revealer-deck .attack-rail .ar-foot { display: none; }
+/* one slim current-action line */
+#revealer-deck .attack-rail .ar-activity {
+  margin-top: 6px;
+  padding: 4px 9px;
+  gap: 8px;
+  border-radius: 7px;
+}
+#revealer-deck .attack-rail .ar-banner {
+  margin-top: 5px;
+  padding: 5px 10px;
   font-size: 11px;
 }
-#revealer-deck .attack-rail .ar-label {
-  font-size: 9px;
-}
-#revealer-deck .attack-rail .ar-active-badge {
-  font-size: 7px;
-  padding: 1px 4px;
-  border-radius: 3px;
-}
-#revealer-deck .attack-rail .ar-seg {
-  margin-top: 11px;
-}
-#revealer-deck .attack-rail .ar-pulse {
-  width: 5px;
-  height: 5px;
-}
-#revealer-deck .attack-rail .ar-activity-text {
-  font-size: 10px;
-}
-#revealer-deck .attack-rail .ar-foot {
-  display: none;
+
+/* OSINT card fades out entirely once exploitation opens (attackRailToolStart). */
+#revealer-deck .osint-card.osint-dismiss {
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity .26s ease, transform .26s ease;
+  pointer-events: none;
 }
 
 /* OSINT Card Compaction inside Deck */

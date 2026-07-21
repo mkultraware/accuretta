@@ -188,62 +188,72 @@
   }
 
   // ---------- notifications & audio ----------
-  function playDing() {
+  // Smooth, modern chimes synthesized via Web Audio (no asset files). Soft
+  // attack + gentle exponential release through a warm lowpass = no clicks, no
+  // harsh beep. Gated by the Sound-notifications setting and debounced so a
+  // burst (rapid approvals) doesn't stutter.
+  let _lastSound = 0;
+  function soundOn() { return state.settings ? state.settings.sound_notifications !== false : true; }
+  function playChime(notes, vol) {
+    if (!soundOn()) return;
+    const now = performance.now();
+    if (now - _lastSound < 1200) return;
+    _lastSound = now;
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = "sine";
-      osc.frequency.setValueAtTime(1046.50, ctx.currentTime); // C6
-      gain.gain.setValueAtTime(0.2, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.6);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start();
-      osc.stop(ctx.currentTime + 0.6);
-    } catch(e) {}
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AC();
+      const master = ctx.createGain();
+      master.gain.value = vol || 0.16;
+      const lp = ctx.createBiquadFilter();
+      lp.type = "lowpass"; lp.frequency.value = 2600; lp.Q.value = 0.7;
+      master.connect(lp); lp.connect(ctx.destination);
+      const t0 = ctx.currentTime;
+      let end = t0;
+      notes.forEach(n => {
+        const st = t0 + (n.t || 0), dur = n.dur || 0.5;
+        const osc = ctx.createOscillator();
+        osc.type = "sine"; osc.frequency.value = n.f;
+        const osc2 = ctx.createOscillator();   // faint detuned layer for warmth
+        osc2.type = "triangle"; osc2.frequency.value = n.f; osc2.detune.value = 6;
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.0001, st);
+        g.gain.exponentialRampToValueAtTime(1, st + 0.015);
+        g.gain.exponentialRampToValueAtTime(0.0001, st + dur);
+        osc.connect(g); osc2.connect(g); g.connect(master);
+        osc.start(st); osc2.start(st);
+        osc.stop(st + dur + 0.05); osc2.stop(st + dur + 0.05);
+        end = Math.max(end, st + dur);
+      });
+      setTimeout(() => { try { ctx.close(); } catch (e) {} }, (end - t0) * 1000 + 300);
+    } catch (e) {}
   }
+  // gentle rising "attention" for approvals (C5 -> G5)
+  function playApprovalSound() { playChime([{ f: 523.25, t: 0, dur: 0.28 }, { f: 783.99, t: 0.13, dur: 0.5 }], 0.15); }
+  // warm resolving triad when a long task finishes (C5 -> E5 -> G5)
+  function playCompletionSound() { playChime([{ f: 523.25, t: 0, dur: 0.22 }, { f: 659.25, t: 0.1, dur: 0.22 }, { f: 783.99, t: 0.2, dur: 0.6 }], 0.14); }
 
-  function notifyCompletion() {
-    if (document.visibilityState === "visible") return;
-    playDing();
-    if (Notification.permission === "granted") {
-      const n = new Notification("Accuretta", { body: "Agent finished generating.", icon: "logo-mark-dark.png" });
-      n.onclick = () => { window.focus(); n.close(); };
-    } else if (Notification.permission === "default") {
-      Notification.requestPermission();
+  function notifyApproval() {
+    playApprovalSound();   // always audible (when enabled) — approvals are the point
+    if (document.visibilityState !== "visible") {
+      if (Notification.permission === "granted") {
+        const n = new Notification("Accuretta needs approval", { body: "The agent is waiting for your permission.", icon: "logo-mark-dark.png" });
+        n.onclick = () => { window.focus(); n.close(); };
+      } else if (Notification.permission === "default") {
+        Notification.requestPermission();
+      }
     }
   }
 
-  function playApprovalDing() {
-    try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const playTone = (freq, time, dur) => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = "sine";
-        osc.frequency.setValueAtTime(freq, time);
-        gain.gain.setValueAtTime(0.1, time);
-        gain.gain.exponentialRampToValueAtTime(0.01, time + dur);
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start(time);
-        osc.stop(time + dur);
-      };
-      // A soft double-knock/chime (C5 then E5)
-      playTone(523.25, ctx.currentTime, 0.3);
-      playTone(659.25, ctx.currentTime + 0.15, 0.4);
-    } catch(e) {}
-  }
-
-  function notifyApproval() {
-    if (document.visibilityState === "visible") return;
-    playApprovalDing();
-    if (Notification.permission === "granted") {
-      const n = new Notification("Accuretta Needs Approval", { body: "The agent requires your permission to proceed.", icon: "logo-mark-dark.png" });
-      n.onclick = () => { window.focus(); n.close(); };
-    } else if (Notification.permission === "default") {
-      Notification.requestPermission();
+  // Chime only for a genuinely longer task, not every quick reply. durMs = turn length.
+  function notifyCompletion(durMs) {
+    if ((durMs || 0) >= 20000) playCompletionSound();
+    if (document.visibilityState !== "visible") {
+      if (Notification.permission === "granted") {
+        const n = new Notification("Accuretta", { body: "The agent finished.", icon: "logo-mark-dark.png" });
+        n.onclick = () => { window.focus(); n.close(); };
+      } else if (Notification.permission === "default") {
+        Notification.requestPermission();
+      }
     }
   }
 
@@ -3339,7 +3349,7 @@
       setStreamingUI(false);
       await loadChats();
       renderChatList();
-      notifyCompletion();
+      notifyCompletion(agentRow._workStart ? Date.now() - agentRow._workStart : 0);
     }
   }
 
@@ -3918,12 +3928,20 @@
     rail.dataset.recondone = "1";
     if (+rail.dataset.active < 1) rail.dataset.active = "1";
     renderRail(rail);
+    // Recon is behind us once exploitation opens — dismiss the OSINT card
+    // entirely (smooth fade) so it doesn't linger above the attack chain.
+    const osint = osintCard(row);
+    if (osint && !osint.dataset.dismissed) {
+      osint.dataset.dismissed = "1";
+      osint.classList.add("osint-dismiss");
+      setTimeout(() => osint.remove(), 280);
+    }
   }
   function attackRailBreach(row, stage) {
     // Only advance a chain that exploitation already opened. A breach during a
     // recon-only/OSINT run (e.g. an injection PROBE flagging a candidate) should
     // not conjure the whole kill-chain — the finding still shows in the timeline.
-    const rail = row.querySelector(".attack-rail");
+    const rail = (row && row.querySelector(".attack-rail")) || document.querySelector("#revealer-deck .attack-rail");
     if (!rail) return;
     const raw = Math.max(1, parseInt(stage, 10) || 1);
     // dataset.flags (capped at 3) drives the 4-node visual; flagsraw is the
@@ -3985,6 +4003,12 @@
     if (name.startsWith("mcp_osint")) return "intel";
     for (const c of OSINT_CATS) if (c.tools.includes(name)) return c.key;
     return null;
+  }
+  // ensureOsintCard appends the card to #revealer-deck, so result/finalize
+  // callers must look there too — not only inside `row`. That mismatch is why
+  // the tiles used to stay at 0 while recon actually returned findings.
+  function osintCard(row) {
+    return (row && row.querySelector(".osint-card")) || document.querySelector("#revealer-deck .osint-card");
   }
   // Best-effort "how much did this source return" — biggest array or a count-ish
   // number in the result. Falls back to 1 (one source queried, nothing counted).
@@ -4064,8 +4088,8 @@
   }
   function osintCardToolResult(row, name, res) {
     const cat = osintCatForTool(name);
-    if (!cat || !row) return;
-    const card = row.querySelector(".osint-card");
+    if (!cat) return;
+    const card = osintCard(row);
     if (!card) return;
     const tile = card.querySelector(`.oc-cat[data-cat="${cat}"]`);
     if (!tile) return;
@@ -4083,7 +4107,7 @@
     if (tn) tn.textContent = String(total);
   }
   function osintCardFinalize(row) {
-    const card = row && row.querySelector(".osint-card");
+    const card = osintCard(row);
     if (!card) return;
     card.classList.remove("is-running");
     card.classList.add("is-done");
@@ -6369,9 +6393,9 @@
               <span>Allow shell commands</span>
             </label>
             <label class="permission-option-label">
-              <input type="checkbox" id="perm-remember-subfolder">
+              <input type="checkbox" id="perm-remember-session">
               <span class="custom-checkbox"></span>
-              <span>Remember for this subfolder</span>
+              <span>Remember this action for this session</span>
             </label>
           </div>
           <div class="permissions-actions">
@@ -6390,18 +6414,15 @@
           // Toggle shell auto-approve if needed
         });
       }
-      const subfolderCheckbox = card.querySelector("#perm-remember-subfolder");
-      if (subfolderCheckbox) {
-        subfolderCheckbox.addEventListener("change", (e) => {
-          // Toggle remember subfolder if needed
-        });
-      }
-      
       // Bind BOTH the head quick-actions and the body buttons. stopPropagation
-      // keeps a head click from toggling the card's collapse.
+      // keeps a head click from toggling the card's collapse. When "remember this
+      // action for this session" is ticked, approve with always=true so the
+      // bridge session-allows this action kind (request_approval auto-approves the
+      // same kind for the rest of the session — e.g. rapid browser MCP actions).
       card.querySelectorAll('[data-act="approve"]').forEach(b => b.addEventListener("click", (e) => {
         e.stopPropagation();
-        decideApproval(a.id, "approve");
+        const remember = !!card.querySelector("#perm-remember-session")?.checked;
+        decideApproval(a.id, "approve", remember);
       }));
       card.querySelectorAll('[data-act="deny"]').forEach(b => b.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -7101,6 +7122,7 @@
 
     // desktop automation
     $("#sw-desktop-enabled")?.classList.toggle("on", !!s.desktop_enabled);
+    $("#sw-sound-notifications")?.classList.toggle("on", s.sound_notifications !== false);
     $("#sw-red-team-enabled")?.classList.toggle("on", !!s.red_team_enabled);
     $("#sw-rt-force-exploit")?.classList.toggle("on", !!s.rt_force_exploit);
     $("#sw-discord-enabled")?.classList.toggle("on", !!s.discord_enabled);
@@ -7185,6 +7207,7 @@
       theme: ($("#set-theme")?.value || "light"),
       allow_web_preview: $("#sw-web").classList.contains("on"),
       desktop_enabled: $("#sw-desktop-enabled")?.classList.contains("on") || false,
+      sound_notifications: $("#sw-sound-notifications")?.classList.contains("on") ?? true,
       red_team_enabled: $("#sw-red-team-enabled")?.classList.contains("on") || false,
       rt_force_exploit: $("#sw-rt-force-exploit")?.classList.contains("on") || false,
       discord_enabled: $("#sw-discord-enabled")?.classList.contains("on") || false,
@@ -8607,6 +8630,13 @@
       e.currentTarget.classList.toggle("on");
       saveSettings({ desktop_enabled: e.currentTarget.classList.contains("on") });
       toast("desktop setting saved", "ok", 1500);
+    });
+    $("#sw-sound-notifications")?.addEventListener("click", (e) => {
+      const on = e.currentTarget.classList.toggle("on");
+      if (state.settings) state.settings.sound_notifications = on;   // so the preview chime respects it now
+      saveSettings({ sound_notifications: on });
+      if (on) { _lastSound = 0; playApprovalSound(); }   // preview the chime when turning on
+      toast(on ? "sound notifications on" : "sound notifications off", "ok", 1500);
     });
     $("#sw-red-team-enabled")?.addEventListener("click", (e) => {
       e.currentTarget.classList.toggle("on");

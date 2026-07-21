@@ -536,6 +536,7 @@ DEFAULT_SETTINGS = {
     "frequency_penalty": 0.0,
     "keep_alive": "30m",
     "theme": "light",
+    "sound_notifications": True,    # smooth chimes for approvals + long-task completion
     "auto_approve_read": True,
     "auto_approve_write": False,    # trust writes: skip approval for in-workspace file writes/edits (registry/system/powershell still always prompt)
     "allow_web_preview": True,
@@ -1024,6 +1025,132 @@ def _rt_target_from_args(name: str, args: dict) -> str:
         if isinstance(v, str) and v.strip():
             return _rt_url_host(v)
     return ""
+
+
+# ---- red-team scope enforcement (HARD, not advisory) -----------------------
+# The mission's scope line is only a hint to the model, and models routinely
+# wander onto localhost services. These guards make the tools REFUSE to touch
+# accuretta's own bridge / llama.cpp ports, or any host/port the user marked
+# out of scope, regardless of what the model decides.
+
+def _rt_self_ports() -> set[int]:
+    """Ports that belong to accuretta itself — never a red-team target."""
+    ports = {int(PORT)}
+    for u in (LLAMA, VISION_LLAMA):
+        try:
+            p = urllib.parse.urlparse(u).port
+            if p:
+                ports.add(int(p))
+        except Exception:
+            pass
+    return ports
+
+
+def _rt_is_local_host(host: str) -> bool:
+    """Loopback / private / this machine — where our own services live."""
+    host = (host or "").lower().strip().strip("[]")
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "", "host.docker.internal"):
+        return True
+    if host.endswith(".local"):
+        return True
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_loopback or ip.is_private or ip.is_link_local
+    except ValueError:
+        pass
+    try:
+        if host == socket.gethostname().lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _rt_endpoint_from_args(args: dict) -> tuple[str, int | None]:
+    """(host, port) a red-team tool is aimed at. port None when unspecified."""
+    if not isinstance(args, dict):
+        return "", None
+    raw = ""
+    for k in ("url", "base_url", "target", "host", "endpoint", "origin"):
+        v = args.get(k)
+        if isinstance(v, str) and v.strip():
+            raw = v.strip()
+            break
+    if not raw:
+        return "", None
+    s = raw if "://" in raw else "//" + raw
+    host, port = "", None
+    try:
+        sp = urllib.parse.urlsplit(s)
+        host = (sp.hostname or "").lower()
+        port = sp.port
+    except Exception:
+        host = raw.split("/", 1)[0].split(":", 1)[0].lower()
+    if port is None and args.get("port") not in (None, ""):
+        try:
+            port = int(args.get("port"))
+        except Exception:
+            pass
+    if port is None and "://" in raw:
+        port = 443 if raw.lower().startswith("https") else 80
+    return host, port
+
+
+def _rt_scope_out_tokens(chat: dict | None) -> list[str]:
+    """Out-of-scope tokens (hosts and/or bare ports) parsed from mission.scope's
+    'out:' segment. Only fires when an explicit out list was declared."""
+    m = _rt_mission_get(chat) if isinstance(chat, dict) else None
+    scope = str((m or {}).get("scope", "")) if m else ""
+    low = scope.lower()
+    if "out:" not in low:
+        return []
+    seg = scope[low.index("out:") + 4:]
+    toks = []
+    for t in re.split(r"[,\s|]+", seg):
+        t = re.sub(r"^https?://", "", t.strip().strip("/")).lower()
+        if t and t not in ("out", "in", "scope"):
+            toks.append(t)
+    return toks
+
+
+def _rt_tok_matches(tok: str, host: str, port: int | None) -> bool:
+    tok = tok.strip()
+    if not tok:
+        return False
+    if tok.isdigit():                      # bare port
+        return port is not None and int(tok) == port
+    if ":" in tok:                         # host:port
+        th, tp = tok.rsplit(":", 1)
+        if tp.isdigit():
+            return (host == th or host.endswith("." + th)) and port == int(tp)
+    return host == tok or host.endswith("." + tok)   # host / parent domain
+
+
+def _rt_scope_block(name: str, args: dict) -> str | None:
+    """Refusal reason if this red-team call is aimed at accuretta's own infra or
+    an out-of-scope host/port; None if it is allowed."""
+    host, port = _rt_endpoint_from_args(args)
+    if not host:
+        return None
+    if _rt_is_local_host(host) and port in _rt_self_ports():
+        svc = "bridge" if int(port) == int(PORT) else "llama.cpp server"
+        return (f"refused: {host}:{port} is accuretta's OWN {svc}. Red-team tools "
+                f"never touch the app's own infrastructure. Aim at the target "
+                f"(e.g. the challenge on its own port), not localhost:{port}.")
+    try:
+        # invoke_tool runs on a worker via copy_context(), so read the chat id
+        # from the CONTEXTVAR (propagates), not the thread-local _get_current_chat.
+        chat_id = _current_chat_id.get() or ""
+        chat = (get_chats().get("chats", {}) or {}).get(chat_id) if chat_id else None
+    except Exception:
+        chat = None
+    for tok in _rt_scope_out_tokens(chat):
+        if _rt_tok_matches(tok, host, port):
+            where = f"{host}:{port}" if port else host
+            return (f"refused: {where} is OUT OF SCOPE (you marked '{tok}' out of "
+                    f"scope). Stay on the in-scope target.")
+    return None
 
 
 def _rt_mission_get(chat: dict) -> dict | None:
@@ -8048,6 +8175,12 @@ def tool_recon_port_scan(args: dict) -> dict:
             return {"error": "ports must be a list of integers"}
     else:
         port_list = list(_RECON_TOP_PORTS)
+    # Never probe accuretta's own bridge/llama ports on a local scan — that's the
+    # "sniffing around my own ports" problem. Only strips them for local targets;
+    # a remote host's 8080 is fair game.
+    if _rt_is_local_host(host) or _rt_is_local_host(target_ip):
+        _self = _rt_self_ports()
+        port_list = [p for p in port_list if p not in _self]
     random.shuffle(port_list)  # randomized order = less obvious sweep pattern
     timeout = max(0.3, min(float(args.get("timeout") or 1.5), 5.0))
     concurrency = max(1, min(int(args.get("concurrency") or 8), 32))
@@ -10867,21 +11000,24 @@ def _load_mcp_servers():
             # prefix tool name to avoid collisions
             prefixed_name = f"mcp_{server_name}_{tool_name}"
             
-            def make_tool_callable(mcp_client, name, desc):
+            def make_tool_callable(mcp_client, name, desc, kind):
                 def wrapper(args: dict):
-                    # ALWAYS APPROVAL GATE MCP TOOLS
+                    # ALWAYS APPROVAL GATE MCP TOOLS. `kind` is the stable
+                    # prefixed tool name so "remember this action for this session"
+                    # (approve with always=true) session-allows THIS mcp tool and
+                    # auto-approves its repeats — the rapid browser-MCP case.
                     appr = request_approval(
                         title=f"MCP: {name}",
                         command=f"Execute {name} via {mcp_client.name}",
-                        details={"Arguments": args}
+                        details={"kind": kind, "Arguments": args}
                     )
                     if appr.get("decision") != "approve":
                         return {"error": "User denied action.", "reason": appr.get("reason", "")}
-                        
+
                     response = mcp_client.call_tool(name, args)
                     if "error" in response:
                         return {"error": response['error']}
-                        
+
                     content = response.get("result", {}).get("content", [])
                     return "\n".join(item.get("text", "") for item in content if item.get("type") == "text")
                 return wrapper
@@ -10890,7 +11026,7 @@ def _load_mcp_servers():
             TOOLS[prefixed_name] = {
                 "description": f"[MCP: {server_name}] {tool_def.get('description', '')}. Requires user approval.",
                 "parameters": tool_def.get("inputSchema", {}),
-                "fn": make_tool_callable(client, tool_name, tool_def.get('description', '')),
+                "fn": make_tool_callable(client, tool_name, tool_def.get('description', ''), prefixed_name),
             }
             # Add to analysis tool names so it's registered
             _ANALYSIS_TOOL_NAMES.add(prefixed_name)
@@ -12836,6 +12972,13 @@ def invoke_tool(name: str, args: dict) -> dict:
     if not t:
         # Surface the available names so a repair-retry round can fix a typo.
         return {"error": f"unknown tool: {name}", "available": sorted(TOOLS.keys())}
+    # HARD scope guard for red-team tools: refuse accuretta's own bridge/llama
+    # ports and any user-declared out-of-scope host/port BEFORE running. The
+    # model's judgement is advisory; this is not.
+    if canon in _RED_TEAM_TOOL_NAMES:
+        _blk = _rt_scope_block(canon, args or {})
+        if _blk:
+            return {"error": _blk, "scope_blocked": True, "tool": canon}
     # Loop-breaker (result-aware). Refuse only when the SAME call has returned the
     # SAME result TOOL_REPEAT_LIMIT times running — genuinely stuck, nothing
     # moving. A changed result resets the streak (see _record_tool_result), so a
@@ -13891,6 +14034,13 @@ you may occasionally append exactly one of these to the absolute end of your res
                 "\"0 flags\". only cite a FLAG{...} if a tool result actually contains one."
             )
             parts.append(
+                f"scope: NEVER target accuretta's own infrastructure — the bridge "
+                f"(localhost:{PORT}) and the llama.cpp server(s) ({', '.join(str(p) for p in sorted(_rt_self_ports()))}). "
+                "stay within the in-scope target and honor any hosts/ports marked out "
+                "of scope. the tools hard-refuse these regardless, so aiming at them "
+                "just wastes a turn."
+            )
+            parts.append(
                 "recon vs attack: when the user asks to \"look around\", \"see what you "
                 "can find\", do \"OSINT\", or \"recon\" a target, stay PASSIVE — DNS, "
                 "whois, cert transparency, subdomain enumeration, TLS/HTTP fingerprint, "
@@ -13907,7 +14057,10 @@ you may occasionally append exactly one of these to the absolute end of your res
                 "and — most importantly — unpacking or analyzing UNTRUSTED files pulled back from "
                 "a target (firmware images, malware samples, archives), so a booby-trapped file "
                 "cannot compromise the host. The workspace is visible inside at /mnt/<drive>/... ; "
-                "pass cwd as a Windows path. Ordinary host tasks still use run_powershell."
+                "pass cwd as a Windows path. It has real tools installed (binwalk -e extraction "
+                "works, plus 7z/unsquashfs/mtd-utils, sqlmap, nmap, etc.) — use them, don't hand-"
+                "roll a replacement; if a tool errors, fix the invocation. Ordinary host tasks "
+                "still use run_powershell."
             )
 
     # === MEMORIES (most useful only, not all) ===
@@ -15177,8 +15330,31 @@ SANDBOX_ROOTFS_URLS = [
 # apt-install more on demand once the guest is up.
 SANDBOX_APT_TOOLS = [
     "ca-certificates", "curl", "wget", "git", "python3", "python3-pip",
-    "file", "unzip", "xxd", "binutils", "binwalk", "sqlmap", "nmap",
+    "file", "unzip", "zip", "xxd", "binutils", "binwalk", "sqlmap", "nmap",
+    # extraction backends binwalk needs — these are apt "recommends" that
+    # --no-install-recommends drops, which is why `binwalk -e` used to unpack
+    # nothing (p7zip -> 7z archives, mtd-utils -> jffs2, squashfs-tools ->
+    # unsquashfs). jq for parsing tool output.
+    "p7zip-full", "mtd-utils", "squashfs-tools", "jq",
 ]
+
+# binwalk 2.x refuses to run its extraction utilities as root unless you pass
+# --run-as=root — and the sandbox runs as root, so the natural `binwalk -e
+# firmware.bin` throws a Python traceback and the model gives up and reinvents
+# extraction by hand. This wrapper, dropped ahead of /usr/bin in PATH, injects
+# --run-as=root for extraction so the tool just works.
+_SBX_BINWALK_WRAPPER = (
+    "#!/bin/bash\n"
+    "need=0; has_runas=0\n"
+    "for a in \"$@\"; do case \"$a\" in\n"
+    "  -e|--extract|-M|--matryoshka|--dd|--dd=*) need=1 ;;\n"
+    "  --run-as=*) has_runas=1 ;;\n"
+    "esac; done\n"
+    "if [ \"$need\" = 1 ] && [ \"$has_runas\" = 0 ] && [ \"$(id -u)\" = 0 ]; then\n"
+    "  exec /usr/bin/binwalk --run-as=root \"$@\"\n"
+    "fi\n"
+    "exec /usr/bin/binwalk \"$@\"\n"
+)
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 SANDBOX_LOCK = threading.Lock()
@@ -15439,6 +15615,7 @@ def _sbx_provision_thread(reinstall: bool = False) -> None:
         save_json(SANDBOX_STATE_FILE, {"provisioned": False, "distro": SANDBOX_DISTRO,
                                        "updated": time.time()})
         tools = " ".join(SANDBOX_APT_TOOLS)
+        wrap_b64 = _b64.b64encode(_SBX_BINWALK_WRAPPER.encode("utf-8")).decode("ascii")
         script = (
             "set -e; export DEBIAN_FRONTEND=noninteractive; "
             # A fresh Ubuntu cloud rootfs ships /etc/resolv.conf as a symlink to a
@@ -15450,7 +15627,17 @@ def _sbx_provision_thread(reinstall: bool = False) -> None:
             "printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf; "
             "echo '== apt-get update =='; apt-get update; "
             f"echo '== installing: {tools} =='; "
-            f"apt-get install -y --no-install-recommends {tools}; "
+            # Resilient: if the batch install fails (one unavailable package used
+            # to abort the WHOLE toolset under set -e, leaving the guest bare),
+            # fall back to installing each package on its own so a single miss
+            # doesn't cost every other tool.
+            f"apt-get install -y --no-install-recommends {tools} || "
+            f"{{ echo '== batch failed; installing individually =='; "
+            f"for p in {tools}; do apt-get install -y --no-install-recommends \"$p\" "
+            f"|| echo \"WARN: $p unavailable\"; done; }}; "
+            # Drop the binwalk root-extraction wrapper ahead of /usr/bin.
+            f"echo {wrap_b64} | base64 -d > /usr/local/bin/binwalk "
+            "&& chmod +x /usr/local/bin/binwalk && echo '== binwalk wrapper installed =='; "
             "apt-get clean; echo PROVISION_DONE"
         )
         _sbx_stream_provision(script, timeout=1800)
@@ -15518,9 +15705,14 @@ def sandbox_selftest() -> dict:
         return {"ok": False, "state": probe["state"],
                 "error": "sandbox not ready - set it up first."}
     rc, out = _wsl_in(SANDBOX_DISTRO,
-                      "uname -a; echo '---'; for t in python3 nmap sqlmap binwalk file git; do "
-                      "printf '%-10s ' \"$t\"; (command -v $t || echo 'missing'); done",
-                      timeout=60)
+                      "uname -a; echo '--- tools ---'; "
+                      "for t in python3 nmap sqlmap binwalk 7z unsquashfs file xxd jq git curl; do "
+                      "printf '%-10s ' \"$t\"; (command -v $t >/dev/null && echo ok || echo MISSING); done; "
+                      # prove binwalk extraction actually works as root (the wrapper fix)
+                      "echo '--- binwalk extract ---'; d=$(mktemp -d); echo probe | gzip > \"$d/t.gz\"; "
+                      "(cd \"$d\" && binwalk -e t.gz >/dev/null 2>&1 && ls _t.gz.extracted >/dev/null 2>&1 "
+                      "&& echo 'binwalk -e OK' || echo 'binwalk -e FAILED'); rm -rf \"$d\"",
+                      timeout=90)
     return {"ok": rc == 0, "output": (out or "").strip()[-4000:], "exit_code": rc}
 
 
@@ -15578,15 +15770,20 @@ def tool_sandbox_run(args: dict) -> dict:
 TOOLS["sandbox_run"] = {
     "description": (
         "Run a shell command inside an ISOLATED Ubuntu Linux guest (kernel-isolated "
-        "from the host via WSL2). Use this for anything that shouldn't touch the host "
-        "directly: running offensive/recon tools (nmap, sqlmap, binwalk), and — most "
-        "importantly — unpacking or analyzing UNTRUSTED files pulled back from a target "
-        "(firmware images, malware samples, archives) so a booby-trapped file can't "
-        "compromise the user's machine. The user's workspace is visible inside the guest "
-        "at /mnt/<drive>/... ; pass `cwd` as a normal Windows path and it is translated. "
-        "Runs as root. Read-only commands run freely; write/modify commands require approval; "
-        "commands that would wipe a drive are refused. Preinstalled: python3, nmap, sqlmap, "
-        "binwalk, binutils, file, xxd, unzip, git, curl (apt-get more as needed)."
+        "from the host via WSL2), as root. Use it for anything that shouldn't touch "
+        "the host directly: offensive/recon tools, and most importantly unpacking or "
+        "analyzing UNTRUSTED files pulled back from a target (firmware, malware, "
+        "archives) so a booby-trapped file can't compromise the user's machine. The "
+        "workspace is visible at /mnt/<drive>/... ; pass `cwd` as a Windows path and "
+        "it is translated. Read-only commands run freely; write/modify need approval; "
+        "drive-wipes are refused. "
+        "PREINSTALLED and working — USE THESE, do not write your own replacement for a "
+        "tool that is already here: python3/pip3, nmap, sqlmap, binwalk (extraction "
+        "works: `binwalk -e file` runs its extractors as root automatically), file, "
+        "xxd, strings, binutils, unzip/zip, 7z (p7zip), unsquashfs + mtd-utils "
+        "(squashfs/jffs2), git, curl, wget, jq, nc, dig, openssl. `apt-get install -y "
+        "<pkg>` for anything else. If a tool errors, read the error and fix the "
+        "invocation rather than reimplementing the tool by hand."
     ),
     "parameters": {
         "type": "object",

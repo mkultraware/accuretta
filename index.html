@@ -24,7 +24,7 @@
     document.documentElement.setAttribute('data-theme', theme);
   })();
 </script>
-<link rel="stylesheet" href="/app.css?v=19">
+<link rel="stylesheet" href="/app.css?v=21">
 <script src="https://unpkg.com/@phosphor-icons/web"></script>
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer></script>
@@ -51,7 +51,7 @@
         <img class="brand-mark brand-mark-light" src="/logo-mark-light.png" alt="" aria-hidden="true">
         <img class="brand-mark brand-mark-dark" src="/logo-mark-dark.png" alt="" aria-hidden="true">
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.6.7</span>
+        <span class="v" id="brand-v">v0.6.8</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -772,6 +772,15 @@
       <button class="btn sm" id="btn-run-setup-wizard" type="button"><i class="ph ph-magic-wand"></i>Run Setup Wizard</button>
     </div>
 
+    <div class="form-group">Notifications</div>
+    <div class="form-row">
+      <span class="hint">a soft chime when the agent needs your approval, and when a longer task (20s+) finishes. off = silent.</span>
+    </div>
+    <div class="form-row inline">
+      <label>Sound notifications</label>
+      <div class="sw" id="sw-sound-notifications"></div>
+    </div>
+
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
       <span>Machine context</span>
       <span class="grow" style="flex:1;"></span>
@@ -972,7 +981,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
-<script src="/app.js?v=202607172400"></script>
+<script src="/app.js?v=202607211700"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {
