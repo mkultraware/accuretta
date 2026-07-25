@@ -51,7 +51,7 @@
         <img class="brand-mark brand-mark-light" src="/logo-mark-light.png" alt="" aria-hidden="true">
         <img class="brand-mark brand-mark-dark" src="/logo-mark-dark.png" alt="" aria-hidden="true">
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.6.8</span>
+        <span class="v" id="brand-v">v0.6.9</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -542,9 +542,6 @@
   </div>
 </aside>
 
-<!-- ====== APPROVAL STACK ====== -->
-<div class="approval-stack" id="approval-stack"></div>
-
 <!-- ====== SETTINGS DRAWER ====== -->
 <!-- ====== COMMAND PALETTE (⌘K) ====== -->
 <div class="palette-scrim hidden" id="palette-scrim"></div>
@@ -813,6 +810,17 @@
     </div>
     <div class="form-row">
       <span class="hint">skips the recon-to-exploit gate: offers the break-in tools (http_request, sql_injection, jwt_tool, fuzz, batch_probe, tcp_send, auth spray) from the first turn instead of waiting for a validate_finding confirm. use when the model won't validate on its own. adds ~2,200 tokens per turn while on.</span>
+    </div>
+
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+      <span>Analysis tools</span>
+    </div>
+    <div class="form-row">
+      <span class="hint">adds the reverse-engineering / forensics suite — APK, binary, firmware &amp; forensics scanners (scan_apk, decompile_apk, ghidra_analyze, binary_inspect, disasm_at, binwalk_scan, yara_scan, parse_evtx, analyze_pcap, scan_secrets, etc.) — to the model's toolset. off by default so normal coding turns don't carry the extra tool schemas.</span>
+    </div>
+    <div class="form-row inline">
+      <label>Enable analysis tools</label>
+      <div class="sw" id="sw-analysis-tools-enabled"></div>
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">

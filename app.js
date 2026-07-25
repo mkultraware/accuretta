@@ -398,60 +398,6 @@
   // mark — keeps theme toggling instant with no fetch lag.
   const AGENT_AVATAR_HTML = `<div class="avatar"><img class="avatar-mark avatar-mark-light" src="logo-mark-light.png" alt="" aria-hidden="true" draggable="false"><img class="avatar-mark avatar-mark-dark" src="logo-mark-dark.png" alt="" aria-hidden="true" draggable="false"></div>`;
 
-  function getOrCreateToolGroup(stack) {
-    // ONE group per agent turn, period. The toolStack itself is created fresh
-    // for each new agent row, so this naturally scopes to the turn. No more
-    // sealing-and-recreating between tool calls (the source of the vertical
-    // pill stack the user complained about).
-    let group = stack.querySelector(".tool-group");
-    if (group) return { group, body: group.querySelector(".tool-group-body") };
-    group = document.createElement("div");
-    group.className = "tool-group collapsed";   /* always starts minimized; user clicks the head to expand */
-    group.innerHTML = `
-      <div class="tool-group-head">
-        <span class="tool-group-icon spinning">${WRENCH_SVG}</span>
-        <span class="tool-group-activity">working…</span>
-        <span class="tool-mcp-badge" hidden title="Runs through an external MCP server">MCP</span>
-        <span class="tool-group-chips" hidden></span>
-        <span class="tool-group-summary" hidden></span>
-        <i class="ph ph-caret-down chevron"></i>
-      </div>
-      <div class="tool-group-body"></div>`;
-    const head = group.querySelector(".tool-group-head");
-    head.addEventListener("click", () => group.classList.toggle("collapsed"));
-    stack.appendChild(group);
-    return { group, body: group.querySelector(".tool-group-body") };
-  }
-
-  // Update the head to reflect the most-recently-started running tool: swap
-  // the icon to that tool's actual SVG and update the activity label. This is
-  // what gives the "tool icon refreshes as the model chains tools" behavior
-  // — no permanent wrench placeholder, the head IS the live tool.
-  function updateToolGroupActivity(group, evt) {
-    if (!group || !evt) return;
-    const activity = group.querySelector(".tool-group-activity");
-    const iconSlot = group.querySelector(".tool-group-icon");
-    const mcpBadge = group.querySelector(".tool-mcp-badge");
-    if (mcpBadge) mcpBadge.hidden = !(evt.name && String(evt.name).startsWith("mcp_"));
-    if (activity) {
-      activity.classList.add("shimmer");
-      activity.textContent = toolLabel(evt.name, evt.arguments).replace(/…$/, "");
-    }
-    if (iconSlot) {
-      // Swap with a brief fade so chained tools visibly "refresh" rather
-      // than snap-replace.
-      iconSlot.classList.remove("icon-in");
-      iconSlot.classList.add("icon-out");
-      const map = TOOL_ICON_MAP[evt.name];
-      const svg = (map && TOOL_SVG[map.run]) || WRENCH_SVG;
-      setTimeout(() => {
-        iconSlot.innerHTML = svg;
-        iconSlot.classList.remove("icon-out");
-        iconSlot.classList.add("icon-in", "spinning");
-      }, 120);
-    }
-  }
-
   // Render web-search chips into the head's chip strip. New searches REPLACE
   // the chip set with a fade-in animation — gives the "rotating sources" feel
   // the user asked for without stacking.
@@ -573,8 +519,8 @@
     const summary = group.querySelector(".tool-group-summary");
     if (running.length > 0) {
       icon?.classList.add("spinning");
-      // Activity stays as set by updateToolGroupActivity (the most recent
-      // tool_start label). Don't overwrite mid-run.
+      // Activity stays as set by the tool_start label (the most recent one).
+      // Don't overwrite mid-run.
       activity.hidden = false;
       summary.hidden = true;
       group.classList.remove("done-pill");
@@ -2005,8 +1951,9 @@
 
     // Background self-correct: re-tune for the currently loaded model on every
     // boot so saved settings from old/buggy autotune runs heal themselves.
-    // Same "grow only" rule — never shrinks ctx behind the user's back. Silent
-    // on success; logs to console on failure so we don't spam toasts at boot.
+    // Grow-only is enforced server-side via min_ctx — never shrinks ctx behind
+    // the user's back. Silent on success; logs to console on failure so we
+    // don't spam toasts at boot.
     autoRetuneOnBoot().catch(e => console.warn("boot auto-retune skipped:", e));
   }
 
@@ -2015,39 +1962,20 @@
     const modelPath = s.model_path || "";
     const tier = Number(s.vram_tier_gb || 0) || 0;
     if (!modelPath || !tier) return;  // nothing to tune for
+    const curCtx = Number(s.num_ctx || 0) || 0;
     let r;
     try {
       r = await api("/api/llama/auto-tune", {
         method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ model_path: modelPath, vram_gb: tier }),
+        body: JSON.stringify({ model_path: modelPath, vram_gb: tier, min_ctx: curCtx }),
       });
     } catch (e) {
       throw e;  // bubbled to caller's .catch
     }
-    const sug = r?.suggested || {};
-    const cur = state.settings;
-    // Compare what would change. Only push an update if at least one tuned
-    // value differs AND (for ctx) it's strictly larger than current.
-    const update = {};
-    const sugCtx = Number(sug.num_ctx || 0) || 0;
-    const curCtx = Number(cur.num_ctx || 0) || 0;
-    if (sugCtx > curCtx) update.num_ctx = sugCtx;  // grow only
-    // For non-ctx flags, defer to the suggester since these are speed knobs
-    // and the user explicitly asked for autotune behavior.
-    const speedKeys = ["num_gpu", "num_batch", "n_cpu_moe", "n_ubatch", "kv_cache_type", "spec_strategy"];
-    for (const k of speedKeys) {
-      if (sug[k] != null && String(sug[k]) !== String(cur[k] ?? "")) {
-        update[k] = sug[k];
-      }
-    }
-    // Booleans: same idea but explicit
-    for (const k of ["flash_attn"]) {
-      if (sug[k] != null && !!sug[k] !== !!cur[k]) {
-        update[k] = !!sug[k];
-      }
-    }
-    if (!Object.keys(update).length) return;  // already tuned, nothing to do
-    await saveSettings(update);
+    // Grow-only is the tuner's job now (min_ctx above) — apply the returned
+    // (ctx, offload) combo verbatim instead of hand-mixing values.
+    const update = await applyAutoTune(r?.suggested);
+    if (!update) return;  // already tuned, nothing to do
     // If llama-server is already running, restart it so the tuned flags take
     // effect immediately — otherwise the user would still see stale ctx until
     // they manually reload. If it's not running, the next /api/models/load
@@ -2061,8 +1989,9 @@
         await refreshModels();
       } catch (e) { console.warn("boot reload failed:", e); }
     }
-    if (sugCtx > curCtx) {
-      toast(`auto-tune grew context: ${curCtx.toLocaleString()} → ${sugCtx.toLocaleString()}`, "ok", 4000);
+    const newCtx = Number(update.num_ctx || 0) || 0;
+    if (newCtx > curCtx) {
+      toast(`auto-tune grew context: ${curCtx.toLocaleString()} → ${newCtx.toLocaleString()}`, "ok", 4000);
     }
   }
 
@@ -2594,276 +2523,26 @@
     buildWelcomeBars();
   }
 
-  // Generates the welcome-screen backdrop: a warm→cool set of blurred vertical
-  // bars, each fading into the background at a different point (some at the
-  // top, some at the bottom, some spanning) so they read as varying lengths.
-  // Colours reference the --bar-* palette on .welcome-blobs, so they follow
-  // the active theme.
+  // Generates the welcome-screen backdrop, modeled on SEKURA's AbstractWave
+  // hero: three slowly drifting colour blobs (per-theme via --wb-a/b/c) sit
+  // BEHIND 28 sharp vertical "pillars" whose horizontal white→black alpha
+  // gradients create the pleated/striped lighting. A backdrop-blur pass then
+  // softens the pillars uniformly, a second overlay-blended pillar pass
+  // restores edge definition, and an SVG noise layer adds grain. The pillars
+  // themselves are static — only the colour field behind them moves.
   function buildWelcomeBars() {
     const wrap = document.querySelector(".welcome-blobs");
     if (!wrap) return;
-    // Deterministic PRNG so the layout stays stable across new chats.
-    let seed = 0x9e3779b9 >>> 0;
-    const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
-    const palette = ["--bar-warm", "--bar-rose", "--bar-mid", "--bar-violet", "--bar-blue", "--bar-sky"];
-    // A broad warm→cool wash fills the field first, so the streaks read as
-    // soft variations within a colour rather than isolated panels on black
-    // (which looked like curtains).
-    let html = `<div class="welcome-wash"></div>`;
-    const N = 13;
-    for (let i = 0; i < N; i++) {
-      const x = i / (N - 1);                                     // 0 → 1, left → right
-      // Wide, irregular, overlapping placement — not evenly-spaced panels.
-      const left = (x * 112 - 6 + (rnd() - 0.5) * 9).toFixed(1);
-      const width = (6 + rnd() * 12).toFixed(1);
-      const c = palette[Math.min(palette.length - 1, Math.floor(x * palette.length))];
-      const topFade = Math.round(8 + rnd() * 40);                // long, soft fade-in from the top
-      const botFade = Math.round(8 + rnd() * 40);                // long, soft fade-out before the bottom
-      const o = (0.14 + rnd() * 0.24).toFixed(2);
-      const blur = (26 + rnd() * 40).toFixed(0);
-      const dur = (20 + rnd() * 16).toFixed(1);
-      const delay = (-rnd() * 24).toFixed(1);
-      html += `<div class="welcome-bar" style="left:${left}%;width:${width}%;--o:${o};opacity:${o};`
-        + `background:linear-gradient(180deg,transparent 0%,var(${c}) ${topFade}%,var(${c}) ${100 - botFade}%,transparent 100%);`
-        + `filter:blur(${blur}px);animation-duration:${dur}s;animation-delay:${delay}s;"></div>`;
-    }
-    wrap.innerHTML = html;
-  }
-
-  function initWelcomeWebGL() {
-    const canvas = document.getElementById("welcome-canvas");
-    if (!canvas) return;
-
-    let gl;
-    try {
-      gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
-    } catch (e) {
-      console.warn("WebGL not supported by this browser. Falling back to CSS blobs.");
-      return;
-    }
-    if (!gl) {
-      console.warn("WebGL context creation failed. Falling back to CSS blobs.");
-      return;
-    }
-
-    const vsSource = `
-      attribute vec2 position;
-      void main() {
-        gl_Position = vec4(position, 0.0, 1.0);
-      }
-    `;
-
-    const fsSource = `
-      #ifdef GL_FRAGMENT_PRECISION_HIGH
-      precision highp float;
-      #else
-      precision mediump float;
-      #endif
-      uniform vec2 u_resolution;
-      uniform float u_time;
-      uniform vec2 u_mouse;
-      uniform vec3 u_accent_color;
-      uniform vec3 u_bg_color;
-
-      float hash21(vec2 p) {
-        p = fract(p * vec2(123.34, 345.45));
-        p += dot(p, p + 34.345);
-        return fract(p.x * p.y);
-      }
-
-      float vnoise(vec2 p) {
-        vec2 i = floor(p);
-        vec2 f = fract(p);
-        vec2 u = f * f * (3.0 - 2.0 * f);
-        float a = hash21(i);
-        float b = hash21(i + vec2(1.0, 0.0));
-        float c = hash21(i + vec2(0.0, 1.0));
-        float d = hash21(i + vec2(1.0, 1.0));
-        return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-      }
-
-      float fbm(vec2 p) {
-        float v = 0.0;
-        float amp = 0.5;
-        for (int i = 0; i < 3; i++) {
-          v += amp * vnoise(p);
-          p *= 2.02;
-          amp *= 0.5;
-        }
-        return v;
-      }
-
-      void main() {
-        vec2 uv = gl_FragCoord.xy / u_resolution.xy;
-        float aspect = u_resolution.x / u_resolution.y;
-        vec2 st = uv * 2.0 - 1.0;
-        st.x *= aspect;
-
-        // Gentle pointer parallax — dormant while the cursor rests at centre.
-        vec2 m = (u_mouse / u_resolution) * 2.0 - 1.0;
-        vec2 p = st * 0.8 - m * 0.06;
-        float t = u_time * 0.05;
-
-        // Companion tones derived from the theme accent — each theme drives
-        // its own palette with no per-theme branching.
-        vec3 shift1 = vec3(u_accent_color.z, u_accent_color.x, u_accent_color.y);
-        vec3 shift2 = vec3(u_accent_color.y, u_accent_color.z, u_accent_color.x);
-        vec3 base   = mix(u_bg_color, u_accent_color, 0.12);
-        vec3 bright = min(u_accent_color * 1.35 + 0.05, vec3(1.0));
-
-        // Domain-warped flow field (Inigo Quilez style) — smooth, liquid,
-        // slowly folding gradients rather than discrete blobs.
-        vec2 q = vec2(fbm(p + t), fbm(p + vec2(3.4, 1.7) - t));
-        vec2 r = vec2(fbm(p + 1.7 * q + vec2(1.2, 6.1) + t * 1.2),
-                      fbm(p + 1.7 * q + vec2(8.3, 2.4) - t * 0.9));
-        float f = fbm(p + 1.6 * r);
-
-        // Blend the palette along the flow so colours pool and drift.
-        vec3 col = base;
-        col = mix(col, u_accent_color, smoothstep(0.15, 0.95, f + 0.15));
-        col = mix(col, shift1, clamp(q.x * 0.9, 0.0, 1.0));
-        col = mix(col, shift2, clamp(r.y * 0.8, 0.0, 1.0));
-        col = mix(col, bright, smoothstep(0.55, 1.05, f) * 0.6);
-
-        // Bold toward the edges, calmer behind the centred logo + title.
-        float centreClear = smoothstep(0.1, 1.1, length(st * vec2(0.7, 1.0)));
-        float vign = smoothstep(2.9, 0.2, length(st));
-        float amt = mix(0.4, 1.0, centreClear) * vign * 0.92;
-
-        vec3 color = mix(u_bg_color, col, clamp(amt, 0.0, 1.0));
-        gl_FragColor = vec4(color, 1.0);
-      }
-    `;
-
-    function compileShader(source, type) {
-      const shader = gl.createShader(type);
-      gl.shaderSource(shader, source);
-      gl.compileShader(shader);
-      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-        console.error("Shader compile error:", gl.getShaderInfoLog(shader));
-        gl.deleteShader(shader);
-        return null;
-      }
-      return shader;
-    }
-
-    const vs = compileShader(vsSource, gl.VERTEX_SHADER);
-    const fs = compileShader(fsSource, gl.FRAGMENT_SHADER);
-    if (!vs || !fs) return;
-
-    const program = gl.createProgram();
-    gl.attachShader(program, vs);
-    gl.attachShader(program, fs);
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      console.error("Program link error:", gl.getProgramInfoLog(program));
-      return;
-    }
-    gl.useProgram(program);
-
-    const vertices = new Float32Array([
-      -1, -1,   1, -1,  -1,  1,
-      -1,  1,   1, -1,   1,  1
-    ]);
-    const buffer = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
-
-    const posAttr = gl.getAttribLocation(program, "position");
-    gl.enableVertexAttribArray(posAttr);
-    gl.vertexAttribPointer(posAttr, 2, gl.FLOAT, false, 0, 0);
-
-    const uResolution = gl.getUniformLocation(program, "u_resolution");
-    const uTime = gl.getUniformLocation(program, "u_time");
-    const uMouse = gl.getUniformLocation(program, "u_mouse");
-    const uAccentColor = gl.getUniformLocation(program, "u_accent_color");
-    const uBgColor = gl.getUniformLocation(program, "u_bg_color");
-
-    let mouseX = canvas.width / 2;
-    let mouseY = canvas.height / 2;
-    let targetMouseX = mouseX;
-    let targetMouseY = mouseY;
-
-    function onPointerMove(e) {
-      const rect = canvas.getBoundingClientRect();
-      if (!rect.width || !rect.height) return;
-      targetMouseX = e.clientX - rect.left;
-      targetMouseY = rect.height - (e.clientY - rect.top);
-    }
-    window.addEventListener("mousemove", onPointerMove, { passive: true });
-
-    function getThemeColors() {
-      const styles = getComputedStyle(document.documentElement);
-      
-      function hexToRgb(hex) {
-        hex = hex.trim();
-        if (hex.startsWith("rgba")) {
-          const m = hex.match(/\d+/g);
-          return m ? [parseInt(m[0])/255, parseInt(m[1])/255, parseInt(m[2])/255] : [1, 1, 1];
-        }
-        if (hex.startsWith("#")) {
-          if (hex.length === 4) {
-            const r = parseInt(hex[1] + hex[1], 16) / 255;
-            const g = parseInt(hex[2] + hex[2], 16) / 255;
-            const b = parseInt(hex[3] + hex[3], 16) / 255;
-            return [r, g, b];
-          }
-          const r = parseInt(hex.substring(1, 3), 16) / 255;
-          const g = parseInt(hex.substring(3, 5), 16) / 255;
-          const b = parseInt(hex.substring(5, 7), 16) / 255;
-          return [r, g, b];
-        }
-        return [0.5, 0.5, 0.5];
-      }
-
-      const accent = styles.getPropertyValue("--accent") || "#B8A3F2";
-      const bg = styles.getPropertyValue("--bg") || "#1a1a1d";
-
-      return {
-        accent: hexToRgb(accent),
-        bg: hexToRgb(bg)
-      };
-    }
-
-    function resize() {
-      const displayWidth = canvas.clientWidth;
-      const displayHeight = canvas.clientHeight;
-      if (canvas.width !== displayWidth || canvas.height !== displayHeight) {
-        canvas.width = displayWidth;
-        canvas.height = displayHeight;
-        gl.viewport(0, 0, canvas.width, canvas.height);
-      }
-    }
-
-    const startTime = performance.now();
-
-    function render(now) {
-      if (!document.getElementById("welcome-canvas")) {
-        window.removeEventListener("mousemove", onPointerMove);
-        return;
-      }
-
-      resize();
-
-      const elapsed = (now - startTime) / 1000;
-
-      mouseX += (targetMouseX - mouseX) * 0.1;
-      mouseY += (targetMouseY - mouseY) * 0.1;
-
-      const colors = getThemeColors();
-
-      gl.uniform2f(uResolution, canvas.width, canvas.height);
-      gl.uniform1f(uTime, elapsed);
-      gl.uniform2f(uMouse, mouseX, mouseY);
-      gl.uniform3fv(uAccentColor, colors.accent);
-      gl.uniform3fv(uBgColor, colors.bg);
-
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
-
-      requestAnimationFrame(render);
-    }
-
-    requestAnimationFrame(render);
+    let pillars = "";
+    for (let i = 0; i < 28; i++) pillars += `<div class="wb-pillar"></div>`;
+    wrap.innerHTML =
+      `<div class="wb-blob wb-blob-a"></div>` +
+      `<div class="wb-blob wb-blob-b"></div>` +
+      `<div class="wb-blob wb-blob-c"></div>` +
+      `<div class="wb-pillars">${pillars}</div>` +
+      `<div class="wb-soften"></div>` +
+      `<div class="wb-pillars wb-pillars-edge">${pillars}</div>` +
+      `<div class="wb-noise"></div>`;
   }
 
   function renderBubble(m) {
@@ -6669,7 +6348,11 @@
       const gb = Number(r?.gb || 0);
       if (gb > 0) {
         const name = r.name ? ` ${r.name}` : "";
-        hint.textContent = `detected: ${gb.toFixed(1)} GB${name} (via ${r.source || "nvidia-smi"})`;
+        // gb is FREE VRAM now (other processes' allocations excluded) — show
+        // it as such, and nudge the tier picker against free, not total.
+        const total = Number(r.total_gb || 0);
+        const size = total > 0 ? `${gb.toFixed(1)} GB free of ${total.toFixed(1)} GB` : `${gb.toFixed(1)} GB`;
+        hint.textContent = `detected: ${size}${name} (via ${r.source || "nvidia-smi"})`;
         // If the user hasn't picked a tier yet (it's still 0 = Manual), nudge to
         // the closest detected tier so the Suggest button is one click away.
         const sel = $("#set-vram-tier");
@@ -6680,6 +6363,50 @@
     } catch (e) {
       hint.textContent = `vram detect failed: ${e.message || e}`;
     }
+  }
+
+  // Shared auto-tune application. Grow-only ctx is the tuner's job now — the
+  // caller passes its saved num_ctx as min_ctx in the /api/llama/auto-tune
+  // request and the backend returns a (ctx, offload) combo that actually
+  // fits. This applies that combo AS RETURNED: saves every tuner key via the
+  // settings-save path and mirrors the values into the Settings drawer
+  // fields. Returns the applied update, or null when nothing changed.
+  async function applyAutoTune(result, opts = {}) {
+    const sug = result || {};
+    const update = {};
+    for (const k of ["num_ctx", "num_gpu", "num_batch", "n_ubatch", "n_cpu_moe", "num_thread"]) {
+      if (sug[k] != null) update[k] = Number(sug[k]);
+    }
+    if (sug.kv_cache_type) update.kv_cache_type = String(sug.kv_cache_type);
+    if (sug.spec_strategy) update.spec_strategy = String(sug.spec_strategy);
+    if (sug.flash_attn != null) update.flash_attn = !!sug.flash_attn;
+    // Keep the legacy flag in sync with the strategy pick, same convention as
+    // collectAndSaveSettings — otherwise a stale enable_speculative=false
+    // outlives the strategy the tuner just chose.
+    if (update.spec_strategy) update.enable_speculative = update.spec_strategy !== "off";
+    if (!Object.keys(update).length) return null;
+    // Mirror into the Settings drawer so the visible fields match what's saved.
+    const setVal = (id, v) => { const el = $(id); if (el != null && v != null) el.value = String(v); };
+    const setSwitch = (id, v) => { const el = $(id); if (!el || v == null) return; el.classList.toggle("on", !!v); };
+    setVal("#set-ctx", update.num_ctx);
+    setVal("#set-gpu", update.num_gpu);
+    setVal("#set-batch", update.num_batch);
+    const kv = $("#set-kv"); if (kv && update.kv_cache_type) kv.value = update.kv_cache_type;
+    setVal("#set-ncmoe", update.n_cpu_moe);
+    setVal("#set-ubatch", update.n_ubatch);
+    setVal("#set-thread", update.num_thread);
+    setSwitch("#sw-flash", update.flash_attn);
+    if (update.spec_strategy) setVal("#set-spec-strategy", update.spec_strategy);
+    // Skip the save when every value already matches — keeps boot idempotent.
+    const cur = state.settings || {};
+    const changed = Object.entries(update).some(([k, v]) =>
+      typeof v === "boolean" ? !!cur[k] !== v : String(cur[k] ?? "") !== String(v));
+    if (!changed) return null;
+    await saveSettings(update);
+    if (opts.toastPrefix) {
+      toast(`${opts.toastPrefix} (ctx ${Number(update.num_ctx || 0).toLocaleString()}, n_cpu_moe ${update.n_cpu_moe ?? 0})`, "ok", 4000);
+    }
+    return update;
   }
 
   async function runAutoTune() {
@@ -6699,40 +6426,18 @@
     if (btn) btn.disabled = true;
     if (notes) notes.textContent = "thinking...";
     try {
+      // min_ctx = the ctx we already have: grow-only is the tuner's job, so
+      // the returned (ctx, offload) combo always comes from the same solve.
+      const curCtx = Number($("#set-ctx")?.value || state.settings.num_ctx || 0) || 0;
       const r = await api("/api/llama/auto-tune", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model_path: modelPath, vram_gb: tier }),
+        body: JSON.stringify({ model_path: modelPath, vram_gb: tier, min_ctx: curCtx }),
       });
       const sug = r?.suggested || {};
-      // RULE: autotune may GROW num_ctx, never shrink it. If the user already
-      // has a larger context working, don't downgrade them.
-      const curCtx = Number($("#set-ctx")?.value || state.settings.num_ctx || 0) || 0;
-      const sugCtx = Number(sug.num_ctx || 0) || 0;
-      if (sugCtx > 0 && sugCtx < curCtx) {
-        sug.num_ctx = curCtx;
-      }
-      // Prefill every field the suggester returns. Only touches fields that
-      // exist in the suggested payload — leaves untouched fields alone so the
-      // user's manual tweaks survive.
-      const setVal = (id, v) => { const el = $(id); if (el != null && v != null) el.value = String(v); };
-      const setSwitch = (id, v) => {
-        const el = $(id);
-        if (!el || v == null) return;
-        el.classList.toggle("on", !!v);
-      };
-      setVal("#set-ctx", sug.num_ctx);
-      setVal("#set-gpu", sug.num_gpu);
-      setVal("#set-batch", sug.num_batch);
-      const kv = $("#set-kv");
-      if (kv && sug.kv_cache_type) kv.value = sug.kv_cache_type;
-      setVal("#set-ncmoe", sug.n_cpu_moe);
-      setVal("#set-ubatch", sug.n_ubatch);
-      setVal("#set-parallel", sug.n_parallel);
-      setSwitch("#sw-flash", sug.flash_attn);
-      if (sug.spec_strategy) setVal("#set-spec-strategy", sug.spec_strategy);
-      setSwitch("#sw-nowarmup", sug.no_warmup);
-      setSwitch("#sw-metrics", sug.enable_metrics);
+      // Apply the returned combo verbatim (shared helper: saves every tuner
+      // key + mirrors into the drawer fields below).
+      await applyAutoTune(sug);
 
       // Build a short, friendly notes blob from the server reply + model meta.
       const lines = [];
@@ -6759,11 +6464,11 @@
         lines.push("");
       }
       if (sug.notes) lines.push(sug.notes);
-      lines.push("review the values below, then Save to apply (model will reload).");
+      lines.push("applied to settings — the new flags take effect on the next model load.");
       if (notes) notes.textContent = lines.join("\n");
       const toastMsg = sug.quant_downshift
-        ? "values filled — but consider the quant suggestion in the notes"
-        : "suggested values filled in — review then Save";
+        ? "auto-tune applied — but consider the quant suggestion in the notes"
+        : "auto-tune applied — see the notes below";
       toast(toastMsg, sug.quant_downshift ? "warn" : "ok", 4000);
     } catch (e) {
       if (notes) notes.textContent = `auto-tune failed: ${e.message || e}`;
@@ -7124,6 +6829,7 @@
     $("#sw-desktop-enabled")?.classList.toggle("on", !!s.desktop_enabled);
     $("#sw-sound-notifications")?.classList.toggle("on", s.sound_notifications !== false);
     $("#sw-red-team-enabled")?.classList.toggle("on", !!s.red_team_enabled);
+    $("#sw-analysis-tools-enabled")?.classList.toggle("on", !!s.analysis_tools_enabled);
     $("#sw-rt-force-exploit")?.classList.toggle("on", !!s.rt_force_exploit);
     $("#sw-discord-enabled")?.classList.toggle("on", !!s.discord_enabled);
     fill("#set-discord-token", s.discord_bot_token || "");
@@ -7209,6 +6915,7 @@
       desktop_enabled: $("#sw-desktop-enabled")?.classList.contains("on") || false,
       sound_notifications: $("#sw-sound-notifications")?.classList.contains("on") ?? true,
       red_team_enabled: $("#sw-red-team-enabled")?.classList.contains("on") || false,
+      analysis_tools_enabled: $("#sw-analysis-tools-enabled")?.classList.contains("on") || false,
       rt_force_exploit: $("#sw-rt-force-exploit")?.classList.contains("on") || false,
       discord_enabled: $("#sw-discord-enabled")?.classList.contains("on") || false,
       discord_bot_token: ($("#set-discord-token")?.value || "").trim(),
@@ -7242,17 +6949,6 @@
       }
     }
     closeSettings();
-  }
-
-  async function prewarmModel(model) {
-    if (!model) return;
-    toast(`loading ${model.split("/").pop()}…`, "info", 30000, "prewarm");
-    try {
-      await api("/api/prewarm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model }) });
-      toast(`${model.split("/").pop()} ready`, "ok", 2500, "prewarm");
-    } catch {
-      toast("prewarm failed — will load on first send", "warn", 3000, "prewarm");
-    }
   }
 
   // Seven themes: dark (default), dim (warm cappuccino), aurora, nebula,
@@ -7986,26 +7682,16 @@
     if (tier > 0) {
       if (hint) hint.textContent = "auto-tuning for this model…";
       try {
+        const curCtx = Number($("#set-ctx")?.value || state.settings.num_ctx || 0) || 0;
         const r = await api("/api/llama/auto-tune", {
           method: "POST", headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({ model_path: modelPath, vram_gb: tier }),
+          body: JSON.stringify({ model_path: modelPath, vram_gb: tier, min_ctx: curCtx }),
         });
         tuned = r?.suggested || null;
         if (tuned) {
-          // RULE: autotune may GROW num_ctx, never shrink it.
-          const curCtx = Number($("#set-ctx")?.value || state.settings.num_ctx || 0) || 0;
-          const sugCtx = Number(tuned.num_ctx || 0) || 0;
-          if (sugCtx > 0 && sugCtx < curCtx) tuned.num_ctx = curCtx;
-          const setVal = (id, v) => { const el = $(id); if (el != null && v != null) el.value = String(v); };
-          const setSwitch = (id, v) => { const el = $(id); if (!el || v == null) return; el.classList.toggle("on", !!v); };
-          setVal("#set-ctx", tuned.num_ctx);
-          setVal("#set-gpu", tuned.num_gpu);
-          setVal("#set-batch", tuned.num_batch);
-          const kv = $("#set-kv"); if (kv && tuned.kv_cache_type) kv.value = tuned.kv_cache_type;
-          setVal("#set-ncmoe", tuned.n_cpu_moe);
-          setVal("#set-ubatch", tuned.n_ubatch);
-          setSwitch("#sw-flash", tuned.flash_attn);
-          if (tuned.spec_strategy) setVal("#set-spec-strategy", tuned.spec_strategy);
+          // Grow-only is the tuner's job now (min_ctx above) — apply the
+          // returned (ctx, offload) combo verbatim via the shared helper.
+          await applyAutoTune(tuned);
           const tnotes = $("#autotune-notes");
           if (tnotes && tuned.notes) {
             const lines = [];
@@ -8022,20 +7708,12 @@
     // Surface the backend output so the model-load progress is visible live.
     try { toggleConsolePane(true); activateTerminalTab("backend"); } catch {}
     try {
+      // Tuner keys were already saved by applyAutoTune above — this persists
+      // just the model selection itself.
       const persistPayload = {
         model_path: modelPath,
         model: modelPath.split(/[\\/]/).pop().replace(/\.gguf$/i, ""),
       };
-      if (tuned) {
-        if (tuned.num_ctx != null) persistPayload.num_ctx = Number(tuned.num_ctx);
-        if (tuned.num_gpu != null) persistPayload.num_gpu = Number(tuned.num_gpu);
-        if (tuned.num_batch != null) persistPayload.num_batch = Number(tuned.num_batch);
-        if (tuned.kv_cache_type) persistPayload.kv_cache_type = tuned.kv_cache_type;
-        if (tuned.n_cpu_moe != null) persistPayload.n_cpu_moe = Number(tuned.n_cpu_moe);
-        if (tuned.n_ubatch != null) persistPayload.n_ubatch = Number(tuned.n_ubatch);
-        if (tuned.flash_attn != null) persistPayload.flash_attn = !!tuned.flash_attn;
-        if (tuned.spec_strategy) persistPayload.spec_strategy = String(tuned.spec_strategy);
-      }
       await saveSettings(persistPayload);
       await api("/api/models/load", {
         method: "POST", headers: {"Content-Type": "application/json"},
@@ -8642,6 +8320,11 @@
       e.currentTarget.classList.toggle("on");
       saveSettings({ red_team_enabled: e.currentTarget.classList.contains("on") });
       toast("red team setting saved", "ok", 1500);
+    });
+    $("#sw-analysis-tools-enabled")?.addEventListener("click", (e) => {
+      e.currentTarget.classList.toggle("on");
+      saveSettings({ analysis_tools_enabled: e.currentTarget.classList.contains("on") });
+      toast("analysis tools setting saved", "ok", 1500);
     });
     $("#sw-rt-force-exploit")?.addEventListener("click", (e) => {
       e.currentTarget.classList.toggle("on");

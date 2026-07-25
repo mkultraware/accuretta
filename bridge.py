@@ -177,13 +177,6 @@ except Exception:
     _dpkt = None  # type: ignore
     _HAVE_DPKT = False
 
-try:
-    from scapy.all import rdpcap as _rdpcap  # type: ignore
-    _HAVE_SCAPY = True
-except Exception:
-    _rdpcap = None  # type: ignore
-    _HAVE_SCAPY = False
-
 
 # Kill switch: when set, every desktop action tool refuses immediately.
 # The frontend panic button and the user deny-action both flip this via
@@ -505,15 +498,21 @@ DEFAULT_SETTINGS = {
     # red-team recon suite (off by default — opt-in; keeps ~13 recon tools out
     # of the prompt for normal coding turns)
     "red_team_enabled": False,
+    # reverse-engineering / forensics suite (off by default — opt-in; keeps the
+    # APK, binary, firmware & forensics scanners out of the prompt for normal
+    # coding turns)
+    "analysis_tools_enabled": False,
     # durable mission state for authorized red-team runs. Auto-captures the
     # target/scope/objective + confirmed-access facts into per-chat state and
-    # re-injects them so the model can't drift off-task on long runs. rt_tail_*
-    # control the recency-end echo (the large-window fix); 0 = auto-scale off
-    # the live context (see _rt_tail_params). See tool_pin_note / _rt_mission_*.
-    "rt_mission_state": True,        # master: auto-capture + top-of-prompt inject
-    "rt_tail_echo": True,           # also echo a compact state block at the recency end
-    "rt_tail_trigger_frac": 0,      # 0 = auto (clamp(S/ctx)); else fill-fraction to start echoing
-    "rt_tail_budget_frac": 0,       # 0 = auto (~1% of ctx, 256–1024 tok); else fraction of ctx
+    # re-injects them (as a recency-end tail message — see run_chat_turn) so the
+    # model can't drift off-task on long runs. See tool_pin_note / _rt_mission_*.
+    "rt_mission_state": True,        # master: auto-capture + recency-end tail inject
+    # legacy: the mission now ALWAYS rides the tail, so the old fill-gated echo
+    # (and its tuning knobs) no longer fires — kept only so existing settings
+    # files load cleanly. See the volatile-tail block in run_chat_turn.
+    "rt_tail_echo": True,
+    "rt_tail_trigger_frac": 0,
+    "rt_tail_budget_frac": 0,
     # discord remote bridge (off by default — DM accuretta from your phone with
     # push notifications + reaction approvals; outbound only, locked to owner id)
     "discord_enabled": False,
@@ -902,9 +901,10 @@ def _maybe_roll_summary(chat: dict, ctx_limit: int) -> bool:
 
 def tool_pin_note(args: dict) -> dict:
     """Pin a fact, decision, or fix to THIS session. Pins are injected verbatim
-    into the system prompt every turn and NEVER trimmed or summarized away — use
-    them for the critical 'do not undo / do not repeat' items (a bug's root cause
-    and fix, a user constraint, a chosen approach)."""
+    at the recency end of every turn's context (a tail message, so the cached
+    prompt prefix survives) and NEVER trimmed or summarized away — use them for
+    the critical 'do not undo / do not repeat' items (a bug's root cause and
+    fix, a user constraint, a chosen approach)."""
     note = (args.get("note") or "").strip()
     if not note:
         return {"error": "note required"}
@@ -1291,7 +1291,12 @@ def _rt_mission_render(chat: dict, budget_chars: int | None = None) -> str:
 
 
 def _rt_tail_params(ctx: int, settings: dict) -> tuple[float, int]:
-    """Scaling math for the recency-end echo, in ONE place. Returns
+    """LEGACY — no longer called. The fill-gated recency echo this scaled was
+    subsumed by the always-on volatile tail in run_chat_turn (the mission now
+    rides the tail every round, so there is nothing left to trigger). Kept so
+    the rt_tail_* settings in existing settings files still have a referent.
+
+    Scaling math for the recency-end echo, in ONE place. Returns
     (trigger_fill_fraction, tail_budget_tokens), both derived from the LIVE
     context window `ctx` (the value autotune computed for this card+model) so a
     32k user and a 262k user both get sane behavior with zero hand-tuning.
@@ -2332,8 +2337,19 @@ def _run_linter(path: str) -> str:
     if ext == ".py":
         try:
             res = subprocess.run(["flake8", "--isolated", "--select=E9,F821,F822,F823", path], capture_output=True, text=True, timeout=5)
-            if res.returncode != 0:
+            if res.returncode == 0:
+                return ""
+            if res.stdout.strip():
                 return f"flake8 syntax/name error:\n{res.stdout.strip()}"
+        except Exception:
+            pass
+        # flake8 missing or inconclusive: an in-process compile still catches a
+        # real syntax error. (The old code silently passed when flake8 wasn't
+        # installed, so a broken edit came back looking clean.)
+        try:
+            compile(Path(path).read_text(encoding="utf-8", errors="replace"), path, "exec")
+        except SyntaxError as e:
+            return f"python syntax error: {e.msg} (line {e.lineno})"
         except Exception:
             pass
             
@@ -2354,6 +2370,24 @@ def _run_linter(path: str) -> str:
                     return f"eslint error:\n{res.stdout.strip()}"
             except Exception:
                 pass
+
+    elif ext == ".json":
+        try:
+            json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+        except ValueError as e:
+            return f"invalid JSON: {e}"
+        except Exception:
+            pass
+
+    elif ext in (".yaml", ".yml"):
+        try:
+            import yaml  # type: ignore
+        except Exception:
+            return ""
+        try:
+            yaml.safe_load(Path(path).read_text(encoding="utf-8", errors="replace"))
+        except Exception as e:
+            return f"invalid YAML: {e}"
     return ""
 
 
@@ -2879,6 +2913,146 @@ def tool_find_references(args: dict) -> dict:
             unique_hits.append(h)
             
     return {"symbol": symbol, "matches": unique_hits[:100]}
+
+
+# ---- symbol index (find_symbol) -------------------------------------------
+# Reuses the tree-sitter grammars already loaded for AST edits. Answers "where is
+# X DEFINED" (find_references answers "where is X used") plus single-file outline.
+# In-memory mtime cache so repeat lookups don't reparse. No embeddings, no server.
+_SYMBOL_DEF_TYPES = {
+    "py": {"function_definition": "function", "class_definition": "class"},
+    "js": {"function_declaration": "function", "generator_function_declaration": "function",
+           "class_declaration": "class", "method_definition": "method"},
+    "ts": {"function_declaration": "function", "generator_function_declaration": "function",
+           "class_declaration": "class", "abstract_class_declaration": "class",
+           "method_definition": "method", "interface_declaration": "interface",
+           "type_alias_declaration": "type", "enum_declaration": "enum"},
+}
+_SYMBOL_CACHE: dict = {}   # fpath -> (mtime, [ {name,kind,line,sig} ])
+
+def _symbols_in_file(fpath: str, lang, kinds: dict) -> list:
+    import tree_sitter
+    try:
+        mtime = os.path.getmtime(fpath)
+    except Exception:
+        return []
+    cached = _SYMBOL_CACHE.get(fpath)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        content = Path(fpath).read_bytes()
+        parser = tree_sitter.Parser(lang)
+        tree = parser.parse(content)
+    except Exception:
+        return []
+    syms: list = []
+    def name_of(node):
+        n = node.child_by_field_name("name")
+        if n is not None:
+            try:
+                return n.text.decode("utf8", "replace")
+            except Exception:
+                return ""
+        return ""
+    def first_line(node):
+        try:
+            t = node.text.decode("utf8", "replace")
+        except Exception:
+            return ""
+        return (t.splitlines()[0].strip() if t else "")[:120]
+    def visit(node):
+        kind = kinds.get(node.type)
+        if kind:
+            nm = name_of(node)
+            if nm:
+                syms.append({"name": nm, "kind": kind, "line": node.start_point[0] + 1, "sig": first_line(node)})
+        elif node.type == "variable_declarator":
+            val = node.child_by_field_name("value")
+            if val is not None and val.type in ("arrow_function", "function", "function_expression"):
+                nm = name_of(node)
+                if nm:
+                    syms.append({"name": nm, "kind": "function", "line": node.start_point[0] + 1, "sig": first_line(node)})
+        for c in node.children:
+            visit(c)
+    visit(tree.root_node)
+    _SYMBOL_CACHE[fpath] = (mtime, syms)
+    return syms
+
+def tool_find_symbol(args: dict) -> dict:
+    """Where a symbol is DEFINED across the workspace (with signature), or outline
+    one file's definitions. Complements find_references (which finds uses)."""
+    name = (args.get("name") or "").strip()
+    only_path = normalize_path(args.get("path") or "") if args.get("path") else ""
+    if not name and not only_path:
+        return {"error": "pass name (symbol to locate) and/or path (file to outline)"}
+
+    import tree_sitter
+    langs = {}
+    try:
+        import tree_sitter_python
+        langs["py"] = (tree_sitter.Language(tree_sitter_python.language()), _SYMBOL_DEF_TYPES["py"])
+    except Exception:
+        pass
+    try:
+        import tree_sitter_javascript
+        langs["js"] = (tree_sitter.Language(tree_sitter_javascript.language()), _SYMBOL_DEF_TYPES["js"])
+    except Exception:
+        pass
+    try:
+        import tree_sitter_typescript
+        langs["ts"] = (tree_sitter.Language(tree_sitter_typescript.language_typescript()), _SYMBOL_DEF_TYPES["ts"])
+        langs["tsx"] = (tree_sitter.Language(tree_sitter_typescript.language_tsx()), _SYMBOL_DEF_TYPES["ts"])
+    except Exception:
+        pass
+    if not langs:
+        return {"error": "tree-sitter language grammars not installed"}
+
+    def lang_for(ext):
+        if ext == ".py":
+            return langs.get("py")
+        if ext in (".js", ".jsx"):
+            return langs.get("js")
+        if ext == ".ts":
+            return langs.get("ts")
+        if ext == ".tsx":
+            return langs.get("tsx")
+        return None
+
+    if only_path:
+        lf = lang_for(os.path.splitext(only_path)[1].lower())
+        if not lf:
+            return {"error": f"unsupported file type for outline: {only_path}"}
+        syms = _symbols_in_file(only_path, lf[0], lf[1])
+        if name:
+            syms = [s for s in syms if s["name"] == name]
+        return {"path": only_path, "symbols": syms[:200]}
+
+    folders = get_workspace().get("folders", [])
+    if not folders:
+        return {"error": "No workspace folders configured"}
+    target = name.encode("utf8")
+    hits = []
+    for folder in folders:
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))]
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                if is_ignored(fpath):
+                    continue
+                lf = lang_for(os.path.splitext(fname)[1].lower())
+                if not lf:
+                    continue
+                try:
+                    if target not in Path(fpath).read_bytes():
+                        continue
+                except Exception:
+                    continue
+                for s in _symbols_in_file(fpath, lf[0], lf[1]):
+                    if s["name"] == name:
+                        hits.append({"file": fpath, "line": s["line"], "kind": s["kind"], "sig": s["sig"]})
+            if len(hits) >= 100:
+                break
+    return {"symbol": name, "definitions": hits[:100]}
 
 
 def tool_delete_file(args: dict) -> dict:
@@ -7749,8 +7923,8 @@ def tool_parse_evtx(args: dict) -> dict:
 # --- Tool 3: analyze_pcap ---
 def tool_analyze_pcap(args: dict) -> dict:
     """Analyze a PCAP or PCAPNG packet capture file."""
-    if not _HAVE_DPKT and not _HAVE_SCAPY:
-        return {"error": "PCAP parser not available. install with: pip install dpkt (preferred) or scapy"}
+    if not _HAVE_DPKT:
+        return {"error": "PCAP parser not available. install with: pip install dpkt"}
         
     raw_path = args.get("path")
     if not raw_path:
@@ -7769,10 +7943,7 @@ def tool_analyze_pcap(args: dict) -> dict:
         return {"error": "user denied"}
 
     try:
-        if _HAVE_DPKT:
-            return _analyze_pcap_dpkt(target, max_packets, dns_only, http_only)
-        else:
-            return _analyze_pcap_scapy(target, max_packets, dns_only, http_only)
+        return _analyze_pcap_dpkt(target, max_packets, dns_only, http_only)
     except Exception as e:
         return {"error": f"parsing failed: {e}"}
 
@@ -7781,7 +7952,6 @@ def _analyze_pcap_dpkt(path: Path, max_packets: int, dns_only: bool, http_only: 
     
     dns_queries = []
     http_requests = []
-    tls_sni = []
     src_ips = {}
     dst_ips = {}
     ports = {}
@@ -7884,20 +8054,7 @@ def _analyze_pcap_dpkt(path: Path, max_packets: int, dns_only: bool, http_only: 
                             continue # Successfully parsed HTTP
                         except Exception:
                             pass
-                            
-                        # Try TLS Client Hello
-                        if not http_only and len(tcp.data) >= 5 and tcp.data[0] == 22 and tcp.data[1] == 3: # Handshake, TLS/SSL
-                            try:
-                                if tcp.data[5] == 1:
-                                    records, bytes_used = _dpkt.ssl.tls_multi_factory(tcp.data)
-                                    for record in records:
-                                        if record.type == 22: # Handshake
-                                            for msg in record.data:
-                                                if msg.type == 1: # ClientHello
-                                                    pass
-                            except Exception:
-                                pass
-                                
+
     except Exception as e:
         return {"error": f"Failed reading PCAP: {e}"}
 
@@ -7913,15 +8070,12 @@ def _analyze_pcap_dpkt(path: Path, max_packets: int, dns_only: bool, http_only: 
         "protocols": protocols,
         "dns_queries": dns_queries[:1000],
         "http_requests": http_requests[:1000],
-        "tls_sni": tls_sni[:1000],
+        "tls_sni": [],
         "top_sources": sorted([{"ip": k, "count": v} for k, v in src_ips.items()], key=lambda x: x["count"], reverse=True)[:20],
         "top_destinations": sorted([{"ip": k, "count": v} for k, v in dst_ips.items()], key=lambda x: x["count"], reverse=True)[:20],
         "top_ports": sorted([{"port": k, "count": v} for k, v in ports.items()], key=lambda x: x["count"], reverse=True)[:20],
         "suspicious": list(set(suspicious))
     }
-
-def _analyze_pcap_scapy(path: Path, max_packets: int, dns_only: bool, http_only: bool) -> dict:
-    return {"error": "Scapy fallback not fully implemented. Please install dpkt for PCAP analysis."}
 
 # --- Tool 4: audit_http_headers ---
 def tool_audit_http_headers(args: dict) -> dict:
@@ -11576,6 +11730,18 @@ TOOLS: dict[str, dict] = {
         },
         "fn": tool_find_references,
     },
+    "find_symbol": {
+        "description": "Where a symbol is DEFINED across the workspace (with its signature), or outline one file's definitions. Complements find_references (which finds uses). Pass name and/or path.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Symbol to locate the definition(s) of, e.g. renderMarkdown"},
+                "path": {"type": "string", "description": "Optional: outline this one file's definitions instead of searching by name"},
+            },
+            "required": [],
+        },
+        "fn": tool_find_symbol,
+    },
     "delete_file": {
         "description": "Delete a file or folder. Requires user approval.",
         "parameters": {
@@ -12511,6 +12677,19 @@ _TOOL_RESULT_CAPS = {
     "git_log": 24000,
 }
 
+# Aging for replayed tool results. The caps above only bite ONCE, at append
+# time — after that a 64K git_diff result is replayed verbatim on every
+# request for the rest of the session. At request-assembly time (see
+# _sanitize_messages_for_openai) any tool message older than the last
+# _TOOL_RESULT_KEEP_RECENT messages of the assembled request is replaced with
+# a compact stub naming the tool; the stored chat JSON keeps the full content
+# (non-destructive — the rolling-summary fold and truncate_messages still see
+# the real text). Position-from-end is the only input, so a stubbed message
+# stays stubbed and the stub text is byte-identical every turn (prompt-cache
+# friendly). The model can always re-call the tool if it needs the output.
+_TOOL_RESULT_KEEP_RECENT = 24
+
+
 def _tool_result_cap(name: str) -> int:
     if name in _TOOL_RESULT_CAPS:
         return _TOOL_RESULT_CAPS[name]
@@ -12714,11 +12893,30 @@ _RT_RECON_TOOL_NAMES = {
 # union; the split above only drives per-phase gating.
 _RED_TEAM_TOOL_NAMES = _RT_RECON_TOOL_NAMES | _RT_EXPLOIT_TOOL_NAMES
 
+# Reverse-engineering / forensics / firmware analysis suite — gated behind
+# `analysis_tools_enabled` so a normal coding turn doesn't carry the schema
+# token cost of tools it will never call. Visibility only; distinct from
+# _ANALYSIS_TOOL_NAMES (result size caps — do NOT merge them). Front-end/JS
+# secret scanning (scan_js_secrets, cors_probe) stays in the red-team set
+# above; general helpers (find_files, grep_files, read_bytes, file_inspect,
+# extract_archive, check_deps) stay ungated for normal coding turns.
+_ANALYSIS_SUITE_TOOL_NAMES = {
+    # APK / Android.
+    "scan_apk", "decompile_apk",
+    # native binary RE / disassembly.
+    "binary_inspect", "ghidra_analyze", "disasm_at", "strings_dump",
+    # firmware scan / carve / extraction.
+    "binwalk_scan", "carve_file", "extract_squashfs",
+    # signature scan + forensics.
+    "yara_scan", "parse_evtx", "analyze_pcap", "scan_secrets",
+}
+
 
 def _active_tools(include_exploit: bool = True) -> dict:
     """Return TOOLS filtered by current settings — desktop tools only show when
-    desktop automation is enabled, and the red-team recon suite only when red
-    team mode is on, so a normal coding turn carries neither (and pays no token
+    desktop automation is enabled, the red-team recon suite only when red team
+    mode is on, and the analysis/forensics suite only when analysis tools are
+    enabled, so a normal coding turn carries none of them (and pays no token
     cost for tools it can't or won't use).
 
     include_exploit=False additionally drops the heavier exploit subset
@@ -12734,6 +12932,8 @@ def _active_tools(include_exploit: bool = True) -> dict:
         excluded |= _RED_TEAM_TOOL_NAMES
     elif not include_exploit:
         excluded |= _RT_EXPLOIT_TOOL_NAMES
+    if not s.get("analysis_tools_enabled"):
+        excluded |= _ANALYSIS_SUITE_TOOL_NAMES
     # The sandbox tool is only useful once the guest is provisioned; don't pay
     # its token cost (or tempt the model to call it) before then.
     if not _sandbox_ready_cached():
@@ -13738,28 +13938,36 @@ def _estimate_context_tokens(chat_id: str) -> int:
     yet (so llama-server has not reported a real prompt_eval_count). We tokenize
     the ACTUAL assembled prompt text with the model's own tokenizer via
     /tokenize — far better than a char count — and add the measured tools-spec
-    overhead and any image-token cost. Mirrors how _handle_chat assembles the
-    prompt (system + pins + rolling summary + replayed tail past summary_through)
-    so the number matches what would actually be sent. Cached per chat by a
-    cheap content fingerprint so the 2s gauge poll doesn't re-tokenize unchanged
-    history. Returns 0 if the chat is unknown."""
+    overhead and any image-token cost. Mirrors how _handle_chat + run_chat_turn
+    assemble the prompt (system + rolling summary + replayed history past
+    summary_through, with the volatile mission/pins counted at the tail where
+    run_chat_turn now injects them) so the number matches what would actually
+    be sent. Cached per chat by a cheap content fingerprint so the 2s gauge
+    poll doesn't re-tokenize unchanged history. Returns 0 if the chat is
+    unknown."""
     chats = get_chats()
     chat = chats.get("chats", {}).get(chat_id)
     if not chat:
         return 0
     msgs = chat.get("messages", [])
     last_len = len(str(msgs[-1].get("content", ""))) if msgs else 0
-    fp = (len(msgs), last_len, len(chat.get("rolling_summary", "")), len(chat.get("pins") or []))
+    fp = (len(msgs), last_len, len(chat.get("rolling_summary", "")),
+          len(chat.get("pins") or []), len(str(chat.get("mission") or "")))
     cached = _CTX_EST_CACHE.get(chat_id)
     if cached and cached[0] == fp:
         return cached[1]
 
     try:
-        sysp = build_system_prompt(include_tools=True, chat_mode=chat.get("last_mode") or "auto")
+        # Mirror _handle_chat's native-vs-text tool routing so the estimate
+        # matches what will actually be sent: Gemma runs text-tools (the list
+        # stays in the prompt), everything else gets schemas on the wire.
+        _gm = any(_is_gemma_model(m) for m in
+                  (get_settings().get("model"), get_settings().get("model_path"),
+                   _llama.loaded_model()))
+        sysp = build_system_prompt(include_tools=True, chat_mode=chat.get("last_mode") or "auto",
+                                   include_tool_list=not _gm)
     except Exception:
         sysp = ""
-    for p in (chat.get("pins") or []):
-        sysp += "\n" + str(p)
     if chat.get("rolling_summary"):
         sysp += "\n" + chat["rolling_summary"]
 
@@ -13781,6 +13989,20 @@ def _estimate_context_tokens(chat_id: str) -> int:
         if m.get("tool_calls"):
             parts.append(json.dumps(m["tool_calls"], ensure_ascii=False))
         img_count += len(m.get("images") or [])
+
+    # Volatile tail, mirroring run_chat_turn: mission + pins are appended AFTER
+    # the history there (not spliced into the system prompt), so count them at
+    # the end here. Position barely moves the token count, but this keeps the
+    # estimate structurally honest about what gets sent.
+    try:
+        if get_settings().get("rt_mission_state", True):
+            _m = _rt_mission_render(chat)
+            if _m:
+                parts.append(_m)
+    except Exception:
+        pass
+    for p in (chat.get("pins") or []):
+        parts.append(str(p))
 
     joined = "\n".join(parts)
     exact = _llama_tokenize(joined)
@@ -13909,12 +14131,16 @@ def describe_image(b64: str, hint: str = "") -> str:
 # ---- system prompt ---------------------------------------------------------
 
 
-def build_system_prompt(include_tools: bool, chat_mode: str = "auto") -> str:
+def build_system_prompt(include_tools: bool, chat_mode: str = "auto",
+                        include_tool_list: bool = True) -> str:
     """Build a token-efficient system prompt. Target: < 1500 tokens total.
     The core is mode-aware: in IDE mode we strip ALL tool guidance so the
     model doesn't hallucinate a write_file call wrapping the HTML it was
     asked to produce — Qwen3 / DeepSeek-distilled families default to that
-    behavior the moment the prompt mentions tools or write_file."""
+    behavior the moment the prompt mentions tools or write_file.
+    include_tool_list gates ONLY the abbreviated `tools:` block — native-tools
+    turns already carry the full JSON schemas on the wire, so the list would
+    be pure duplication there. Text-tools mode (Gemma) must keep it."""
     settings = get_settings()
     parts = []
 
@@ -14007,12 +14233,13 @@ you may occasionally append exactly one of these to the absolute end of your res
     # so just listing the tools doesn't trigger the wrap-everything-in-write_file
     # regression we saw before.
     if include_tools:
-        tool_lines = ["tools:"]
-        for name, t in _active_tools().items():
-            params = t["parameters"].get("properties", {})
-            sig = ",".join(f"{k}:{v.get('type','any')[:3]}" for k, v in params.items())
-            tool_lines.append(f"- {name}({sig})")
-        parts.append("\n".join(tool_lines))
+        if include_tool_list:
+            tool_lines = ["tools:"]
+            for name, t in _active_tools().items():
+                params = t["parameters"].get("properties", {})
+                sig = ",".join(f"{k}:{v.get('type','any')[:3]}" for k, v in params.items())
+                tool_lines.append(f"- {name}({sig})")
+            parts.append("\n".join(tool_lines))
         # Nudge the progress panel: for genuinely multi-step work the model should
         # publish a checklist so the user can watch it advance. Kept opt-in so a
         # trivial one-shot turn doesn't spam a plan.
@@ -14092,6 +14319,29 @@ you may occasionally append exactly one of these to the absolute end of your res
         parts.append("workspace:\n" + "\n".join(f"- {f}" for f in ws))
     else:
         parts.append("workspace: none (file tools will refuse)")
+
+    # === AGENTS.md (cross-harness project instructions) ===
+    # Honor a repo-root AGENTS.md in each workspace folder if present. This is the
+    # de-facto convention across Codex/Cursor/OpenCode/Zed, so a project already
+    # set up for another agent carries its conventions here with no extra work.
+    # Only injected when the file exists, so there is no baseline token cost.
+    try:
+        agents_blocks = []
+        for f in ws:
+            ap = os.path.join(f, "AGENTS.md")
+            if os.path.isfile(ap):
+                try:
+                    txt = Path(ap).read_text(encoding="utf-8", errors="replace").strip()
+                except Exception:
+                    txt = ""
+                if txt:
+                    if len(txt) > 2000:
+                        txt = txt[:2000] + "\n... (truncated)"
+                    agents_blocks.append(txt)
+        if agents_blocks:
+            parts.append("project instructions (AGENTS.md):\n" + "\n\n".join(agents_blocks))
+    except Exception:
+        pass
 
     # Today's date — placed LAST, not at the top. It changes daily while
     # everything before it stays byte-identical, so keeping it out of the
@@ -14176,29 +14426,6 @@ def _warmup_tool_grammar() -> None:
         print(f"[llama] tool-grammar warmup skipped: {e}", flush=True)
 
 
-# Mid-plan stall detection. Small local models (Gemma above all) announce a
-# multi-step plan, execute ONE tool call, then end the turn with "I'll now do
-# B" or "Shall I continue?" — the user has to bump them with "continue" for
-# every remaining step. These patterns, matched against the END of a reply in
-# a turn where tools already ran, identify that stall so the loop can bump
-# automatically. Negative lookaheads keep sign-offs ("I'll be here", "let me
-# know") from tripping it.
-_UNFINISHED_PLAN_RE = re.compile(
-    r"(?:i(?:'|’)?ll\s+(?:now\s+|also\s+|then\s+)?(?!be\b|have\b|get\b|see\b|use\b|keep\b|need\b|know|let|wait|stop|leave|remember|note|explain|mention|cover|include)\w+|"
-    r"i\s+will\s+(?:now\s+|also\s+|then\s+)?(?!be\b|have\b|get\b|see\b|use\b|keep\b|need\b|know|wait|stop|remember|note|explain|mention|cover|include)\w+|"
-    r"let\s+me\s+(?!know)\w+|"
-    r"i(?:'|’)?m\s+going\s+to\s+\w+|i\s+am\s+going\s+to\s+\w+|"
-    r"next,?\s+(?:i(?:'|’)?ll|i\s+will|step)|"
-    r"proceeding\s+(?:to|with)|moving\s+on\s+to|"
-    r"the\s+next\s+step\s+is|now\s+i\s+(?:need|have|want)\s+to)",
-    re.IGNORECASE,
-)
-_ASKS_TO_CONTINUE_RE = re.compile(
-    r"(?:shall|should|may|can)\s+i\s|do\s+you\s+want\s+me\s+to|"
-    r"want\s+me\s+to\s+(?:continue|proceed)|ready\s+to\s+(?:continue|proceed)",
-    re.IGNORECASE,
-)
-
 # Chat turn-boundary markers. When a model fails to stop at the end of its turn
 # and rolls straight into a new one (Qwen3.6 Q4 in particular emits these as
 # LITERAL text instead of the special stop token, so llama-server's own stop
@@ -14206,15 +14433,6 @@ _ASKS_TO_CONTINUE_RE = re.compile(
 _TURN_BOUNDARY_STOPS = ["<|im_end|>", "<|im_start|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>"]
 _TURN_BOUNDARY_RE = re.compile(
     r"<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|eot_id\|>|<\|end_of_text\|>"
-)
-
-_COMPLETED_SIGNAL_RE = re.compile(
-    r"(?:all\s+done|no\s+further\s+action|task\s+(?:is\s+)?(?:complete|done|finished)|"
-    r"everything\s+(?:is\s+)?(?:complete|done|finished)|successfully\s+completed|"
-    r"nothing\s+(?:left|else|more)\s+to\s+do|that\s+(?:completes|concludes|finishes)|"
-    r"no\s+(?:additional|more)\s+(?:steps|actions|changes)\s+(?:needed|required|necessary)|"
-    r"already\s+completed|already\s+done|have\s+been\s+completed|has\s+been\s+completed)",
-    re.IGNORECASE,
 )
 
 
@@ -14282,19 +14500,23 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         captured_flags: list = []
         # Durable mission state. Loaded ONCE from disk into a working holder and
         # kept fresh in memory as tools capture the target/flags this turn, so the
-        # recency echo reflects mid-turn progress without a per-round disk read.
-        # Changes are handed back on final["_mission_updates"] for the caller to
-        # persist (one save, outside the hot loop). Only when tracking is enabled.
+        # recency-end tail reflects mid-turn progress without a per-round disk
+        # read. Changes are handed back on final["_mission_updates"] for the
+        # caller to persist (one save, outside the hot loop). Only when tracking
+        # is enabled. Pins are snapshotted alongside: both ride as a TAIL message
+        # (below) instead of a system-prompt splice, so llama.cpp's cached prompt
+        # prefix stays byte-identical when they change mid-session.
         _rt_on = bool(settings.get("red_team_enabled") and settings.get("rt_mission_state", True))
         _rt_chat: dict = {}
         _rt_dirty = False
-        if _rt_on:
-            try:
-                _c0 = get_chats().get("chats", {}).get(chat_id) or {}
-                if isinstance(_c0.get("mission"), dict):
-                    _rt_chat["mission"] = dict(_c0["mission"])
-            except Exception:
-                pass
+        _pins_tail: list = []
+        try:
+            _c0 = get_chats().get("chats", {}).get(chat_id) or {}
+            if settings.get("rt_mission_state", True) and isinstance(_c0.get("mission"), dict):
+                _rt_chat["mission"] = dict(_c0["mission"])
+            _pins_tail = [str(p) for p in (_c0.get("pins") or [])]
+        except Exception:
+            pass
         force_no_think = False   # set when the thinking-budget enforcer aborts a runaway
         budget_retries = 0       # cap how many times we force-stop thinking per turn
         conversation = list(messages)
@@ -14348,24 +14570,34 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             if dropped > 0:
                 emit({"type": "context_trimmed", "dropped": dropped, "total": len(conversation)})
 
-            # Recency-end mission echo — the large-window drift fix. The top-of-
-            # prompt mission block falls outside reliable attention once enough
-            # tokens pile up beneath it; re-echo a compact copy right before
-            # generation, where attention actually lands. Trigger (how full the
-            # window must be) and budget both scale off the live ctx via
-            # _rt_tail_params, so it fires early on a 262k window and effectively
-            # never on a small one. Mutates the per-round `trimmed` copy ONLY —
-            # never `conversation` — so it is never persisted or double-counted.
-            if _rt_on and settings.get("rt_tail_echo", True):
-                _trig, _budget = _rt_tail_params(ctx_limit, settings)
-                _fill = _last_prompt_tokens_by_chat.get(chat_id, 0)
-                if _fill >= ctx_limit * _trig:
-                    _mtxt = _rt_mission_render(_rt_chat, budget_chars=_budget * 4)
-                    if _mtxt:
-                        _body = ("[MISSION STATE — authorized run in progress; stay on "
-                                 "this task, do not drift to generic chat]\n" + _mtxt)
-                        _role = "system" if _rt_trailing_system_ok() else "user"
-                        trimmed = trimmed + [{"role": _role, "content": _body}]
+            # Volatile session state — mission block + pins — appended AFTER the
+            # history, right before generation, where attention actually lands.
+            # These used to be spliced into the TOP of the system prompt, but
+            # they change mid-session (pin_note calls, mission facts accruing)
+            # and every change invalidated llama.cpp's cached prompt prefix
+            # (~15K+ tokens of system prompt + tool schemas re-prefilled).
+            # Riding the tail keeps the prefix byte-identical across turns;
+            # only this small tail message is re-evaluated when they change.
+            # This also subsumes the old fill-gated rt_tail_echo: the mission
+            # now ALWAYS sits at the recency end, so no separate echo is needed.
+            # Mutates the per-round `trimmed` copy ONLY — never `conversation` —
+            # so it is never persisted or double-counted.
+            if use_tools:
+                _tail_secs: list = []
+                _mtxt = _rt_mission_render(_rt_chat) if settings.get("rt_mission_state", True) else ""
+                if _mtxt:
+                    _tail_secs.append(
+                        "=== MISSION (authorized run — hold this; do NOT drift off-task) ===\n"
+                        + _mtxt)
+                if _pins_tail:
+                    _tail_secs.append(
+                        "=== PINNED FOR THIS SESSION (established facts/fixes — do NOT undo or repeat) ===\n"
+                        + "\n".join(f"- {p}" for p in _pins_tail))
+                if _tail_secs:
+                    _body = ("[SESSION STATE — live, re-sent every turn; hold these — "
+                             "do NOT drift off-task or undo them]\n" + "\n\n".join(_tail_secs))
+                    _role = "system" if _rt_trailing_system_ok() else "user"
+                    trimmed = trimmed + [{"role": _role, "content": _body}]
 
             payload = {
                 "model": model or "local",
@@ -14899,7 +15131,10 @@ def _sanitize_messages_for_openai(msgs: list[dict]) -> list[dict]:
     """llama-server's OpenAI endpoint is stricter about message shape than
     Ollama. Strip local-only fields (`t`, `_stats`), coerce tool messages to
     the `{role:'tool', tool_call_id, content}` shape, and ensure assistant
-    tool_calls have a string `arguments` field."""
+    tool_calls have a string `arguments` field. Also ages old tool results:
+    any tool message older than the last _TOOL_RESULT_KEEP_RECENT messages is
+    replaced with a compact stub (see that constant) — the stored chat JSON is
+    never touched, only the outgoing payload."""
     try:
         preserve_thinking = bool(get_settings().get("preserve_prior_thinking", False))
     except Exception:
@@ -14911,6 +15146,20 @@ def _sanitize_messages_for_openai(msgs: list[dict]) -> list[dict]:
     for i, m in enumerate(msgs):
         if m.get("role") == "assistant":
             last_assistant_idx = i
+    # tool_call_id → tool name from assistant tool_calls, so stubbed results
+    # can still name the tool that produced them even when the tool message
+    # itself carries no `name` field.
+    tc_names: dict = {}
+    for m in msgs:
+        if m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            fn_name = (tc.get("function") or {}).get("name")
+            if tc.get("id") and fn_name:
+                tc_names[tc["id"]] = fn_name
+    # Tool messages at or past this index keep their full content; anything
+    # older gets stubbed. Position-from-end only → deterministic per turn.
+    stub_cutoff = len(msgs) - _TOOL_RESULT_KEEP_RECENT
     for i, m in enumerate(msgs):
         role = m.get("role")
         if role not in ("system", "user", "assistant", "tool"):
@@ -14929,6 +15178,14 @@ def _sanitize_messages_for_openai(msgs: list[dict]) -> list[dict]:
             clean["tool_call_id"] = m.get("tool_call_id") or m.get("name") or "tool"
             if m.get("name"):
                 clean["name"] = m["name"]
+            if i < stub_cutoff and isinstance(clean["content"], str):
+                tool_name = m.get("name") or tc_names.get(m.get("tool_call_id") or "")
+                if tool_name:
+                    clean["content"] = (f"[output elided — {tool_name} result from earlier in the "
+                                        f"session; call the tool again if you need it]")
+                else:
+                    clean["content"] = ("[output elided — tool result from earlier in the "
+                                        "session; call the tool again if you need it]")
         if role == "assistant" and m.get("tool_calls"):
             tcs = []
             for tc in m["tool_calls"]:
@@ -16518,17 +16775,20 @@ class Handler(BaseHTTPRequestHandler):
                 # null bytes in source etc.
                 return self._send_json(200, {"ok": False, "file": file_label, "msg": str(e)})
         if p == "/api/llama/auto-tune":
-            # POST {model_path?, vram_gb} -> suggested llama-server settings.
-            # If model_path is omitted, uses the currently configured model_path
-            # from settings. If vram_gb is omitted or 0, tries nvidia-smi.
+            # POST {model_path?, vram_gb, min_ctx?} -> suggested llama-server
+            # settings. If model_path is omitted, uses the currently configured
+            # model_path from settings. If vram_gb is omitted or 0, tries
+            # nvidia-smi. min_ctx makes context grow-only: the tuner honors a
+            # saved ctx larger than its pick when it still fits the budget.
             mp = (body.get("model_path") or get_settings().get("model_path") or "").strip()
             vram = float(body.get("vram_gb") or 0)
+            min_ctx = int(body.get("min_ctx") or 0)
             detected = None
             if vram <= 0:
                 detected = detect_vram_gb()
                 vram = float(detected.get("gb") or 0)
-            suggested = auto_tune(mp, vram)
             profile = inspect_model(mp)
+            suggested = auto_tune(mp, vram, profile=profile, min_ctx=min_ctx)
             return self._send_json(200, {
                 "vram_gb": vram,
                 "vram_source": (detected or {}).get("source", "user"),
@@ -17118,22 +17378,17 @@ class Handler(BaseHTTPRequestHandler):
                     save_json(CHATS_FILE, chats)
             except Exception:
                 traceback.print_exc()
-        system_prompt = build_system_prompt(include_tools=use_tools, chat_mode=mode)
-        # Durable mission block — TOP of the appended sections for primacy; never
-        # trimmed. Parallel to pins but auto-derived (no model cooperation).
-        _mission = _rt_mission_render(chat) if get_settings().get("rt_mission_state", True) else ""
-        if _mission:
-            system_prompt += (
-                "\n\n=== MISSION (authorized run — hold this; do NOT drift off-task) ===\n"
-                + _mission
-            )
-        # Pinned facts/fixes — verbatim, highest priority, never trimmed.
-        _pins = chat.get("pins") or []
-        if _pins:
-            system_prompt += (
-                "\n\n=== PINNED FOR THIS SESSION (established facts/fixes — do NOT undo or repeat) ===\n"
-                + "\n".join(f"- {p}" for p in _pins)
-            )
+        # Native-tools turns carry the full JSON tool schemas on the wire, so
+        # the abbreviated list in the prompt would duplicate them (~1.5K tokens).
+        # Text-tools mode (Gemma) attaches nothing — the list must stay.
+        system_prompt = build_system_prompt(include_tools=use_tools, chat_mode=mode,
+                                            include_tool_list=not native_tools)
+        # Durable mission block + pins: NOT spliced here anymore — they change
+        # mid-session and every change busted llama.cpp's cached prompt prefix.
+        # run_chat_turn appends them as a tail message after the history instead
+        # (same wording, recency-end position). Only the slow-changing sections
+        # stay in the system prompt: the rolling summary (rare folds) and the
+        # static pin_note nudge below.
         _roll = chat.get("rolling_summary", "")
         if _roll:
             system_prompt += (
@@ -17336,27 +17591,42 @@ class Handler(BaseHTTPRequestHandler):
 # headroom beats hitting an OOM mid-generation.
 
 def detect_vram_gb() -> dict:
-    """Best-effort GPU VRAM probe. Returns {gb, name, source} or
-    {gb: 0, name: "", source: "none"} on failure. Tries nvidia-smi first
-    (most common), then falls back to silence. Never raises."""
+    """Best-effort GPU VRAM probe. Returns {gb, name, source, total_gb, gpus}
+    or {gb: 0, name: "", source: "none"} on failure. `gb` is GPU 0's FREE VRAM
+    in GB — what the tuner can actually budget, since other processes'
+    allocations are invisible to a total-only probe. `total_gb` is GPU 0's
+    physical total and `gpus` lists every detected GPU as
+    {name, total_gb, free_gb}. Tries nvidia-smi first (most common), then
+    falls back to silence. Never raises."""
     out = {"gb": 0, "name": "", "source": "none"}
-    # nvidia-smi --query-gpu=memory.total,name --format=csv,noheader,nounits
+    # nvidia-smi --query-gpu=memory.total,memory.free,name --format=csv,noheader,nounits
     smi = shutil.which("nvidia-smi")
     if smi:
         try:
             r = subprocess.run(
-                [smi, "--query-gpu=memory.total,name", "--format=csv,noheader,nounits"],
+                [smi, "--query-gpu=memory.total,memory.free,name", "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=3,
                 creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
             )
             if r.returncode == 0 and r.stdout.strip():
-                # First line = primary GPU. "12282, NVIDIA GeForce RTX 4070"
-                first = r.stdout.strip().splitlines()[0]
-                parts = [p.strip() for p in first.split(",", 1)]
-                if parts and parts[0].isdigit():
-                    mb = int(parts[0])
-                    out["gb"] = round(mb / 1024, 1)
-                    out["name"] = parts[1] if len(parts) > 1 else "NVIDIA GPU"
+                # One line per GPU: "12282, 11001, NVIDIA GeForce RTX 4070"
+                gpus = []
+                for line in r.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                        continue
+                    gpus.append({
+                        "name": ", ".join(parts[2:]) if len(parts) > 2 else "NVIDIA GPU",
+                        "total_gb": round(int(parts[0]) / 1024, 1),
+                        "free_gb": round(int(parts[1]) / 1024, 1),
+                    })
+                if gpus:
+                    # GPU 0 = primary. `gb` is FREE so the tuner never budgets
+                    # VRAM another process already holds.
+                    out["gb"] = gpus[0]["free_gb"]
+                    out["total_gb"] = gpus[0]["total_gb"]
+                    out["name"] = gpus[0]["name"]
+                    out["gpus"] = gpus
                     out["source"] = "nvidia-smi"
                     return out
         except Exception:
@@ -17383,8 +17653,18 @@ _QUANT_RE = re.compile(r"\b(IQ\d_[A-Z]{1,3}|Q\d_[KS01]?_?[MS]?|Q\d_K|F16|BF16|F3
 def read_gguf_metadata(path: str, max_bytes: int = 4 * 1024 * 1024) -> dict:
     """Parse the GGUF v2/v3 header and return architecture-level metadata.
     Reads at most a few MB from the file's start — the metadata block lives
-    right after the magic. Never raises; returns {ok: False} on any parse
-    failure so callers can fall back to filename heuristics.
+    right after the magic (if the KV list doesn't fit in `max_bytes`, retries
+    once with a 64MB cap; the tensor-info section that follows the KV list is
+    never parsed). Never raises; returns {ok: False} on any parse failure so
+    callers can fall back to filename heuristics.
+
+    Besides the structured fields below, every scalar KV entry is collected
+    verbatim into out["keys"] (full key names, nothing stripped) so tuners can
+    probe architecture-specific keys we don't hardcode. Arrays are recorded as
+    {"__array_len__": n} — contents are skipped, the length is cheap and useful
+    (e.g. tokenizer.ggml.tokens length ≈ vocab size). out["parse_status"] is
+    "complete" (whole KV list read), "truncated" (buffer ran out mid-list), or
+    "degraded" (unknown/nested value type — clean stop, entries so far kept).
 
     GGUF spec reference: https://github.com/ggerganov/ggml/blob/master/docs/gguf.md
     Layout: "GGUF" magic, uint32 version, uint64 tensor_count, uint64 kv_count,
@@ -17409,22 +17689,13 @@ def read_gguf_metadata(path: str, max_bytes: int = 4 * 1024 * 1024) -> dict:
                                           # (key: "<arch>.nextn_predict_layers"). This is the same
                                           # signal llama.cpp itself uses to enable --spec-type draft-mtp.
         "has_mtp": False,                 # convenience flag: nextn_predict_layers > 0
+        "keys": {},                       # all scalar metadata KV entries (see docstring)
+        "parse_status": "",               # complete | truncated | degraded
     }
     if not path:
         return out
     try:
         import struct
-        with open(path, "rb") as f:
-            data = f.read(max_bytes)
-        if len(data) < 24 or data[:4] != b"GGUF":
-            return out
-        pos = 4
-        version = struct.unpack_from("<I", data, pos)[0]; pos += 4
-        if version < 2:
-            return out  # v1 had a different layout
-        # tensor_count, kv_count
-        struct.unpack_from("<Q", data, pos)[0]; pos += 8  # tensor_count, unused
-        kv_count = struct.unpack_from("<Q", data, pos)[0]; pos += 8
 
         # GGUF value type enum
         T_UINT8, T_INT8 = 0, 1
@@ -17441,45 +17712,89 @@ def read_gguf_metadata(path: str, max_bytes: int = 4 * 1024 * 1024) -> dict:
             T_FLOAT64: ("<d", 8),
         }
 
-        def read_str(p):
-            n = struct.unpack_from("<Q", data, p)[0]
-            p += 8
-            s = data[p:p + n].decode("utf-8", errors="replace")
-            return s, p + n
+        class _Degraded(Exception):
+            """Unknown/nested value type hit — stop parsing at that entry."""
 
-        def read_value(p, vtype):
-            if vtype in scalar_fmt:
-                fmt, sz = scalar_fmt[vtype]
-                return struct.unpack_from(fmt, data, p)[0], p + sz
-            if vtype == T_STRING:
-                return read_str(p)
-            if vtype == T_ARRAY:
-                etype = struct.unpack_from("<I", data, p)[0]; p += 4
-                ecount = struct.unpack_from("<Q", data, p)[0]; p += 8
-                # We never need array contents for tuning; just skip past them.
-                if etype in scalar_fmt:
-                    _, sz = scalar_fmt[etype]
-                    return None, p + sz * ecount
-                if etype == T_STRING:
-                    for _ in range(ecount):
-                        n = struct.unpack_from("<Q", data, p)[0]
-                        p += 8 + n
-                    return None, p
-                # Nested arrays / unknown — bail safely
-                return None, p
-            return None, p  # unknown scalar type, give up gracefully
+        def _parse_kv_list(data: bytes):
+            """Parse just the metadata KV list from `data`. Returns
+            (meta, status). Never raises on malformed input."""
+            meta: dict = {}
+            if len(data) < 24 or data[:4] != b"GGUF":
+                return meta, "degraded"
+            pos = 4
+            version = struct.unpack_from("<I", data, pos)[0]; pos += 4
+            if version < 2:
+                return meta, "degraded"  # v1 had a different layout
+            pos += 8  # tensor_count, unused
+            kv_count = struct.unpack_from("<Q", data, pos)[0]; pos += 8
 
-        meta: dict = {}
-        for _ in range(kv_count):
-            try:
-                key, pos = read_str(pos)
-                vtype = struct.unpack_from("<I", data, pos)[0]; pos += 4
-                val, pos = read_value(pos, vtype)
-                if val is not None:
+            def read_str(p):
+                n = struct.unpack_from("<Q", data, p)[0]
+                p += 8
+                s = data[p:p + n].decode("utf-8", errors="replace")
+                return s, p + n
+
+            def read_value(p, vtype):
+                if vtype in scalar_fmt:
+                    fmt, sz = scalar_fmt[vtype]
+                    return struct.unpack_from(fmt, data, p)[0], p + sz
+                if vtype == T_STRING:
+                    return read_str(p)
+                if vtype == T_ARRAY:
+                    etype = struct.unpack_from("<I", data, p)[0]; p += 4
+                    ecount = struct.unpack_from("<Q", data, p)[0]; p += 8
+                    # Array contents aren't needed for tuning; record just the
+                    # length (cheap) and skip past them.
+                    if etype in scalar_fmt:
+                        _, sz = scalar_fmt[etype]
+                        return {"__array_len__": int(ecount)}, p + sz * ecount
+                    if etype == T_STRING:
+                        for _ in range(ecount):
+                            n = struct.unpack_from("<Q", data, p)[0]
+                            p += 8 + n
+                        return {"__array_len__": int(ecount)}, p
+                    # Nested arrays / unknown element type — bail cleanly.
+                    raise _Degraded()
+                # Unknown scalar type. Returning the unadvanced position here
+                # used to desync the stream and garbage-parse every subsequent
+                # key; stop cleanly at this entry instead, keeping what we have.
+                raise _Degraded()
+
+            status = "complete"
+            for _ in range(kv_count):
+                if len(meta) >= 4096:
+                    # Sane bound — real GGUFs carry ~50-200 KV entries.
+                    status = "degraded"
+                    break
+                try:
+                    key, pos = read_str(pos)
+                    vtype = struct.unpack_from("<I", data, pos)[0]; pos += 4
+                    val, pos = read_value(pos, vtype)
+                    if isinstance(val, str) and len(val) > 2048:
+                        # Huge string (chat template etc.) — keep length only.
+                        val = {"__array_len__": len(val)}
                     meta[key] = val
-            except (struct.error, IndexError):
-                # Ran past the buffered window — stop gracefully, keep what we got.
+                except _Degraded:
+                    status = "degraded"
+                    break
+                except (struct.error, IndexError):
+                    # Ran past the buffered window.
+                    status = "truncated"
+                    break
+            return meta, status
+
+        # First pass with the small read; if the KV list didn't fit in the
+        # buffer, retry once with a much larger cap before giving up.
+        meta: dict = {}
+        status = "truncated"
+        for cap in (max_bytes, 64 * 1024 * 1024):
+            with open(path, "rb") as f:
+                data = f.read(cap)
+            meta, status = _parse_kv_list(data)
+            if status != "truncated" or len(data) < cap:
                 break
+        out["keys"] = meta
+        out["parse_status"] = status
 
         arch = str(meta.get("general.architecture", "")).strip()
         if not arch:
@@ -17567,6 +17882,7 @@ def inspect_model(model_path: str) -> dict:
         "metadata_source": "filename",  # or "gguf"
         "has_mtp": False,                 # GGUF carries built-in MTP heads (nextn_predict_layers > 0)
         "nextn_predict_layers": 0,
+        "keys": {},                       # raw GGUF metadata KV scalars (empty on filename fallback)
     }
     if not model_path:
         return out
@@ -17599,6 +17915,7 @@ def inspect_model(model_path: str) -> dict:
         out["is_moe"] = gg["expert_count"] > 1
         out["has_mtp"] = bool(gg.get("has_mtp", False))
         out["nextn_predict_layers"] = int(gg.get("nextn_predict_layers", 0) or 0)
+        out["keys"] = gg.get("keys") or {}
         # total/active param counts: prefer the size_label like "30B-A3B"
         sl = (gg.get("size_label") or "").lower()
         am = _ACTIVE_RE.search(sl) or _ACTIVE_RE.search(name_lc)
@@ -17651,20 +17968,104 @@ def inspect_model(model_path: str) -> dict:
 _KV_DTYPE_BYTES = {"f16": 2.0, "q8_0": 1.0625, "q4_0": 0.5625}
 
 
+# Key fragments that mark hybrid recurrent/SSM + full-attention architectures
+# (Mamba/SSM blocks interleaved with periodic full-attention layers). Matched
+# against the raw GGUF keys dict, so no per-arch hardcoding is needed.
+_HYBRID_KEY_FRAGMENTS = (".ssm.", ".recurrent.", ".linear_attention.", ".mamba")
+# Candidate suffixes for the "every Nth layer is full attention" interval key.
+# Probe several — different converters name it differently.
+_HYBRID_INTERVAL_SUFFIXES = (
+    "full_attention_interval", "global_attention_interval",
+    "hybrid_attention_interval", "attention_interval",
+)
+
+
+def _mla_dims(profile: dict):
+    """DeepSeek V2/V3-style MLA detection. Returns (kv_lora_rank,
+    qk_rope_head_dim) when the GGUF metadata exposes kv_lora_rank, else None.
+    llama.cpp caches the compressed latent for MLA, not per-head K/V."""
+    keys = profile.get("keys") or {}
+    arch = profile.get("architecture") or ""
+    if not arch:
+        return None
+    kv_lora = keys.get(f"{arch}.attention.kv_lora_rank")
+    if not isinstance(kv_lora, (int, float)) or not kv_lora:
+        return None
+    qk_rope = keys.get(f"{arch}.attention.qk_rope_head_dim")
+    qk_rope = int(qk_rope) if isinstance(qk_rope, (int, float)) and qk_rope else 0
+    return int(kv_lora), qk_rope
+
+
+def _hybrid_info(profile: dict) -> dict:
+    """Detect hybrid SSM/attention models purely from GGUF metadata keys.
+    Returns {"hybrid": bool, "interval": int (0 = unknown), "evidence": str}.
+    Known hybrid arch names (granitemoehybrid, nemotron-h, jamba, ...) only
+    corroborate — key evidence is required before we treat a model as hybrid."""
+    keys = profile.get("keys") or {}
+    arch = (profile.get("architecture") or "").lower()
+    evidence = ""
+    for k in keys:
+        kl = k.lower()
+        if any(frag in kl for frag in _HYBRID_KEY_FRAGMENTS):
+            evidence = k
+            break
+    interval = 0
+    interval_key = ""
+    for suffix in _HYBRID_INTERVAL_SUFFIXES:
+        for k, v in keys.items():
+            if k.lower().endswith(suffix) and isinstance(v, (int, float)) and v >= 2:
+                interval = int(v)
+                interval_key = k
+                break
+        if interval:
+            break
+    hybrid = bool(evidence or interval)
+    if hybrid and not evidence:
+        evidence = interval_key
+    # Arch-name corroboration only (never triggers on its own): noted for
+    # transparency when the keys and the arch name agree.
+    _KNOWN_HYBRID_ARCHES = ("granitemoehybrid", "granitehybrid", "nemotron-h",
+                            "nemotron_h", "jamba", "zamba", "falcon-h1", "bamba")
+    arch_hit = any(a in arch for a in _KNOWN_HYBRID_ARCHES) or "hybrid" in arch
+    return {"hybrid": hybrid, "interval": interval, "evidence": evidence,
+            "arch_corroborates": bool(hybrid and arch_hit)}
+
+
 def _kv_bytes_per_token(profile: dict, kv_dtype: str) -> int:
-    """Exact KV cache cost per token using GGUF-derived attention config.
-    Formula: 2 (K + V) * n_layer * head_count_kv * key_length * dtype_bytes.
-    Returns 0 when GGUF metadata wasn't readable (caller falls back to bucket).
-    """
+    """KV cache cost per token using GGUF-derived attention config.
+    Standard path: n_layer * head_count_kv * (key_length + value_length) * dtype_bytes
+    (value_length used when the parser actually read it; falls back to
+    key_length only when absent). MLA path (DeepSeek V2/V3): llama.cpp caches
+    the compressed latent, so n_layer * (kv_lora_rank + qk_rope_head_dim) *
+    dtype_bytes. Hybrid SSM/attention models with a known full-attention
+    interval are scaled by the attention-layer fraction. Returns 0 when GGUF
+    metadata wasn't readable (caller falls back to bucket)."""
     n_layer = profile.get("block_count", 0) or 0
-    n_kv = profile.get("head_count_kv", 0) or 0
-    head_dim = profile.get("key_length", 0) or 0
-    if not (n_layer and n_kv and head_dim):
+    if not n_layer:
         return 0
     db = _KV_DTYPE_BYTES.get(kv_dtype, 1.0625)
-    # K and V can have different dims (rare); use the larger to stay safe.
-    v_dim = max(profile.get("value_length", 0) or head_dim, head_dim)
-    return int(n_layer * n_kv * (head_dim + v_dim) * db)
+
+    mla = _mla_dims(profile)
+    if mla:
+        kv_lora, qk_rope = mla
+        base = n_layer * (kv_lora + qk_rope) * db
+    else:
+        n_kv = profile.get("head_count_kv", 0) or 0
+        head_dim = profile.get("key_length", 0) or 0
+        if not (n_kv and head_dim):
+            return 0
+        # V dim can differ from K dim; use the parsed value_length, falling
+        # back to key_length only when the metadata didn't carry it.
+        v_dim = profile.get("value_length", 0) or head_dim
+        base = n_layer * n_kv * (head_dim + v_dim) * db
+
+    hy = _hybrid_info(profile)
+    if hy["hybrid"] and hy["interval"]:
+        # Full attention applies only to every Nth layer — KV cache lives on
+        # those layers alone (SSM state is ctx-independent, not per-token KV).
+        attn_layers = max(1, n_layer // hy["interval"])
+        base *= attn_layers / n_layer
+    return int(base)
 
 
 def _kv_per_1k_mb(profile: dict, kv_dtype: str, file_size_gb: float) -> float:
@@ -17688,7 +18089,7 @@ def _kv_per_1k_mb(profile: dict, kv_dtype: str, file_size_gb: float) -> float:
     return base
 
 
-def auto_tune(model_path: str, vram_gb: float) -> dict:
+def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: int = 0) -> dict:
     """Suggest llama-server flags for a (model, VRAM) pair.
 
     Uses GGUF header metadata (layer count, expert count, GQA config) when
@@ -17696,12 +18097,20 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
     size-bucket heuristics when the header is unreadable. Returns the same
     keys the Settings drawer uses plus `notes` (multi-line reasoning) and
     `quant_downshift` (banner shown when the model needs heavy offload).
+    `profile` may be passed in to reuse an existing inspect_model() result.
+
+    `min_ctx` makes context grow-only: when it's larger than the picked tier,
+    the solver re-runs pinned to the smallest tier >= min_ctx and recomputes
+    the offload for THAT ctx. The pinned combo is kept only if it fits within
+    the same offload caps the normal solve uses; otherwise the normal pick
+    stands and a note explains the saved ctx doesn't fit. Absent/0/smaller
+    min_ctx changes nothing.
 
     Leaves ~8% VRAM headroom when GGUF math is exact, ~15% when falling back
     to filename heuristics. Disables speculative decoding for MoE because
     independent benchmarks show it's net-negative there.
     """
-    profile = inspect_model(model_path)
+    profile = profile or inspect_model(model_path)
     notes: list[str] = []
     size_gb = profile["size_gb"] or 0.0
     is_moe = profile["is_moe"]
@@ -17760,6 +18169,29 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
         out["kv_cache_type"] = "q8_0"
         notes.append("KV cache: q8_0 (zero perplexity loss baseline).")
 
+    # -- MTP detection (hoisted above the context solver: the draft-mtp choice
+    # feeds the compute-overhead reserve below, and the speculative section
+    # further down reuses this result) --
+    # Primary signal: GGUF metadata key "<arch>.nextn_predict_layers" set by
+    # llama.cpp's own converter for MTP-capable arches. Reliable — no false
+    # positives from filenames, no false negatives from non-canonical names.
+    has_mtp = bool(profile.get("has_mtp", False))
+    if not has_mtp and profile.get("metadata_source") != "gguf":
+        # Fallback: filename / arch heuristic, for GGUFs that lost the metadata
+        # during conversion or third-party repacks that didn't carry it through.
+        name_blob = ((profile.get("name") or "") + " " + (profile.get("architecture") or "")).lower()
+        _MTP_HINTS = (
+            "qwen3.5", "qwen3.6", "qwen-3.5", "qwen-3.6", "qwen_3.5", "qwen_3.6",
+            "qwen3_5", "qwen3_6", "qwen_3_5", "qwen_3_6",
+            "deepseek-v3", "deepseek_v3", "deepseekv3",
+            "deepseek-r1", "deepseek_r1", "deepseekr1",
+        )
+        has_mtp = any(h in name_blob for h in _MTP_HINTS)
+        if has_mtp:
+            _EXCLUDE_MTP = ("distil", "distill", "distilled", "glm")
+            if any(e in name_blob for e in _EXCLUDE_MTP):
+                has_mtp = False
+
     # -- Context window + n_cpu_moe (joint optimization) --
     # The two settings are coupled: bigger ctx eats more KV cache VRAM, which
     # forces more expert offload, which slows tokens. We want the LARGEST ctx
@@ -17767,9 +18199,30 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
     # gives the user "biggest context that's still fast" instead of the old
     # "fixed 45%-of-budget cap that left context on the table".
     kv_per_1k = _kv_per_1k_mb(profile, out["kv_cache_type"], size_gb)
-    # Compute buffer: ~1.5 GB for activations, scratch, CUDA workspace,
-    # attention work area. Padded to accommodate explicit 512+ ubatch sizing.
-    compute_buf_mb = 1536.0
+
+    # Surface which KV math path is in use (MLA latent cache / hybrid scaling).
+    mla = _mla_dims(profile)
+    hy = _hybrid_info(profile)
+    if src == "gguf":
+        if mla:
+            notes.append(
+                f"KV math: MLA latent cache (kv_lora_rank={mla[0]} + qk_rope={mla[1]}, "
+                f"not per-head K/V)."
+            )
+        if hy["hybrid"]:
+            if hy["interval"] and n_layer:
+                attn_layers = max(1, n_layer // hy["interval"])
+                pct = int(round(100.0 * attn_layers / n_layer))
+                notes.append(
+                    f"hybrid SSM/attention detected ({hy['evidence']}): full attention every "
+                    f"{hy['interval']} layers — KV scaled to ~{pct}% of layers."
+                )
+            else:
+                notes.append(
+                    f"hybrid SSM/attention detected ({hy['evidence']}) but attention-layer "
+                    f"fraction unknown — KV kept conservative (all layers treated as full attention)."
+                )
+
     size_mb = size_gb * 1024
     # Tier ladder. We deliberately do NOT cap to GGUF-reported trained_max —
     # many GGUFs report a conservative trained context that the model handles
@@ -17779,85 +18232,248 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
     trained_max = int(profile.get("context_length", 0) or 0)
     ctx_tiers = (262144, 131072, 98304, 65536, 49152, 32768, 24576, 16384, 12288, 8192, 4096)
 
-    if is_moe and n_layer > 0:
-        # Dense share: attention + embeddings + router + LM head. Empirically
-        # ~10-15% for big MoEs, more for small ones. Bounded.
-        dense_share = max(0.08, min(0.20, 1.5 / max(profile.get("expert_count", 8), 1) + 0.08))
-        expert_total_mb = size_mb * (1 - dense_share)
-        expert_per_layer_mb = expert_total_mb / n_layer
-        # Offload tolerance: 70% means we're willing to push experts off GPU as
-        # long as the active set + attention + KV cache still fit. Past 70%
-        # the speed cost outweighs the context win.
-        max_offload_layers = int(n_layer * 0.7)
-
-        chosen_ctx = ctx_tiers[-1]  # smallest as fallback
-        chosen_n_cpu_moe = n_layer  # max offload as fallback
-        for tier in ctx_tiers:
-            kv_mb = (tier / 1000.0) * kv_per_1k
-            available_for_model = budget_mb - kv_mb - compute_buf_mb
-            if available_for_model <= 0:
-                continue  # KV alone busts the budget
-            if available_for_model >= size_mb:
-                # Whole model + KV + compute fits. No offload, max speed.
-                chosen_ctx = tier
-                chosen_n_cpu_moe = 0
-                break
-            shortfall = size_mb - available_for_model
-            need_offload = int((shortfall + expert_per_layer_mb - 1) // expert_per_layer_mb)
-            if need_offload <= max_offload_layers:
-                chosen_ctx = tier
-                chosen_n_cpu_moe = need_offload
-                break
-        out["num_ctx"] = chosen_ctx
-        out["n_cpu_moe"] = chosen_n_cpu_moe
-        kv_at_chosen = (chosen_ctx / 1000.0) * kv_per_1k
-        if chosen_n_cpu_moe == 0:
-            notes.append(
-                f"context: {chosen_ctx:,} tokens · n_cpu_moe: 0 "
-                f"(model fits fully in VRAM at this context, KV ≈ {kv_at_chosen:.0f} MB)."
-            )
-        else:
-            notes.append(
-                f"context: {chosen_ctx:,} tokens · n_cpu_moe: {chosen_n_cpu_moe} of {n_layer} "
-                f"(KV ≈ {kv_at_chosen:.0f} MB; offloading {chosen_n_cpu_moe} expert layers to fit + leave room)."
-            )
-        # Quant downshift suggestion: if we're offloading more than half
-        # the layers even at the chosen context, the user is leaving real
-        # throughput on the table by not picking a smaller quant.
-        if chosen_n_cpu_moe > n_layer * 0.5:
-            cur_q = profile.get("quant", "Q4_K_M")
-            suggest_q = "Q3_K_S" if cur_q.upper().startswith("Q4") else "IQ3_XS"
-            out["quant_downshift"] = (
-                f"Offloading {chosen_n_cpu_moe}/{n_layer} layers at {cur_q or 'this quant'}. "
-                f"Grab the {suggest_q} variant for ~3-5x throughput with full context."
-            )
-    elif is_moe:
-        # No layer count from GGUF — fall back to ratio formula + old context calc.
-        ctx_budget_mb = budget_mb * 0.45
-        max_ctx_tokens = int((ctx_budget_mb / kv_per_1k) * 1000) if kv_per_1k > 0 else 8192
-        for tier in ctx_tiers:
-            if max_ctx_tokens >= tier:
-                out["num_ctx"] = tier
-                break
-        shortfall_gb = (size_gb * 1.1) - vram
-        ratio = max(0.0, min(1.0, shortfall_gb / max(size_gb, 1)))
-        out["n_cpu_moe"] = max(0, min(int(round(ratio * 50)), 60))
-        notes.append(f"context: {out['num_ctx']:,} tokens (estimated — no layer count from GGUF).")
-        notes.append(f"n_cpu_moe: {out['n_cpu_moe']} (estimated).")
+    # -- Compute buffer + runtime overhead reserve --
+    # Replaces the old flat 1536MB. Three parts, all deterministic:
+    #   1. compute buffer: 256MB floor, scaled by batch tokens × embedding
+    #      width (activations, scratch, attention work area). Sized for the
+    #      largest batch we might pick (2048) so it stays conservative.
+    #      Falls back to the old flat 1536MB when embd is unknown.
+    #   2. runtime allowance: fixed 400MB for CUDA context + driver on GPU tiers.
+    #   3. MTP overhead when draft-mtp is selected: MTP head weights ≈
+    #      nextn_predict_layers × per-layer weight size (per-layer ≈
+    #      size_mb/n_layer) plus ~200MB of speculative buffers.
+    embd = profile.get("embedding_length", 0) or 0
+    if embd:
+        compute_mb = 256.0 + (2048.0 / 512.0) * (embd / 4096.0) * 384.0
     else:
-        # Dense model: max context that fits alongside model weights.
-        for tier in ctx_tiers:
-            kv_mb = (tier / 1000.0) * kv_per_1k
-            if size_mb + kv_mb + compute_buf_mb <= budget_mb:
-                out["num_ctx"] = tier
-                break
+        compute_mb = 1536.0  # no embd from GGUF — keep the old flat reserve
+    runtime_mb = 400.0
+    mtp_mb = 0.0
+    nextn = int(profile.get("nextn_predict_layers", 0) or 0)
+    if has_mtp and nextn and n_layer and size_mb > 0:
+        mtp_mb = nextn * (size_mb / n_layer) + 200.0
+    compute_buf_mb = compute_mb + runtime_mb + mtp_mb
+    notes.append(
+        f"overhead reserve: {compute_buf_mb:.0f} MB "
+        f"(compute buffer {compute_mb:.0f} MB scaled to batch 2048 × embd {embd or 'unknown'}"
+        f" + runtime {runtime_mb:.0f} MB"
+        + (f" + MTP {mtp_mb:.0f} MB ({nextn} heads)" if mtp_mb else "") + ")."
+    )
+
+    # -- MoE dense/expert split (analytic when GGUF carries the fields) --
+    keys = profile.get("keys") or {}
+    arch_name = profile.get("architecture") or ""
+    dense_share = None
+    if is_moe and n_layer > 0:
+        exp_cnt = profile.get("expert_count", 0) or 0
+        exp_ffn = profile.get("expert_feed_forward_length", 0) or 0
+        if embd and exp_cnt and exp_ffn:
+            # Element counts; the dtype factor cancels in the ratio.
+            # attention ≈ 4·embd² (q/k/v/o projections — documented
+            # approximation; exact head dims rarely move the ratio much).
+            attn_per_layer = 4 * embd * embd
+            shared_per_layer = 0
+            shared_ffn = keys.get(f"{arch_name}.expert_shared_feed_forward_length")
+            shared_cnt = keys.get(f"{arch_name}.expert_shared_count")
+            if isinstance(shared_ffn, (int, float)) and shared_ffn:
+                shared_per_layer = 3 * int(shared_ffn) * embd
+            elif isinstance(shared_cnt, (int, float)) and shared_cnt:
+                shared_per_layer = int(shared_cnt) * 3 * exp_ffn * embd
+            dense_per_layer = attn_per_layer + shared_per_layer
+            expert_per_layer = exp_cnt * 3 * exp_ffn * embd
+            dense_share = max(0.03, min(0.50, dense_per_layer / (dense_per_layer + expert_per_layer)))
+            notes.append(
+                f"MoE dense share: {dense_share*100:.1f}% (analytic: attention 4·embd²"
+                f"{' + shared expert' if shared_per_layer else ''} "
+                f"vs {exp_cnt} experts × 3·{exp_ffn}·embd)."
+            )
         else:
-            out["num_ctx"] = ctx_tiers[-1]
-        kv_at_chosen = (out["num_ctx"] / 1000.0) * kv_per_1k
-        notes.append(
-            f"context: {out['num_ctx']:,} tokens "
-            f"(KV ≈ {kv_at_chosen:.0f} MB at {out['kv_cache_type']})."
+            # Old heuristic: empirically ~10-15% for big MoEs, more for small
+            # ones. Bounded. Used only when GGUF lacks the fields above.
+            dense_share = max(0.08, min(0.20, 1.5 / max(profile.get("expert_count", 8), 1) + 0.08))
+            notes.append(
+                f"MoE dense share: {dense_share*100:.1f}% (heuristic fallback — "
+                f"GGUF lacks embd/expert-FFN fields for the analytic split)."
+            )
+
+    # Embedding + LM head are never offloaded by --n-cpu-moe — reserve them as
+    # fixed VRAM when we can size them. vocab × embd × 2 tensors × ~2 bytes
+    # (f16-ish: a conservative overestimate for quantized embedding tables).
+    embed_mb = 0.0
+    if is_moe and embd:
+        vocab = keys.get(f"{arch_name}.vocab_size")
+        if not (isinstance(vocab, (int, float)) and vocab):
+            tok = keys.get("tokenizer.ggml.tokens")
+            vocab = tok.get("__array_len__", 0) if isinstance(tok, dict) else 0
+        if vocab:
+            embed_mb = (int(vocab) * embd * 2 * 2) / (1024 * 1024)
+            notes.append(
+                f"embedding + LM head reserve: {embed_mb:.0f} MB "
+                f"(vocab {int(vocab):,} × embd {embd} × 2 tensors, not offloadable)."
+            )
+
+    def _solve(kv_1k_mb: float, dtype_label: str, pinned_tier: int = 0):
+        """Pick (ctx, n_cpu_moe) for a given KV cost. With pinned_tier=0 the
+        tier ladder is scanned for the largest ctx that fits; with a pinned
+        tier exactly that tier is evaluated. Returns
+        (ctx, n_cpu_moe, note_lines, fits) — fits is False only for a pinned
+        tier that busts the budget or needs more offload than the caps allow.
+        May set out["quant_downshift"]."""
+        tier_notes: list[str] = []
+        if is_moe and n_layer > 0:
+            expert_total_mb = max(size_mb * (1 - dense_share) - embed_mb, size_mb * 0.1)
+            expert_per_layer_mb = expert_total_mb / n_layer
+            # Offload tolerance: 70% means we're willing to push experts off GPU
+            # as long as the active set + attention + KV cache still fit. Past
+            # 70% the speed cost outweighs the context win.
+            max_offload_layers = int(n_layer * 0.7)
+
+            chosen_ctx = 0
+            chosen_n_cpu_moe = 0
+            for tier in ([pinned_tier] if pinned_tier else ctx_tiers):
+                kv_mb = (tier / 1000.0) * kv_1k_mb
+                available_for_model = budget_mb - kv_mb - compute_buf_mb - embed_mb
+                if available_for_model <= 0:
+                    continue  # KV alone busts the budget
+                if available_for_model >= size_mb:
+                    # Whole model + KV + compute fits. No offload, max speed.
+                    chosen_ctx = tier
+                    chosen_n_cpu_moe = 0
+                    break
+                shortfall = size_mb - available_for_model
+                need_offload = int((shortfall + expert_per_layer_mb - 1) // expert_per_layer_mb)
+                if need_offload <= max_offload_layers:
+                    chosen_ctx = tier
+                    chosen_n_cpu_moe = need_offload
+                    break
+            if not chosen_ctx:
+                if pinned_tier:
+                    # Pinned tier doesn't fit within the offload caps.
+                    return pinned_tier, n_layer, [], False
+                chosen_ctx = ctx_tiers[-1]  # smallest as fallback
+                chosen_n_cpu_moe = n_layer  # max offload as fallback
+            kv_at_chosen = (chosen_ctx / 1000.0) * kv_1k_mb
+            if chosen_n_cpu_moe == 0:
+                tier_notes.append(
+                    f"context: {chosen_ctx:,} tokens · n_cpu_moe: 0 "
+                    f"(model fits fully in VRAM at this context, KV ≈ {kv_at_chosen:.0f} MB)."
+                )
+            else:
+                tier_notes.append(
+                    f"context: {chosen_ctx:,} tokens · n_cpu_moe: {chosen_n_cpu_moe} of {n_layer} "
+                    f"(KV ≈ {kv_at_chosen:.0f} MB; offloading {chosen_n_cpu_moe} expert layers to fit + leave room)."
+                )
+            # Quant downshift suggestion: if we're offloading more than half
+            # the layers even at the chosen context, the user is leaving real
+            # throughput on the table by not picking a smaller quant.
+            if chosen_n_cpu_moe > n_layer * 0.5:
+                cur_q = profile.get("quant", "Q4_K_M")
+                suggest_q = "Q3_K_S" if cur_q.upper().startswith("Q4") else "IQ3_XS"
+                out["quant_downshift"] = (
+                    f"Offloading {chosen_n_cpu_moe}/{n_layer} layers at {cur_q or 'this quant'}. "
+                    f"Grab the {suggest_q} variant for ~3-5x throughput with full context."
+                )
+            return chosen_ctx, chosen_n_cpu_moe, tier_notes, True
+        if is_moe:
+            # No layer count from GGUF — fall back to ratio formula + old context calc.
+            if pinned_tier:
+                est_ctx = pinned_tier
+                # Fit check: KV + compute must leave something for the model.
+                fits = budget_mb - (est_ctx / 1000.0) * kv_1k_mb - compute_buf_mb > 0
+            else:
+                ctx_budget_mb = budget_mb * 0.45
+                max_ctx_tokens = int((ctx_budget_mb / kv_1k_mb) * 1000) if kv_1k_mb > 0 else 8192
+                est_ctx = ctx_tiers[-1]
+                for tier in ctx_tiers:
+                    if max_ctx_tokens >= tier:
+                        est_ctx = tier
+                        break
+                fits = True
+            shortfall_gb = (size_gb * 1.1) - vram
+            ratio = max(0.0, min(1.0, shortfall_gb / max(size_gb, 1)))
+            est_n_cpu_moe = max(0, min(int(round(ratio * 50)), 60))
+            tier_notes.append(f"context: {est_ctx:,} tokens (estimated — no layer count from GGUF).")
+            tier_notes.append(f"n_cpu_moe: {est_n_cpu_moe} (estimated).")
+            return est_ctx, est_n_cpu_moe, tier_notes, fits
+        # Dense model: max context that fits alongside model weights.
+        if pinned_tier:
+            kv_mb = (pinned_tier / 1000.0) * kv_1k_mb
+            if size_mb + kv_mb + compute_buf_mb > budget_mb:
+                return pinned_tier, 0, [], False
+            dense_ctx = pinned_tier
+        else:
+            dense_ctx = ctx_tiers[-1]
+            for tier in ctx_tiers:
+                kv_mb = (tier / 1000.0) * kv_1k_mb
+                if size_mb + kv_mb + compute_buf_mb <= budget_mb:
+                    dense_ctx = tier
+                    break
+        kv_at_chosen = (dense_ctx / 1000.0) * kv_1k_mb
+        tier_notes.append(
+            f"context: {dense_ctx:,} tokens "
+            f"(KV ≈ {kv_at_chosen:.0f} MB at {dtype_label})."
         )
+        return dense_ctx, 0, tier_notes, True
+
+    chosen_ctx, chosen_n_cpu_moe, tier_notes, _ = _solve(kv_per_1k, out["kv_cache_type"])
+
+    # -- Two-pass KV dtype --
+    # If the first pass starved context below the 16k floor, retry with q4_0
+    # KV and keep it only when it buys ≥1.5× the context. q4_0 KV has a small
+    # quality cost, so it's a starvation escape hatch, not a default.
+    if chosen_ctx < 16384 and out["kv_cache_type"] != "q4_0":
+        prev_downshift = out["quant_downshift"]
+        out["quant_downshift"] = ""
+        kv_per_1k_q4 = _kv_per_1k_mb(profile, "q4_0", size_gb)
+        ctx_q4, moe_q4, q4_tier_notes, _ = _solve(kv_per_1k_q4, "q4_0")
+        if ctx_q4 >= int(chosen_ctx * 1.5):
+            out["kv_cache_type"] = "q4_0"
+            chosen_ctx, chosen_n_cpu_moe, tier_notes = ctx_q4, moe_q4, q4_tier_notes
+            notes.append(
+                "KV cache: switched to q4_0 — first-pass context was below the "
+                "16384 floor and q4_0 buys ≥1.5× context."
+            )
+        else:
+            out["quant_downshift"] = prev_downshift
+            notes.append(
+                f"KV cache: kept {out['kv_cache_type']} — q4_0 retry only buys "
+                f"{ctx_q4 / max(chosen_ctx, 1):.1f}× context (<1.5× threshold)."
+            )
+
+    # -- Grow-only context (min_ctx) --
+    # Frontend callers pass their saved num_ctx so a re-tune never silently
+    # downgrades context — and never hand-combines a big saved ctx with the
+    # offload computed for a smaller one (a combo the solver itself rejected,
+    # which can OOM at boot). If the saved ctx beats our pick, re-solve pinned
+    # to the smallest tier >= min_ctx and keep it only when the offload needed
+    # for THAT ctx stays within the solver's normal caps.
+    min_ctx = int(min_ctx or 0)
+    if min_ctx > chosen_ctx:
+        pinned = min((t for t in ctx_tiers if t >= min_ctx), default=None)
+        if pinned is None:
+            notes.append(
+                f"saved ctx {min_ctx:,} exceeds the tuner's {ctx_tiers[0]:,} ceiling — "
+                f"not honored; using {chosen_ctx:,} instead."
+            )
+        else:
+            kv_now = _kv_per_1k_mb(profile, out["kv_cache_type"], size_gb)
+            p_ctx, p_moe, p_tier_notes, p_fits = _solve(kv_now, out["kv_cache_type"], pinned_tier=pinned)
+            if p_fits:
+                chosen_ctx, chosen_n_cpu_moe, tier_notes = p_ctx, p_moe, p_tier_notes
+                notes.append(
+                    f"honored existing ctx {min_ctx:,} (pinned tier {pinned:,}; "
+                    f"offload recomputed for that context)."
+                )
+            else:
+                notes.append(
+                    f"saved ctx {min_ctx:,} doesn't fit the current VRAM budget "
+                    f"(KV alone ≈ {pinned / 1000.0 * kv_now:.0f} MB at tier {pinned:,}) — "
+                    f"not honored; using {chosen_ctx:,} instead."
+                )
+
+    out["num_ctx"] = chosen_ctx
+    out["n_cpu_moe"] = chosen_n_cpu_moe
+    notes.extend(tier_notes)
     if trained_max:
         notes.append(f"GGUF reports trained max {trained_max:,} tokens (informational, not enforced).")
 
@@ -17883,7 +18499,7 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
             notes.append(f"num_gpu: {out['num_gpu']} layers (dense partial offload).")
 
     # -- Speculative decoding --
-    # Three-way pick:
+    # Three-way pick (detection itself is hoisted above the context solver):
     #   1. If the model ships MTP heads (Qwen 3.5/3.6, DeepSeek V3/R1) → "draft-mtp".
     #      The model's own MTP heads draft 3 tokens/step; reported ~1.85x decode
     #      win on Qwen3.6 27B with ~75% acceptance. Beats both n-gram and off on
@@ -17894,28 +18510,8 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
     #      on MoE: every drafted token pulls a fresh expert through the memory
     #      hierarchy, even at 100% draft acceptance.
     #   3. Else (dense, non-MTP) → "ngram-mod". Free win, no model requirements.
-    # Primary signal: GGUF metadata key "<arch>.nextn_predict_layers" set by
-    # llama.cpp's own converter for MTP-capable arches. Reliable — no false
-    # positives from filenames, no false negatives from non-canonical names.
-    has_mtp = bool(profile.get("has_mtp", False))
-    if not has_mtp and profile.get("metadata_source") != "gguf":
-        # Fallback: filename / arch heuristic, for GGUFs that lost the metadata
-        # during conversion or third-party repacks that didn't carry it through.
-        name_blob = ((profile.get("name") or "") + " " + (profile.get("architecture") or "")).lower()
-        _MTP_HINTS = (
-            "qwen3.5", "qwen3.6", "qwen-3.5", "qwen-3.6", "qwen_3.5", "qwen_3.6",
-            "qwen3_5", "qwen3_6", "qwen_3_5", "qwen_3_6",
-            "deepseek-v3", "deepseek_v3", "deepseekv3",
-            "deepseek-r1", "deepseek_r1", "deepseekr1",
-        )
-        has_mtp = any(h in name_blob for h in _MTP_HINTS)
-        if has_mtp:
-            _EXCLUDE_MTP = ("distil", "distill", "distilled", "glm")
-            if any(e in name_blob for e in _EXCLUDE_MTP):
-                has_mtp = False
     if has_mtp:
         out["spec_strategy"] = "draft-mtp"
-        nextn = int(profile.get("nextn_predict_layers", 0) or 0)
         if nextn:
             notes.append(f"speculative decoding: draft-mtp ({nextn} MTP heads detected, ~1.85x decode win).")
         else:
@@ -17927,21 +18523,43 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
         out["spec_strategy"] = "ngram-mod"
         notes.append("speculative decoding: ngram-mod (free win on dense models).")
 
-    # -- batch / ubatch --
+    # -- batch / ubatch / threads --
     # When offloading to CPU, bigger batches dramatically improve prompt eval
     # because the PCIe transfer is amortized over more tokens. Default 512 is
     # too small for hybrid CPU/GPU.
-    if out["n_cpu_moe"] > 0 or (not is_moe and out["num_gpu"] < 99):
+    cpu_offload = out["n_cpu_moe"] > 0 or (not is_moe and out["num_gpu"] < 99)
+    if cpu_offload:
         out["num_batch"] = 2048
         notes.append("batch: 2048 (offloading).")
     elif vram >= 24:
         out["num_batch"] = 2048
     elif vram >= 16:
         out["num_batch"] = 1024
-        
-    # Explicitly lock micro-batch to 512. Higher values on CPU-offloaded MoEs
-    # cause massive L3 cache thrashing and RAM bandwidth bottlenecks.
-    out["n_ubatch"] = 512
+
+    # Sanity: batch must never exceed ctx (llama.cpp rejects n_batch > n_ctx).
+    if out["num_batch"] > out["num_ctx"]:
+        out["num_batch"] = max(512, out["num_ctx"])
+        notes.append(f"batch: clamped to {out['num_batch']} (was larger than ctx {out['num_ctx']:,}).")
+
+    # Micro-batch: lock to 512 only when CPU offload is active — higher values
+    # on CPU-offloaded MoEs cause massive L3 cache thrashing and RAM bandwidth
+    # bottlenecks. Full-GPU runs get 0 = auto: the spawn path then picks
+    # min(max(n_batch//2, 512), 1024), which is better there.
+    if cpu_offload:
+        out["n_ubatch"] = 512
+        notes.append("n_ubatch: 512 (CPU offload active — larger ubatch thrashes L3/RAM bandwidth).")
+    else:
+        out["n_ubatch"] = 0
+        notes.append("n_ubatch: 0 (auto — spawn path picks min(max(n_batch//2, 512), 1024) for full-GPU runs).")
+
+    # Threads matter when part of the model lives on CPU. Physical-core
+    # heuristic: half the logical count, floor 4. 0 = llama-server default.
+    if cpu_offload:
+        out["num_thread"] = max(4, (os.cpu_count() or 8) // 2)
+        notes.append(f"threads: {out['num_thread']} (CPU offload active — physical-core heuristic).")
+    else:
+        out["num_thread"] = 0
+        notes.append("threads: 0 (server default — full GPU offload).")
 
     out["notes"] = " ".join(notes)
     return out
@@ -18551,19 +19169,22 @@ class LlamaProcess:
         flash_on = bool(s.get("flash_attn", True))
         # Three-way speculative strategy with legacy-flag honoring.
         #
-        # Migration is trickier than it looks because DEFAULTS now carries
-        # spec_strategy="ngram-mod", which gets merged into `s` for any
-        # settings.json that pre-dates this field. That means a user whose
-        # autotuner wrote `enable_speculative=false` (e.g. for an MoE model
-        # where n-gram speculation is net-negative) would see their preference
-        # silently overridden by the merged default — and llama-server crash
-        # at startup with spec flags it shouldn't be getting.
+        # Migration is trickier than it looks because get_settings() merges
+        # DEFAULTS (which carry spec_strategy="ngram-mod") into `s` — so the
+        # merged dict ALWAYS has a spec_strategy key. To tell a true legacy
+        # settings.json (only enable_speculative) apart from one written by
+        # auto-tune / the newer UI, key presence must be checked on the raw
+        # file, not on the merged dict.
         #
-        # Rule: an EXPLICIT False on the legacy field always wins. That
-        # preserves the autotuner's intent across the upgrade. Otherwise
-        # spec_strategy is the source of truth.
+        # Rule: the legacy `enable_speculative=false` veto applies ONLY when
+        # the raw file has no spec_strategy key at all. Once spec_strategy
+        # exists on disk it wins — auto-tune and the UI write it deliberately,
+        # and honoring the stale veto would silently override their pick while
+        # the UI keeps showing the strategy that isn't actually used.
         spec_strategy = (s.get("spec_strategy") or "").strip().lower()
-        if s.get("enable_speculative") is False:
+        _raw_settings = load_json(SETTINGS_FILE, {})
+        _has_spec_key = isinstance(_raw_settings, dict) and "spec_strategy" in _raw_settings
+        if s.get("enable_speculative") is False and not _has_spec_key:
             spec_strategy = "off"
         elif spec_strategy not in ("off", "ngram-mod", "draft-mtp"):
             spec_strategy = "ngram-mod" if bool(s.get("enable_speculative", True)) else "off"
@@ -18920,6 +19541,11 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
         save_json(CHATS_FILE, chats)
 
         replay_from = 0
+        # Gemma over discord gets the same text-tools routing as the web UI:
+        # llama-server can't parse its dialect, so keep tools in the prompt but
+        # off the wire and let extract_tool_calls handle the tool_code shape.
+        _gm = any(_is_gemma_model(m) for m in
+                  (get_settings().get("model"), get_settings().get("model_path"), _llama.loaded_model()))
         if use_tools:
             # Owner path: same long-session memory as the web UI — token-aware
             # rolling summary + pinned facts/fixes, replaying only the un-folded
@@ -18937,15 +19563,12 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
                         save_json(CHATS_FILE, chats)
                 except Exception:
                     traceback.print_exc()
-            system_prompt = build_system_prompt(include_tools=True, chat_mode="agent")
-            _mission = _rt_mission_render(chat) if get_settings().get("rt_mission_state", True) else ""
-            if _mission:
-                system_prompt += ("\n\n=== MISSION (authorized run — hold this; do NOT drift off-task) ===\n"
-                                  + _mission)
-            _pins = chat.get("pins") or []
-            if _pins:
-                system_prompt += ("\n\n=== PINNED FOR THIS SESSION (established facts/fixes — do NOT undo or repeat) ===\n"
-                                  + "\n".join(f"- {p}" for p in _pins))
+            system_prompt = build_system_prompt(include_tools=True, chat_mode="agent",
+                                                include_tool_list=not _gm)
+            # Mission block + pins are NOT spliced here — run_chat_turn appends
+            # them as a tail message after the history (cache-friendly; see the
+            # volatile-tail block there). Only the rare-changing rolling summary
+            # and the static pin_note nudge stay in the system prompt.
             _roll = chat.get("rolling_summary", "")
             if _roll:
                 system_prompt += ("\n\n=== EARLIER IN THIS SESSION (older turns condensed to save context; "
@@ -18970,11 +19593,6 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
                     out["name"] = m["name"]
             msgs.append(out)
 
-        # Gemma over discord gets the same text-tools routing as the web UI:
-        # llama-server can't parse its dialect, so keep tools in the prompt but
-        # off the wire and let extract_tool_calls handle the tool_code shape.
-        _gm = any(_is_gemma_model(m) for m in
-                  (get_settings().get("model"), get_settings().get("model_path"), _llama.loaded_model()))
         final = run_chat_turn(chat_id, msgs, use_tools=use_tools, emit=lambda e: None,
                               native_tools=not _gm)
         if not final:

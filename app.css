@@ -208,17 +208,6 @@ button {
   letter-spacing: 0.06em;
 }
 
-.side-actions {
-  display: flex;
-  gap: 6px;
-  padding: 10px 10px 8px;
-}
-
-.side-actions .btn {
-  flex: 1;
-  justify-content: center;
-}
-
 .section-head {
   display: flex;
   align-items: center;
@@ -701,38 +690,6 @@ button {
   display: block;
 }
 
-.status-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 8px;
-  border-radius: 999px;
-  background: var(--mint);
-  color: #1D4732;
-  font-size: 10px;
-  font-weight: 500;
-  letter-spacing: 0.06em;
-  width: fit-content;
-}
-
-.status-pill .dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 999px;
-  background: var(--mint-3);
-  animation: pulse 2s infinite;
-}
-
-.status-pill.off {
-  background: var(--bg-inset);
-  color: var(--fg-muted);
-}
-
-.status-pill.off .dot {
-  background: var(--fg-faint);
-  animation: none;
-}
-
 @keyframes pulse {
   50% {
     opacity: 0.4;
@@ -1151,12 +1108,6 @@ button {
 /* ---- folded work block ("Worked for Xs") ---- */
 .tool-group.work-hidden { display: none; }
 
-/* ---- approval: always-allow button + keyboard affordances ---- */
-.appr-btn-always { border-color: var(--border-strong); }
-.appr-btn-always:hover { border-color: var(--accent); background: var(--accent-subtle); }
-.appr-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.appr-kbd-hint { margin-top: 6px; text-align: center; font-size: 10.5px; color: var(--fg-faint); }
-
 /* ---- OSINT recon card (passive intel dossier) ---- */
 .osint-card {
   margin: 6px 0 10px;
@@ -1229,10 +1180,6 @@ button {
   .osint-card .oc-grid { grid-template-columns: repeat(2, 1fr); }
   .osint-card .oc-cat-count { font-size: 15px; }
   .osint-card .oc-ico { width: 26px; height: 26px; font-size: 14px; }
-  .appr-kbd-hint { display: none; }          /* no keyboard on a phone */
-  .approval .appr-actions { gap: 6px; }
-  .approval .appr-btn { padding: 9px 6px; font-size: 12px; }
-  .approval .appr-btn span { overflow: hidden; text-overflow: ellipsis; }
   .turn-changes { font-size: 11.5px; }
   .turn-changes .tc-head { flex-wrap: wrap; }
 }
@@ -1584,7 +1531,6 @@ button {
 }
 .recon-disclaimer i { color: var(--warning); font-size: 18px; flex-shrink: 0; margin-top: 1px; }
 .recon-disclaimer strong { color: var(--fg); }
-.recon-q { font-size: 14px; font-weight: 500; color: var(--fg); margin: 0 0 14px; }
 .recon-label { display: block; font-size: 12px; font-weight: 500; color: var(--fg-muted); margin-bottom: 6px; }
 .recon-input {
   width: 100%;
@@ -1599,7 +1545,6 @@ button {
 }
 .recon-input:focus { outline: none; border-color: var(--accent); }
 .recon-input + .recon-input { margin-top: 8px; }
-.recon-hint { font-size: 12px; color: var(--fg-subtle); line-height: 1.5; margin: 8px 0 16px; }
 .recon-actions { display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap; }
 #recon-panel .recon-label { margin-top: 16px; }
 #recon-panel > .recon-disclaimer + .recon-label,
@@ -2858,15 +2803,6 @@ button {
   }
 }
 
-/* web search rich results — link chips with favicons (mimics native search UI) */
-.web-results-wrap {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  width: fit-content;
-  max-width: 100%;
-}
-
 .web-results {
   display: flex;
   flex-wrap: wrap;
@@ -3727,58 +3663,6 @@ button {
   to {
     transform: rotate(360deg);
   }
-}
-
-/* legacy tool-card (unused but kept to avoid breaking anything) */
-.tool-card {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 8px 10px;
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-family: var(--font-sans);
-  font-size: 11px;
-  color: var(--fg-muted);
-  margin: 6px 0;
-}
-
-.tool-card .head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--fg);
-}
-
-.tool-card .head .name {
-  font-weight: 500;
-}
-
-.tool-card .head .st {
-  margin-left: auto;
-  font-size: 9px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--mint-3);
-}
-
-.tool-card .head .st.err {
-  color: var(--danger);
-}
-
-.tool-card .head .st.run {
-  color: var(--accent);
-}
-
-.tool-card pre {
-  margin: 0;
-  background: var(--bg-inset);
-  padding: 6px 8px;
-  border-radius: 4px;
-  font-size: 10px;
-  max-height: 200px;
-  overflow: auto;
 }
 
 /* ---- composer ---- */
@@ -4661,10 +4545,6 @@ button {
   font-style: italic;
 }
 
-.code-view .tok-value {
-  color: var(--fg);
-}
-
 .preview-foot {
   display: flex;
   justify-content: space-between;
@@ -5436,603 +5316,6 @@ button {
 }
 
 /* ============================================================
-   Approval card — sleek, compact, theme-aware
-   ============================================================ */
-.approval-stack {
-  position: fixed;
-  right: 20px;
-  bottom: 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  z-index: var(--z-toast);
-  max-width: min(460px, calc(100vw - 40px));
-}
-
-.approval {
-  background: var(--bg-raised);
-  border: 1px solid var(--border-strong);
-  border-radius: 14px;
-  box-shadow: var(--shadow-lg);
-  padding: 14px 16px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  animation: appr-enter 0.35s cubic-bezier(0.22, 1, 0.36, 1) both;
-  font-family: var(--font-sans);
-  color: var(--fg);
-  position: relative;
-  overflow: hidden;
-  box-sizing: border-box;
-  max-width: 100%;
-  min-width: 0;
-}
-
-/* Left accent stripe */
-.approval .appr-accent-bar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  bottom: 0;
-  width: 3px;
-  background: var(--accent);
-  border-radius: 14px 0 0 14px;
-  animation: appr-bar-in 0.4s 0.15s cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-.approval.kind-destructive .appr-accent-bar { background: var(--danger); }
-.approval.kind-registry .appr-accent-bar { background: var(--danger); }
-
-@keyframes appr-enter {
-  from { transform: translateY(16px) scale(0.98); opacity: 0; }
-}
-@keyframes appr-bar-in {
-  from { transform: scaleY(0); }
-}
-
-/* Stagger children */
-.approval [data-appr-child] {
-  animation: appr-child-in 0.3s cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-.approval [data-appr-child]:nth-child(2) { animation-delay: 0.04s; }
-.approval [data-appr-child]:nth-child(3) { animation-delay: 0.08s; }
-.approval [data-appr-child]:nth-child(4) { animation-delay: 0.12s; }
-.approval [data-appr-child]:nth-child(5) { animation-delay: 0.16s; }
-.approval [data-appr-child]:nth-child(6) { animation-delay: 0.20s; }
-.approval [data-appr-child]:nth-child(7) { animation-delay: 0.24s; }
-.approval [data-appr-child]:nth-child(8) { animation-delay: 0.28s; }
-@keyframes appr-child-in {
-  from { opacity: 0; transform: translateY(6px); }
-}
-
-/* ---- header: icon · title · tag · pill ---- */
-.approval .appr-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.approval .appr-head-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 7px;
-  background: var(--accent-subtle);
-  color: var(--accent);
-  flex-shrink: 0;
-}
-.approval .appr-head-icon svg { width: 16px; height: 16px; display: block; }
-.approval.kind-destructive .appr-head-icon {
-  background: var(--danger-subtle);
-  color: var(--danger);
-}
-.approval .appr-head-title {
-  font-family: var(--font-display);
-  font-size: 14px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
-  color: var(--fg);
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.approval .appr-head-tag {
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 9px;
-  font-weight: 600;
-  color: var(--fg-faint);
-  background: var(--bg-sunken);
-  border: 1px solid var(--border);
-  padding: 2px 7px;
-  border-radius: 5px;
-  flex-shrink: 0;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-}
-
-/* ============================================================
-   Soft status pills — used on approval cards (Pending / Approved
-   / Denied / Expired) and free for reuse anywhere a status
-   indicator with an icon belongs. Each variant is a coloured
-   icon + matching tinted text on a soft pill background. The
-   shape inherits the same depth treatment as .chip / .btn so
-   the family reads consistently.
-   ============================================================ */
-.status-pill-soft {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px 4px 8px;
-  border-radius: 999px;
-  background: var(--bg-raised);
-  font-family: var(--font-sans);
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--fg-muted);
-  flex-shrink: 0;
-  box-shadow: var(--btn-shadow-rest);
-  transition: box-shadow var(--dur-fast) var(--ease-out),
-    background-color var(--dur-fast) var(--ease-out),
-    color var(--dur-fast) var(--ease-out);
-}
-
-.status-pill-soft .pill-dot {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  border-radius: 999px;
-  flex-shrink: 0;
-}
-
-.status-pill-soft .pill-dot svg {
-  width: 11px;
-  height: 11px;
-  display: block;
-}
-
-.status-pill-soft .pill-dot i {
-  font-size: 11px;
-  line-height: 1;
-}
-
-/* Pending — yellow/amber. The default for any new approval. */
-.status-pill-soft.is-pending {
-  color: #b27800;
-}
-
-.status-pill-soft.is-pending .pill-dot {
-  background: rgba(232, 178, 40, 0.18);
-  color: #b27800;
-  animation: appr-dot-pulse 2s ease-in-out infinite;
-}
-@keyframes appr-dot-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.45; }
-}
-
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .status-pill-soft.is-pending {
-  color: #f0c44a;
-}
-
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .status-pill-soft.is-pending .pill-dot {
-  background: rgba(232, 178, 40, 0.18);
-  color: #f0c44a;
-}
-
-/* Approved — green. Briefly shown on approval click before card slides out. */
-.status-pill-soft.is-approved {
-  color: #2f7a3a;
-}
-
-.status-pill-soft.is-approved .pill-dot {
-  background: rgba(106, 196, 154, 0.20);
-  color: #2f7a3a;
-}
-
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .status-pill-soft.is-approved {
-  color: #95e0a8;
-}
-
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .status-pill-soft.is-approved .pill-dot {
-  background: rgba(106, 196, 154, 0.20);
-  color: #95e0a8;
-}
-
-/* Denied — red. Briefly shown on deny click. */
-.status-pill-soft.is-denied {
-  color: #c44141;
-}
-
-.status-pill-soft.is-denied .pill-dot {
-  background: rgba(231, 108, 108, 0.18);
-  color: #c44141;
-}
-
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .status-pill-soft.is-denied {
-  color: #ff9b9b;
-}
-
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .status-pill-soft.is-denied .pill-dot {
-  background: rgba(231, 108, 108, 0.18);
-  color: #ff9b9b;
-}
-
-/* Expired — neutral grey, no urgency. */
-.status-pill-soft.is-expired {
-  color: var(--fg-faint);
-}
-
-.status-pill-soft.is-expired .pill-dot {
-  background: color-mix(in srgb, var(--fg-faint) 18%, transparent);
-  color: var(--fg-faint);
-}
-
-/* ---- subtitle ---- */
-.approval .appr-sub {
-  font-size: 11.5px;
-  line-height: 1.4;
-  color: var(--fg-muted);
-  margin: -2px 0 0;
-}
-
-/* ---- structured detail rows ---- */
-.approval .appr-details {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-  background: var(--bg-sunken);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
-}
-.approval .appr-detail-row {
-  display: grid;
-  grid-template-columns: 22px auto 1fr;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
-  font-size: 11.5px;
-  border-bottom: 1px solid var(--border-subtle, var(--border));
-}
-.approval .appr-detail-row:last-child { border-bottom: 0; }
-.approval .appr-detail-icon {
-  display: inline-flex; align-items: center; justify-content: center;
-  color: var(--accent);
-}
-.approval .appr-detail-icon svg { width: 13px; height: 13px; display: block; }
-.approval.kind-destructive .appr-detail-icon { color: var(--danger); }
-.approval .appr-detail-key {
-  color: var(--fg-muted);
-  font-weight: 500;
-  white-space: nowrap;
-}
-.approval .appr-detail-val {
-  color: var(--fg);
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 11px;
-  font-weight: 500;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-
-/* ---- command preview ---- */
-.approval .appr-cmd {
-  margin: 0;
-  padding: 10px 12px;
-  background: var(--bg-sunken);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--fg);
-  overflow-x: auto;
-  max-height: 100px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-.approval .appr-cmd code { background: transparent; padding: 0; font-family: inherit; font-size: inherit; color: inherit; }
-.approval .appr-cmd-fn   { color: var(--accent); font-weight: 600; }
-.approval .appr-cmd-arg  { color: var(--fg); }
-.approval .appr-cmd-val  { color: var(--accent); }
-.approval .appr-cmd-shell { color: var(--fg); white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere; }
-
-/* ---- inline info line ---- */
-.approval .appr-info-line {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  font-size: 11px;
-  line-height: 1.45;
-  color: var(--fg-faint);
-}
-.approval .appr-info-icon {
-  display: inline-flex;
-  align-items: center;
-  color: var(--fg-faint);
-  flex-shrink: 0;
-  margin-top: 1px;
-}
-.approval .appr-info-icon svg { width: 12px; height: 12px; display: block; }
-
-/* ---- actions ---- */
-.approval .appr-actions {
-  display: flex;
-  gap: 8px;
-  width: 100%;
-}
-.approval .appr-btn {
-  display: inline-flex; align-items: center; justify-content: center;
-  flex: 1;
-  min-width: 0;
-  gap: 6px;
-  padding: 9px 10px;
-  font-family: var(--font-sans);
-  font-size: 12.5px;
-  font-weight: 600;
-  border-radius: 9px;
-  cursor: pointer;
-  border: 1px solid transparent;
-  transition:
-    background 0.15s ease,
-    color 0.15s ease,
-    border-color 0.15s ease,
-    transform 0.1s ease,
-    box-shadow 0.15s ease;
-}
-.approval .appr-btn svg { width: 14px; height: 14px; display: block; }
-.approval .appr-btn:active { transform: scale(0.97); }
-.approval .appr-btn-deny {
-  background: var(--bg-raised);
-  color: var(--fg-muted);
-  border-color: var(--border-strong);
-}
-.approval .appr-btn-deny:hover {
-  color: var(--danger);
-  background: var(--danger-subtle);
-  border-color: var(--danger);
-}
-.approval .appr-btn-approve {
-  background: var(--accent);
-  color: var(--accent-fg);
-  border-color: var(--accent);
-}
-.approval .appr-btn-approve:hover {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
-  box-shadow: 0 2px 10px color-mix(in srgb, var(--accent) 30%, transparent);
-}
-
-/* ============================================================
-   REGISTRY EDIT approval — loud variant.
-   Bridge hard-blocks system-hive (HKLM/HKCR/HKU) writes outright;
-   anything that reaches this card is HKCU/HKCC scope and routed
-   through request_approval with kind="registry". The styling is
-   deliberately the loudest in the whole UI so it can't be confused
-   with a regular write_file / powershell approval.
-   ============================================================ */
-.approval.kind-registry {
-  border-color: var(--danger);
-  /* Faint orange wash + an inner stripe along the top edge so the
-     card reads as "this is hot" even before you look at the icon. */
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--danger) 14%, transparent) 0, transparent 6px),
-    var(--bg-raised);
-  box-shadow:
-    var(--shadow-lg),
-    0 0 0 1px var(--danger),
-    0 0 28px color-mix(in srgb, var(--danger) 22%, transparent);
-}
-
-.approval.kind-registry .appr-head-icon {
-  background: var(--danger);
-  color: var(--accent-fg);
-}
-
-.approval.kind-registry .appr-head-title {
-  color: var(--danger);
-  font-weight: 700;
-  letter-spacing: 0.01em;
-  text-transform: uppercase;
-}
-
-.approval.kind-registry .appr-head-tag {
-  background: var(--danger);
-  color: var(--accent-fg);
-  border-color: var(--danger);
-}
-
-.approval.kind-registry .appr-sub {
-  color: var(--fg);
-  font-weight: 600;
-}
-
-.approval.kind-registry .appr-detail-icon {
-  color: var(--danger);
-}
-
-.approval.kind-registry .appr-detail-row {
-  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
-  background: color-mix(in srgb, var(--danger) 8%, transparent);
-}
-
-.approval.kind-registry .appr-detail-row:last-child {
-  border-bottom: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
-}
-
-/* Target keys highlighted in mono so the user can scan exactly what's
-   getting touched without parsing PowerShell syntax. */
-.approval.kind-registry .appr-detail-val {
-  font-family: var(--font-mono, ui-monospace, monospace);
-  color: var(--danger);
-  font-weight: 600;
-  word-break: break-all;
-}
-
-/* Hold-to-approve button. A ::before pseudo-element fills the button
-   from left to right over the hold duration (2s). Releasing snaps the
-   fill back to 0 width (transition: 0s on the inactive state). The
-   button label switches to "Hold to approve" via JS. */
-.approval.kind-registry .appr-btn-approve {
-  background: var(--danger);
-  border-color: var(--danger);
-  color: var(--accent-fg);
-  position: relative;
-  overflow: hidden;
-  user-select: none;
-  -webkit-user-select: none;
-  touch-action: none;
-}
-
-.approval.kind-registry .appr-btn-approve:hover {
-  background: color-mix(in srgb, var(--danger) 85%, #000);
-  border-color: var(--danger);
-}
-
-.approval.kind-registry .appr-btn-approve.appr-btn-hold::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  width: 0;
-  background: rgba(255, 255, 255, 0.28);
-  transition: width 0s linear;
-  pointer-events: none;
-  z-index: 0;
-}
-
-.approval.kind-registry .appr-btn-approve.appr-btn-hold.is-holding::before {
-  width: 100%;
-  transition: width 2s linear;
-}
-
-/* Keep the icon + label above the fill */
-.approval.kind-registry .appr-btn-approve>svg,
-.approval.kind-registry .appr-btn-approve>span {
-  position: relative;
-  z-index: 1;
-}
-
-.approval.kind-registry .appr-btn-approve.is-armed {
-  background: var(--success, #3fa86a);
-  border-color: var(--success, #3fa86a);
-}
-
-/* Brighten the deny button too — it's the safer of the two options
-   on this card so it should look fully clickable. */
-.approval.kind-registry .appr-btn-deny {
-  border-color: var(--border-strong);
-  color: var(--fg);
-}
-
-.approval.kind-registry .appr-btn-deny:hover {
-  background: var(--bg-inset);
-  color: var(--fg);
-  border-color: var(--fg-muted);
-}
-
-/* Subtle pulse on the danger glow so the card actively pulls attention
-   while it's pending. Stops once the user interacts. */
-@keyframes appr-registry-pulse {
-
-  0%,
-  100% {
-    box-shadow: var(--shadow-lg), 0 0 0 1px var(--danger), 0 0 28px color-mix(in srgb, var(--danger) 22%, transparent);
-  }
-
-  50% {
-    box-shadow: var(--shadow-lg), 0 0 0 1px var(--danger), 0 0 42px color-mix(in srgb, var(--danger) 40%, transparent);
-  }
-}
-
-.approval.kind-registry {
-  animation: appr-enter 0.35s cubic-bezier(0.22, 1, 0.36, 1) both, appr-registry-pulse 2.8s ease-in-out infinite;
-}
-
-/* ---- advanced details disclosure ---- */
-.approval .appr-advanced {
-  margin-top: 2px;
-}
-
-.approval .appr-advanced summary {
-  list-style: none;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--fg-muted);
-  user-select: none;
-  padding: 4px 0;
-}
-
-.approval .appr-advanced summary::-webkit-details-marker {
-  display: none;
-}
-
-.approval .appr-advanced summary:hover {
-  color: var(--fg);
-}
-
-.approval .appr-advanced-chevron {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: currentColor;
-  transition: transform var(--dur-fast) var(--ease-out);
-}
-
-.approval .appr-advanced-chevron svg {
-  width: 14px;
-  height: 14px;
-  display: block;
-}
-
-.approval .appr-advanced[open] .appr-advanced-chevron {
-  transform: rotate(180deg);
-}
-
-.approval .appr-advanced-body {
-  margin: 6px 0 0;
-  padding: 10px 12px;
-  background: var(--bg-sunken);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 11px;
-  color: var(--fg-muted);
-  white-space: pre-wrap;
-  word-break: break-all;
-  max-height: 180px;
-  overflow: auto;
-}
-
-/* ---- inline-in-chat row avatar tint ---- */
-.approval-avatar {
-  background: var(--accent-subtle);
-  color: var(--accent);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.approval-avatar svg {
-  width: 18px;
-  height: 18px;
-  display: block;
-}
-
-/* ============================================================
    Mobile
    ============================================================ */
 body.is-mobile {
@@ -6317,20 +5600,6 @@ body.is-mobile {
     width: 100%;
   }
 
-  .approval-stack {
-    left: 0;
-    right: 0;
-    bottom: calc(64px + env(safe-area-inset-bottom, 0));
-    max-width: none;
-  }
-
-  .approval {
-    border-radius: 16px 16px 0 0;
-    border-left: none;
-    border-right: none;
-    border-bottom: none;
-  }
-
   /* roomier composer on mobile — bigger tap targets, fills the bottom area */
   .composer {
     padding: 10px 12px 12px;
@@ -6476,10 +5745,6 @@ body.is-mobile {
     inset: 48px 0 0 0;
   }
 
-  .approval-stack {
-    bottom: calc(env(safe-area-inset-bottom, 0) + 140px);
-  }
-
   /* keep everything in the drawer inside its box — no horizontal swipe.
      use 100dvh so iOS Safari URL bar collapsing/expanding doesn't crop
      the drawer, and pad the bottom past the home-bar safe area so the
@@ -6603,17 +5868,6 @@ body.is-mobile {
   margin-top: -2px;
 }
 
-/* ---- viewport presets in preview toolbar ---- */
-.vp-group {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 2px;
-  background: var(--bg-sunken);
-  border: 1px solid var(--border-subtle);
-  border-radius: 7px;
-}
-
 .vp-btn {
   display: inline-flex;
   align-items: center;
@@ -6687,24 +5941,6 @@ body.is-mobile {
   display: none;
 }
 
-.console-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
-  background: var(--bg-sunken);
-  border-bottom: 1px solid var(--border-subtle);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--fg-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-
-.console-head .grow {
-  flex: 1;
-}
-
 .console-body {
   overflow: auto;
   font-family: var(--font-mono);
@@ -6722,17 +5958,6 @@ body.is-mobile {
   word-break: break-word;
 }
 
-.c-row .c-time {
-  color: var(--fg-faint);
-  flex: none;
-  width: 64px;
-}
-
-.c-row .c-text {
-  flex: 1;
-  min-width: 0;
-}
-
 .c-row.c-log {
   color: var(--fg);
 }
@@ -6748,13 +5973,6 @@ body.is-mobile {
 .c-row.c-error {
   color: var(--danger, #c6392f);
   background: color-mix(in srgb, var(--danger, #c6392f) 7%, transparent);
-}
-
-.console-empty {
-  color: var(--fg-faint);
-  padding: 10px;
-  font-family: var(--font-mono);
-  font-size: 11px;
 }
 
 /* ---- copy-code button on rendered pre blocks ---- */
@@ -6945,19 +6163,6 @@ pre.code-block:hover .copy-code,
 
 .palette-item.sel {
   background: var(--accent-soft);
-  color: var(--accent-strong);
-}
-
-.palette-item .pi-icon {
-  width: 18px;
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--fg-muted);
-}
-
-.palette-item.sel .pi-icon {
   color: var(--accent-strong);
 }
 
@@ -7171,10 +6376,6 @@ pre.code-block:hover .copy-code,
 
   .mem-list {
     max-height: 220px;
-  }
-
-  .vp-group {
-    display: none;
   }
 }
 
@@ -8478,12 +7679,6 @@ body,
     font-size: 13px;
     min-height: 40px;
   }
-
-  .chatlist .chat-item,
-  .workspace .ws-row {
-    min-height: 40px;
-    padding: 8px 10px;
-  }
 }
 
 /* ============================================================
@@ -9485,25 +8680,6 @@ body,
   padding-left: 0 !important;       /* the hairline ::before rail is the keyline now */
   border-left: 0 !important;
 }
-.tool-group-green-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: color-mix(in srgb, #2f9e44 14%, transparent);
-  color: #2f9e44;
-  border-radius: 99px;
-  padding: 2px 10px;
-  font-family: var(--font-sans);
-  font-size: 11px;
-  font-weight: 600;
-}
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .tool-group-green-pill {
-  background: color-mix(in srgb, #51cf66 18%, transparent);
-  color: #51cf66;
-}
-.tool-group-green-pill i {
-  font-size: 12px;
-}
 
 /* 6. Vertical Preview / Terminal Split */
 #preview-top-pane {
@@ -9684,15 +8860,6 @@ body,
   50% { opacity: 0; }
 }
 
-.agent-log-line {
-  font-size: 11.5px;
-  margin-bottom: 4px;
-}
-.agent-log-line .log-time {
-  color: var(--fg-faint);
-  margin-right: 6px;
-}
-
 /* ============================================================
    WELCOME SCREEN (EMPTY CHAT STATE)
    ============================================================ */
@@ -9715,71 +8882,119 @@ body,
   pointer-events: none;
   overflow: hidden;
   z-index: 0;
-  /* Soft warm→cool bar palette, leaned off the theme accent so every theme
-     keeps its own identity while still spanning several hues. */
-  --bar-warm:   color-mix(in oklab, var(--accent) 55%, #ff6ea6);
-  --bar-rose:   color-mix(in oklab, var(--accent) 68%, #ff9ec4);
-  --bar-mid:    var(--accent);
-  --bar-violet: color-mix(in oklab, var(--accent) 62%, #8f7bff);
-  --bar-blue:   color-mix(in oklab, var(--accent) 55%, #6ea8ff);
-  --bar-sky:    color-mix(in oklab, var(--accent) 62%, #86ccff);
+  /* Blob colours — the SEKURA pastel trio (pink/violet/blue) leaned 55%
+     toward the theme accent, so every theme gets its own palette with no
+     per-theme branching. Override --wb-a/b/c under a [data-theme] block to
+     hand-tune one theme. --wb-strength dims the whole field (dark themes). */
+  --wb-a: color-mix(in oklab, var(--accent) 55%, #ff9a9e);
+  --wb-b: color-mix(in oklab, var(--accent) 55%, #a18cd1);
+  --wb-c: color-mix(in oklab, var(--accent) 55%, #8fd3f4);
+  --wb-strength: 1;
+  opacity: var(--wb-strength);
+  /* Fade the field out toward the bottom of the screen (SEKURA's mask). */
+  -webkit-mask-image: radial-gradient(ellipse 80% 50% at 50% 0%, #000 80%, transparent 100%);
+  mask-image: radial-gradient(ellipse 80% 50% at 50% 0%, #000 80%, transparent 100%);
 }
 
-/* Soft vertical colour bars of varying height — a warm→cool set of blurred
-   columns, each fading into the background at a different point (some at the
-   top, some at the bottom, some spanning) and breathing gently. The bars are
-   generated in buildWelcomeBars(); their colours come from the --bar-* palette
-   above. This is the whole welcome backdrop (no canvas). */
+/* SEKURA AbstractWave-style backdrop (markup from buildWelcomeBars()):
+   three drifting colour blobs UNDER 28 sharp pleated pillars, then a
+   backdrop-blur softening pass, an overlay pillar pass for edge definition,
+   and grain. The pillars are static — only the colour field moves. */
 
-/* Broad warm→cool wash beneath the streaks so they blend into a colour field
-   instead of reading as isolated panels on the background. */
-.welcome-wash {
+/* 1. Colour field — oversized blurred blobs on slow drift loops. */
+.wb-blob {
   position: absolute;
-  inset: -8% -12%;
-  background: linear-gradient(100deg,
-    var(--bar-warm), var(--bar-rose) 22%, var(--bar-mid) 44%,
-    var(--bar-violet) 64%, var(--bar-blue) 84%, var(--bar-sky));
-  filter: blur(90px);
-  opacity: 0.4;
-  will-change: transform;
-  animation: welcome-wash-sway 30s ease-in-out infinite;
-}
-
-@keyframes welcome-wash-sway {
-  0%, 100% { transform: translateX(-1.5%) scale(1.02); }
-  50%      { transform: translateX(1.5%) scale(1.06); }
-}
-
-.welcome-bar {
-  position: absolute;
-  top: -6%;
-  height: 112%;
+  border-radius: 50%;
   will-change: transform, opacity;
-  animation-name: welcome-bar-breathe;
-  animation-timing-function: ease-in-out;
-  animation-iteration-count: infinite;
+}
+.wb-blob-a {
+  top: -20%; left: -10%; width: 85%; height: 75%;
+  background: var(--wb-a);
+  filter: blur(140px);
+  animation: wb-drift-a 15s ease-in-out infinite;
+}
+.wb-blob-b {
+  top: 10%; right: -10%; width: 75%; height: 65%;
+  background: var(--wb-b);
+  filter: blur(120px);
+  animation: wb-drift-b 18s ease-in-out infinite;
+}
+.wb-blob-c {
+  bottom: -10%; left: 20%; width: 85%; height: 70%;
+  background: var(--wb-c);
+  filter: blur(140px);
+  animation: wb-drift-c 22s ease-in-out infinite;
 }
 
-@keyframes welcome-bar-breathe {
-  0%, 100% { transform: translateY(-1.5%) scaleY(1);   opacity: calc(var(--o, 0.5) * 0.72); }
-  50%      { transform: translateY(1.5%) scaleY(1.06); opacity: var(--o, 0.5); }
+@keyframes wb-drift-a {
+  0%, 100% { transform: translate(0, 0) rotate(0deg) scale(1); opacity: 0.3; }
+  33%      { transform: translate(30px, -40px) rotate(10deg) scale(1.1); opacity: 0.5; }
+  66%      { transform: translate(-20px, 20px) rotate(-5deg) scale(0.9); opacity: 0.3; }
+}
+@keyframes wb-drift-b {
+  0%, 100% { transform: translate(0, 0) rotate(0deg) scale(1); opacity: 0.4; }
+  33%      { transform: translate(-40px, 30px) rotate(-15deg) scale(0.85); opacity: 0.2; }
+  66%      { transform: translate(30px, -30px) rotate(10deg) scale(1.15); opacity: 0.5; }
+}
+@keyframes wb-drift-c {
+  0%, 100% { transform: translate(0, 0) rotate(0deg) scale(1); opacity: 0.3; }
+  33%      { transform: translate(20px, 20px) rotate(20deg) scale(1.2); opacity: 0.6; }
+  66%      { transform: translate(-40px, -20px) rotate(-10deg) scale(0.8); opacity: 0.2; }
+}
+
+/* 2. Pleats — 28 sharp columns with a horizontal white→black lighting
+   gradient. This is the "vertical bars" read; they stay sharp here and get
+   softened uniformly by the backdrop-blur pass below. */
+.wb-pillars {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  transform: scale(1.05);
+}
+.wb-pillar {
+  flex: 1;
+  height: 100%;
+  background: linear-gradient(90deg,
+    rgba(255,255,255,0.5) 0%, rgba(255,255,255,0.1) 30%,
+    rgba(0,0,0,0.02) 80%, rgba(0,0,0,0.05) 100%);
+}
+
+/* 3. Softening pass — melts the pleats into the colour field. */
+.wb-soften {
+  position: absolute;
+  inset: 0;
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+}
+
+/* 4. Edge pass — a second set of pleats in overlay blend restores a hint of
+   pillar definition the blur removed. */
+.wb-pillars-edge {
+  mix-blend-mode: overlay;
+  opacity: 0.6;
+}
+.wb-pillars-edge .wb-pillar {
+  border-right: 1px solid rgba(255,255,255,0.4);
+  background: linear-gradient(90deg,
+    transparent 0%, rgba(255,255,255,0.1) 80%, rgba(255,255,255,0.5) 100%);
+}
+
+/* 5. Grain. */
+.wb-noise {
+  position: absolute;
+  inset: 0;
+  opacity: 0.05;
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* Dark themes: same field, turned down — mirrors SEKURA's dark:opacity-20. */
+:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .welcome-blobs {
+  --wb-strength: 0.3;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .welcome-wash { animation: none; }
-  .welcome-bar { animation: none; opacity: var(--o, 0.5); }
-}
-
-#welcome-canvas {
-  position: absolute;
-  top: 0;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 100vw;
-  height: 100%;
-  pointer-events: none;
-  z-index: 0;
-  opacity: 0.92;
+  .wb-blob { animation: none; }
 }
 
 .welcome-content {

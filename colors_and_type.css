@@ -679,22 +679,6 @@ p, .p {
   margin: 0;
 }
 
-.eyebrow {
-  font-family: var(--font-sans);
-  font-size: var(--fs-xs);
-  text-transform: uppercase;
-  letter-spacing: var(--ls-widest);
-  color: var(--fg-muted);
-  font-weight: 500;
-}
-
-.caption {
-  font-family: var(--font-sans);
-  font-size: var(--fs-sm);
-  color: var(--fg-muted);
-  line-height: var(--lh-normal);
-}
-
 code, pre, .code {
   font-family: var(--font-mono);
   font-size: var(--fs-sm);

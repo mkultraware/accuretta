@@ -171,199 +171,311 @@ def _logo_data_uri(theme: str) -> str:
         return ""
 
 
+def _hex_rgb(h: str):
+    """'#abc'/'#aabbcc' -> (r, g, b) ints, or None if it isn't hex."""
+    h = (h or "").lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) != 6:
+        return None
+    try:
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+
+def _hue_shift(hex_color: str, dh: float) -> str:
+    """Rotate a hex colour's hue by `dh` degrees (saturation/lightness kept), so
+    the splash's colour field can derive per-theme companions from the accent.
+    colorsys is imported here — this runs exactly once per launch."""
+    import colorsys
+    rgb = _hex_rgb(hex_color)
+    if not rgb:
+        return hex_color
+    r, g, b = (c / 255 for c in rgb)
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    h = (h + dh / 360.0) % 1.0
+    r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
+    return "#{:02x}{:02x}{:02x}".format(*(round(c * 255) for c in (r2, g2, b2)))
+
+
 def _build_splash_html() -> str:
-    """Branded boot splash that honors the last saved theme and shows a subtly
-    animated logo. Rebuilt each launch, so a theme change is reflected next boot."""
+    """Branded boot splash honoring the last saved theme. Rebuilt each launch,
+    so a theme change shows next boot. Shares its visual DNA with the welcome
+    screen's backdrop (a drifting per-theme colour field under sharp pleated
+    bars), so the handoff from splash to app feels like one continuous reveal.
+    _boot() pushes live stages into window.__splashStage(), so the status line
+    and progress bar are real."""
     theme = _read_saved_theme()
     pal = _splash_palette(theme)
     logo = _logo_data_uri(theme)
     accent = pal["accent"]
-    
+
     is_light = theme in _LIGHT_THEMES
-    grid_color = "rgba(0, 0, 0, 0.02)" if is_light else "rgba(255, 255, 255, 0.012)"
-    
+    track_bg = "rgba(0, 0, 0, 0.07)" if is_light else "rgba(255, 255, 255, 0.08)"
+    # Same idea as the welcome screen's --wb-strength: full field on light
+    # themes, turned down on dark ones.
+    field_opacity = "1" if is_light else "0.35"
+
     if accent.startswith("#") and len(accent) == 7:
         glow_color = accent + "44"
-        glow_color_faint = accent + "18"
+        # Per-theme colour field: the accent plus two hue-rotated companions —
+        # every theme gets its own palette with no hardcoded hex.
+        blob_a = accent
+        blob_b = _hue_shift(accent, 42)
+        blob_c = _hue_shift(accent, -42)
     else:
-        glow_color = "rgba(56, 189, 248, 0.25)"
-        glow_color_faint = "rgba(56, 189, 248, 0.1)"
-        
-    loader_track_bg = "rgba(0, 0, 0, 0.05)" if is_light else "rgba(255, 255, 255, 0.06)"
-    
+        glow_color = "rgba(56, 189, 248, 0.27)"
+        blob_a = blob_b = blob_c = "#38bdf8"
+
+    # Wordmark with a per-letter staggered reveal (starts as the ring lands).
+    letters = "".join(
+        f'<span style="animation-delay:{0.55 + i * 0.045:.2f}s">{ch}</span>'
+        for i, ch in enumerate("accuretta")
+    )
+
+    # 28 pleated bars — same layering as the welcome screen: colour behind,
+    # uncoloured white/black pleats in front, blur between, overlay pass after.
+    pleats = '<div class="pleat"></div>' * 28
+
     logo_html = (
         f'<div class="logo-wrapper">'
-        f'<div class="logo-ring-outer"></div>'
-        f'<div class="logo-ring-inner"></div>'
+        f'<div class="halo"></div>'
+        f'<svg class="ring" viewBox="0 0 120 120" aria-hidden="true">'
+        f'<circle cx="60" cy="60" r="56"/></svg>'
         f'<img src="{logo}" class="logo-img" alt="">'
         f'</div>'
         if logo else ""
     )
-    
+
     return f"""<!doctype html><html><head><meta charset="utf-8"></head>
 <body style="margin:0;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:{pal['bg']};color:{pal['fg']};font-family:system-ui,-apple-system,'Segoe UI',sans-serif;user-select:none;overflow:hidden;position:relative">
-  <div class="grid"></div>
+  <div class="field">
+    <div class="wb-blob a"></div>
+    <div class="wb-blob b"></div>
+    <div class="wb-blob c"></div>
+    <div class="pleats">{pleats}</div>
+    <div class="soften"></div>
+    <div class="pleats edge">{pleats}</div>
+    <div class="grain"></div>
+  </div>
   <div class="content">
     {logo_html}
-    <h1 class="title">accuretta</h1>
-    <p class="subtitle">starting your engine…</p>
-    <div class="loader-track">
-      <div class="loader-bar"></div>
-    </div>
+    <h1 class="title">{letters}</h1>
+    <p class="status" id="status">warming up…</p>
+    <div class="track"><div class="fill" id="fill"></div></div>
   </div>
+  <div class="foot">your model · your machine</div>
   <style>
-    .grid {{
-      position: absolute;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      background-image: 
-        radial-gradient(circle at center, transparent 30%, {pal['bg']} 85%),
-        linear-gradient({grid_color} 1px, transparent 1px),
-        linear-gradient(90deg, {grid_color} 1px, transparent 1px);
-      background-size: 100% 100%, 36px 36px, 36px 36px;
-      background-position: center;
-      z-index: 1;
+    /* --- Pleated colour field (shared language with the welcome screen) --- */
+    .field {{
+      position: absolute; inset: 0; z-index: 0; overflow: hidden;
       pointer-events: none;
+      opacity: {field_opacity};
+      -webkit-mask-image: radial-gradient(ellipse 80% 65% at 50% 40%, #000 55%, transparent 100%);
+      mask-image: radial-gradient(ellipse 80% 65% at 50% 40%, #000 55%, transparent 100%);
     }}
+    .wb-blob {{
+      position: absolute; border-radius: 50%;
+      will-change: transform, opacity;
+    }}
+    .wb-blob.a {{
+      top: -25%; left: -15%; width: 70vmax; height: 70vmax;
+      background: {blob_a}; filter: blur(120px);
+      animation: drift-a 15s ease-in-out infinite;
+    }}
+    .wb-blob.b {{
+      top: 5%; right: -15%; width: 60vmax; height: 60vmax;
+      background: {blob_b}; filter: blur(110px);
+      animation: drift-b 18s ease-in-out infinite;
+    }}
+    .wb-blob.c {{
+      bottom: -20%; left: 20%; width: 65vmax; height: 65vmax;
+      background: {blob_c}; filter: blur(120px);
+      animation: drift-c 22s ease-in-out infinite;
+    }}
+    @keyframes drift-a {{
+      0%, 100% {{ transform: translate(0, 0) rotate(0deg) scale(1); opacity: 0.30; }}
+      33%      {{ transform: translate(3vmax, -4vmax) rotate(8deg) scale(1.1); opacity: 0.46; }}
+      66%      {{ transform: translate(-2vmax, 2vmax) rotate(-4deg) scale(0.92); opacity: 0.30; }}
+    }}
+    @keyframes drift-b {{
+      0%, 100% {{ transform: translate(0, 0) rotate(0deg) scale(1); opacity: 0.34; }}
+      33%      {{ transform: translate(-4vmax, 3vmax) rotate(-12deg) scale(0.88); opacity: 0.22; }}
+      66%      {{ transform: translate(3vmax, -3vmax) rotate(8deg) scale(1.12); opacity: 0.48; }}
+    }}
+    @keyframes drift-c {{
+      0%, 100% {{ transform: translate(0, 0) rotate(0deg) scale(1); opacity: 0.26; }}
+      33%      {{ transform: translate(2vmax, 2vmax) rotate(16deg) scale(1.18); opacity: 0.42; }}
+      66%      {{ transform: translate(-4vmax, -2vmax) rotate(-8deg) scale(0.85); opacity: 0.18; }}
+    }}
+    .pleats {{
+      position: absolute; inset: 0; display: flex;
+      transform: scale(1.05);
+    }}
+    .pleat {{
+      flex: 1; height: 100%;
+      background: linear-gradient(90deg,
+        rgba(255,255,255,0.5) 0%, rgba(255,255,255,0.1) 30%,
+        rgba(0,0,0,0.02) 80%, rgba(0,0,0,0.05) 100%);
+    }}
+    .soften {{
+      position: absolute; inset: 0;
+      -webkit-backdrop-filter: blur(16px);
+      backdrop-filter: blur(16px);
+    }}
+    .pleats.edge {{ mix-blend-mode: overlay; opacity: 0.6; }}
+    .pleats.edge .pleat {{
+      border-right: 1px solid rgba(255,255,255,0.4);
+      background: linear-gradient(90deg,
+        transparent 0%, rgba(255,255,255,0.1) 80%, rgba(255,255,255,0.5) 100%);
+    }}
+    .grain {{
+      position: absolute; inset: 0;
+      opacity: 0.05; mix-blend-mode: multiply;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    }}
+
+    /* --- Content --- */
     .content {{
-      position: relative;
-      z-index: 2;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
+      position: relative; z-index: 2;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
     }}
     .logo-wrapper {{
-      position: relative;
-      width: 130px;
-      height: 130px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      position: relative; width: 130px; height: 130px;
+      display: flex; align-items: center; justify-content: center;
       margin-bottom: 20px;
-      animation: logo-reveal 1.2s cubic-bezier(0.19, 1, 0.22, 1) both;
+      animation: logo-reveal 0.9s cubic-bezier(0.34, 1.4, 0.64, 1) both;
     }}
-    .logo-ring-inner {{
-      position: absolute;
-      width: 96px;
-      height: 96px;
-      border-radius: 50%;
-      border: 2px solid transparent;
-      border-top-color: {accent};
-      border-bottom-color: {accent};
-      opacity: 0.35;
-      animation: spin-clockwise 2.8s linear infinite;
+    .halo {{
+      position: absolute; width: 92px; height: 92px; border-radius: 50%;
+      background: radial-gradient(circle, {glow_color} 0%, transparent 70%);
+      animation: halo-pulse 3.2s ease-in-out infinite;
     }}
-    .logo-ring-outer {{
-      position: absolute;
-      width: 122px;
-      height: 122px;
-      border-radius: 50%;
-      border: 1px dashed {accent};
-      opacity: 0.12;
-      animation: spin-counter-clockwise 10s linear infinite;
+    /* Draw-on ring: paints once around the logo, then holds — reads as the
+       app "assembling" rather than a generic spinner. */
+    .ring {{
+      position: absolute; width: 120px; height: 120px;
+      transform: rotate(-90deg);
     }}
+    .ring circle {{
+      fill: none; stroke: {accent}; stroke-width: 2.5; stroke-linecap: round;
+      stroke-dasharray: 352; stroke-dashoffset: 352;
+      animation: ring-draw 1.15s cubic-bezier(0.65, 0, 0.35, 1) 0.3s forwards;
+      filter: drop-shadow(0 0 6px {glow_color});
+    }}
+    @keyframes ring-draw {{ to {{ stroke-dashoffset: 0; }} }}
     .logo-img {{
-      width: 60px;
-      height: 60px;
-      object-fit: contain;
-      z-index: 3;
-      filter: drop-shadow(0 0 16px {glow_color});
-      animation: breathe 3s ease-in-out infinite;
+      width: 58px; height: 58px; object-fit: contain; z-index: 3;
+      filter: drop-shadow(0 0 18px {glow_color});
+      animation: breathe 3.2s ease-in-out infinite;
     }}
     .title {{
-      margin: 16px 0 0 0;
-      font-size: 28px;
-      font-weight: 700;
-      letter-spacing: 0.22em;
-      text-indent: 0.22em; /* offset letter-spacing on last char */
-      text-transform: lowercase;
+      margin: 14px 0 0 0;
+      font-size: 27px; font-weight: 700;
+      letter-spacing: 0.22em; text-indent: 0.22em;
       text-align: center;
-      opacity: 0;
-      animation: title-reveal 1.4s cubic-bezier(0.19, 1, 0.22, 1) 0.25s both;
     }}
-    .subtitle {{
-      margin: 8px 0 0 0;
-      font-size: 13px;
+    .title span {{
+      display: inline-block;
+      opacity: 0;
+      transform: translateY(12px);
+      filter: blur(5px);
+      animation: letter-in 0.75s cubic-bezier(0.19, 1, 0.22, 1) both;
+    }}
+    .status {{
+      margin: 10px 0 0 0;
+      font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+      font-size: 11.5px;
+      letter-spacing: 0.08em;
       color: {pal['muted']};
-      letter-spacing: 0.05em;
       text-align: center;
+      min-height: 15px;
       opacity: 0;
-      animation: fade-in 1s ease-out 0.6s both;
+      animation: fade-in 0.8s ease-out 1.1s both;
+      transition: opacity 0.15s ease;
     }}
-    .loader-track {{
-      margin-top: 24px;
-      width: 140px;
-      height: 2px;
-      background: {loader_track_bg};
-      border-radius: 1px;
-      overflow: hidden;
-      position: relative;
+    /* Blinking accent caret after the stage label — echoes the brand wordmark. */
+    .status::after {{
+      content: "_";
+      margin-left: 2px;
+      color: {accent};
+      animation: caret-blink 1.1s steps(1) infinite;
+    }}
+    @keyframes caret-blink {{
+      0%, 55% {{ opacity: 1; }}
+      56%, 100% {{ opacity: 0; }}
+    }}
+    /* !important: the fade-in animation's forward fill would otherwise pin
+       opacity at 1 and swallow the swap dim. */
+    .status.swap {{ opacity: 0.25 !important; }}
+    .track {{
+      margin-top: 22px; width: 200px; height: 2px;
+      background: {track_bg}; border-radius: 2px; overflow: hidden;
       opacity: 0;
-      animation: fade-in 1s ease-out 0.8s both;
+      animation: fade-in 0.8s ease-out 1.3s both;
     }}
-    .loader-bar {{
-      position: absolute;
-      top: 0;
-      left: 0;
-      height: 100%;
-      width: 50px;
-      background: linear-gradient(90deg, transparent, {accent}, transparent);
-      animation: loading-slide 1.6s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+    .fill {{
+      position: relative; overflow: hidden;
+      height: 100%; width: 4%;
+      background: linear-gradient(90deg, {accent}66, {accent});
+      border-radius: 2px;
+      box-shadow: 0 0 10px {glow_color};
+      transition: width 0.7s cubic-bezier(0.22, 1, 0.36, 1);
     }}
-    @keyframes spin-clockwise {{
-      0% {{ transform: rotate(0deg); }}
-      100% {{ transform: rotate(360deg); }}
+    /* Sheen sweeping along the fill so progress reads as alive between stages. */
+    .fill::after {{
+      content: ""; position: absolute; inset: 0;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.5), transparent);
+      transform: translateX(-110%);
+      animation: sheen 1.8s ease-in-out infinite;
     }}
-    @keyframes spin-counter-clockwise {{
-      0% {{ transform: rotate(360deg); }}
-      100% {{ transform: rotate(0deg); }}
+    @keyframes sheen {{
+      60%, 100% {{ transform: translateX(110%); }}
+    }}
+    .foot {{
+      position: absolute; bottom: 26px; left: 0; width: 100%;
+      text-align: center; z-index: 2;
+      font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+      font-size: 10px; letter-spacing: 0.22em; text-indent: 0.22em;
+      color: {pal['muted']};
+      opacity: 0;
+      animation: fade-in 1.2s ease-out 1.5s both;
     }}
     @keyframes logo-reveal {{
-      0% {{
-        transform: scale(0.85);
-        opacity: 0;
-      }}
-      100% {{
-        transform: scale(1);
-        opacity: 1;
-      }}
+      from {{ transform: scale(0.82); opacity: 0; }}
+      to   {{ transform: scale(1); opacity: 1; }}
+    }}
+    @keyframes halo-pulse {{
+      0%, 100% {{ transform: scale(1); opacity: 0.7; }}
+      50%      {{ transform: scale(1.25); opacity: 1; }}
     }}
     @keyframes breathe {{
-      0%, 100% {{ transform: scale(1); opacity: 0.95; }}
-      50% {{ transform: scale(1.05); opacity: 1; }}
+      0%, 100% {{ transform: scale(1); }}
+      50%      {{ transform: scale(1.05); }}
     }}
-    @keyframes title-reveal {{
-      0% {{
-        letter-spacing: 0.1em;
-        text-indent: 0.1em;
-        opacity: 0;
-      }}
-      100% {{
-        letter-spacing: 0.22em;
-        text-indent: 0.22em;
-        opacity: 1;
-      }}
+    @keyframes letter-in {{
+      to {{ opacity: 1; transform: translateY(0); filter: blur(0); }}
     }}
-    @keyframes loading-slide {{
-      0% {{
-        left: -50px;
-      }}
-      100% {{
-        left: 140px;
-      }}
-    }}
-    @keyframes fade-in {{
-      0% {{
-        opacity: 0;
-      }}
-      100% {{
-        opacity: 1;
-      }}
+    @keyframes fade-in {{ to {{ opacity: 1; }} }}
+    @media (prefers-reduced-motion: reduce) {{
+      .wb-blob, .halo, .logo-img, .fill::after, .status::after {{ animation: none; }}
+      .ring circle {{ animation: none; stroke-dashoffset: 0; }}
     }}
   </style>
+  <script>
+    window.__splashStage = function (label, pct) {{
+      var s = document.getElementById('status');
+      var f = document.getElementById('fill');
+      if (s && s.textContent !== label) {{
+        s.classList.add('swap');
+        setTimeout(function () {{ s.textContent = label; s.classList.remove('swap'); }}, 150);
+      }}
+      if (f && typeof pct === 'number') {{
+        f.style.width = Math.max(4, Math.min(100, pct)) + '%';
+      }}
+    }};
+  </script>
 </body></html>"""
 
 _ALREADY_RUNNING_HTML = """<body style="margin:0;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#12151c;color:#e6e6e6;font-family:system-ui,sans-serif">
@@ -459,9 +571,22 @@ def main() -> int:
                                 text_select=True)
 
     def _boot() -> None:
+        def _stage(label: str, pct: int) -> None:
+            # Push a live boot stage into the splash (label + progress fill).
+            try:
+                win.evaluate_js(f"window.__splashStage && window.__splashStage({label!r}, {pct})")
+            except Exception:
+                pass
+
         if not _port_in_use(PORT):
+            _stage("starting the bridge…", 18)
             threading.Thread(target=_run_bridge, daemon=True).start()
+        else:
+            _stage("found a running bridge…", 40)
+        _stage("waiting for the engine…", 55)
         if _wait_ready():
+            _stage("loading your workspace…", 100)
+            time.sleep(0.35)  # let the 100% fill paint before the swap
             win.load_url(f"http://127.0.0.1:{PORT}")
             threading.Thread(target=_watch_bridge, args=(win,), daemon=True).start()
         else:
