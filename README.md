@@ -18,6 +18,10 @@
 </div>
 
 <p align="center">
+  <img src="media/accuretta-demo-loop.gif" alt="Accuretta — local AI workspace demo" width="900">
+</p>
+
+<p align="center">
   <img src="welcome_screen.png" alt="The Accuretta chat UI: session list on the left, a workspace tree, the chat with mode chips (IDE, Agent, Auto, Image, Trust writes), and a preview pane with Terminal, Backend, Shell, and Agent log tabs on the right." width="880" />
 </p>
 
