@@ -51,7 +51,7 @@
         <img class="brand-mark brand-mark-light" src="/logo-mark-light.png" alt="" aria-hidden="true">
         <img class="brand-mark brand-mark-dark" src="/logo-mark-dark.png" alt="" aria-hidden="true">
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.6.9</span>
+        <span class="v" id="brand-v">v0.7.0</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -139,7 +139,7 @@
           </div>
         </div>
         <div class="side-foot-actions" style="display: flex; gap: 8px; align-items: center; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-muted);">
-          <button class="iconbtn" id="btn-theme-side" title="Toggle light / dark theme"><i class="ph ph-sparkle" id="btn-theme-side-icon"></i></button>
+          <button class="iconbtn" id="btn-theme-side" title="Cycle theme"><i class="ph ph-sparkle" id="btn-theme-side-icon"></i></button>
           <button class="iconbtn" id="btn-faq" title="FAQ / About"><i class="ph ph-question"></i></button>
           <span class="grow"></span>
           <button class="iconbtn" id="btn-settings" title="Settings"><i class="ph ph-gear-six"></i></button>
@@ -301,6 +301,10 @@
           <iframe class="preview-frame hidden" id="preview-frame" sandbox="allow-scripts allow-forms allow-modals allow-popups"></iframe>
         </div>
         <pre class="code-view hidden" id="code-view"></pre>
+        <div class="pycheck-pane hidden" id="pycheck-pane">
+          <div class="pycheck-banner pending" id="pycheck-banner">No python check run yet. Run check from a .py file in the workspace.</div>
+          <pre class="pycheck-code" id="pycheck-code"><code></code></pre>
+        </div>
       </div>
 
       <div id="preview-v-resizer" title="Drag to resize console pane"></div>
@@ -308,7 +312,7 @@
       <div id="terminal-bottom-pane">
         <div class="term-tabs-header">
           <button class="term-tab active" data-tab="terminal"><i class="ph ph-terminal-window"></i>Terminal</button>
-          <button class="term-tab" data-tab="pycheck"><i class="ph ph-check-square"></i>Python check</button>
+          <button class="term-tab" data-tab="sandbox"><i class="ph ph-shield-check"></i>Sandbox</button>
           <button class="term-tab" data-tab="backend"><i class="ph ph-cpu"></i>Backend</button>
           <button class="term-tab" data-tab="shell"><i class="ph ph-terminal"></i>Shell</button>
           <button class="term-tab" data-tab="agentlog"><i class="ph ph-activity"></i>Agent log</button>
@@ -319,11 +323,8 @@
           <div class="term-tab-pane active" id="term-pane-terminal">
             <pre class="term-pre" id="term-console-pre"><code>$ <span class="term-cursor"></span></code></pre>
           </div>
-          <div class="term-tab-pane hidden" id="term-pane-pycheck">
-            <div class="pycheck-pane" id="pycheck-pane">
-              <div class="pycheck-banner pending" id="pycheck-banner">No python check run yet. Run check from a .py file in the workspace.</div>
-              <pre class="pycheck-code" id="pycheck-code"><code></code></pre>
-            </div>
+          <div class="term-tab-pane hidden" id="term-pane-sandbox">
+            <pre class="term-pre" id="sandbox-log-pre"><code>[system] Sandbox isolated guest environment logs...</code></pre>
           </div>
           <div class="term-tab-pane hidden" id="term-pane-backend">
             <div class="backend-pane" id="backend-pane">
@@ -633,6 +634,30 @@
       </select>
       <span class="hint">lower = more context window fits in VRAM. saving reloads the model.</span>
     </div>
+    <div class="form-row">
+      <label>V cache quant · kv_cache_type_v <i class="ph ph-info" title="K is the sensitive half of the KV cache (softmax error propagation); V is linearly combined and tolerates 4-bit with no measurable loss. 'same as K' mirrors kv_cache_type."></i></label>
+      <select id="set-kvv">
+        <option value="">same as K</option>
+        <option value="q4_0">q4_0 · ~40% smaller KV, near-lossless</option>
+        <option value="q8_0">q8_0</option>
+        <option value="f16">f16</option>
+      </select>
+      <span class="hint">q8_0 K + q4_0 V ≈ free 23% KV savings. saving reloads the model.</span>
+    </div>
+    <div class="form-row">
+      <label>GPU reserve GB · vram_reserve_gb <i class="ph ph-info" title="Minimal GPU-side safety for Windows desktop/compositor spikes on the same card. 0 = give the LLM everything (the ~8% headroom still guards CUDA workspace)."></i></label>
+      <input type="number" id="set-vram-reserve" step="0.05" min="0" max="4">
+      <span class="hint">0.25 default.</span>
+    </div>
+    <div class="form-row">
+      <label>RAM reserve GB · safety_reserve_gb <i class="ph ph-info" title="System RAM kept free for Windows when CPU-offloading experts/layers — prevents the memory thrash that bluescreens. Applies to system RAM only, never the VRAM budget."></i></label>
+      <input type="number" id="set-ram-reserve" step="0.25" min="0" max="8">
+      <span class="hint">1.0 default — Windows 11 anti-bluescreen floor.</span>
+    </div>
+    <div class="form-row inline">
+      <label>Hybrid q4 KV · allow_hybrid_q4_kv <i class="ph ph-info" title="Hybrid SSM/DeltaNet models (Qwen 3.5/3.6, Qwen3-Next) tolerate q4_0 KV cache with measured token-identical output (llama.cpp #21385) — the linear-attention layers absorb the noise. ON = the auto-tuner may use q4_0 KV for ~2x context on those models only. Dense models are never auto-q4_0 beyond the starved-context escape hatch."></i></label>
+      <div class="sw" id="sw-hybridq4"></div>
+    </div>
 
     <div class="form-group">Auto-tune <span class="hint" style="font-size:10px;font-weight:normal;text-transform:none;letter-spacing:0;">· pick your VRAM, get sane defaults</span></div>
     <div class="form-row">
@@ -758,6 +783,7 @@
       <select id="set-theme" style="font-family:var(--font-mono);font-size:var(--fs-sm);padding:4px 8px;border-radius:var(--r-sm);border:1px solid var(--border-strong);background:var(--bg-raised);color:var(--fg);">
         <option value="dark">Dark</option>
         <option value="dim">Dim</option>
+        <option value="retro">Retro</option>
         <option value="aurora">Aurora</option>
         <option value="nebula">Nebula</option>
         <option value="operator">Operator</option>
@@ -795,6 +821,20 @@
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+      <span>Approvals</span>
+    </div>
+    <div class="form-row">
+      <span class="hint"><b>soft</b> = the agent runs autonomously (MCP browser included) &mdash; only deletions, program launches, desktop actions and protected ops still ask. <b>medium</b> = trust writes: workspace file writes/edits save without asking, everything else asks. <b>hard</b> = every action asks. in ALL modes, Windows/System32 and registry changes need the hold-to-approve card, and drive-wipe / self-harm commands are refused outright.</span>
+    </div>
+    <div class="form-row inline">
+      <label>Approval mode</label>
+      <div class="seg" id="seg-approval-mode">
+        <button class="chip" data-mode="soft" type="button">soft</button>
+        <button class="chip" data-mode="medium" type="button">medium</button>
+        <button class="chip" data-mode="hard" type="button">hard</button>
+      </div>
+    </div>
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
       <span>Red team tools</span>
     </div>
     <div class="form-row">
@@ -812,6 +852,24 @@
       <span class="hint">skips the recon-to-exploit gate: offers the break-in tools (http_request, sql_injection, jwt_tool, fuzz, batch_probe, tcp_send, auth spray) from the first turn instead of waiting for a validate_finding confirm. use when the model won't validate on its own. adds ~2,200 tokens per turn while on.</span>
     </div>
 
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+      <span>Red team stealth</span>
+    </div>
+    <div class="form-row">
+      <span class="hint">anti-fingerprinting for the recon HTTP tools: per-request rotating browser User-Agents and browser-like headers (no app name; no machine identifiers are ever sent). optional <b>proxy</b> routes red-team HTTP through Burp / Tor / a VPN gateway so your real IP never touches the target; <b>XFF spoof</b> seeds target logs with random source IPs; <b>jitter</b> randomizes request timing. TLS fingerprint stays python-native &mdash; for a real browser fingerprint, use the playwright MCP browser.</span>
+    </div>
+    <div class="form-row inline">
+      <label>Proxy (http://host:port or socks5://host:port)</label>
+      <input type="text" id="set-rt-proxy" placeholder="http://[IP_ADDRESS]:8080" style="min-width:220px;">
+    </div>
+    <div class="form-row inline">
+      <label>Spoof X-Forwarded-For</label>
+      <div class="sw" id="sw-rt-spoof-xff"></div>
+    </div>
+    <div class="form-row inline">
+      <label>Request timing jitter</label>
+      <div class="sw" id="sw-rt-jitter"></div>
+    </div>
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
       <span>Analysis tools</span>
     </div>

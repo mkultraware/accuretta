@@ -196,6 +196,7 @@ PENDING_DIR = DATA / "pending"
 SNAPSHOTS_DIR = DATA / "snapshots"
 CHATS_FILE = DATA / "chats.json"
 SETTINGS_FILE = DATA / "settings.json"
+MODELS_CONFIG_FILE = DATA / "models_config.json"   # per-model tuned flag memory (auto-tune on load)
 WORKSPACE_FILE = DATA / "workspace.json"
 SAVINGS_FILE = DATA / "savings.json"
 SYSTEM_CONTEXT_FILE = DATA / "ACCURETTA.md"
@@ -538,9 +539,15 @@ DEFAULT_SETTINGS = {
     "sound_notifications": True,    # smooth chimes for approvals + long-task completion
     "auto_approve_read": True,
     "auto_approve_write": False,    # trust writes: skip approval for in-workspace file writes/edits (registry/system/powershell still always prompt)
+    "approval_mode": "",            # soft|medium|hard; empty = derive from auto_approve_write (legacy)
+    "rt_proxy": "",                 # optional proxy for red-team HTTP tools + sqlmap, e.g. http://127.0.0.1:8080
+    "rt_spoof_xff": False,          # random X-Forwarded-For/X-Real-IP on recon requests (log obfuscation)
+    "rt_jitter": True,              # small random delays between recon requests (timing anti-fingerprint)
     "allow_web_preview": True,
     # memory / performance
-    "kv_cache_type": "q8_0",        # q4_0 | q8_0 | f16 — lower = less VRAM, slightly lower quality
+    "kv_cache_type": "q8_0",        # K cache: q4_0 | q8_0 | f16 — lower = less VRAM, slightly lower quality
+    "kv_cache_type_v": "",          # V cache: "" = same as K. Split K/V is near-free savings: K is the
+                                    # sensitive half (softmax error propagation), V tolerates 4-bit fine.
     # IDE preview extras (composer toolbar toggles)
     "use_tailwind_cdn": False,      # inject Tailwind Play CDN into preview + ask model to use tailwind classes
     "ide_multifile": False,         # tell the model to emit a small folder structure (index.html / style.css / script.js / assets/)
@@ -568,6 +575,34 @@ DEFAULT_SETTINGS = {
     # llama-server tuning (all map to llama-server CLI flags). Restart required.
     "n_cpu_moe": 0,                 # --n-cpu-moe: how many MoE experts to keep on CPU. 0 = all on GPU.
                                     # The killer flag for fitting big MoE models (Qwen3 35B-A3B, GLM 4.7) on small VRAM.
+    "ram_bandwidth_gbps": 30,       # System RAM bandwidth for the auto-tune MoE offload speed model.
+                                    # 30 (the default) = AUTO: probe once via memcpy benchmark and cache the result.
+                                    # Any other value = manual override (DDR4 ~20, dual-channel DDR5 ~40-60, Apple Silicon 100+).
+    "min_tok_s_estimate": 6,        # Auto-tune won't pick an MoE (ctx, n_cpu_moe) combo whose estimated decode
+                                    # speed falls below this floor (context you can't use isn't a win).
+    "safety_reserve_gb": 1.0,       # SYSTEM RAM kept free for the OS — the floor under available RAM for CPU
+                                    # expert/layer offload. Keeps Windows 11 responsive (no thrash/bluescreen)
+                                    # when big models push the machine to the edge. Never touches the VRAM budget.
+    "vram_reserve_gb": 0.25,        # Minimal GPU-side safety (Windows compositor/desktop spikes on the same card).
+                                    # Shaved off the auto-tune VRAM budget only; 0 = give the LLM everything
+                                    # (the ~8% headroom still guards CUDA workspace + alignment).
+    "allow_hybrid_q4_kv": True,     # Hybrid SSM/DeltaNet models (Qwen3.5/3.6, Qwen3-Next) carry KV on
+                                    # only ~1/4 of layers; community benchmarks report q4_0 KV token-
+                                    # identical to f16 there (llama.cpp #21385) — let the tuner use it
+                                    # for ~2x context. Dense models never get auto-q4_0 except as the
+                                    # starved-context escape hatch.
+    "ctx_checkpoints": 8,           # --ctx-checkpoints N: rolling snapshots of the conversation's KV state,
+                                    # so hybrid/SWA models (Qwen 3.5/3.6, Qwen3-Next) can restore a cached
+                                    # prefix instead of re-prefilling every turn (~45x TTFT win, llama.cpp
+                                    # #23814). 0 = off. Each snapshot ≈ ctx-so-far × KV bytes/token of host
+                                    # RAM — at spawn the count is auto-capped so all checkpoints together
+                                    # stay under ~2 GB (a big-ctx hybrid would otherwise claim ~22 GB).
+                                    # Hybrid/SWA models only.
+    "checkpoint_min_step": 4096,    # --checkpoint-min-step (newer builds) / --checkpoint-every-n-tokens
+                                    # (older): minimum spacing between snapshots. 4096 beats the 8192 default
+                                    # for mid-prompt restores.
+    "auto_tune_on_load": True,      # When a model loads with no saved per-model config, run the auto-tuner
+                                    # automatically first (per-model results are remembered in models_config.json).
     "flash_attn": True,             # --flash-attn on/off. Off only if your GPU/build doesn't support it.
     "n_parallel": 1,                # --parallel: concurrent sequences. 1 is fine for chat. 2+ wastes ctx.
     "n_ubatch": 0,                  # --ubatch-size. 0 = auto (half of batch, clamped 512..1024).
@@ -657,12 +692,25 @@ def _enforce_chat_retention(chat: dict) -> None:
     if first_user_idx is None:
         # no user message? just trim from the front
         chat["messages"] = msgs[overflow:]
+        # shift the rolling-summary fold pointer by the same count — it indexes
+        # into THIS list, so dropping from the front without adjusting it would
+        # silently skip unsummarized messages on the next replay.
+        through = int(chat.get("summary_through", 0) or 0)
+        if through:
+            chat["summary_through"] = max(0, through - overflow)
         return
     keep_head = msgs[: first_user_idx + 1]
     rest = msgs[first_user_idx + 1:]
     # drop `overflow` oldest from rest
     rest = rest[overflow:]
     chat["messages"] = keep_head + rest
+    # The dropped region sits at indices [first_user_idx+1, +overflow). If the
+    # fold pointer indexed past it, shift it down so it still marks the same
+    # boundary message — otherwise msgs[through:] silently skips messages that
+    # were never folded into the summary (an amnesia hole on very long chats).
+    through = int(chat.get("summary_through", 0) or 0)
+    if through > first_user_idx + 1:
+        chat["summary_through"] = max(first_user_idx + 1, through - overflow)
 
 
 # ---- token counting (approximation) ----------------------------------------
@@ -794,15 +842,17 @@ def truncate_messages(msgs: list[dict], max_tokens: int, reserve: int = 256) -> 
 # real limit): compaction becomes a rare "about to overflow" safety net, not a
 # routine tax. truncate_messages is the hard backstop below it.
 _SUMMARY_MIN_KEEP = 6          # always keep at least this many recent messages raw
-_SUMMARY_TRIGGER_FRAC = 0.85  # summarize only once the tail is near the limit (was 0.55 — premature, cache-busting)
-_SUMMARY_KEEP_FRAC = 0.55     # after folding, keep ~this much raw — a wide gap below the trigger so folds are infrequent
+_SUMMARY_TRIGGER_FRAC = 0.85
+_SUMMARY_KEEP_FRAC = 0.10     # aggressively fold most of the history, keeping only the recent tail raw
 _SUMMARY_INSTR = (
-    "You are compressing an earlier slice of a coding-assistant conversation into a dense, "
-    "factual summary for the assistant's OWN future reference. Merge the PRIOR SUMMARY (if any) "
-    "with the NEW MESSAGES into one updated summary. Preserve precisely: decisions made; bugs or "
-    "mistakes found AND how they were fixed (so they are not repeated); constraints and requirements "
-    "the user stated; important file paths, function names, and identifiers; and the current state of "
-    "the work. Use terse bullet points, no pleasantries, no preamble. Keep it under ~220 words."
+    "You are compressing an earlier slice of a coding-assistant conversation into a structured state block. "
+    "Merge the PRIOR SUMMARY (if any) with the NEW MESSAGES into one updated state. "
+    "You MUST use this EXACT markdown format and preserve exact file paths, variable names, and error codes:\n\n"
+    "## ACTIVE TASK:\n(Briefly state what we are trying to accomplish right now)\n"
+    "## COMPLETED:\n(Bullet points of what has already worked)\n"
+    "## ROADBLOCKS:\n(Exact error codes, failed attempts, or outstanding bugs)\n"
+    "## FILES IN USE:\n(Exact absolute paths of files currently being modified)\n\n"
+    "Output ONLY the new markdown state block and nothing else."
 )
 
 
@@ -828,9 +878,10 @@ def _render_msgs_for_summary(slice_msgs: list[dict]) -> str:
     return "\n".join(out)
 
 
-def _update_rolling_summary(old_summary: str, slice_msgs: list[dict]) -> str:
+def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: str = "") -> str | None:
     """One non-streaming model call: merge old summary + new slice into an
-    updated summary. Returns old_summary unchanged on any failure (never raises)."""
+    updated summary. Returns None on failure (callers treat that as 'fold did
+    not happen' — distinct from an unchanged summary, which is a no-op)."""
     rendered = _render_msgs_for_summary(slice_msgs)
     if not rendered.strip():
         return old_summary
@@ -842,16 +893,30 @@ def _update_rolling_summary(old_summary: str, slice_msgs: list[dict]) -> str:
         "model": "local",
         "messages": [
             {"role": "system", "content": _SUMMARY_INSTR},
-            {"role": "user", "content": user[:14000]},
+            {"role": "user", "content": user[:300000]},
         ],
-        "stream": False, "temperature": 0.2, "max_tokens": 450,
+        "stream": False, "temperature": 0.2, "max_tokens": 1024,
     }
     try:
-        resp = llama_post("/v1/chat/completions", payload, timeout=90)
+        resp = llama_post("/v1/chat/completions", payload, timeout=600)
         txt = ((resp.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
         return txt or old_summary
     except Exception:
-        return old_summary
+        # Surface it — a silent failure here is invisible state loss: the
+        # trimmer keeps deleting the middle and the model loops with no hint
+        # why. Throttled by the caller's backoff so a wedged server doesn't
+        # toast-spam every round.
+        try:
+            broadcast_event({"type": "summary_fold_failed", "chat_id": chat_id})
+        except Exception:
+            pass
+        return None
+
+
+# After a summarizer failure, don't retry for this long — otherwise a wedged
+# llama-server makes every subsequent round eat a 90s timeout mid-turn.
+_SUMMARY_FAIL_BACKOFF_S = 180
+_summary_last_fail_by_chat: dict[str, float] = {}
 
 
 def _maybe_roll_summary(chat: dict, ctx_limit: int) -> bool:
@@ -864,12 +929,15 @@ def _maybe_roll_summary(chat: dict, ctx_limit: int) -> bool:
     tail = msgs[through:]
     if len(tail) <= _SUMMARY_MIN_KEEP:
         return False
+    chat_id = chat.get("id") or ""
+    if time.time() - _summary_last_fail_by_chat.get(chat_id, 0) < _SUMMARY_FAIL_BACKOFF_S:
+        return False
     # Trustworthy fill signal: llama-server's real prompt_eval_count from this
     # chat's last turn (the whole prompt — system + tools + history). That is
     # the true "how close to the limit" measure, so the fold can't misfire on a
     # bad char estimate. Only fall back to the char count before a chat has run
     # a turn (no real number exists yet).
-    real_fill = _last_prompt_tokens_by_chat.get(chat.get("id") or "", 0)
+    real_fill = _last_prompt_tokens_by_chat.get(chat_id, 0)
     if real_fill > 0:
         if real_fill <= ctx_limit * _SUMMARY_TRIGGER_FRAC:
             return False  # plenty of headroom — don't summarize yet
@@ -890,13 +958,148 @@ def _maybe_roll_summary(chat: dict, ctx_limit: int) -> bool:
     # never fold so far that fewer than MIN_KEEP recent messages remain raw
     cut = min(cut, len(msgs) - _SUMMARY_MIN_KEEP)
     if cut <= through:
+        # The trigger fired (real fill is near the limit) but the raw tail alone
+        # never reached keep_budget — meaning system prompt + tool schemas, not
+        # chat volume, are what fills the window (small ctx, native tools). If
+        # we bail here the fold NEVER advances and truncate_messages silently
+        # deletes the middle instead — the amnesia loop. Fold down to the
+        # minimum raw keep anyway: near-full is near-full.
+        cut = len(msgs) - _SUMMARY_MIN_KEEP
+        if cut <= through:
+            return False
+    new_summary = _update_rolling_summary(chat.get("rolling_summary", ""), msgs[through:cut],
+                                          chat_id=chat_id)
+    if new_summary is None:
+        _summary_last_fail_by_chat[chat_id] = time.time()
         return False
-    new_summary = _update_rolling_summary(chat.get("rolling_summary", ""), msgs[through:cut])
     if new_summary and new_summary != chat.get("rolling_summary", ""):
         chat["rolling_summary"] = new_summary
         chat["summary_through"] = cut
+        try:
+            broadcast_event({"type": "summary_folded", "chat_id": chat_id,
+                             "folded": cut - through})
+        except Exception:
+            pass
         return True
     return False
+
+
+# Matches the "=== EARLIER IN THIS SESSION ===" block both call sites splice
+# into the system prompt (web and discord use slightly different wording —
+# the [^)]* covers both). Non-greedy up to the next instruction block.
+_SUMMARY_SECTION_RE = re.compile(
+    r"\n\n=== EARLIER IN THIS SESSION \(older turns condensed to save context;[^)]*\) ===\n"
+    r"[\s\S]*?(?=\n\n(?:When you fix a bug|TOOL CALLING)|$)"
+)
+
+
+def _splice_rolling_summary(system_content: str, new_summary: str) -> str:
+    """Replace (or append) the rolling-summary section inside an assembled
+    system prompt. Used when a fold happens MID-turn: the summary the system
+    prompt was built with is stale, and the rebuild must carry the new one."""
+    section = ""
+    if new_summary:
+        section = (
+            "\n\n=== EARLIER IN THIS SESSION (older turns condensed to save context; "
+            "treat these as established facts — do not redo work or re-ask) ===\n" + new_summary
+        )
+    if _SUMMARY_SECTION_RE.search(system_content):
+        return _SUMMARY_SECTION_RE.sub(section, system_content)
+    return system_content + section
+
+
+def _replay_wire_msg(m: dict, replay_vision: bool) -> dict | None:
+    """Map one STORED chat message to its wire shape for the model (the same
+    mapping the chat handler's replay loop uses). Returns None for roles that
+    are never replayed."""
+    role = m.get("role")
+    if role not in ("user", "assistant", "tool"):
+        return None
+    stored_images = m.get("images") if role == "user" else None
+    if stored_images and replay_vision:
+        # Rebuild OpenAI-style content array. Text first (the model reads
+        # top-to-bottom), then each image as image_url.
+        parts: list[dict] = []
+        txt = m.get("content", "") or ""
+        if txt:
+            parts.append({"type": "text", "text": txt})
+        for img in stored_images:
+            if not isinstance(img, str) or not img:
+                continue
+            url = img if img.startswith("data:") else f"data:image/png;base64,{img}"
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+        out: dict = {"role": role, "content": parts if parts else (txt or "")}
+    else:
+        out = {"role": role, "content": m.get("content", "") or ""}
+    if role == "assistant" and m.get("tool_calls"):
+        out["tool_calls"] = m["tool_calls"]
+    if role == "tool":
+        if m.get("tool_call_id"):
+            out["tool_call_id"] = m["tool_call_id"]
+        if m.get("name"):
+            out["name"] = m["name"]
+    return out
+
+
+def _mid_turn_fold(chat_id: str, conversation: list[dict], start_len: int,
+                   ctx_limit: int, replay_vision: bool):
+    """Compaction INSIDE the agentic loop. The rolling summary otherwise only
+    advances between user turns — so a long unattended turn that fills the
+    window used to hit truncate_messages, which DELETES the middle: the model
+    loses all progress, re-answers the anchored first user message, and loops
+    forever. This folds instead: persist this turn's working memory, advance
+    the summary, rebuild the conversation from the new fold boundary.
+
+    Returns {"conversation", "start_len", "folded"} on success, or
+    {"conversation": None, "start_len", "folded": 0} when the fold didn't
+    advance but intermediates were persisted (caller must still move its
+    persist boundary so nothing is stored twice). None when there's no chat."""
+    if not chat_id:
+        return None
+    chats = get_chats()
+    chat = chats.get("chats", {}).get(chat_id)
+    if not chat:
+        return None
+    chat.setdefault("id", chat_id)
+    old_through = int(chat.get("summary_through", 0) or 0)
+    # Persist this turn's intermediates first — the fold operates on the
+    # STORED message list, and this turn's tool work is part of that history.
+    # Same persisted shape the chat handler uses at end-of-turn.
+    now_t = int(time.time())
+    for im in conversation[start_len:]:
+        role = im.get("role")
+        if role not in ("assistant", "tool"):
+            continue
+        persisted: dict = {"role": role, "content": im.get("content", "") or "", "t": now_t}
+        if role == "assistant":
+            persisted["_internal"] = True
+            if im.get("tool_calls"):
+                persisted["tool_calls"] = im["tool_calls"]
+        else:
+            if im.get("tool_call_id"):
+                persisted["tool_call_id"] = im["tool_call_id"]
+            if im.get("name"):
+                persisted["name"] = im["name"]
+        chat["messages"].append(persisted)
+    persisted_upto = len(conversation)
+    if not _maybe_roll_summary(chat, ctx_limit):
+        save_json(CHATS_FILE, chats)
+        return {"conversation": None, "start_len": persisted_upto, "folded": 0}
+    save_json(CHATS_FILE, chats)
+    new_through = int(chat.get("summary_through", 0) or 0)
+    sys_content = ""
+    if conversation and conversation[0].get("role") == "system":
+        sys_content = conversation[0].get("content", "") or ""
+    rebuilt: list[dict] = [{
+        "role": "system",
+        "content": _splice_rolling_summary(sys_content, chat.get("rolling_summary", "")),
+    }]
+    for m in chat["messages"][new_through:]:
+        out = _replay_wire_msg(m, replay_vision)
+        if out is not None:
+            rebuilt.append(out)
+    return {"conversation": rebuilt, "start_len": len(rebuilt),
+            "folded": new_through - old_through}
 
 
 def tool_pin_note(args: dict) -> dict:
@@ -1900,6 +2103,73 @@ def bridge_self_threat(cmd: str) -> str | None:
     return None
 
 
+# ---- approval policy (soft / medium / hard) --------------------------------
+# approval_mode drives how much the agent may do without asking:
+#   soft   = autonomous except deletions, program launches, desktop actions and
+#            protected ops (registry / System32) - those still prompt, the
+#            protected ones via the hold-to-approve card.
+#   medium = "trust writes": in-workspace file writes/edits auto-approve.
+#   hard   = every action prompts.
+# The REFUSE set (drive wipes, fork bombs, bridge self-harm) is mode-independent.
+
+_SOFT_PROMPT_KINDS = {"delete", "registry", "launch"}
+_SOFT_COMMAND_KINDS = {"powershell", "sandbox", "session", "git"}
+_MCP_SOFT_BLOCK = re.compile(r"delete|remove|drop|destroy|terminate|unregister", re.IGNORECASE)
+
+
+def _approval_mode() -> str:
+    """soft|medium|hard. Legacy fallback: auto_approve_write -> medium/hard."""
+    try:
+        m = str(get_settings().get("approval_mode") or "").strip().lower()
+        if m in ("soft", "medium", "hard"):
+            return m
+        return "medium" if get_settings().get("auto_approve_write") else "hard"
+    except Exception:
+        return "hard"
+
+
+_SOFT_DESTRUCTIVE_RES = [re.compile(p, re.IGNORECASE) for p in (
+    r"\bremove-item\b",
+    r"\bdel(?:ete)?\s+[/a-z0-9(\"\']",
+    r"\berase\s+[/a-z0-9(\"\']",
+    r"\brd\s+/s", r"\brmdir\s+/s", r"\brmdir\s+[a-z0-9~./]",
+    r"\brm\s+-", r"\brm\s+[/~.]", r"\brm\s+[a-z0-9_]",
+    r"\bunlink\s+", r"\bshred\s+",
+    r"\breg\s+(?:add|delete|import|restore|copy)\b", r"\bregedit\b",
+    r"\bset-itemproperty\b", r"\bnew-itemproperty\b",
+    r"\bremove-itemproperty\b", r"\bclear-itemproperty\b",
+    r"\bformat\s+[a-z]:", r"\bdisk" r"part\b", r"\bmkfs\b", r"\bwipefs\b", r"\bdd\s+[^|;&]*\bof=/dev/",
+    r"\bgit\s+reset\s+--hard", r"\bgit\s+clean\s+-\w*f",
+    r"\bgit\s+push\s+[^&|;]*(?:--force\w*|-f(?:\s|$))", r"\bgit\s+rm\b", r"\bgit\s+branch\s+-D\b",
+)]
+
+
+def _is_destructive_command(cmd: str) -> bool:
+    """True when a shell/git command line deletes or overwrites data. Matches
+    deletion VERBS with arguments (word-bounded), not substrings, so 'firm',
+    'model', an 'rm' inside a path, or 'delete' in prose don't trip it. Soft
+    approval mode: destructive -> still prompts, everything else runs."""
+    if not cmd:
+        return False
+    return any(p.search(cmd) for p in _SOFT_DESTRUCTIVE_RES)
+
+
+def _critical_path_gate(path: str, kind: str, title: str) -> dict | None:
+    """Hold-to-approve gate for writes under Windows/System32. Returns an error
+    dict when denied, None when the path isn't protected or the user
+    held-and-approved. Never auto-approves (details['critical'])."""
+    if not is_blocked_path(path):
+        return None
+    approval = request_approval(
+        title=title,
+        command=f"modify protected system path: {path}",
+        details={"kind": kind, "critical": True, "path": path},
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied protected-path change ({approval.get('status')})"}
+    return None
+
+
 # ---- approval queue --------------------------------------------------------
 
 _approvals: dict[str, dict] = {}
@@ -1926,11 +2196,29 @@ def request_approval(title: str, command: str, details: dict | None = None, time
     instantly; delete / registry / powershell / git / desktop / launch always
     still prompt."""
     details = details or {}
+    kind = details.get("kind")
+    # The frontend may only offer "remember for this session" on kinds the
+    # bridge actually honors in decide_approval (safe writes + MCP tools).
+    details.setdefault("allow_always",
+                       bool(kind) and (kind in _SAFE_WRITE_KINDS or kind.startswith("mcp_")))
     try:
-        if details.get("kind") in _SAFE_WRITE_KINDS and get_settings().get("auto_approve_write"):
-            return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
-        if details.get("kind") and details.get("kind") in _approval_session_allow:
-            return {"status": "session-approved", "decision": "approve", "auto": True, "details": details}
+        if not details.get("critical"):   # protected ops NEVER auto-approve
+            mode = _approval_mode()
+            if kind and kind in _approval_session_allow:
+                return {"status": "session-approved", "decision": "approve", "auto": True, "details": details}
+            if mode != "hard" and kind in _SAFE_WRITE_KINDS:
+                return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
+            if mode == "soft":
+                if kind in _SOFT_PROMPT_KINDS or (kind or "").startswith("desktop_"):
+                    pass                                    # launches + desktop stay gated
+                elif (kind or "").startswith("mcp_"):
+                    if not _MCP_SOFT_BLOCK.search(kind):    # playwright runs free; delete-ish MCP still prompts
+                        return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
+                elif kind in _SOFT_COMMAND_KINDS:           # shell-ish: deletions still prompt
+                    if not _is_destructive_command(command or ""):
+                        return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
+                elif kind:
+                    return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
     except Exception:
         pass
     aid = uuid.uuid4().hex[:12]
@@ -1970,7 +2258,10 @@ def decide_approval(aid: str, decision: str, always: bool = False) -> bool:
         entry["status"] = "decided"
         if always and entry["decision"] == "approve":
             kind = (entry.get("details") or {}).get("kind")
-            if kind:
+            # BUGFIX: session-allow only safe kinds. Previously ANY kind could
+            # be remembered (powershell, delete, registry...) because the UI
+            # showed the "remember" checkbox on every approval card.
+            if kind and (kind in _SAFE_WRITE_KINDS or kind.startswith("mcp_")):
                 _approval_session_allow.add(kind)
         ev.set()
     broadcast_event({"type": "approval:decided", "id": aid, "decision": entry["decision"]})
@@ -2019,17 +2310,29 @@ def unsubscribe(q: Queue) -> None:
             _subscribers.remove(q)
 
 
+# Event types forwarded live but excluded from the resume ring buffer (see
+# broadcast_event). ctx_fill fires once per agentic round.
+_TRANSIENT_EVENT_TYPES = frozenset({"ctx_fill"})
+
+
 def broadcast_event(evt: dict) -> None:
     global _event_log_id
     with _subs_lock:
-        _event_log_id += 1
-        evt_id = _event_log_id
+        # High-frequency gauge noise (one per agentic round) is forwarded to
+        # live subscribers but NOT logged — a 120-round turn would otherwise
+        # flush approvals and other resumable state out of the 256-event ring
+        # buffer that Last-Event-ID resume replays from.
+        transient = evt.get("type") in _TRANSIENT_EVENT_TYPES
+        if not transient:
+            _event_log_id += 1
+        evt_id = _event_log_id if not transient else None
         # Tag a copy so the original dict the caller passed isn't mutated.
         # Clients that want the id can read evt['_id']; the SSE handler
         # writes it into the wire `id:` field for Last-Event-ID resume.
         logged = dict(evt)
-        logged["_id"] = evt_id
-        _event_log.append((evt_id, logged))
+        if evt_id is not None:
+            logged["_id"] = evt_id
+            _event_log.append((evt_id, logged))
         dead = []
         for q in _subscribers:
             try:
@@ -2440,7 +2743,7 @@ def _undo_snapshot(path: str) -> None:
     _undo_journal[np] = {"existed": existed, "prior": prior}
 
 
-def _undo_prune(keep: int = 40) -> None:
+def _undo_prune(keep: int = 20) -> None:
     try:
         js = sorted(_UNDO_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
         for old in js[keep:]:
@@ -2530,8 +2833,9 @@ def tool_write_file(args: dict) -> dict:
         return {"error": "missing path"}
     if is_bridge_self_path(path):
         return {"error": "refused: bridge.py is the running server — edit it from your real IDE, not from a chat tool call. Restart the bridge afterward."}
-    if is_blocked_path(path):
-        return {"error": "path blocked (Windows/System32)"}
+    _cerr = _critical_path_gate(path, "write_file", "PROTECTED PATH - write under Windows/System32")
+    if _cerr:
+        return _cerr
     if not is_in_workspace(path):
         return {"error": "path outside workspace. Add folder in Workspace panel."}
     if is_ignored(path):
@@ -2620,8 +2924,9 @@ def tool_edit_file(args: dict) -> dict:
         return {"error": "edits must be a non-empty list of {old_text, new_text}"}
     if is_bridge_self_path(path):
         return {"error": "refused: bridge.py is the running server — edit it from your real IDE, not from a chat tool call. Restart the bridge afterward."}
-    if is_blocked_path(path):
-        return {"error": "path blocked (Windows/System32)"}
+    _cerr = _critical_path_gate(path, "edit_file", "PROTECTED PATH - edit under Windows/System32")
+    if _cerr:
+        return _cerr
     if not is_in_workspace(path):
         return {"error": "path outside workspace. Add folder in Workspace panel."}
     if is_ignored(path):
@@ -3061,8 +3366,9 @@ def tool_delete_file(args: dict) -> dict:
         return {"error": f"not found: {path}"}
     if is_bridge_self_path(path):
         return {"error": "refused: bridge.py is the running server — won't delete the file backing this process."}
-    if is_blocked_path(path):
-        return {"error": "path blocked (Windows/System32)"}
+    _cerr = _critical_path_gate(path, "delete", "PROTECTED PATH - delete under Windows/System32")
+    if _cerr:
+        return _cerr
     if not is_in_workspace(path):
         return {"error": "path outside workspace"}
     approval = request_approval(
@@ -3355,32 +3661,23 @@ def tool_run_powershell(args: dict) -> dict:
             "refused_command": cmd,
             "catastrophic": True,
         }
-    # Registry tier check runs BEFORE the generic powershell approval so
-    # system-hive writes never even reach the approval queue. Refusal here
-    # is the catastrophic-failure safeguard that prevents another "one rule
-    # bricked the PC" incident.
+    # Registry tier check runs BEFORE the generic powershell approval. Both
+    # tiers now route to the hold-to-approve CRITICAL card (never auto-
+    # approved in any approval_mode); system hives get the loudest wording.
     reg = registry_assess(cmd)
     if reg["level"] == "system":
-        return {
-            "error": (
-                "refused: command writes to a SYSTEM registry hive "
-                f"({', '.join(reg['targets']) or 'HKLM/HKCR/HKU'}). "
-                "Accuretta hard-blocks these because a single bad value here "
-                "can brick Windows. If this is genuinely intentional, do it "
-                "manually in regedit with admin rights — no agent path."
-            ),
-            "refused_command": cmd,
-            "registry_level": "system",
-            "registry_targets": reg["targets"],
-        }
-    if reg["level"] == "user":
-        # Loud REGISTRY EDIT approval card with hold-to-approve on the
-        # frontend. Detail keys travel via details["targets"] so the card
-        # can render them as a prominent list.
+        approval = request_approval(
+            title="REGISTRY EDIT (SYSTEM hive - can brick Windows)",
+            command=cmd,
+            details={"kind": "registry", "level": "system", "targets": reg["targets"], "critical": True},
+        )
+        if approval.get("decision") != "approve":
+            return {"error": f"user denied SYSTEM registry edit ({approval.get('status')})"}
+    elif reg["level"] == "user":
         approval = request_approval(
             title="REGISTRY EDIT (user hive)",
             command=cmd,
-            details={"kind": "registry", "level": "user", "targets": reg["targets"]},
+            details={"kind": "registry", "level": "user", "targets": reg["targets"], "critical": True},
         )
         if approval.get("decision") != "approve":
             return {"error": f"user denied registry edit ({approval.get('status')})"}
@@ -4196,8 +4493,9 @@ def tool_git_clone(args: dict) -> dict:
     parent = str(Path(dest_norm).parent)
     if not is_in_workspace(parent):
         return {"error": "dest is outside the workspace"}
-    if is_blocked_path(dest_norm):
-        return {"error": "dest path is blocked"}
+    _cerr = _critical_path_gate(dest_norm, "git", "PROTECTED PATH - git clone destination under Windows/System32")
+    if _cerr:
+        return _cerr
     if os.path.exists(dest_norm) and os.listdir(dest_norm):
         return {"error": f"dest already exists and is non-empty: {dest_norm}"}
     Path(parent).mkdir(parents=True, exist_ok=True)
@@ -8656,7 +8954,7 @@ def tool_recon_subdomains(args: dict) -> dict:
     timeout = max(4.0, min(float(args.get("timeout") or 15.0), 30.0))
     url = f"https://crt.sh/?q=%25.{urllib.parse.quote(domain)}&output=json"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "accuretta-recon"})
+        req = urllib.request.Request(url, headers=_rt_stealth_headers())
         with urllib.request.urlopen(req, timeout=timeout) as r:
             rows = json.loads(r.read().decode("utf-8", "replace"))
     except Exception as e:
@@ -8835,8 +9133,62 @@ def tool_recon_dns(args: dict) -> dict:
     return {"domain": domain, "records": records, "source": "DNS-over-HTTPS (dns.google)"}
 
 
-_RECON_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+# ---- red-team stealth / anti-fingerprint ------------------------------------
+# What a target can fingerprint from our probes: User-Agent, header set, timing
+# and source IP. No machine GUID, username or hostname is ever sent by these
+# tools - Windows simply doesn't put those in HTTP requests. TLS (JA3) stays
+# python-native: for a real browser fingerprint drive the playwright MCP tools.
+_RT_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+]
+
+
+def _rt_ua() -> str:
+    return random.choice(_RT_UA_POOL)
+
+
+def _rt_stealth_headers(base: dict | None = None) -> dict:
+    """Browser-like header profile with a per-request rotated UA (repeated
+    probes don't share one identity). Honors rt_spoof_xff: random source-IP
+    headers so target logs that trust XFF record noise, not you."""
+    s = get_settings()
+    hdrs = dict(base or {})
+    hdrs.setdefault("User-Agent", _rt_ua())
+    hdrs.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+    hdrs.setdefault("Accept-Language", random.choice(
+        ["en-US,en;q=0.9", "en-GB,en;q=0.8,en;q=0.6", "en-US,en;q=0.7"]))
+    if s.get("rt_spoof_xff"):
+        fake = ".".join(str(random.randint(1, 254)) for _ in range(4))
+        hdrs.setdefault("X-Forwarded-For", fake)
+        hdrs.setdefault("X-Real-IP", fake)
+    return hdrs
+
+
+def _rt_proxy_handler():
+    """Route red-team HTTP through settings.rt_proxy (Burp / Tor / VPN gateway)
+    when set - the real origin never touches the target."""
+    p = (get_settings().get("rt_proxy") or "").strip()
+    if not p:
+        return None
+    return urllib.request.ProxyHandler({"http": p, "https": p})
+
+
+def _rt_jitter() -> None:
+    """Small random delay so automated probes don't fire at machine-regular
+    intervals (timing fingerprint). Disable via rt_jitter=false."""
+    try:
+        if get_settings().get("rt_jitter", True):
+            time.sleep(random.uniform(0.05, 0.45))
+    except Exception:
+        pass
+
+
+_RECON_UA = _RT_UA_POOL[0]  # deprecated alias; new code should call _rt_ua()
 
 
 class _ReconNoRedirect(urllib.request.HTTPRedirectHandler):
@@ -8853,14 +9205,18 @@ def _recon_fetch(url: str, timeout: float = 8.0, max_bytes: int = 8000,
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    hdrs = {"User-Agent": _RECON_UA}
+    hdrs = _rt_stealth_headers()
     if extra_headers:
         hdrs.update(extra_headers)
     req = urllib.request.Request(url, headers=hdrs)
     _handlers = [urllib.request.HTTPSHandler(context=ctx)]
     if not follow:
         _handlers.insert(0, _ReconNoRedirect())
+    _ph = _rt_proxy_handler()
+    if _ph:
+        _handlers.append(_ph)
     opener = urllib.request.build_opener(*_handlers)
+    _rt_jitter()
     try:
         resp = opener.open(req, timeout=timeout)
         body = resp.read(max_bytes).decode("utf-8", "replace")
@@ -9538,10 +9894,14 @@ def _recon_try_login(url, mode, user, pw, opts, timeout):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+    _spray_handlers = [urllib.request.HTTPSHandler(context=ctx)]
+    _ph = _rt_proxy_handler()
+    if _ph:
+        _spray_handlers.append(_ph)
+    opener = urllib.request.build_opener(*_spray_handlers)
     if mode == "basic":
         token = base64.b64encode(f"{user}:{pw}".encode()).decode()
-        req = urllib.request.Request(url, headers={"User-Agent": _RECON_UA,
+        req = urllib.request.Request(url, headers={"User-Agent": _rt_ua(),
                                                    "Authorization": "Basic " + token})
         try:
             resp = opener.open(req, timeout=timeout)
@@ -9557,7 +9917,7 @@ def _recon_try_login(url, mode, user, pw, opts, timeout):
     data.update(opts.get("extra_fields") or {})
     body = urllib.parse.urlencode(data).encode()
     req = urllib.request.Request(url, data=body, headers={
-        "User-Agent": _RECON_UA, "Content-Type": "application/x-www-form-urlencoded"})
+        "User-Agent": _rt_ua(), "Content-Type": "application/x-www-form-urlencoded"})
     try:
         resp = opener.open(req, timeout=timeout)
         text = resp.read(20000).decode("utf-8", "replace")
@@ -10520,7 +10880,7 @@ def tool_cors_probe(args: dict) -> dict:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        req = urllib.request.Request(url, headers={"User-Agent": _RECON_UA, "Origin": origin})
+        req = urllib.request.Request(url, headers={"User-Agent": _rt_ua(), "Origin": origin})
         opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
         try:
             resp = opener.open(req, timeout=timeout)
@@ -11112,9 +11472,59 @@ class MCPClient:
             self.process.terminate()
             self.process.wait()
 
+
+# ---- MCP result shaping ------------------------------------------------------
+# Playwright-style accessibility (aria) snapshots are YAML-ish trees where
+# 40-60% of lines are anonymous layout containers: `- generic [ref=e12]:` with
+# no accessible name, no cursor, nothing actionable. They cost real tokens
+# (a big page snapshot is 20-60 KB) and buy the model nothing — actions target
+# named/interactive elements. Drop the noise lines; keep everything else.
+_ARIA_NOISE_RE = re.compile(
+    r"^\s*- generic(?: \[[^\]]*\])?:\s*$", re.IGNORECASE)
+
+
+def _compress_aria_text(text: str) -> str:
+    """Shrink playwright-mcp snapshot/page-state text. Only lines that are
+    PURE structural noise are removed (anonymous `generic` containers whose
+    attributes carry nothing but a ref/active marker — never a name, role
+    info, or cursor=pointer). Indentation of children is left untouched; the
+    model reads these trees loosely, and every actionable element keeps its
+    ref. Non-snapshot text is returned unchanged."""
+    if "- generic" not in text and "Page Snapshot" not in text:
+        return text
+    out_lines: list[str] = []
+    dropped = 0
+    for ln in text.split("\n"):
+        if _ARIA_NOISE_RE.match(ln):
+            # keep generics that are named or clickable: they carry a quoted
+            # name or cursor=pointer inside the brackets
+            if '"' in ln or "cursor=pointer" in ln or "pressed" in ln or "expanded" in ln:
+                out_lines.append(ln)
+            else:
+                dropped += 1
+        else:
+            out_lines.append(ln)
+    if dropped:
+        out_lines.append(f"[{dropped} anonymous layout containers omitted — page structure unchanged]")
+    return "\n".join(out_lines)
+
+
 _ACTIVE_MCP_CLIENTS = []
 
+def _prune_playwright_mcp(days: int = 3) -> None:
+    try:
+        pw_dir = ROOT / ".playwright-mcp"
+        if not pw_dir.exists():
+            return
+        now = time.time()
+        for f in pw_dir.iterdir():
+            if f.is_file() and now - f.stat().st_mtime > days * 86400:
+                f.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"[!] Failed to prune playwright-mcp: {e}")
+
 def _load_mcp_servers():
+    _prune_playwright_mcp()
     config_path = ROOT / "bridge_mcp_config.json"
     if not config_path.exists():
         return
@@ -11173,7 +11583,32 @@ def _load_mcp_servers():
                         return {"error": response['error']}
 
                     content = response.get("result", {}).get("content", [])
-                    return "\n".join(item.get("text", "") for item in content if item.get("type") == "text")
+                    texts: list[str] = []
+                    n_images = 0
+                    for item in content:
+                        if item.get("type") == "text":
+                            texts.append(item.get("text", ""))
+                        elif item.get("type") == "image":
+                            n_images += 1
+                    out_text = "\n".join(t for t in texts if t)
+                    if n_images:
+                        # Screenshots can't be SEEN without a vision projector
+                        # (mmproj) — and the user shouldn't have to load one
+                        # just for browser automation. Steer the model to the
+                        # text snapshot, which needs no vision at all.
+                        out_text += (f"\n[{n_images} image(s) omitted — no vision projector is loaded, "
+                                     f"so screenshots can't be seen. Use the page's text snapshot "
+                                     f"(browser_snapshot) to read structure; it needs no vision.]")
+                    # Playwright aria snapshots/page-state: strip anonymous
+                    # layout-container noise (40-60% of lines) so a big page
+                    # doesn't flood the context and stall every later turn.
+                    out_text = _compress_aria_text(out_text)
+                    # Return a DICT (not a bare string): "text" is a known bulk
+                    # field, so oversized results get line-aware head/tail
+                    # elision instead of the dead-end "too large" envelope that
+                    # used to leave the model blind on big pages (the
+                    # "stuck on browser_snapshot" loop).
+                    return {"text": out_text, "_mcp_tool": name}
                 return wrapper
 
             # Inject into the global TOOLS dictionary
@@ -12693,6 +13128,13 @@ _TOOL_RESULT_KEEP_RECENT = 24
 def _tool_result_cap(name: str) -> int:
     if name in _TOOL_RESULT_CAPS:
         return _TOOL_RESULT_CAPS[name]
+    # Playwright aria snapshots/page-state: even compressed they run big on
+    # real pages, and chopping them mid-tree is what sent models into the
+    # re-snapshot loop. 24K chars keeps the tree usable on all but the
+    # largest pages (head/tail elision keeps errors + the tail visible past
+    # that).
+    if name.startswith("mcp_playwright_"):
+        return 24000
     return 16000 if name in _ANALYSIS_TOOL_NAMES else 4000
 
 
@@ -12879,6 +13321,8 @@ _RT_RECON_TOOL_NAMES = {
     "recon_port_scan", "recon_content_discovery", "recon_check_exposure",
     "recon_subdomain_takeover", "recon_cve_match", "recon_injection_probe",
     "recon_open_services", "recon_capture_evidence",
+    # sandbox-backed scanners (guest does the noisy work) + report builder.
+    "sandbox_nmap", "sandbox_sqlmap", "rt_generate_report",
     # Token encoder/decoder (Burp Decoder equivalent) — inspect/forge a token
     # without hand-computing base64. Benign on its own; stays in recon.
     "encode_decode",
@@ -14510,11 +14954,49 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         _rt_chat: dict = {}
         _rt_dirty = False
         _pins_tail: list = []
+        _roll_active = False
         try:
             _c0 = get_chats().get("chats", {}).get(chat_id) or {}
             if settings.get("rt_mission_state", True) and isinstance(_c0.get("mission"), dict):
                 _rt_chat["mission"] = dict(_c0["mission"])
             _pins_tail = [str(p) for p in (_c0.get("pins") or [])]
+            _roll_active = bool(_c0.get("rolling_summary"))
+        except Exception:
+            pass
+        # Objective anchor for long-horizon drift. The red-team mission block
+        # only exists for authorized runs, and pin_note depends on the model
+        # choosing to call it — a plain long agentic task (APK triage, firmware
+        # digs) has NO durable statement of what it's doing once folds or the
+        # trimmer remove the first user message from context. Deriving it here
+        # costs nothing and rides the same recency-end tail as the mission.
+        # We capture BOTH the original ask (first user message) and the current
+        # task (most recent substantive user message before the live turn):
+        # multi-task sessions outgrow the first message — task 1 long done,
+        # task 3 in flight — and a fold that hides the switch is exactly how
+        # the model "finished a task and completely forgot it".
+        _user_texts: list[str] = []
+        for _m in messages:
+            if _m.get("role") != "user":
+                continue
+            _uc = _m.get("content")
+            if isinstance(_uc, list):
+                _uc = " ".join(p.get("text", "") for p in _uc
+                               if isinstance(p, dict) and p.get("type") == "text")
+            _uc = re.sub(r"\s+", " ", str(_uc or "")).strip()
+            if _uc:
+                _user_texts.append(_uc)
+        _objective = _user_texts[0][:240] if _user_texts else ""
+        _current_task = ""
+        for _uc in reversed(_user_texts[:-1]):   # skip the live turn's prompt
+            if len(_uc) >= 40:
+                _current_task = _uc[:240]
+                break
+        # Long-session detector: past the reliable attention span the objective
+        # anchor rides the tail EVERY round, not just on the exact round the
+        # trimmer fired — the model forgot tasks BETWEEN trim events too.
+        _session_long = False
+        try:
+            _session_long = sum(_count_msg_tokens(_m) for _m in messages) > _RT_ATTN_SPAN
         except Exception:
             pass
         force_no_think = False   # set when the thinking-budget enforcer aborts a runaway
@@ -14567,37 +15049,82 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             effective_reserve = min(reserve + tools_overhead + 768, ctx_limit - 2048)
             trimmed = truncate_messages(conversation, ctx_limit, reserve=effective_reserve)
             dropped = max(0, len(conversation) - len(trimmed))
+            _fold = None
+            if dropped > 0 and use_tools and settings.get("summarize_history", True):
+                # The trimmer is about to DELETE the middle of a live agentic
+                # turn — the amnesia loop. Fold into the rolling summary
+                # instead (mid-turn compaction), then re-trim against the
+                # rebuilt, shorter conversation. One summarizer call; the KV
+                # reprocess it costs is already being paid by the hard trim.
+                try:
+                    _fold = _mid_turn_fold(chat_id, conversation, _start_len,
+                                           ctx_limit, _llama.is_vision_capable())
+                    if _fold:
+                        _start_len = _fold["start_len"]
+                        if _fold.get("conversation") is not None:
+                            conversation = _fold["conversation"]
+                            _roll_active = True
+                            trimmed = truncate_messages(conversation, ctx_limit,
+                                                        reserve=effective_reserve)
+                            dropped = max(0, len(conversation) - len(trimmed))
+                except Exception:
+                    traceback.print_exc()
             if dropped > 0:
-                emit({"type": "context_trimmed", "dropped": dropped, "total": len(conversation)})
+                # "folded" tells the UI whether these messages were genuinely
+                # compacted into the session summary (mid-turn fold ran) or
+                # silently elided from the prompt — the pill label must not
+                # say "summarized" for a plain drop.
+                emit({"type": "context_trimmed", "dropped": dropped, "total": len(conversation),
+                      "folded": bool(_fold and _fold.get("folded"))})
 
-            # Volatile session state — mission block + pins — appended AFTER the
-            # history, right before generation, where attention actually lands.
-            # These used to be spliced into the TOP of the system prompt, but
-            # they change mid-session (pin_note calls, mission facts accruing)
-            # and every change invalidated llama.cpp's cached prompt prefix
-            # (~15K+ tokens of system prompt + tool schemas re-prefilled).
-            # Riding the tail keeps the prefix byte-identical across turns;
-            # only this small tail message is re-evaluated when they change.
-            # This also subsumes the old fill-gated rt_tail_echo: the mission
-            # now ALWAYS sits at the recency end, so no separate echo is needed.
+            # Volatile session state — mission block + pins + objective —
+            # appended AFTER the history, right before generation, where
+            # attention actually lands. These used to be spliced into the TOP
+            # of the system prompt, but they change mid-session (pin_note
+            # calls, mission facts accruing) and every change invalidated
+            # llama.cpp's cached prompt prefix (~15K+ tokens of system prompt
+            # + tool schemas re-prefilled). Riding the tail keeps the prefix
+            # byte-identical across turns; only this small tail message is
+            # re-evaluated when they change. This also subsumes the old
+            # fill-gated rt_tail_echo: the mission now ALWAYS sits at the
+            # recency end, so no separate echo is needed.
             # Mutates the per-round `trimmed` copy ONLY — never `conversation` —
             # so it is never persisted or double-counted.
+            _tail_secs: list = []
+            _mission_shown = False
             if use_tools:
-                _tail_secs: list = []
                 _mtxt = _rt_mission_render(_rt_chat) if settings.get("rt_mission_state", True) else ""
                 if _mtxt:
                     _tail_secs.append(
                         "=== MISSION (authorized run — hold this; do NOT drift off-task) ===\n"
                         + _mtxt)
+                    _mission_shown = True
                 if _pins_tail:
                     _tail_secs.append(
                         "=== PINNED FOR THIS SESSION (established facts/fixes — do NOT undo or repeat) ===\n"
                         + "\n".join(f"- {p}" for p in _pins_tail))
-                if _tail_secs:
-                    _body = ("[SESSION STATE — live, re-sent every turn; hold these — "
-                             "do NOT drift off-task or undo them]\n" + "\n\n".join(_tail_secs))
-                    _role = "system" if _rt_trailing_system_ok() else "user"
-                    trimmed = trimmed + [{"role": _role, "content": _body}]
+            # General long-horizon anchor (no red-team mission in play) — fires
+            # for tools AND plain chats once the session is long enough that
+            # folds or the trimmer can hide what we're working on: the exact
+            # moment the model used to "finish a task and forget it". Carries
+            # the original ask AND the latest substantive instruction so
+            # mid-session task switches survive compaction.
+            if (not _mission_shown) and (_objective or _current_task) and (
+                    dropped > 0 or _roll_active or _session_long):
+                _obj_lines = []
+                if _objective:
+                    _obj_lines.append("original ask: " + _objective)
+                if _current_task and _current_task != _objective:
+                    _obj_lines.append("current task: " + _current_task)
+                _tail_secs.append(
+                    "=== OBJECTIVE (what this session is working toward — keep pushing it "
+                    "forward from where you are; do NOT restart it, and do NOT ask what "
+                    "we're working on) ===\n" + "\n".join(_obj_lines))
+            if _tail_secs:
+                _body = ("[SESSION STATE — live, re-sent every turn; hold these — "
+                         "do NOT drift off-task or undo them]\n" + "\n\n".join(_tail_secs))
+                _role = "system" if _rt_trailing_system_ok() else "user"
+                trimmed = trimmed + [{"role": _role, "content": _body}]
 
             payload = {
                 "model": model or "local",
@@ -14653,6 +15180,21 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 payload["tools"] = tools_for_llama(_rt_incl_exploit)
                 payload["tool_choice"] = "auto"
 
+            # Lead the context gauge: push the assembled prompt size BEFORE the
+            # round starts. The /api/ctx-stats poll can only report the last
+            # COMPLETED round's prompt_eval_count, so the UI percent always
+            # lagged one round behind — the gauge hit 100% only after the
+            # trimmer had already fired. This estimate (char-based, + the
+            # cached tools-spec overhead) lands before generation begins.
+            def _emit_ctx_fill() -> None:
+                try:
+                    est = sum(_count_msg_tokens(m) for m in payload["messages"]) + tools_overhead
+                    emit({"type": "ctx_fill", "prompt_tokens": est,
+                          "capacity": ctx_limit, "source": "estimate"})
+                except Exception:
+                    pass
+            _emit_ctx_fill()
+
             # Open the stream. If the prompt overflows n_ctx (--no-context-shift
             # makes the server reject rather than slide the window), trim older
             # turns harder and retry instead of failing the whole turn — the
@@ -14668,6 +15210,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         tighter = min(effective_reserve + pad, ctx_limit - 1024)
                         trimmed = truncate_messages(conversation, ctx_limit, reserve=tighter)
                         payload["messages"] = _sanitize_messages_for_openai(trimmed)
+                        _emit_ctx_fill()
                         emit({"type": "notice",
                               "note": "prompt exceeded the context window — trimmed older turns and retrying"})
                         continue
@@ -15593,6 +16136,11 @@ SANDBOX_APT_TOOLS = [
     # nothing (p7zip -> 7z archives, mtd-utils -> jffs2, squashfs-tools ->
     # unsquashfs). jq for parsing tool output.
     "p7zip-full", "mtd-utils", "squashfs-tools", "jq",
+    # red-team expansion set: web fuzzing, default-cred testing, SSL and
+    # SMB/NetBIOS enumeration, plus SecLists wordlists (/usr/share/seclists).
+    # Install is resilient per-package, so an unavailable name just warns.
+    "gobuster", "ffuf", "nikto", "hydra", "whatweb", "wafw00f",
+    "masscan", "testssl.sh", "enum4linux", "smbclient", "seclists",
 ]
 
 # binwalk 2.x refuses to run its extraction utilities as root unless you pass
@@ -15678,12 +16226,34 @@ def _wsl_bash(distro, script, timeout=120):
     env = dict(os.environ)
     env["WSL_UTF8"] = "1"
     try:
-        r = subprocess.run([_wsl_exe(), "-d", distro, "-u", "root", "--", "bash", "-l"],
-                           input=script, capture_output=True, text=True, timeout=timeout,
-                           env=env, creationflags=_NO_WINDOW, encoding="utf-8", errors="replace")
-        return r.returncode, (r.stdout or "") + (r.stderr or "")
-    except subprocess.TimeoutExpired:
-        return 124, "timeout"
+        p = subprocess.Popen([_wsl_exe(), "-d", distro, "-u", "root", "--", "bash", "-l"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, env=env, creationflags=_NO_WINDOW, encoding="utf-8", errors="replace")
+        
+        p.stdin.write(script)
+        p.stdin.close()
+        
+        output = []
+        def _reader():
+            for line in iter(p.stdout.readline, ''):
+                output.append(line)
+                try:
+                    broadcast_event({"type": "sandbox:stream", "line": line.rstrip("\\r\\n")})
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        
+        try:
+            rc = p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            rc = 124
+            output.append("timeout\\n")
+        
+        t.join(timeout=1.0)
+        return rc, "".join(output)
     except FileNotFoundError:
         return 127, "wsl not found"
     except Exception as e:
@@ -15963,7 +16533,7 @@ def sandbox_selftest() -> dict:
                 "error": "sandbox not ready - set it up first."}
     rc, out = _wsl_in(SANDBOX_DISTRO,
                       "uname -a; echo '--- tools ---'; "
-                      "for t in python3 nmap sqlmap binwalk 7z unsquashfs file xxd jq git curl; do "
+                      "for t in python3 nmap sqlmap binwalk 7z unsquashfs file xxd jq git curl gobuster ffuf nikto hydra whatweb wafw00f masscan testssl.sh enum4linux smbclient; do "
                       "printf '%-10s ' \"$t\"; (command -v $t >/dev/null && echo ok || echo MISSING); done; "
                       # prove binwalk extraction actually works as root (the wrapper fix)
                       "echo '--- binwalk extract ---'; d=$(mktemp -d); echo probe | gzip > \"$d/t.gz\"; "
@@ -15993,6 +16563,37 @@ def _sandbox_ready_cached(ttl: float = 30.0) -> bool:
     return ready
 
 
+def _sandbox_scope_block(command: str) -> str | None:
+    """Best-effort OUT-OF-SCOPE check for sandbox commands during an active RT
+    mission. sandbox_run is a generic bash pipe, so scope can't be enforced by
+    argument like the typed RT tools - extract host-like tokens from the
+    command text and refuse when one matches the mission's out: list. Only
+    fires when an explicit out list was declared (no false positives otherwise).
+    """
+    try:
+        chat_id = _current_chat_id.get() or ""
+        chat = (get_chats().get("chats", {}) or {}).get(chat_id) if chat_id else None
+    except Exception:
+        chat = None
+    toks = _rt_scope_out_tokens(chat)
+    if not toks:
+        return None
+    scrub = re.sub(r"/mnt/[a-z]/\S+", " ", command.lower())
+    hosts = set(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", scrub))
+    hosts |= {h for h in re.findall(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", scrub)
+              if not h.endswith((".py", ".js", ".txt", ".gz", ".xz", ".img", ".bin",
+                                 ".zip", ".tar", ".json", ".md", ".html", ".css",
+                                 ".apk", ".so", ".elf", ".yar", ".pcap", ".evtx"))}
+    for h in hosts:
+        pm = re.search(re.escape(h) + r"[^\d]{1,12}(?:-p\s*|port[=\s])(\d{2,5})", scrub)
+        port = int(pm.group(1)) if pm else None
+        for tok in toks:
+            if _rt_tok_matches(tok, h, port):
+                return (f"refused: sandbox command references {h}, which is OUT OF SCOPE "
+                        f"(mission marks '{tok}' out). Stay on the in-scope target.")
+    return None
+
+
 def tool_sandbox_run(args: dict) -> dict:
     """Run a shell command inside the isolated accuretta-sbx Linux guest. Gated
     the same way as run_powershell: catastrophic commands are hard-refused, and
@@ -16013,6 +16614,9 @@ def tool_sandbox_run(args: dict) -> dict:
             "refused_command": command,
             "catastrophic": True,
         }
+    sblk = _sandbox_scope_block(command)
+    if sblk:
+        return {"error": sblk, "scope_blocked": True}
     if needs_approval(command):
         approval = request_approval(
             title="Sandbox command (write/modify)",
@@ -16038,7 +16642,7 @@ TOOLS["sandbox_run"] = {
         "tool that is already here: python3/pip3, nmap, sqlmap, binwalk (extraction "
         "works: `binwalk -e file` runs its extractors as root automatically), file, "
         "xxd, strings, binutils, unzip/zip, 7z (p7zip), unsquashfs + mtd-utils "
-        "(squashfs/jffs2), git, curl, wget, jq, nc, dig, openssl. `apt-get install -y "
+        "(squashfs/jffs2), git, curl, wget, jq, nc, dig, openssl, gobuster, ffuf, nikto, hydra, whatweb, wafw00f, masscan, testssl.sh, enum4linux, smbclient, seclists (/usr/share/seclists). Prefer sandbox_nmap / sandbox_sqlmap for those two - they return parsed results. `apt-get install -y "
         "<pkg>` for anything else. If a tool errors, read the error and fix the "
         "invocation rather than reimplementing the tool by hand."
     ),
@@ -16052,6 +16656,216 @@ TOOLS["sandbox_run"] = {
         "required": ["command"],
     },
     "fn": tool_sandbox_run,
+}
+
+
+def tool_sandbox_nmap(args: dict) -> dict:
+    """nmap from inside the sandbox guest, XML-parsed to compact JSON."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    target = (args.get("target") or "").strip()
+    if not target or not re.fullmatch(r"[A-Za-z0-9._:/-]+", target):
+        return {"error": "target required (hostname, IP, or CIDR - no spaces/flags)"}
+    blk = _rt_scope_block("sandbox_nmap", {"target": target})
+    if blk:
+        return {"error": blk, "scope_blocked": True}
+    ports = (args.get("ports") or "").strip()
+    if ports and not re.fullmatch(r"[0-9,\-]+", ports):
+        return {"error": "ports must look like '22,80,443' or '1-1024'"}
+    timing = max(0, min(int(args.get("timing", 3)), 4))
+    cmd = f"nmap -Pn -T{timing} --open -sV --version-light -oX - "
+    if ports:
+        cmd += f"-p {ports} "
+    cmd += shlex.quote(target)
+    approval = request_approval(
+        title="Sandbox nmap scan",
+        command=cmd,
+        details={"kind": "sandbox", "distro": SANDBOX_DISTRO},
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied nmap scan ({approval.get('status')})"}
+    res = sandbox_run(cmd, timeout=int(args.get("timeout", 600)))
+    out = res.get("output") or ""
+    hosts = []
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(out[out.index("<"):])
+        for h in root.iter("host"):
+            addr = h.find("address")
+            state = h.find("status")
+            entry = {"ip": addr.get("addr", "") if addr is not None else "",
+                     "state": state.get("state", "") if state is not None else "",
+                     "ports": []}
+            for p in h.iter("port"):
+                st = p.find("state")
+                if st is None or st.get("state") != "open":
+                    continue
+                sv = p.find("service")
+                entry["ports"].append({
+                    "port": int(p.get("portid", "0")),
+                    "proto": p.get("protocol", "tcp"),
+                    "service": sv.get("name", "") if sv is not None else "",
+                    "product": (sv.get("product", "") or "") if sv is not None else "",
+                    "version": (sv.get("version", "") or "") if sv is not None else "",
+                })
+            hosts.append(entry)
+    except Exception as e:
+        return {"error": f"nmap output parse failed: {e}",
+                "exit_code": res.get("exit_code"), "raw": out[-4000:]}
+    return {"ok": True, "target": target, "command": cmd, "hosts": hosts,
+            "host_count": len(hosts),
+            "open_ports": sum(len(h["ports"]) for h in hosts)}
+
+
+def tool_sandbox_sqlmap(args: dict) -> dict:
+    """sqlmap from inside the sandbox guest: batch mode, rotating UA, optional
+    proxy via rt_proxy. Parsed verdict (injectable / params / DBMS) + raw tail."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    url = (args.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return {"error": "url must start with http:// or https://"}
+    blk = _rt_scope_block("sandbox_sqlmap", {"url": url})
+    if blk:
+        return {"error": blk, "scope_blocked": True}
+    level = max(1, min(int(args.get("level", 1)), 5))
+    risk = max(1, min(int(args.get("risk", 1)), 3))
+    parts = ["sqlmap", "-u", shlex.quote(url), "--batch", "--random-agent",
+             f"--level={level}", f"--risk={risk}", "--threads=4"]
+    if args.get("forms"):
+        parts.append("--forms")
+    if args.get("tamper"):
+        parts.append("--tamper=between,space2comment")
+    if args.get("flush_session"):
+        parts.append("--flush-session")
+    proxy = (get_settings().get("rt_proxy") or "").strip()
+    if proxy:
+        parts.append(f"--proxy={shlex.quote(proxy)}")
+    cmd = " ".join(parts)
+    approval = request_approval(
+        title="Sandbox sqlmap",
+        command=cmd,
+        details={"kind": "sandbox", "distro": SANDBOX_DISTRO},
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied sqlmap ({approval.get('status')})"}
+    res = sandbox_run(cmd, timeout=int(args.get("timeout", 900)))
+    out = res.get("output") or ""
+    injectable = ("is vulnerable" in out
+                  or "sqlmap identified the following injection point" in out)
+    params = sorted(set(re.findall(r"Parameter:\s*(\S+)", out)))
+    m = re.search(r"back-end DBMS:\s*(.+)", out)
+    return {"ok": True, "url": url, "injectable": injectable,
+            "parameters": params, "dbms": m.group(1).strip() if m else "",
+            "exit_code": res.get("exit_code"), "raw_tail": out[-3000:]}
+
+
+def tool_rt_generate_report(args: dict) -> dict:
+    """Assemble a markdown engagement report: mission header (objective /
+    target / scope), model-supplied findings body, and the evidence manifest
+    from data/recon_evidence. Saves to data/reports/."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    title = (args.get("title") or "Red Team Engagement Report").strip()
+    body = (args.get("findings") or "").strip()
+    if not body:
+        return {"error": "findings markdown required"}
+    try:
+        chat_id = _current_chat_id.get() or ""
+        chat = (get_chats().get("chats", {}) or {}).get(chat_id) if chat_id else None
+    except Exception:
+        chat = None
+    mission = _rt_mission_get(chat) if isinstance(chat, dict) else None
+    ev_dir = DATA / "recon_evidence"
+    evidence = []
+    try:
+        if ev_dir.exists():
+            for f in sorted(ev_dir.iterdir()):
+                if f.is_file():
+                    evidence.append(f"| `{f.name}` | {f.stat().st_size} bytes |")
+    except Exception:
+        pass
+    lines = [f"# {title}", "",
+             f"_generated {datetime.datetime.now().isoformat(timespec='seconds')} by accuretta_", ""]
+    if mission:
+        lines += ["## Mission", ""]
+        for k in ("objective", "target", "scope"):
+            if mission.get(k):
+                lines.append(f"- **{k}:** {mission[k]}")
+        lines.append("")
+    lines += ["## Findings", "", body, ""]
+    if evidence:
+        lines += ["## Evidence artifacts", "", "| file | size |", "|---|---|"] + evidence + ["",
+                 "_evidence files live in `data/recon_evidence/`._"]
+    rep_dir = DATA / "reports"
+    rep_dir.mkdir(parents=True, exist_ok=True)
+    path = rep_dir / f"report-{int(time.time())}.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return {"ok": True, "report": str(path), "evidence_count": len(evidence)}
+
+
+TOOLS["sandbox_nmap"] = {
+    "description": (
+        "Run nmap INSIDE the sandbox guest and get parsed JSON (hosts, open "
+        "ports, service/product/version) instead of raw text. AUTHORIZED RECON "
+        "ONLY. Scan traffic originates from the guest, not the host. timing "
+        "0-4 (default 3); ports like '22,80,443' or '1-1024' (default: nmap "
+        "top 1000). Scope-enforced: refuses out-of-mission targets."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target": {"type": "string", "description": "hostname, IP, or CIDR"},
+            "ports": {"type": "string", "description": "optional '22,80,443' or '1-1024'"},
+            "timing": {"type": "integer", "description": "nmap -T timing 0-4, default 3"},
+            "timeout": {"type": "integer", "description": "seconds, default 600"},
+        },
+        "required": ["target"],
+    },
+    "fn": tool_sandbox_nmap,
+}
+
+TOOLS["sandbox_sqlmap"] = {
+    "description": (
+        "Run sqlmap INSIDE the sandbox guest against a URL and get a parsed "
+        "verdict: injectable true/false, injectable parameters, backend DBMS, "
+        "raw tail. Batch mode, rotating User-Agent, optional forms crawling, "
+        "optional light WAF-evasion tamper scripts, honors the rt_proxy "
+        "setting. AUTHORIZED PENTEST only; scope-enforced."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "target URL with query params"},
+            "level": {"type": "integer", "description": "1-5, default 1"},
+            "risk": {"type": "integer", "description": "1-3, default 1"},
+            "forms": {"type": "boolean", "description": "crawl and test forms"},
+            "tamper": {"type": "boolean", "description": "light WAF-evasion tamper scripts"},
+            "flush_session": {"type": "boolean", "description": "ignore prior session state"},
+            "timeout": {"type": "integer", "description": "seconds, default 900"},
+        },
+        "required": ["url"],
+    },
+    "fn": tool_sandbox_sqlmap,
+}
+
+TOOLS["rt_generate_report"] = {
+    "description": (
+        "Assemble the engagement report at the end of a red-team run: markdown "
+        "file with the mission header (objective/target/scope), your findings "
+        "(pass full findings markdown: severity, evidence, impact, fix), and "
+        "the evidence manifest from data/recon_evidence. Saved under "
+        "data/reports/; the path is returned."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "report title"},
+            "findings": {"type": "string", "description": "full findings markdown"},
+        },
+        "required": ["findings"],
+    },
+    "fn": tool_rt_generate_report,
 }
 
 
@@ -16787,8 +17601,20 @@ class Handler(BaseHTTPRequestHandler):
             if vram <= 0:
                 detected = detect_vram_gb()
                 vram = float(detected.get("gb") or 0)
+                try:
+                    _ram_mb, _vram_mb = _running_instance_mem_mb()
+                    if _vram_mb > 0:
+                        # A save+reload follows the suggest — that swap frees
+                        # the running instance's VRAM before the new load.
+                        vram += _vram_mb / 1024.0
+                except Exception:
+                    pass
             profile = inspect_model(mp)
             suggested = auto_tune(mp, vram, profile=profile, min_ctx=min_ctx)
+            # Remember the tune for this model — the next /api/models/load
+            # restores it without re-running the tuner.
+            if mp and suggested.get("num_ctx"):
+                _save_model_config(mp, suggested)
             return self._send_json(200, {
                 "vram_gb": vram,
                 "vram_source": (detected or {}).get("source", "user"),
@@ -16847,7 +17673,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(400, {"error": "path required"})
             if not safe_exists(target):
                 return self._send_json(400, {"error": f"file not found: {target}"})
-            
+
+            # Per-model config memory + auto-tune on load: restore this model's
+            # tuned flags (or compute them on first load) BEFORE the spawn reads
+            # settings, so every model gets ITS best config — not the previous
+            # model's leftovers.
+            _auto_tune_for_load(target)
+
             s = get_settings()
             if target != _llama.loaded_model():
                 # Clear the explicit projector path on model switch so we don't
@@ -16856,7 +17688,16 @@ class Handler(BaseHTTPRequestHandler):
                 s["mmproj_path"] = ""
                 save_json(SETTINGS_FILE, s)
                 
-            res = _llama.start(target)
+            # Big models load slowly from a cold disk (a 24 GB GGUF on an HDD
+            # takes 5-8 min before llama-server answers). The flat 120s wait
+            # reported those as failures while the server was still loading
+            # fine — scale the wait with file size, floor 120s, cap 15 min.
+            try:
+                _sz_gb = os.path.getsize(target) / 1e9
+            except Exception:
+                _sz_gb = 0.0
+            wait_s = max(120, min(900, int(_sz_gb * 20)))
+            res = _llama.start(target, wait_seconds=wait_s)
             if res.get("ok"):
                 s = get_settings()
                 s["model_path"] = target
@@ -17431,37 +18272,13 @@ class Handler(BaseHTTPRequestHandler):
         replay_vision = _llama.is_vision_capable()
         # Replay only turns NOT already folded into the rolling summary — this
         # is what actually saves the window (the summary stands in for them).
+        # Mapping lives in _replay_wire_msg so the mid-turn fold rebuilds the
+        # exact same wire shape.
         _replay_from = int(chat.get("summary_through", 0) or 0)
         for m in chat["messages"][_replay_from:]:
-            role = m.get("role")
-            if role not in ("user", "assistant", "tool"):
-                continue
-            stored_images = m.get("images") if role == "user" else None
-            if stored_images and replay_vision:
-                # Rebuild OpenAI-style content array. Text first (the model
-                # reads top-to-bottom), then each image as image_url.
-                parts: list[dict] = []
-                txt = m.get("content", "") or ""
-                if txt:
-                    parts.append({"type": "text", "text": txt})
-                for img in stored_images:
-                    if not isinstance(img, str) or not img:
-                        continue
-                    url = img if img.startswith("data:") else f"data:image/png;base64,{img}"
-                    parts.append({"type": "image_url", "image_url": {"url": url}})
-                # If we somehow ended up with no parts (shouldn't happen),
-                # fall back to plain text so the message isn't empty.
-                out: dict = {"role": role, "content": parts if parts else (txt or "")}
-            else:
-                out: dict = {"role": role, "content": m.get("content", "") or ""}
-            if role == "assistant" and m.get("tool_calls"):
-                out["tool_calls"] = m["tool_calls"]
-            if role == "tool":
-                if m.get("tool_call_id"):
-                    out["tool_call_id"] = m["tool_call_id"]
-                if m.get("name"):
-                    out["name"] = m["name"]
-            msgs.append(out)
+            out = _replay_wire_msg(m, replay_vision)
+            if out is not None:
+                msgs.append(out)
 
         # set up SSE response — Connection: close so the browser reader resolves done
         self.send_response(200)
@@ -17743,11 +18560,18 @@ def read_gguf_metadata(path: str, max_bytes: int = 4 * 1024 * 1024) -> dict:
                 if vtype == T_ARRAY:
                     etype = struct.unpack_from("<I", data, p)[0]; p += 4
                     ecount = struct.unpack_from("<Q", data, p)[0]; p += 8
-                    # Array contents aren't needed for tuning; record just the
-                    # length (cheap) and skip past them.
                     if etype in scalar_fmt:
-                        _, sz = scalar_fmt[etype]
-                        return {"__array_len__": int(ecount)}, p + sz * ecount
+                        efmt, sz = scalar_fmt[etype]
+                        # Small numeric arrays carry real tuning signal on newer
+                        # archs (gemma4 per-layer head_count_kv / sliding_window_
+                        # pattern) — keep them when they're cheap. Big arrays
+                        # (tokenizer vocab etc.) stay length-only.
+                        if 0 < ecount <= 1024:
+                            try:
+                                return list(struct.unpack_from("<" + efmt[1] * int(ecount), data, p)), p + sz * int(ecount)
+                            except Exception:
+                                pass
+                        return {"__array_len__": int(ecount)}, p + sz * int(ecount)
                     if etype == T_STRING:
                         for _ in range(ecount):
                             n = struct.unpack_from("<Q", data, p)[0]
@@ -17965,7 +18789,7 @@ def inspect_model(model_path: str) -> dict:
 
 # KV cache dtype byte costs per element (post block-quant overhead).
 # q4_0/q8_0 numbers are real: 0.5 + 1/32 (delta) = ~0.5625; 1 + 1/32 = ~1.0625.
-_KV_DTYPE_BYTES = {"f16": 2.0, "q8_0": 1.0625, "q4_0": 0.5625}
+_KV_DTYPE_BYTES = {"f16": 2.0, "bf16": 2.0, "q8_0": 1.0625, "q4_0": 0.5625, "q4_1": 0.625, "q5_0": 0.6875, "q5_1": 0.75}
 
 
 # Key fragments that mark hybrid recurrent/SSM + full-attention architectures
@@ -18089,6 +18913,343 @@ def _kv_per_1k_mb(profile: dict, kv_dtype: str, file_size_gb: float) -> float:
     return base
 
 
+# ---- sliding-window attention (SWA) ----------------------------------------
+# Mistral, Gemma 2/3, gpt-oss and friends cap the KV cache of local-attention
+# layers at the sliding window instead of the full context. Treating those
+# layers as full attention massively overestimates KV cost at big ctx — which
+# is exactly how the tuner used to starve these models of context they could
+# easily afford. We read the config straight from GGUF keys.
+_SWA_PATTERN_SUFFIXES = ("sliding_window_pattern", "swa_pattern")
+
+
+def _swa_info(profile: dict) -> dict | None:
+    """Sliding-window attention config from GGUF metadata keys. Returns
+    {"window": w, "pattern": p} or None. pattern p >= 2 means every p-th
+    layer is FULL attention and the rest are windowed (Gemma 3 style: 5:1).
+    pattern 0 = unknown mix (callers pick a conservative split)."""
+    keys = profile.get("keys") or {}
+    w = 0
+    for k, v in keys.items():
+        if k.lower().endswith("attention.sliding_window") and isinstance(v, (int, float)) and v:
+            w = int(v)
+            break
+    if not w:
+        return None
+    p = 0
+    for k, v in keys.items():
+        kl = k.lower()
+        if any(kl.endswith(suf) for suf in _SWA_PATTERN_SUFFIXES) and isinstance(v, (int, float)) and v >= 2:
+            p = int(v)
+            break
+    return {"window": w, "pattern": p}
+
+
+def _kv_total_bytes(profile: dict, kv_dtype: str, ctx_tokens: int, v_dtype: str = "") -> int:
+    """KV cache size in bytes for a REAL context length — not a linear
+    extrapolation. Same GGUF-exact base as _kv_bytes_per_token, but
+    sliding-window layers contribute min(ctx, window) tokens instead of ctx.
+    Hybrid SSM models keep the attention-layer-fraction scaling (their
+    full-attention layers are treated as unwindowed — conservative).
+    v_dtype enables split K/V cache (--cache-type-k/--cache-type-v): K is the
+    sensitive half (softmax error propagation), V tolerates 4-bit fine.
+    Returns 0 when GGUF metadata is unreadable."""
+    n_layer = profile.get("block_count", 0) or 0
+    if not n_layer or ctx_tokens <= 0:
+        return 0
+    db_k = _KV_DTYPE_BYTES.get(kv_dtype, 1.0625)
+    db_v = _KV_DTYPE_BYTES.get(v_dtype, db_k) if v_dtype else db_k
+
+    mla = _mla_dims(profile)
+    hy = _hybrid_info(profile)
+    if mla:
+        kv_lora, qk_rope = mla
+        # MLA stores one combined latent tensor — llama.cpp types it by
+        # cache-type-k alone (no separate V cache exists).
+        return int(n_layer * (kv_lora + qk_rope) * db_k * ctx_tokens)
+
+    n_kv = profile.get("head_count_kv", 0) or 0
+    head_dim = profile.get("key_length", 0) or 0
+    if not (n_kv and head_dim):
+        return 0
+    v_dim = profile.get("value_length", 0) or head_dim
+    per_layer_per_tok = n_kv * (head_dim * db_k + v_dim * db_v)
+
+    if hy["hybrid"] and hy["interval"]:
+        # Full attention applies only to every Nth layer — KV cache lives on
+        # those layers alone (SSM state is ctx-independent, not per-token KV).
+        attn_layers = max(1, n_layer // hy["interval"])
+        return int(attn_layers * per_layer_per_tok * ctx_tokens)
+
+    swa = _swa_info(profile)
+    if swa:
+        w = swa["window"]
+        # Per-layer array metadata (gemma4-style): sliding_window_pattern is a
+        # bool PER LAYER (True = windowed), head_count_kv varies per layer, and
+        # windowed layers use smaller head dims (key/value_length_swa). Exact
+        # per-layer math — a scalar-pattern guess is wildly wrong here.
+        keys = profile.get("keys") or {}
+        arch = profile.get("architecture") or ""
+        pat = keys.get(f"{arch}.attention.sliding_window_pattern")
+        hkv_arr = keys.get(f"{arch}.attention.head_count_kv")
+        if isinstance(pat, list) and len(pat) == n_layer:
+            k_swa = keys.get(f"{arch}.attention.key_length_swa")
+            v_swa = keys.get(f"{arch}.attention.value_length_swa")
+            if not isinstance(k_swa, (int, float)) or not k_swa:
+                k_swa = head_dim
+            if not isinstance(v_swa, (int, float)) or not v_swa:
+                v_swa = v_dim
+            total = 0
+            for i in range(n_layer):
+                heads = hkv_arr[i] if (isinstance(hkv_arr, list) and len(hkv_arr) == n_layer) else n_kv
+                if pat[i]:
+                    total += heads * (k_swa * db_k + v_swa * db_v) * min(ctx_tokens, w)
+                else:
+                    total += heads * (head_dim * db_k + v_dim * db_v) * ctx_tokens
+            return int(total)
+        if swa["pattern"]:
+            full_layers = max(1, n_layer // swa["pattern"])
+        elif "gptoss" in (profile.get("architecture") or "").lower() or "gpt-oss" in (profile.get("architecture") or "").lower():
+            full_layers = (n_layer + 1) // 2  # gpt-oss alternates SWA / full
+        else:
+            # Pattern unknown: assume half the layers are full attention.
+            # Deliberately conservative — for all-SWA models (Mistral) this
+            # OVERestimates KV (smaller ctx, safe), never under.
+            full_layers = (n_layer + 1) // 2
+        swa_layers = max(0, n_layer - full_layers)
+        total = full_layers * per_layer_per_tok * ctx_tokens
+        total += swa_layers * per_layer_per_tok * min(ctx_tokens, w)
+        return int(total)
+
+    return int(n_layer * per_layer_per_tok * ctx_tokens)
+
+
+def _kv_total_mb(profile: dict, kv_dtype: str, ctx_tokens: int, file_size_gb: float, v_dtype: str = "") -> float:
+    """Context-exact KV cost in MB. GGUF-exact (SWA/MLA/hybrid aware, split
+    K/V dtype aware) when the header was readable; linear size-bucket
+    fallback otherwise."""
+    b = _kv_total_bytes(profile, kv_dtype, ctx_tokens, v_dtype)
+    if b > 0:
+        return b / (1024 * 1024)
+    return _kv_per_1k_mb(profile, kv_dtype, file_size_gb) * (ctx_tokens / 1000.0)
+
+
+# ---- quant byte costs -------------------------------------------------------
+# Average bytes per weight for common GGUF quants (post block-quant overhead).
+# Used by the MoE offload speed model to turn "expert layers on CPU" into
+# "bytes pulled through RAM per decoded token".
+_QUANT_BPW = (
+    ("IQ2", 0.35), ("Q2", 0.35),
+    ("IQ3", 0.44), ("Q3", 0.44),
+    ("IQ4", 0.58), ("Q4", 0.60),
+    ("IQ5", 0.70), ("Q5", 0.72),
+    ("Q6", 0.85),
+    ("Q8", 1.06),
+    ("F16", 2.0), ("BF16", 2.0), ("F32", 4.0),
+)
+
+
+def _quant_bpw(quant: str) -> float:
+    q = (quant or "").upper()
+    for prefix, bpw in _QUANT_BPW:
+        if q.startswith(prefix):
+            return bpw
+    return 0.60  # Q4-ish default — the most common quant class
+
+
+# ---- system memory probes (auto-tune safety) --------------------------------
+
+def _system_ram_info():
+    """(total_gb, available_gb) of system RAM, or None. Windows via
+    GlobalMemoryStatusEx, Linux via /proc/meminfo, macOS via sysctl."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MEMSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            m = _MEMSTATUSEX()
+            m.dwLength = ctypes.sizeof(_MEMSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return m.ullTotalPhys / 1e9, m.ullAvailPhys / 1e9
+        elif sys.platform == "darwin":
+            import subprocess as _sp
+            total = int(_sp.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
+            vm = _sp.check_output(["vm_stat"], text=True)
+            free_pages = 0
+            for line in vm.splitlines():
+                if line.startswith("Pages free") or line.startswith("Pages inactive"):
+                    free_pages += int(line.split(":")[1].strip().rstrip("."))
+            return total / 1e9, (free_pages * 16384) / 1e9
+        else:
+            info = {}
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    k, _, rest = line.partition(":")
+                    parts = rest.strip().split()
+                    if parts and parts[0].isdigit():
+                        info[k.strip()] = int(parts[0])  # kB
+            if "MemTotal" in info:
+                return info["MemTotal"] / 1e6, info.get("MemAvailable", info.get("MemFree", 0)) / 1e6
+    except Exception:
+        pass
+    return None
+
+
+def _running_instance_mem_mb() -> tuple[float, float]:
+    """(ram_mb, vram_mb) held by the llama-server process this bridge most
+    recently spawned. (0, 0) when nothing is running or the probe fails.
+
+    auto_tune needs this so tuning for a model SWAP doesn't count the old
+    instance's memory as "used by someone else": the swap frees it before the
+    new model allocates. Without the add-back, tuning while a big MoE is
+    loaded sees ~2 GB free RAM, concludes almost nothing can be offloaded,
+    and writes crippled configs (ctx 4096) — the "MoE models fail instantly"
+    bug: the app's system prompt + tools alone exceed 4k ctx, so every chat
+    errorred out on the spot."""
+    pid = 0
+    try:
+        proc = getattr(_llama, "_proc", None)  # defined further down; call-time resolved
+        if proc is not None and proc.poll() is None:
+            pid = proc.pid
+    except Exception:
+        pid = 0
+    if not pid:
+        return 0.0, 0.0
+    ram_mb = 0.0
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if h:
+                pmc = _PMC()
+                pmc.cb = ctypes.sizeof(_PMC)
+                if ctypes.windll.psapi.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+                    ram_mb = pmc.WorkingSetSize / (1024 * 1024)
+                ctypes.windll.kernel32.CloseHandle(h)
+        else:
+            with open(f"/proc/{pid}/status", "r") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        ram_mb = float(line.split()[1]) / 1024.0
+                        break
+    except Exception:
+        ram_mb = 0.0
+    vram_mb = 0.0
+    try:
+        smi = shutil.which("nvidia-smi")
+        if smi:
+            r = subprocess.run(
+                [smi, "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=3,
+                creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                for line in r.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) == 2 and parts[0] == str(pid) and parts[1].isdigit():
+                        vram_mb += float(parts[1])
+    except Exception:
+        vram_mb = 0.0
+    return ram_mb, vram_mb
+
+
+def _free_vram_gb_for_tune() -> float:
+    """FREE VRAM for a tune that precedes a model load/swap: adds back the
+    VRAM the currently-running instance holds (freed by the swap). Without
+    this, a no-tier user re-tuning while a model is loaded budgets only the
+    crumbs the old instance left behind."""
+    gb = float(detect_vram_gb().get("gb") or 0)
+    try:
+        _ram_mb, vram_mb = _running_instance_mem_mb()
+        if vram_mb > 0:
+            gb += vram_mb / 1024.0
+    except Exception:
+        pass
+    return round(gb, 2)
+
+
+def _resolve_mmproj_for_tune(model_path: str, s: dict) -> str:
+    """The mmproj (if any) a load of `model_path` would boot with, so
+    auto_tune can reserve its VRAM. Mirrors the spawn path: explicit setting
+    wins; otherwise sibling auto-detect when mmproj_auto is on."""
+    mp = ((s or {}).get("mmproj_path") or "").strip()
+    if mp and safe_exists(mp):
+        return mp
+    if bool((s or {}).get("mmproj_auto", True)):
+        try:
+            return find_mmproj_for(model_path) or ""
+        except Exception:
+            return ""
+    return ""
+
+
+def _probe_ram_bandwidth_gbps() -> float:
+    """One-shot system RAM bandwidth estimate via ctypes memcpy (128 MB buffer,
+    8 passes, best of 3; read+write both traverse RAM). Returns 0 on failure.
+    ~0.3-1s — meant to run once per machine, then be cached in settings."""
+    import ctypes
+    size = 128 * 1024 * 1024
+    try:
+        libc = ctypes.CDLL("msvcrt" if os.name == "nt" else None)
+        memcpy = libc.memcpy
+        memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+        memcpy.restype = ctypes.c_void_p
+        src = ctypes.create_string_buffer(size)
+        dst = ctypes.create_string_buffer(size)
+        best = 0.0
+        chunk = ctypes.c_size_t(size)
+        for _ in range(3):
+            t0 = time.perf_counter()
+            for _ in range(8):
+                memcpy(dst, src, chunk)
+            dt = time.perf_counter() - t0
+            if dt > 0:
+                best = max(best, (8 * size * 2) / dt)
+        return round(best / 1e9, 1) if best > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _ram_bandwidth_gbps() -> float:
+    """Resolve the RAM bandwidth for the MoE speed model. A raw settings value
+    OTHER than the auto sentinel (30) is a manual override and wins. Otherwise
+    use the cached probe; probe once and cache if missing; 30 GB/s fallback."""
+    raw = load_json(SETTINGS_FILE, {})
+    if isinstance(raw, dict):
+        v = raw.get("ram_bandwidth_gbps")
+        if isinstance(v, (int, float)) and v > 0 and v != 30:
+            return float(v)
+        v = raw.get("_ram_bw_probe_gbps")
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    bw = _probe_ram_bandwidth_gbps()
+    if bw > 0:
+        try:
+            # Merge into the raw file (not get_settings()) so a concurrent
+            # settings write can't be clobbered.
+            raw = load_json(SETTINGS_FILE, {})
+            if isinstance(raw, dict):
+                raw["_ram_bw_probe_gbps"] = bw
+                save_json(SETTINGS_FILE, raw)
+        except Exception:
+            pass
+        return bw
+    return 30.0
+
+
 def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: int = 0) -> dict:
     """Suggest llama-server flags for a (model, VRAM) pair.
 
@@ -18098,6 +19259,15 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     keys the Settings drawer uses plus `notes` (multi-line reasoning) and
     `quant_downshift` (banner shown when the model needs heavy offload).
     `profile` may be passed in to reuse an existing inspect_model() result.
+
+    The (ctx, n_cpu_moe) pair is chosen by a joint optimizer: KV cache is
+    priced at the EXACT context of each tier (sliding-window layers cap at
+    their window, MLA caches latents, hybrid SSMs scale by attention-layer
+    fraction), and expert offload is gated by a decode-speed model (RAM
+    bandwidth ÷ active expert bytes per token) instead of a fixed layer cap —
+    so both dense and MoE models get the largest context that still decodes
+    at a usable speed. Floors/overrides: `min_tok_s_estimate`,
+    `ram_bandwidth_gbps` in settings.
 
     `min_ctx` makes context grow-only: when it's larger than the picked tier,
     the solver re-runs pinned to the smallest tier >= min_ctx and recomputes
@@ -18122,7 +19292,8 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     out = {
         "num_gpu": 99,                 # all non-MoE layers on GPU
         "n_cpu_moe": 0,                # MoE-only; auto below
-        "kv_cache_type": "q8_0",       # best balance
+        "kv_cache_type": "q8_0",       # K cache — best balance
+        "kv_cache_type_v": "",         # V cache — "" = same as K (split K/V set by the dtype ladder)
         "num_ctx": 32768,
         "num_batch": 512,
         "n_ubatch": 0,                 # auto in spawn
@@ -18143,9 +19314,39 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
 
     # Useable VRAM budget. With exact GGUF-derived KV math we can run hot —
     # ~8% headroom for CUDA workspace + alignment. Filename fallback is fuzzier
-    # so we leave more slack.
+    # so we leave more slack. Two SEPARATE reserves:
+    #   - vram_reserve_gb: minimal GPU-side safety for the Windows desktop
+    #     compositor on single-GPU machines (default 0.25 GB; user-tunable to
+    #     0 = give the LLM everything — the headroom still guards CUDA).
+    #   - safety_reserve_gb (reserve_gb): SYSTEM RAM only, applied further
+    #     down as the floor under CPU offload — the anti-bluescreen guard.
+    _s_tune = get_settings()
+    try:
+        reserve_gb = max(float(_s_tune.get("safety_reserve_gb") or 0), 0.0)
+    except Exception:
+        reserve_gb = 1.0
+    try:
+        _vr = _s_tune.get("vram_reserve_gb")
+        vram_reserve_gb = max(float(0.25 if _vr is None else _vr), 0.0)
+    except Exception:
+        vram_reserve_gb = 0.25
     headroom = 0.92 if src == "gguf" else 0.85
-    budget_mb = vram * headroom * 1024
+    budget_mb = max(vram - vram_reserve_gb, 0.5) * headroom * 1024
+
+    # Vision projector reserve: when an mmproj will load alongside the model
+    # (explicit path, or mmproj_auto sibling detection), it takes real VRAM
+    # the KV/weights math must not spend — the projector used to be invisible
+    # to the tuner, so tuned loads with vision on could OOM at boot.
+    mmproj_mb = 0.0
+    _mp_name = ""
+    try:
+        _mp = _resolve_mmproj_for_tune(model_path, _s_tune)
+        if _mp:
+            _mp_name = os.path.basename(_mp)
+            mmproj_mb = os.path.getsize(_mp) / (1024 * 1024)
+            budget_mb = max(budget_mb - mmproj_mb, 256.0)
+    except Exception:
+        mmproj_mb = 0.0
     if src == "gguf":
         moe_tag = ""
         if is_moe:
@@ -18157,7 +19358,16 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
         )
     else:
         notes.append("GGUF header unreadable — using size-bucket fallback (less accurate).")
-    notes.append(f"VRAM budget: {vram:.1f} GB · usable {budget_mb/1024:.1f} GB ({int(headroom*100)}% of total).")
+    notes.append(
+        f"VRAM budget: {vram:.1f} GB − {vram_reserve_gb:.2f} GB GPU reserve · "
+        f"usable {budget_mb/1024:.1f} GB ({int(headroom*100)}%). "
+        f"System-RAM reserve {reserve_gb:.1f} GB applies to CPU offload only."
+    )
+    if mmproj_mb:
+        notes.append(
+            f"vision projector: {mmproj_mb:.0f} MB reserved "
+            f"({_mp_name} loads alongside the model — disable mmproj to reclaim it)."
+        )
 
     # -- KV cache dtype --
     # q8_0 is the quality/cost sweet spot. We enforce it as a minimum to
@@ -18198,11 +19408,13 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     # whose required offload is still tolerable (here: ≤70% of layers). This
     # gives the user "biggest context that's still fast" instead of the old
     # "fixed 45%-of-budget cap that left context on the table".
-    kv_per_1k = _kv_per_1k_mb(profile, out["kv_cache_type"], size_gb)
-
-    # Surface which KV math path is in use (MLA latent cache / hybrid scaling).
+    # KV cost is priced per-tier at the EXACT context length via _kv_total_mb
+    # (SWA layers cap at their window — big ctx is nearly free on them).
+    # Surface which KV math path is in use (MLA latent cache / hybrid scaling /
+    # sliding-window attention).
     mla = _mla_dims(profile)
     hy = _hybrid_info(profile)
+    swa = _swa_info(profile)
     if src == "gguf":
         if mla:
             notes.append(
@@ -18221,6 +19433,31 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
                 notes.append(
                     f"hybrid SSM/attention detected ({hy['evidence']}) but attention-layer "
                     f"fraction unknown — KV kept conservative (all layers treated as full attention)."
+                )
+        if swa and not mla and not (hy["hybrid"] and hy["interval"]):
+            _w = swa["window"]
+            _pat_arr = (profile.get("keys") or {}).get(
+                f"{profile.get('architecture') or ''}.attention.sliding_window_pattern")
+            if swa["pattern"] and n_layer:
+                _full = max(1, n_layer // swa["pattern"])
+                notes.append(
+                    f"sliding-window attention: window {_w:,} tokens, every "
+                    f"{swa['pattern']} layers full ({n_layer - _full} of {n_layer} layers "
+                    f"windowed) — their KV caps at the window, so long context is cheap."
+                )
+            elif isinstance(_pat_arr, list) and n_layer and len(_pat_arr) == n_layer:
+                _full = sum(1 for x in _pat_arr if not x)
+                notes.append(
+                    f"sliding-window attention: window {_w:,} tokens, per-layer pattern from "
+                    f"GGUF ({_full} full + {n_layer - _full} windowed, windowed layers use "
+                    f"smaller head dims) — exact KV math."
+                )
+            elif n_layer:
+                _full = (n_layer + 1) // 2
+                notes.append(
+                    f"sliding-window attention: window {_w:,} tokens "
+                    f"(layer pattern unknown — conservatively treated as {_full} full + "
+                    f"{n_layer - _full} windowed layers)."
                 )
 
     size_mb = size_gb * 1024
@@ -18312,26 +19549,128 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
                 f"(vocab {int(vocab):,} × embd {embd} × 2 tensors, not offloadable)."
             )
 
-    def _solve(kv_1k_mb: float, dtype_label: str, pinned_tier: int = 0):
-        """Pick (ctx, n_cpu_moe) for a given KV cost. With pinned_tier=0 the
-        tier ladder is scanned for the largest ctx that fits; with a pinned
-        tier exactly that tier is evaluated. Returns
-        (ctx, n_cpu_moe, note_lines, fits) — fits is False only for a pinned
-        tier that busts the budget or needs more offload than the caps allow.
-        May set out["quant_downshift"]."""
+    # -- MoE offload speed model --
+    # --n-cpu-moe moves whole layers' experts to CPU RAM, but every decoded
+    # token still activates expert_used_count experts in those layers — so the
+    # CPU share decodes at roughly RAM-bandwidth / bytes-per-token. We estimate
+    # that and refuse (ctx, offload) combos that decode below the user's floor:
+    # context you can only read at 2 tok/s is not a win, it's a trap.
+    try:
+        min_tok_s = float(_s_tune.get("min_tok_s_estimate") or 6)
+    except Exception:
+        min_tok_s = 6.0
+    expert_tok_bytes = 0.0
+    if is_moe and n_layer > 0 and embd:
+        _eu = profile.get("expert_used_count", 0) or 0
+        _ef = profile.get("expert_feed_forward_length", 0) or 0
+        if _eu and _ef:
+            expert_tok_bytes = _eu * 3 * _ef * embd * _quant_bpw(profile.get("quant", ""))
+    # RAM bandwidth: auto-probed (memcpy benchmark, cached per machine) unless
+    # the user pinned a manual value. Probed lazily — only when the speed
+    # model will actually run; the benchmark costs ~0.5s once per machine.
+    ram_bw_gbps = 30.0
+    if expert_tok_bytes > 0:
+        ram_bw_gbps = _ram_bandwidth_gbps()
+        notes.append(f"RAM bandwidth: {ram_bw_gbps:.0f} GB/s (auto-probed unless pinned in settings).")
+
+    # System-RAM safety cap: CPU-offloaded experts (and dense partial-offload
+    # layers) live in system RAM. Cap offload at (available − OS reserve) × 0.9
+    # so Windows never starts thrashing to fit the model.
+    ram_cap_mb = None
+    ram_info = _system_ram_info()
+    if ram_info:
+        total_ram_gb, avail_ram_gb = ram_info
+        # Swap-aware: a tune almost always precedes a model load that STOPS
+        # the currently-running instance first. Add its RSS back to available
+        # RAM or a re-tune done while a big MoE is loaded sees only crumbs
+        # (the "crippled saved config" bug — ctx 4096, instant chat failure).
+        inst_ram_mb, _inst_vram_mb = _running_instance_mem_mb()
+        if inst_ram_mb > 0:
+            avail_ram_gb += inst_ram_mb / 1024.0
+            notes.append(
+                f"running instance holds {inst_ram_mb/1024:.1f} GB RAM — counted as free "
+                f"(a model swap releases it before the new load allocates)."
+            )
+        ram_cap_mb = max((avail_ram_gb - reserve_gb) * 1024 * 0.9, 0)
+        if is_moe or size_mb > budget_mb:
+            notes.append(
+                f"system RAM: {avail_ram_gb:.1f} GB free of {total_ram_gb:.0f} GB — "
+                f"CPU offload capped at {ram_cap_mb/1024:.1f} GB (OS reserve kept)."
+            )
+
+    def _est_tok_s(n_off: int) -> float:
+        """Estimated decode tok/s with n_off expert layers' experts on CPU.
+        inf = GPU-only (the GPU bound isn't what this model is for)."""
+        if n_off <= 0 or expert_tok_bytes <= 0:
+            return float("inf")
+        cpu_bytes = (n_off / n_layer) * expert_tok_bytes
+        if cpu_bytes <= 0:
+            return float("inf")
+        return (ram_bw_gbps * 1e9) / cpu_bytes
+
+    def _kv_marginal_mb_per_tok(k_dt: str, v_dt: str = "") -> float:
+        """Marginal KV cost (MB) per extra context token, from a finite
+        difference taken high above any sliding window — so windowed layers
+        contribute their true marginal (zero past the window) instead of an
+        average. 0 when GGUF metadata is unreadable."""
+        b_hi = _kv_total_bytes(profile, k_dt, 131072, v_dt)
+        b_lo = _kv_total_bytes(profile, k_dt, 65536, v_dt)
+        if b_hi > b_lo:
+            return (b_hi - b_lo) / (131072 - 65536) / (1024 * 1024)
+        b = _kv_total_bytes(profile, k_dt, 65536, v_dt)
+        return (b / 65536) / (1024 * 1024) if b else 0.0
+
+    # Exact-fit top-up guard: keep this much budget unspent for CUDA
+    # fragmentation/allocation jitter when converting leftover VRAM into
+    # extra context tokens.
+    _TOPUP_GUARD_MB = 96.0
+
+    def _topup_ctx(base_ctx: int, leftover_mb: float, k_dt: str, v_dt: str = "") -> int:
+        """Spend leftover budget on context directly — the tier ladder is
+        coarse (64k → 96k → 128k) and would otherwise leave real tokens on
+        the table. Returns the exact-fit ctx (rounded down to a 4096-token
+        multiple), or base_ctx when the gain isn't worth it (<5%)."""
+        marg = _kv_marginal_mb_per_tok(k_dt, v_dt)
+        if marg <= 0 or leftover_mb <= _TOPUP_GUARD_MB:
+            return base_ctx
+        extra = int((leftover_mb - _TOPUP_GUARD_MB) / marg)
+        exact = min(ctx_tiers[0], (base_ctx + extra) // 4096 * 4096)
+        return exact if exact >= int(base_ctx * 1.05) else base_ctx
+
+    def _solve(kv_dtype: str, pinned_tier: int = 0, v_dtype: str = ""):
+        """Pick (ctx, n_cpu_moe) for a given KV dtype pair (split K/V
+        supported: v_dtype="" mirrors kv_dtype). KV is priced at the EXACT
+        context of each tier (_kv_total_mb), so sliding-window layers stop
+        costing context they don't use. With pinned_tier=0 the tier ladder
+        is scanned for the largest ctx that fits AND decodes at or above the
+        speed floor, then an exact-fit top-up spends the leftover budget on
+        extra tokens beyond the coarse tier; with a pinned tier exactly that
+        tier is evaluated. Returns (ctx, n_cpu_moe, note_lines, fits) — fits
+        is False only for a pinned tier that busts the budget or needs more
+        offload than the caps allow. May set out["quant_downshift"]."""
         tier_notes: list[str] = []
+        kv_tag = f"{kv_dtype}/{v_dtype}" if v_dtype and v_dtype != kv_dtype else kv_dtype
         if is_moe and n_layer > 0:
             expert_total_mb = max(size_mb * (1 - dense_share) - embed_mb, size_mb * 0.1)
             expert_per_layer_mb = expert_total_mb / n_layer
-            # Offload tolerance: 70% means we're willing to push experts off GPU
-            # as long as the active set + attention + KV cache still fit. Past
-            # 70% the speed cost outweighs the context win.
-            max_offload_layers = int(n_layer * 0.7)
+            # Hard offload ceiling: 85% of layers when the speed model can
+            # price the tradeoff (past that almost no compute stays on the
+            # GPU anyway), 70% when it can't (missing GGUF expert fields).
+            max_offload_layers = int(n_layer * (0.85 if expert_tok_bytes > 0 else 0.7))
+            # System-RAM clamp: offloaded experts live in RAM — never offload
+            # more than (available RAM − OS reserve) can actually hold.
+            if ram_cap_mb is not None and expert_per_layer_mb > 0:
+                max_offload_layers = min(max_offload_layers,
+                                         int(ram_cap_mb // expert_per_layer_mb))
+            # Fast zone: offload at or below this share is always acceptable
+            # without consulting the speed floor — the hit is modest.
+            fast_zone_layers = int(n_layer * 0.30)
 
             chosen_ctx = 0
             chosen_n_cpu_moe = 0
+            rejected_slow: list = []   # (tier, need_offload, est_tok_s) — fit but slow
             for tier in ([pinned_tier] if pinned_tier else ctx_tiers):
-                kv_mb = (tier / 1000.0) * kv_1k_mb
+                kv_mb = _kv_total_mb(profile, kv_dtype, tier, size_gb, v_dtype)
                 available_for_model = budget_mb - kv_mb - compute_buf_mb - embed_mb
                 if available_for_model <= 0:
                     continue  # KV alone busts the budget
@@ -18342,26 +19681,84 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
                     break
                 shortfall = size_mb - available_for_model
                 need_offload = int((shortfall + expert_per_layer_mb - 1) // expert_per_layer_mb)
-                if need_offload <= max_offload_layers:
+                if need_offload > max_offload_layers:
+                    continue
+                est = _est_tok_s(need_offload)
+                # A pinned tier is the user's saved ctx — speed never vetoes it.
+                if est >= min_tok_s or need_offload <= fast_zone_layers or pinned_tier:
                     chosen_ctx = tier
                     chosen_n_cpu_moe = need_offload
                     break
+                rejected_slow.append((tier, need_offload, est))
+            if not chosen_ctx and rejected_slow and not pinned_tier:
+                # Every fitting tier decoded under the floor. Take the FASTEST
+                # fitting one (smallest ctx → least offload → best tok/s) —
+                # usable context beats unusable context.
+                tier, need_offload, est = rejected_slow[-1]
+                chosen_ctx, chosen_n_cpu_moe = tier, need_offload
+                tier_notes.append(
+                    f"speed floor relaxed: larger tiers all decoded under "
+                    f"{min_tok_s:g} tok/s est. — took {tier:,} tokens at ~{est:.0f} tok/s instead."
+                )
             if not chosen_ctx:
                 if pinned_tier:
                     # Pinned tier doesn't fit within the offload caps.
                     return pinned_tier, n_layer, [], False
                 chosen_ctx = ctx_tiers[-1]  # smallest as fallback
-                chosen_n_cpu_moe = n_layer  # max offload as fallback
-            kv_at_chosen = (chosen_ctx / 1000.0) * kv_1k_mb
+                # Most offload the caps allow — never past the RAM cap, or
+                # we'd fix a VRAM problem by creating a system-RAM problem.
+                chosen_n_cpu_moe = max_offload_layers
+            # Fit reality-check: even at the caps, does the model actually fit?
+            # If not, say so LOUDLY (quant downshift banner) instead of handing
+            # llama-server a config that OOMs at boot.
+            if chosen_n_cpu_moe > 0 and chosen_n_cpu_moe >= max_offload_layers and expert_per_layer_mb > 0:
+                kv_check = _kv_total_mb(profile, kv_dtype, chosen_ctx, size_gb, v_dtype)
+                avail_check = budget_mb - kv_check - compute_buf_mb - embed_mb
+                shortfall_check = size_mb - avail_check
+                need_check = int((shortfall_check + expert_per_layer_mb - 1) // expert_per_layer_mb)
+                if need_check > max_offload_layers:
+                    cur_q = profile.get("quant", "Q4_K_M")
+                    suggest_q = "Q3_K_S" if cur_q.upper().startswith("Q4") else "IQ3_XS"
+                    out["quant_downshift"] = (
+                        f"This model can't fit on this machine: even offloading the max "
+                        f"{max_offload_layers}/{n_layer} expert layers it falls "
+                        f"{shortfall_check/1024:.1f} GB short at {chosen_ctx:,} ctx. "
+                        f"Grab the {suggest_q} quant, free up VRAM/RAM, or raise the OS reserve tradeoff."
+                    )
+                    out["does_not_fit"] = True
+                    tier_notes.append(
+                        f"WARNING: model does not fit — {need_check} expert layers would need "
+                        f"offloading but caps allow {max_offload_layers}. Expect boot failure."
+                    )
+            kv_at_chosen = _kv_total_mb(profile, kv_dtype, chosen_ctx, size_gb, v_dtype)
+            # Exact-fit top-up: spend leftover budget on context beyond the
+            # coarse tier. Offload stays valid — the fit math above guarantees
+            # the total (KV + compute + embed + on-GPU weights) stays within
+            # budget, and the top-up guard keeps 96 MB unspent for jitter.
+            if not pinned_tier and chosen_ctx < ctx_tiers[0] and expert_per_layer_mb > 0:
+                vram_used = (kv_at_chosen + compute_buf_mb + embed_mb
+                             + size_mb - chosen_n_cpu_moe * expert_per_layer_mb)
+                topped = _topup_ctx(chosen_ctx, budget_mb - vram_used, kv_dtype, v_dtype)
+                if topped != chosen_ctx:
+                    tier_notes.append(
+                        f"exact-fit top-up: ctx {chosen_ctx:,} → {topped:,} "
+                        f"(spent leftover budget at "
+                        f"{_kv_marginal_mb_per_tok(kv_dtype, v_dtype)*1024:.1f} KB/token marginal KV)."
+                    )
+                    chosen_ctx = topped
+                    kv_at_chosen = _kv_total_mb(profile, kv_dtype, chosen_ctx, size_gb, v_dtype)
             if chosen_n_cpu_moe == 0:
                 tier_notes.append(
                     f"context: {chosen_ctx:,} tokens · n_cpu_moe: 0 "
                     f"(model fits fully in VRAM at this context, KV ≈ {kv_at_chosen:.0f} MB)."
                 )
             else:
+                est = _est_tok_s(chosen_n_cpu_moe)
+                est_txt = (f"; est. decode ~{est:.0f} tok/s at {ram_bw_gbps:.0f} GB/s RAM"
+                           if est != float("inf") else "")
                 tier_notes.append(
                     f"context: {chosen_ctx:,} tokens · n_cpu_moe: {chosen_n_cpu_moe} of {n_layer} "
-                    f"(KV ≈ {kv_at_chosen:.0f} MB; offloading {chosen_n_cpu_moe} expert layers to fit + leave room)."
+                    f"(KV ≈ {kv_at_chosen:.0f} MB; offloading {chosen_n_cpu_moe} expert layers to fit + leave room{est_txt})."
                 )
             # Quant downshift suggestion: if we're offloading more than half
             # the layers even at the chosen context, the user is leaving real
@@ -18379,13 +19776,12 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
             if pinned_tier:
                 est_ctx = pinned_tier
                 # Fit check: KV + compute must leave something for the model.
-                fits = budget_mb - (est_ctx / 1000.0) * kv_1k_mb - compute_buf_mb > 0
+                fits = budget_mb - _kv_total_mb(profile, kv_dtype, est_ctx, size_gb, v_dtype) - compute_buf_mb > 0
             else:
                 ctx_budget_mb = budget_mb * 0.45
-                max_ctx_tokens = int((ctx_budget_mb / kv_1k_mb) * 1000) if kv_1k_mb > 0 else 8192
                 est_ctx = ctx_tiers[-1]
                 for tier in ctx_tiers:
-                    if max_ctx_tokens >= tier:
+                    if _kv_total_mb(profile, kv_dtype, tier, size_gb, v_dtype) <= ctx_budget_mb:
                         est_ctx = tier
                         break
                 fits = True
@@ -18395,50 +19791,146 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
             tier_notes.append(f"context: {est_ctx:,} tokens (estimated — no layer count from GGUF).")
             tier_notes.append(f"n_cpu_moe: {est_n_cpu_moe} (estimated).")
             return est_ctx, est_n_cpu_moe, tier_notes, fits
-        # Dense model: max context that fits alongside model weights.
+        # Dense model: max context that fits alongside model weights. KV is
+        # priced exactly per tier, so SWA dense models (Gemma, Mistral) get
+        # the big windows their windowed layers make nearly free.
         if pinned_tier:
-            kv_mb = (pinned_tier / 1000.0) * kv_1k_mb
+            kv_mb = _kv_total_mb(profile, kv_dtype, pinned_tier, size_gb, v_dtype)
             if size_mb + kv_mb + compute_buf_mb > budget_mb:
                 return pinned_tier, 0, [], False
             dense_ctx = pinned_tier
         else:
             dense_ctx = ctx_tiers[-1]
+            fits_any = False
             for tier in ctx_tiers:
-                kv_mb = (tier / 1000.0) * kv_1k_mb
+                kv_mb = _kv_total_mb(profile, kv_dtype, tier, size_gb, v_dtype)
                 if size_mb + kv_mb + compute_buf_mb <= budget_mb:
                     dense_ctx = tier
+                    fits_any = True
                     break
-        kv_at_chosen = (dense_ctx / 1000.0) * kv_1k_mb
+            if not fits_any and not pinned_tier:
+                # Even the smallest tier busts VRAM. Not fatal by itself — the
+                # num_gpu section splits dense layers GPU/CPU — but when VRAM +
+                # offloadable RAM combined still can't hold the weights, say so
+                # loudly instead of persisting a config that OOMs at boot.
+                _ram_hold = ram_cap_mb if ram_cap_mb is not None else size_mb
+                if size_mb + compute_buf_mb > budget_mb + _ram_hold:
+                    cur_q = profile.get("quant", "Q4_K_M")
+                    suggest_q = "Q3_K_M" if cur_q.upper().startswith("Q4") else "Q4_K_S"
+                    out["does_not_fit"] = True
+                    out["quant_downshift"] = (
+                        f"This model can't fit on this machine: {size_mb/1024:.1f} GB of weights "
+                        f"vs {budget_mb/1024:.1f} GB VRAM + {_ram_hold/1024:.1f} GB offloadable RAM. "
+                        f"Grab a smaller quant ({suggest_q}) or free up memory."
+                    )
+        # Exact-fit top-up: the tier ladder is coarse — spend the leftover
+        # budget on context directly instead of leaving it on the table.
+        if not pinned_tier and dense_ctx < ctx_tiers[0]:
+            kv_at_chosen = _kv_total_mb(profile, kv_dtype, dense_ctx, size_gb, v_dtype)
+            leftover = budget_mb - (size_mb + kv_at_chosen + compute_buf_mb)
+            topped = _topup_ctx(dense_ctx, leftover, kv_dtype, v_dtype)
+            if topped != dense_ctx:
+                tier_notes.append(
+                    f"exact-fit top-up: ctx {dense_ctx:,} → {topped:,} "
+                    f"(spent {leftover:.0f} MB leftover budget at "
+                    f"{_kv_marginal_mb_per_tok(kv_dtype, v_dtype)*1024:.1f} KB/token marginal KV)."
+                )
+                dense_ctx = topped
+        kv_at_chosen = _kv_total_mb(profile, kv_dtype, dense_ctx, size_gb, v_dtype)
         tier_notes.append(
             f"context: {dense_ctx:,} tokens "
-            f"(KV ≈ {kv_at_chosen:.0f} MB at {dtype_label})."
+            f"(KV ≈ {kv_at_chosen:.0f} MB at {kv_tag})."
         )
         return dense_ctx, 0, tier_notes, True
 
-    chosen_ctx, chosen_n_cpu_moe, tier_notes, _ = _solve(kv_per_1k, out["kv_cache_type"])
+    chosen_ctx, chosen_n_cpu_moe, tier_notes, _ = _solve(out["kv_cache_type"])
 
-    # -- Two-pass KV dtype --
-    # If the first pass starved context below the 16k floor, retry with q4_0
-    # KV and keep it only when it buys ≥1.5× the context. q4_0 KV has a small
-    # quality cost, so it's a starvation escape hatch, not a default.
-    if chosen_ctx < 16384 and out["kv_cache_type"] != "q4_0":
-        prev_downshift = out["quant_downshift"]
-        out["quant_downshift"] = ""
-        kv_per_1k_q4 = _kv_per_1k_mb(profile, "q4_0", size_gb)
-        ctx_q4, moe_q4, q4_tier_notes, _ = _solve(kv_per_1k_q4, "q4_0")
-        if ctx_q4 >= int(chosen_ctx * 1.5):
-            out["kv_cache_type"] = "q4_0"
-            chosen_ctx, chosen_n_cpu_moe, tier_notes = ctx_q4, moe_q4, q4_tier_notes
-            notes.append(
-                "KV cache: switched to q4_0 — first-pass context was below the "
-                "16384 floor and q4_0 buys ≥1.5× context."
-            )
-        else:
-            out["quant_downshift"] = prev_downshift
-            notes.append(
-                f"KV cache: kept {out['kv_cache_type']} — q4_0 retry only buys "
-                f"{ctx_q4 / max(chosen_ctx, 1):.1f}× context (<1.5× threshold)."
-            )
+    # -- KV dtype ladder (split K/V aware) --
+    # Rungs, in order of increasing compression / decreasing quality:
+    #   1. q8_0/q8_0 (or f16 when headroom allows) — zero measurable loss.
+    #   2. q8_0 K + q4_0 V ("k8v4") — K is the sensitive half (per-channel
+    #      outliers; noise propagates through softmax across all positions),
+    #      V is smoother and shrugs off 4-bit — the asymmetric K/V finding of
+    #      KIVI (ICML 2024, arXiv:2402.02750); llama.cpp supports the split
+    #      natively via --cache-type-k/--cache-type-v. ~23% KV savings at
+    #      ~6.5 bits/value, effectively free.
+    #   3. q4_0/q4_0 — dense models: small but real quality cost, so it stays
+    #      an escape hatch for starved context (<32k, needs a big multiplier).
+    #      Hybrid SSM/DeltaNet models (Qwen3.5/3.6, Qwen3-Next) are different:
+    #      only ~1 in 4 layers carries a KV cache at all, and community
+    #      benchmarks report q4_0 KV token-identical to f16 there (BLEU 1.000,
+    #      llama.cpp issue #21385 — single-machine measurement, not an official
+    #      validation), so for them q4_0 is ~2× context for ~free (setting:
+    #      allow_hybrid_q4_kv). Cost honesty: ANY quantized KV slows decode at
+    #      long context (per-token dequant; measured -12% at 24k, -37% at 110k
+    #      on a GB10 in the TurboQuant thread, less on discrete GPUs) — the
+    #      1.5×-context gate below exists so the trade is only taken when the
+    #      context win is large.
+    _hybrid_kv = bool(hy["hybrid"])
+    try:
+        _allow_hq4 = bool(_s_tune.get("allow_hybrid_q4_kv", True))
+    except Exception:
+        _allow_hq4 = True
+    if out["kv_cache_type"] != "f16":
+        base_ctx = chosen_ctx  # pass-1 (q8_0/q8_0) result — ladder rungs are judged against this
+        # Rung 2: split K/V. Near-free quality-wise, so it competes whenever
+        # context isn't already maxed — not just when starved.
+        if chosen_ctx < ctx_tiers[0]:
+            prev_downshift = out["quant_downshift"]
+            out["quant_downshift"] = ""
+            ctx_kv, moe_kv, kv_tier_notes, _ = _solve("q8_0", v_dtype="q4_0")
+            if ctx_kv >= int(chosen_ctx * 1.2):
+                out["kv_cache_type"] = "q8_0"
+                out["kv_cache_type_v"] = "q4_0"
+                chosen_ctx, chosen_n_cpu_moe, tier_notes = ctx_kv, moe_kv, kv_tier_notes
+                notes.append(
+                    "KV cache: split K/V — q8_0 K + q4_0 V (the V cache tolerates 4-bit "
+                    "with no measurable loss; K stays 8-bit where softmax noise would bite)."
+                )
+            else:
+                out["quant_downshift"] = prev_downshift
+        # Rung 3: full q4_0.
+        if _hybrid_kv and _allow_hq4 and out["kv_cache_type"] != "q4_0":
+            prev_downshift = out["quant_downshift"]
+            out["quant_downshift"] = ""
+            ctx_q4, moe_q4, q4_tier_notes, _ = _solve("q4_0", v_dtype="q4_0")
+            # Judged against the PASS-1 baseline (not the k8v4-boosted pick):
+            # on hybrid archs q4_0 is measured lossless, so a ≥1.5× win over
+            # the safe baseline is worth taking even past the split-K/V rung.
+            if ctx_q4 >= int(base_ctx * 1.5) and ctx_q4 > chosen_ctx:
+                out["kv_cache_type"] = "q4_0"
+                out["kv_cache_type_v"] = ""  # both sides q4_0 — keep the split field clean
+                chosen_ctx, chosen_n_cpu_moe, tier_notes = ctx_q4, moe_q4, q4_tier_notes
+                notes.append(
+                    "KV cache: q4_0 — hybrid SSM/DeltaNet arch, community-reported token-identical "
+                    "to f16 (llama.cpp #21385): only ~1/4 of layers carry KV at all. "
+                    "Set allow_hybrid_q4_kv=false to opt out."
+                )
+            else:
+                out["quant_downshift"] = prev_downshift
+        elif not _hybrid_kv and chosen_ctx < 32768 and out["kv_cache_type"] != "q4_0":
+            # Dense escape hatch (unchanged policy): q4_0 KV has a small
+            # quality cost, so below the 16k floor we accept a 1.5× gain;
+            # between 16k and 32k we demand 2×. Above 32k the conversation
+            # already has room to work.
+            gain_needed = 1.5 if chosen_ctx < 16384 else 2.0
+            prev_downshift = out["quant_downshift"]
+            out["quant_downshift"] = ""
+            ctx_q4, moe_q4, q4_tier_notes, _ = _solve("q4_0", v_dtype="q4_0")
+            if ctx_q4 >= int(chosen_ctx * gain_needed):
+                out["kv_cache_type"] = "q4_0"
+                out["kv_cache_type_v"] = ""
+                chosen_ctx, chosen_n_cpu_moe, tier_notes = ctx_q4, moe_q4, q4_tier_notes
+                notes.append(
+                    f"KV cache: switched to q4_0 — first-pass context was starved at "
+                    f"{chosen_ctx:,} tokens and q4_0 buys ≥{gain_needed:g}× context."
+                )
+            else:
+                out["quant_downshift"] = prev_downshift
+                notes.append(
+                    f"KV cache: kept {out['kv_cache_type']} — q4_0 retry only buys "
+                    f"{ctx_q4 / max(chosen_ctx, 1):.1f}× context (<{gain_needed:g}× threshold)."
+                )
 
     # -- Grow-only context (min_ctx) --
     # Frontend callers pass their saved num_ctx so a re-tune never silently
@@ -18456,8 +19948,8 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
                 f"not honored; using {chosen_ctx:,} instead."
             )
         else:
-            kv_now = _kv_per_1k_mb(profile, out["kv_cache_type"], size_gb)
-            p_ctx, p_moe, p_tier_notes, p_fits = _solve(kv_now, out["kv_cache_type"], pinned_tier=pinned)
+            p_ctx, p_moe, p_tier_notes, p_fits = _solve(out["kv_cache_type"], pinned_tier=pinned,
+                                                        v_dtype=out.get("kv_cache_type_v") or "")
             if p_fits:
                 chosen_ctx, chosen_n_cpu_moe, tier_notes = p_ctx, p_moe, p_tier_notes
                 notes.append(
@@ -18465,9 +19957,11 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
                     f"offload recomputed for that context)."
                 )
             else:
+                kv_pinned = _kv_total_mb(profile, out["kv_cache_type"], pinned, size_gb,
+                                         out.get("kv_cache_type_v") or "")
                 notes.append(
                     f"saved ctx {min_ctx:,} doesn't fit the current VRAM budget "
-                    f"(KV alone ≈ {pinned / 1000.0 * kv_now:.0f} MB at tier {pinned:,}) — "
+                    f"(KV alone ≈ {kv_pinned:.0f} MB at tier {pinned:,}) — "
                     f"not honored; using {chosen_ctx:,} instead."
                 )
 
@@ -18480,6 +19974,16 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     # -- num_gpu (dense partial offload) --
     if not is_moe and size_gb * 1024 > budget_mb:
         frac_on_gpu = max(0.2, budget_mb / (size_gb * 1024))
+        if ram_cap_mb is not None:
+            # Offloaded dense layers live in system RAM — raise the GPU share
+            # if the CPU side would bust (available RAM − OS reserve).
+            min_frac = 1.0 - ram_cap_mb / (size_gb * 1024)
+            if min_frac > frac_on_gpu:
+                frac_on_gpu = min(min_frac, 1.0)
+                notes.append(
+                    f"system RAM cap raised GPU share to {int(frac_on_gpu*100)}% — "
+                    f"more CPU offload than this would exceed free RAM + OS reserve."
+                )
         if n_layer > 0:
             out["num_gpu"] = max(8, int(n_layer * frac_on_gpu))
             notes.append(
@@ -18563,6 +20067,112 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
 
     out["notes"] = " ".join(notes)
     return out
+
+
+# ---- llama-server flag capability probe --------------------------------------
+# Different llama.cpp builds understand different flags, and an unknown flag
+# makes llama-server HARD-EXIT at startup (the old "works on my build" bug
+# class: --n-cpu-moe, the ngram flag rename, draft-mtp, rope-scaling). Probe
+# --help once per binary and gate every optional flag on the answer.
+_LLAMA_CAPS_CACHE: dict = {}
+
+
+def llama_caps(bin_path: str = "") -> dict:
+    """Probe a llama-server binary's --help and report which optional flags it
+    understands. Cached per (path, mtime). On probe failure assume everything
+    is supported — identical to the pre-probe behavior."""
+    caps = {"n_cpu_moe": True, "override_tensor": True, "ngram_mod": True,
+            "ngram_legacy": False, "draft_mtp": True, "rope_scaling": True,
+            "flash_attn": True, "probed": False,
+            # Context checkpoints: OFF unless actually seen in --help. Unlike
+            # the flags above (kept True for pre-probe parity), these are new
+            # enough that assuming them on an old binary would hard-exit the
+            # server at boot.
+            "ctx_checkpoints": False, "checkpoint_min_step": False,
+            "checkpoint_every_n": False, "swa_full": False}
+    if not bin_path:
+        return caps
+    try:
+        mtime = os.path.getmtime(bin_path)
+    except Exception:
+        mtime = 0
+    key = (bin_path, mtime)
+    if key in _LLAMA_CAPS_CACHE:
+        return _LLAMA_CAPS_CACHE[key]
+    try:
+        r = subprocess.run(
+            [bin_path, "--help"], capture_output=True, text=True, timeout=8,
+            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+        )
+        help_txt = (r.stdout or "") + "\n" + (r.stderr or "")
+        if help_txt.strip():
+            caps["probed"] = True
+            caps["n_cpu_moe"] = ("--n-cpu-moe" in help_txt) or ("ncmoe" in help_txt)
+            caps["override_tensor"] = ("--override-tensor" in help_txt) or (" -ot" in help_txt)
+            caps["ngram_mod"] = "--spec-ngram-mod-n-match" in help_txt
+            caps["ngram_legacy"] = "--spec-ngram-size-n" in help_txt
+            caps["draft_mtp"] = "draft-mtp" in help_txt
+            caps["rope_scaling"] = "--rope-scaling" in help_txt
+            caps["flash_attn"] = ("--flash-attn" in help_txt) or ("-fa" in help_txt)
+            caps["ctx_checkpoints"] = ("--ctx-checkpoints" in help_txt) or ("--swa-checkpoints" in help_txt)
+            # llama.cpp renamed --checkpoint-every-n-tokens → --checkpoint-min-step
+            caps["checkpoint_min_step"] = "--checkpoint-min-step" in help_txt
+            caps["checkpoint_every_n"] = "--checkpoint-every-n-tokens" in help_txt
+            caps["swa_full"] = "--swa-full" in help_txt
+    except Exception:
+        pass
+    _LLAMA_CAPS_CACHE[key] = caps
+    return caps
+
+
+def _checkpoint_spawn_flags(caps: dict, profile: dict) -> list[str]:
+    """Context-checkpoint flags for hybrid/SWA models. llama.cpp's slot/LRU
+    prefix reuse is broken on hybrid recurrent + SWA caches (full re-prefill
+    every turn — ~30s on a 36k-token Qwen 3.6 27B); checkpoints restore the
+    cached state instead (~1s, PR #23814). Pure dense-attention models don't
+    need this (slot prefix reuse already works for them). Off unless the
+    probed binary actually knows the flags — unknown flags hard-exit the
+    server at boot. Flag spelling follows the build: --checkpoint-min-step
+    (newer) or --checkpoint-every-n-tokens (older)."""
+    try:
+        s = get_settings()
+        n_ck = int(8 if s.get("ctx_checkpoints") is None else s.get("ctx_checkpoints"))
+    except Exception:
+        n_ck = 8
+    if n_ck <= 0 or not caps.get("ctx_checkpoints"):
+        return []
+    hy = _hybrid_info(profile)
+    swa = _swa_info(profile)
+    if not (hy["hybrid"] or swa):
+        return []
+    # Host-RAM guard: each checkpoint costs ~ctx-filled x KV-bytes/token of
+    # HOST RAM. At 262k ctx a hybrid MoE's 8 checkpoints would claim ~22 GB
+    # on top of offloaded experts — a slow-burn OOM mid-conversation. Cap
+    # total checkpoint RAM (~2 GB) by shrinking the count for big contexts;
+    # even 1 checkpoint delivers the prefix-restore win.
+    try:
+        ctx_now = max(int(s.get("num_ctx") or 32768), 1)
+        kv_t = (s.get("kv_cache_type") or "q8_0").strip().lower()
+        kv_v = (s.get("kv_cache_type_v") or "").strip().lower()
+        per_tok = _kv_total_bytes(profile, kv_t, 65536, kv_v) / 65536.0
+        if per_tok > 0:
+            max_ck = int(2_000_000_000 / (per_tok * ctx_now))
+            n_ck = max(1, min(n_ck, max_ck)) if max_ck >= 1 else 1
+    except Exception:
+        pass
+    flags = ["--ctx-checkpoints", str(n_ck)]
+    try:
+        step = int(s.get("checkpoint_min_step") or 4096)
+    except Exception:
+        step = 4096
+    if step > 0:
+        if caps.get("checkpoint_min_step"):
+            flags += ["--checkpoint-min-step", str(step)]
+        elif caps.get("checkpoint_every_n"):
+            flags += ["--checkpoint-every-n-tokens", str(step)]
+    if swa and caps.get("swa_full"):
+        flags.append("--swa-full")
+    return flags
 
 
 def find_llama_bin() -> str:
@@ -18842,6 +20452,170 @@ def find_all_gguf_files() -> list[dict]:
 
 
 
+def _watchdog_self_heal(attempt: int) -> None:
+    """Progressive degrade for a crash-looping config. The old watchdog retried
+    the IDENTICAL launch 3× then gave up — and the #1 crash cause is resource
+    exhaustion (VRAM/RAM OOM), which identical retries can never fix. So:
+      attempt 2 → halve num_ctx (floor 4096) — KV cache is the usual OOM driver.
+      attempt 3 → speculative decoding off + more CPU offload (MoE: n_cpu_moe
+                  up; dense: num_gpu down).
+    Degraded settings are PERSISTED: a config that boots beats the "perfect"
+    config that crash-loops. The user can re-tune upward from Settings."""
+    try:
+        s = get_settings()
+        changed: list[str] = []
+        if attempt == 2:
+            cur = int(s.get("num_ctx") or 32768)
+            new = max(4096, cur // 2)
+            if new != cur:
+                s["num_ctx"] = new
+                changed.append(f"num_ctx {cur:,} → {new:,}")
+        elif attempt >= 3:
+            if (s.get("spec_strategy") or "off") != "off":
+                s["spec_strategy"] = "off"
+                changed.append("speculative decoding → off")
+            try:
+                mp = s.get("model_path") or ""
+                prof = inspect_model(mp) if mp else {}
+            except Exception:
+                prof = {}
+            if prof.get("is_moe") and (prof.get("block_count") or 0) > 0:
+                cur = int(s.get("n_cpu_moe") or 0)
+                new = min(prof["block_count"], max(cur + 8, int(prof["block_count"] * 0.75)))
+                if new != cur:
+                    s["n_cpu_moe"] = new
+                    changed.append(f"n_cpu_moe {cur} → {new}")
+            else:
+                cur = int(s.get("num_gpu") or 99)
+                new = 40 if cur >= 99 else max(8, int(cur * 0.7))
+                if new != cur:
+                    s["num_gpu"] = new
+                    changed.append(f"num_gpu {cur} → {new}")
+        if changed:
+            save_json(SETTINGS_FILE, s)
+            msg = f"watchdog self-heal (attempt {attempt}): " + "; ".join(changed)
+            print(f"[watchdog] {msg}", file=sys.stderr)
+            broadcast_event({"type": "llama:auto_degraded", "message": msg, "changes": changed})
+    except Exception as e:
+        print(f"[watchdog] self-heal failed: {e!r}", file=sys.stderr)
+
+
+# ---- per-model config memory -------------------------------------------------
+# llama flags that are model-specific (what fits THIS model on THIS machine).
+# Remembered per GGUF path so switching models restores each model's own best
+# config instead of inheriting the previous model's leftovers.
+_MODEL_TUNE_KEYS = ("num_ctx", "n_cpu_moe", "kv_cache_type", "kv_cache_type_v", "num_gpu",
+                    "num_batch", "n_ubatch", "num_thread", "spec_strategy")
+
+
+def _models_config() -> dict:
+    cfg = load_json(MODELS_CONFIG_FILE, {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _apply_model_config(model_path: str) -> bool:
+    """Apply this model's saved tuned flags to settings. Returns True if a
+    saved config existed. Saved configs with a context below the app-usable
+    floor (8192) are treated as scar tissue from crash-loops or from tunes
+    measured while another instance held all the RAM — ignored and deleted
+    so a fresh, honest tune replaces them instead of breaking every chat
+    (system prompt + tools alone don't fit in 4k)."""
+    cfg = _models_config().get(model_path)
+    if isinstance(cfg, dict):
+        saved_ctx = int(cfg.get("num_ctx") or 0)
+        if 0 < saved_ctx < 8192:
+            try:
+                allc = _models_config()
+                allc.pop(model_path, None)
+                save_json(MODELS_CONFIG_FILE, allc)
+            except Exception:
+                pass
+            print(f"[llama] ignoring saved config for {os.path.basename(model_path)}: "
+                  f"ctx {saved_ctx:,} is below the usable floor (scar from a bad tune) — re-tuning",
+                  file=sys.stderr)
+            return False
+    if not isinstance(cfg, dict):
+        return False
+    s = get_settings()
+    for k in _MODEL_TUNE_KEYS:
+        if k in cfg:
+            s[k] = cfg[k]
+    save_json(SETTINGS_FILE, s)
+    return True
+
+
+def _save_model_config(model_path: str, flags: dict) -> None:
+    """Merge tuned flags into this model's remembered config. Give-up results
+    (does_not_fit) are never persisted: they were computed under transient
+    conditions (low free RAM/VRAM, a running instance) and would poison every
+    future load with a config that can't work."""
+    if not model_path:
+        return
+    if flags.get("does_not_fit"):
+        return
+    try:
+        allc = _models_config()
+        ent = allc.get(model_path)
+        if not isinstance(ent, dict):
+            ent = {}
+        for k in _MODEL_TUNE_KEYS:
+            if k in flags:
+                ent[k] = flags[k]
+        ent["tuned_at"] = int(time.time())
+        allc[model_path] = ent
+        save_json(MODELS_CONFIG_FILE, allc)
+    except Exception:
+        pass
+
+
+def _auto_tune_for_load(model_path: str) -> bool:
+    """Auto-tune on model load: restore the model's remembered config if we
+    have one; otherwise run the tuner against live free VRAM and remember the
+    result (opt-out via auto_tune_on_load). Returns True if settings were
+    updated by either path. Never raises — a tuner hiccup must not block a
+    model the user explicitly asked to load."""
+    try:
+        if _apply_model_config(model_path):
+            return True
+        if not get_settings().get("auto_tune_on_load", True):
+            return False
+        vram = float(get_settings().get("vram_tier_gb") or 0)
+        if vram <= 0:
+            vram = _free_vram_gb_for_tune()  # FREE VRAM + what the running instance holds
+        if vram <= 0:
+            return False
+        profile = inspect_model(model_path)
+        suggested = auto_tune(model_path, vram, profile=profile)
+        if not suggested.get("num_ctx"):
+            return False
+        s = get_settings()
+        for k in _MODEL_TUNE_KEYS:
+            if k in suggested:
+                s[k] = suggested[k]
+        save_json(SETTINGS_FILE, s)
+        _save_model_config(model_path, suggested)
+        _kv_disp = suggested.get("kv_cache_type") or ""
+        if suggested.get("kv_cache_type_v") and suggested["kv_cache_type_v"] != _kv_disp:
+            _kv_disp += "/" + suggested["kv_cache_type_v"]
+        print(f"[llama] auto-tuned on load: ctx {suggested['num_ctx']:,} · "
+              f"n_cpu_moe {suggested.get('n_cpu_moe', 0)} · {_kv_disp} KV",
+              file=sys.stderr)
+        try:
+            broadcast_event({"type": "llama:auto_tuned", "model": model_path,
+                             "notes": suggested.get("notes", ""),
+                             "ctx": suggested.get("num_ctx"),
+                             "n_cpu_moe": suggested.get("n_cpu_moe", 0),
+                             "kv_cache_type": suggested.get("kv_cache_type"),
+                             "kv_cache_type_v": suggested.get("kv_cache_type_v") or "",
+                             "quant_downshift": suggested.get("quant_downshift") or ""})
+        except Exception:
+            pass
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
 class LlamaProcess:
     """Single llama-server subprocess; thread-safe start / stop / swap-model.
 
@@ -19088,6 +20862,15 @@ class LlamaProcess:
             args = dict(self._last_start_args)
         except Exception:
             args = {}
+        # Self-heal BEFORE the respawn: restart reads settings fresh, so a
+        # degrade here takes effect on this very attempt. Attempt 1 is always
+        # a plain retry (transient crash); 2+ steps the config down.
+        if attempt >= 2:
+            _watchdog_self_heal(attempt)
+            # An explicit ctx override rides the replayed args, not settings —
+            # step it down too or the degrade above would be bypassed.
+            if int(args.get("ctx_override") or 0) > 0:
+                args["ctx_override"] = max(4096, int(args["ctx_override"]) // 2)
         # _last_start_args was captured at successful-start time; we DON'T
         # call reset_circuit_breaker() before the watchdog-driven restart
         # because we want each respawn attempt to count toward the limit.
@@ -19144,6 +20927,9 @@ class LlamaProcess:
             return {"ok": False, "error": "llama-server.exe not found. Set llama_bin in Settings or install llama.cpp."}
         if not model_path or not safe_exists(model_path):
             return {"ok": False, "error": f"model not found: {model_path}"}
+        # Which optional flags does THIS build understand? Gates every
+        # spawn-time flag decision below (unknown flags hard-exit the server).
+        caps = llama_caps(bin_path)
 
         s = get_settings()
         port = port_override if port_override > 0 else _parse_llama_port()
@@ -19157,15 +20943,20 @@ class LlamaProcess:
         ctx = min(max(ctx_raw, 512), 1_048_576) if ctx_raw > 0 else 32768
         n_batch = max(int(s.get("num_batch") or 2048), 32)
         n_ubatch_raw = int(s.get("n_ubatch") or 0)
-        n_ubatch = n_ubatch_raw if n_ubatch_raw > 0 else min(max(n_batch // 2, 512), 1024)
+        n_ubatch = n_ubatch_raw if n_ubatch_raw > 0 else min(max(n_batch // 2, 512), 4096)
         ngl_setting = ngl_override if ngl_override >= 0 else int(s.get("num_gpu") or 99)
         ngl = -1 if ngl_setting >= 99 else ngl_setting
         n_threads = int(s.get("num_thread") or 0)  # 0 = let llama-server pick
         n_parallel = max(int(s.get("n_parallel") or 1), 1)
         n_cpu_moe = max(int(s.get("n_cpu_moe") or 0), 0)
         kv_type = (s.get("kv_cache_type") or "q8_0").strip().lower()
-        if kv_type not in ("f16", "f32", "q8_0", "q4_0", "q5_0", "q5_1", "q4_1"):
+        if kv_type not in ("f16", "bf16", "f32", "q8_0", "q4_0", "q5_0", "q5_1", "q4_1"):
             kv_type = "q8_0"
+        # Split K/V: V cache may be typed separately ("" = mirror K). K is the
+        # sensitive half; V at 4-bit is near-lossless (llama.cpp KV-quant data).
+        kv_type_v = (s.get("kv_cache_type_v") or "").strip().lower()
+        if kv_type_v not in ("f16", "bf16", "f32", "q8_0", "q4_0", "q5_0", "q5_1", "q4_1"):
+            kv_type_v = kv_type
         flash_on = bool(s.get("flash_attn", True))
         # Three-way speculative strategy with legacy-flag honoring.
         #
@@ -19190,11 +20981,15 @@ class LlamaProcess:
             spec_strategy = "ngram-mod" if bool(s.get("enable_speculative", True)) else "off"
             
         if spec_strategy == "draft-mtp" and model_path:
-            # Fall back to ngram-mod or off if the model has no MTP layers or is a known distilled model.
+            # Fall back to ngram-mod or off if the model has no MTP layers, the
+            # build lacks draft-mtp, or it's a known distilled model.
             model_lower = os.path.basename(model_path).lower()
             _EXCLUDE_MTP = ("distil", "distill", "distilled", "glm")
             forced_fallback = False
-            if any(e in model_lower for e in _EXCLUDE_MTP):
+            if not caps.get("draft_mtp", True):
+                forced_fallback = True
+                print("[llama] this llama-server build has no draft-mtp support — falling back", file=sys.stderr)
+            elif any(e in model_lower for e in _EXCLUDE_MTP):
                 forced_fallback = True
             else:
                 try:
@@ -19258,14 +21053,13 @@ class LlamaProcess:
             "--host", "127.0.0.1",
             "--port", str(port),
             "--jinja",
-            "--flash-attn", "on" if flash_on else "off",
             "--no-context-shift",
             "-ngl", str(ngl),
             "-c", str(ctx),
             "-b", str(n_batch),
             "-ub", str(n_ubatch),
             "--cache-type-k", kv_type,
-            "--cache-type-v", kv_type,
+            "--cache-type-v", kv_type_v,
             # NOTE: we deliberately do NOT pass --cache-reuse. Its KV-shift reuse
             # corrupts positional info on some models (repetition / looping),
             # most visibly right after a large tool result — web_fetch/web_search
@@ -19278,6 +21072,20 @@ class LlamaProcess:
             "--parallel", str(n_parallel),
             "--reasoning-format", "deepseek",
         ]
+        if caps.get("flash_attn", True):
+            cmd += ["--flash-attn", "on" if flash_on else "off"]
+        elif flash_on:
+            print("[llama] this build has no --flash-attn flag; using the binary default", file=sys.stderr)
+        try:
+            # Context checkpoints: hybrid/SWA prefix-restore fix (llama.cpp
+            # #23814). No-op on dense models and on builds without the flags.
+            _ck_flags = _checkpoint_spawn_flags(caps, inspect_model(model_path))
+            if _ck_flags:
+                cmd += _ck_flags
+                print(f"[llama] context checkpoints on (hybrid/SWA model): {' '.join(_ck_flags)}",
+                      file=sys.stderr)
+        except Exception:
+            pass
         if mmproj_path:
             # Loads the vision tower + projector. After this, /v1/chat/completions
             # accepts {type:"image_url", image_url:{url:"data:..."}} content blocks.
@@ -19290,22 +21098,43 @@ class LlamaProcess:
         if n_threads > 0:
             cmd += ["-t", str(n_threads)]
         if n_cpu_moe > 0:
-            # The flag is --n-cpu-moe in newer llama.cpp builds (alias: -ncmoe).
-            # Keeping `n` MoE expert tensors on CPU lets giant MoE models run on
-            # tiny VRAM by paying a latency tax instead of an OOM error.
-            cmd += ["--n-cpu-moe", str(n_cpu_moe)]
+            if caps.get("n_cpu_moe", True):
+                # The flag is --n-cpu-moe in newer llama.cpp builds (alias: -ncmoe).
+                # Keeping `n` MoE expert tensors on CPU lets giant MoE models run on
+                # tiny VRAM by paying a latency tax instead of an OOM error.
+                cmd += ["--n-cpu-moe", str(n_cpu_moe)]
+            elif caps.get("override_tensor"):
+                # Older build without --n-cpu-moe: -ot pushes ALL expert tensors
+                # to CPU (coarser — no per-layer count — but the model boots).
+                cmd += ["-ot", ".ffn_.*_exps.=CPU"]
+                print("[llama] build lacks --n-cpu-moe; falling back to -ot .ffn_.*_exps.=CPU (all experts on CPU)",
+                      file=sys.stderr)
+            else:
+                print("[llama] WARN build supports neither --n-cpu-moe nor -ot; "
+                      "expert offload skipped — big MoEs may OOM", file=sys.stderr)
         if spec_strategy == "ngram-mod":
             # llama.cpp renamed --spec-ngram-size-n to --spec-ngram-mod-n-match
-            # in recent builds. older flag was removed outright (exits with an
-            # error), so older binaries that don't recognise the new flag will
-            # also exit. either way, set spec_strategy="off" in settings
-            # if your llama.cpp build is mismatched.
-            cmd += [
-                "--spec-type", "ngram-mod",
-                "--spec-ngram-mod-n-match", "24",
-                "--spec-draft-n-min", "48",
-                "--spec-draft-n-max", "64",
-            ]
+            # in recent builds. The capability probe picks the flag this binary
+            # actually understands; with neither, speculative turns itself off
+            # instead of hard-exiting the server at startup.
+            if caps.get("ngram_mod", True):
+                cmd += [
+                    "--spec-type", "ngram-mod",
+                    "--spec-ngram-mod-n-match", "24",
+                    "--spec-draft-n-min", "48",
+                    "--spec-draft-n-max", "64",
+                ]
+            elif caps.get("ngram_legacy"):
+                cmd += [
+                    "--spec-type", "ngram-mod",
+                    "--spec-ngram-size-n", "24",
+                    "--spec-draft-n-min", "48",
+                    "--spec-draft-n-max", "64",
+                ]
+                print("[llama] using legacy n-gram flag names (older build)", file=sys.stderr)
+            else:
+                print("[llama] this build supports no n-gram speculative flags — spec_strategy→off",
+                      file=sys.stderr)
         elif spec_strategy == "draft-mtp":
             # Multi-token prediction draft. Requires the model to have MTP heads
             # baked in (Qwen 3.5/3.6, DeepSeek V3/R1 as of 2026-05-16) and a
@@ -19327,6 +21156,21 @@ class LlamaProcess:
                 "--spec-draft-n-max", str(spec_n_max),
             ]
         # "off" emits nothing — no speculative decoding.
+        # Auto-YaRN: running ctx past the model's trained context without rope
+        # scaling silently degrades long-range attention on many architectures
+        # (the model "forgets" the early conversation). When the saved ctx
+        # exceeds the GGUF-trained max and the build supports it, enable YaRN
+        # automatically. A rope flag in llama_extra_args always wins.
+        if caps.get("rope_scaling") and "rope" not in extra_args_raw.lower():
+            try:
+                _gg_yarn = read_gguf_metadata(model_path)
+                _trained = int(_gg_yarn.get("context_length") or 0)
+                if _trained > 0 and ctx > _trained:
+                    cmd += ["--rope-scaling", "yarn"]
+                    print(f"[llama] ctx {ctx:,} > trained max {_trained:,} — auto-enabling YaRN rope scaling",
+                          file=sys.stderr)
+            except Exception:
+                pass
         if no_warmup:
             cmd += ["--no-warmup"]
         if enable_metrics:

@@ -45,7 +45,9 @@ build/
 coverage/
 
 # local design drafts that aren't part of the shipped app
-
+pretune.py
+splash_preview.html
+.playwright-mcp/
 
 # accuretta-specific safety net — if any of these sneak outside ./data
 ACCURETTA.md

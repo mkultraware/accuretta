@@ -344,10 +344,85 @@
   --btn-send-glow:     0 6px 20px rgba(217, 119, 87, 0.35);
 }
 
+/* ============================================================
+   RETRO — the true midpoint between light and dark.
+   Dim leans dark (cappuccino ~25% lightness), soft leans light
+   (cream paper). Retro sits exactly between: muted silver-mauve
+   surfaces at ~55% lightness with deep plum text — neither a
+   dark theme with the lights on nor a light theme in sunglasses.
+   Twilight slate, calm and neutral, easy on the eyes day or night.
+   ============================================================ */
+[data-theme="retro"] {
+  /* Silver-mauve surfaces: raised panels lift toward pearl, sunken
+     wells drop toward slate. All share the same cool-violet hue
+     (~270°) so nothing drifts warm or blue. */
+  --bg:        #948D99;
+  --bg-raised: #A39EA9;
+  --bg-sunken: #857E8C;
+  --bg-inset:  #B2ADB8;
+
+  --glass-bg:       rgba(163, 158, 169, 0.72);
+  --glass-border:   rgba(34, 31, 39, 0.08);
+
+  --bg-gradient: linear-gradient(180deg, #A29DA8 0%, #948D99 45%, #8B8492 100%);
+
+  /* Deep plum text, stepping down through muted violets. */
+  --fg:        #211E27;
+  --fg-muted:  #453F4E;
+  --fg-subtle: #4E4857;
+  --fg-faint:  #665F6E;
+  --fg-invert: #F3F0F5;
+
+  --border:        #7D7685;
+  --border-strong: #6B6373;
+  --border-subtle: #A19AA6;
+
+  /* The contrast the mauve base was missing: a warm sunset-amber accent —
+     near-complement of the 270° surfaces, so controls, links and the send
+     button finally POP instead of dissolving into monochrome purple.
+     Cool violet survives only as the --info secondary (duotone pairing). */
+  --accent:        #B45309; /* burnt amber — deep enough for white text (5.0:1) */
+  --accent-hover:  #92400E; /* hover deepens — light-surface convention */
+  --accent-subtle: rgba(180, 83, 9, 0.16);
+  --accent-fg:     #FFFFFF;
+
+  --success-subtle: rgba(34, 139, 90, 0.18);
+  --warning-subtle: rgba(160, 120, 20, 0.18);
+  --danger-subtle:  rgba(200, 60, 40, 0.16);
+  --info-subtle:    rgba(91, 84, 214, 0.14);
+
+  /* Plum-tinted shadows, softer than dark mode's blacks, deeper than
+     light mode's grays — mid-tone surfaces need mid-tone depth. */
+  --shadow-xs: 0 1px 0 rgba(40, 30, 50, 0.10);
+  --shadow-sm: 0 1px 2px rgba(40, 30, 50, 0.12), 0 0 0 1px rgba(40, 30, 50, 0.06);
+  --shadow-md: 0 4px 12px rgba(40, 30, 50, 0.14), 0 0 0 1px rgba(40, 30, 50, 0.06);
+  --shadow-lg: 0 12px 32px rgba(40, 30, 50, 0.18), 0 0 0 1px rgba(40, 30, 50, 0.06);
+  --shadow-pop: 0 20px 60px rgba(40, 30, 50, 0.24), 0 0 0 1px rgba(40, 30, 50, 0.08);
+
+  --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.18), inset 0 0 0 1px rgba(40, 30, 50, 0.06);
+
+  /* Light-surface button logic (lit from above, soft outer drop), tinted
+     plum so raised controls stay defined against same-toned panels. */
+  --btn-shadow-rest:   inset 0 1px 0 rgba(255, 255, 255, 0.32),
+                       0 1px 1px rgba(40, 30, 50, 0.10),
+                       0 1px 3px rgba(40, 30, 50, 0.12),
+                       0 0 0 1px rgba(40, 30, 50, 0.08);
+  --btn-shadow-hover:  inset 0 1px 0 rgba(255, 255, 255, 0.40),
+                       0 2px 4px rgba(40, 30, 50, 0.14),
+                       0 6px 14px rgba(40, 30, 50, 0.16),
+                       0 0 0 1px rgba(40, 30, 50, 0.10);
+  --btn-shadow-active: inset 0 1px 2px rgba(40, 30, 50, 0.16),
+                       0 0 0 1px rgba(40, 30, 50, 0.08);
+
+  --btn-send-gradient: linear-gradient(135deg, #D97706 0%, #B45309 55%, #92400E 100%);
+  --btn-send-glow:     0 6px 20px rgba(217, 119, 6, 0.35);
+}
+
 /* Apply the gradient at the page level only — children with their own
    bg keep their flat color so we don't "double up" gradients. */
 [data-theme="dark"] body,
 [data-theme="dim"] body,
+[data-theme="retro"] body,
 [data-theme="aurora"] body,
 [data-theme="nebula"] body,
 [data-theme="operator"] body,

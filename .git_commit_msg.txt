@@ -1,0 +1,25 @@
+﻿feat: Major system overhaul (Sandbox streaming, LLM auto-tuning, Red Team stealth, UI)
+
+1. Sandbox & Workspace Enhancements
+- Replaced the bottom 'Python Check' tab with a live 'Sandbox' terminal.
+- Refactored _wsl_bash to stream sandbox outputs line-by-line via SSE for real-time visibility.
+- Moved Python syntax check visual results to the main file preview pane.
+- Hardcapped the undo journal strictly to 20 states to prevent disk bloat.
+- Added _prune_playwright_mcp(days=3) to automatically sweep stale browser artifacts on backend boot.
+
+2. Red Team & Offensive Tooling
+- Introduced extensive Stealth settings in the UI: HTTP/SOCKS5 Proxy routing, X-Forwarded-For spoofing, and Request Timing Jitter.
+- Added new Sandbox-backed offensive tools: sandbox_nmap, sandbox_sqlmap.
+- Added a dedicated rt_generate_report tool for consolidating analysis.
+
+3. Advanced LLM & Memory Management
+- Implemented Split KV cache quantization (e.g. K=q8_0, V=q4_0) yielding significant VRAM savings with near-zero loss.
+- Added 'Hybrid q4 KV' support for SSM/DeltaNet models (like Qwen) allowing the auto-tuner to safely double context windows.
+- Introduced VRAM & System RAM safety reserves to prevent OS compositors from crashing and stop Windows from blue-screening during heavy offloading.
+- Enhanced the backend watchdog (_watchdog_self_heal) to dynamically auto-degrade model settings if it detects an out-of-memory crash.
+
+4. UI & Core Mechanics
+- Added granular 'Approval Modes' (Soft, Medium, Hard) to customize how much autonomy the agent has.
+- Improved the rolling summary engine (_update_rolling_summary, _mid_turn_fold) for better context compression.
+- Renamed the 'Dusk' UI theme to 'Retro' (PS2 Gray aesthetic).
+- Bumped version to v0.7.0.

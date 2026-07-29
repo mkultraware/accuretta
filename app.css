@@ -1794,6 +1794,52 @@ button {
   animation: toast-retreat 0.3s cubic-bezier(0.5, 0, 0.75, 0.25) forwards;
 }
 
+/* Expandable reasoning block inside auto-tune toasts. Renders both in the
+   composer toast and in the revealer-deck notification (innerHTML path). */
+.toast-details {
+  margin-top: 6px;
+  padding-top: 5px;
+  border-top: 1px dashed var(--border-strong);
+}
+
+.toast-details summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--accent);
+  list-style: none;
+}
+
+.toast-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.toast-details summary::before {
+  content: "▸ ";
+  font-size: 9px;
+}
+
+.toast-details[open] summary::before {
+  content: "▾ ";
+}
+
+.toast-details summary:hover {
+  color: var(--accent-hover);
+}
+
+.toast-details-body {
+  margin-top: 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--fg-muted);
+  max-height: 180px;
+  overflow: auto;
+}
+
 /* "Slide up from behind the composer". translateY(64px) puts the toast
    inside the composer's vertical footprint at start; composer's higher
    z-index hides it until the animation lifts it above the top edge. */
@@ -1983,6 +2029,13 @@ button {
   border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
+/* retro theme: twilight-violet glyph on the lifted silver-mauve inset. */
+[data-theme="retro"] .avatar.user {
+  background: var(--bg-inset);
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
 
 /* aurora theme: matches the dark spruce and neon green-cyan user bubble. */
 [data-theme="aurora"] .avatar.user {
@@ -2108,6 +2161,18 @@ button {
     inset 0 1px 0 rgba(255, 235, 220, 0.14),
     0 2px 8px rgba(60, 35, 22, 0.30),
     0 8px 24px rgba(60, 35, 22, 0.22);
+}
+
+/* retro theme: the iMessage blue reads electric against the silver-mauve
+   midpoint, so the user bubble becomes sunset amber — the warm complement
+   that makes the cool mauve surfaces sing, white text, soft ember glow. */
+[data-theme="retro"] .bubble.user {
+  background: linear-gradient(135deg, #D97706 0%, #B45309 100%) !important;
+  color: #FFFFFF !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    0 2px 8px rgba(120, 60, 10, 0.30),
+    0 8px 24px rgba(120, 60, 10, 0.22);
 }
 
 
@@ -10213,4 +10278,25 @@ body,
 @keyframes fade-in-up {
   from { transform: translateY(8px); opacity: 0; }
   to { transform: translateY(0); opacity: 1; }
+}
+
+
+/* approval-mode segmented control + critical hold-to-approve */
+.seg { display: inline-flex; gap: 4px; align-items: center; }
+.perm-btn-hold {
+  position: relative; overflow: hidden;
+  background: #b33939; color: #fff;
+  user-select: none; -webkit-user-select: none;
+}
+.perm-btn-hold .hold-fill {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
+  background: rgba(255,255,255,.28); pointer-events: none;
+}
+.perm-btn-hold .hold-label { position: relative; pointer-events: none; }
+.perm-btn-hold.holding { filter: brightness(1.12); }
+.permissions-critical {
+  display: flex; align-items: center; gap: 8px;
+  margin: 8px 0; padding: 8px 10px;
+  border: 1px solid #b33939; border-radius: 8px;
+  color: #e06c6c; font-size: 12px; font-weight: 600;
 }

@@ -201,21 +201,28 @@ def _hue_shift(hex_color: str, dh: float) -> str:
 
 def _build_splash_html() -> str:
     """Branded boot splash honoring the last saved theme. Rebuilt each launch,
-    so a theme change shows next boot. Shares its visual DNA with the welcome
-    screen's backdrop (a drifting per-theme colour field under sharp pleated
-    bars), so the handoff from splash to app feels like one continuous reveal.
-    _boot() pushes live stages into window.__splashStage(), so the status line
-    and progress bar are real."""
+    so a theme change shows next boot.
+
+    Design: "precision instrument coming online". A 60-tick dial surrounds the
+    logo mark and the ticks IGNITE in sync with real boot progress (__splashStage
+    pct) — the progress bar made physical. Behind the dial a slow conic sheen
+    rotates; a dashed orbit ring carries a satellite dot; a single light sweep
+    passes over the instrument once on entry. Backdrop is a quiet dot-grid over
+    a drifting theme-colour field with film grain — techy, no gimmicks. _boot()
+    pushes live stages into window.__splashStage(), so the status line, tick
+    ring, pct readout and progress bar are all real."""
+    import math
     theme = _read_saved_theme()
     pal = _splash_palette(theme)
     logo = _logo_data_uri(theme)
     accent = pal["accent"]
 
     is_light = theme in _LIGHT_THEMES
-    track_bg = "rgba(0, 0, 0, 0.07)" if is_light else "rgba(255, 255, 255, 0.08)"
+    track_bg = "rgba(0, 0, 0, 0.10)" if is_light else "rgba(255, 255, 255, 0.10)"
     # Same idea as the welcome screen's --wb-strength: full field on light
     # themes, turned down on dark ones.
-    field_opacity = "1" if is_light else "0.35"
+    field_opacity = "0.9" if is_light else "0.4"
+    dot_color = "rgba(0, 0, 0, 0.10)" if is_light else "rgba(255, 255, 255, 0.10)"
 
     if accent.startswith("#") and len(accent) == 7:
         glow_color = accent + "44"
@@ -228,21 +235,41 @@ def _build_splash_html() -> str:
         glow_color = "rgba(56, 189, 248, 0.27)"
         blob_a = blob_b = blob_c = "#38bdf8"
 
-    # Wordmark with a per-letter staggered reveal (starts as the ring lands).
+    # 60-tick progress dial around the logo — the instrument face. Major tick
+    # every 5th. Ticks fade in staggered on load, then __splashStage ignites
+    # them one by one as boot progress lands. Base stroke-opacity rides as a
+    # presentation attribute so the .lit class can override it freely.
+    ticks = []
+    for i in range(60):
+        a = math.radians(i * 6 - 90)
+        major = (i % 5 == 0)
+        r_in, r_out = (100.0, 113.0) if major else (106.0, 113.0)
+        x1, y1 = 120 + r_in * math.cos(a), 120 + r_in * math.sin(a)
+        x2, y2 = 120 + r_out * math.cos(a), 120 + r_out * math.sin(a)
+        w = 2.4 if major else 1.4
+        ticks.append(
+            f'<line class="tick" x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+            f'stroke-width="{w}" stroke-opacity="0.16" '
+            f'style="animation-delay:{0.35 + i * 0.012:.2f}s"/>'
+        )
+    ticks_svg = "".join(ticks)
+
+    # Wordmark with a per-letter staggered reveal (starts as the arc lands).
     letters = "".join(
-        f'<span style="animation-delay:{0.55 + i * 0.045:.2f}s">{ch}</span>'
+        f'<span style="animation-delay:{0.6 + i * 0.045:.2f}s">{ch}</span>'
         for i, ch in enumerate("accuretta")
     )
 
-    # 28 pleated bars — same layering as the welcome screen: colour behind,
-    # uncoloured white/black pleats in front, blur between, overlay pass after.
-    pleats = '<div class="pleat"></div>' * 28
-
     logo_html = (
-        f'<div class="logo-wrapper">'
+        f'<div class="dial-wrap">'
+        f'<div class="sheen"></div>'
+        f'<svg class="dial" viewBox="0 0 240 240" aria-hidden="true">'
+        f'<circle class="orbit" cx="120" cy="120" r="86"/>'
+        f'<g class="sat"><circle cx="120" cy="34" r="2.6"/></g>'
+        f'<circle class="arc" cx="120" cy="120" r="94"/>'
+        f'{ticks_svg}'
+        f'</svg>'
         f'<div class="halo"></div>'
-        f'<svg class="ring" viewBox="0 0 120 120" aria-hidden="true">'
-        f'<circle cx="60" cy="60" r="56"/></svg>'
         f'<img src="{logo}" class="logo-img" alt="">'
         f'</div>'
         if logo else ""
@@ -251,23 +278,24 @@ def _build_splash_html() -> str:
     return f"""<!doctype html><html><head><meta charset="utf-8"></head>
 <body style="margin:0;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:{pal['bg']};color:{pal['fg']};font-family:system-ui,-apple-system,'Segoe UI',sans-serif;user-select:none;overflow:hidden;position:relative">
   <div class="field">
+    <div class="dots"></div>
     <div class="wb-blob a"></div>
     <div class="wb-blob b"></div>
     <div class="wb-blob c"></div>
-    <div class="pleats">{pleats}</div>
-    <div class="soften"></div>
-    <div class="pleats edge">{pleats}</div>
     <div class="grain"></div>
   </div>
   <div class="content">
     {logo_html}
     <h1 class="title">{letters}</h1>
-    <p class="status" id="status">warming up…</p>
+    <div class="readout">
+      <span class="status" id="status">warming up…</span>
+      <span class="pct" id="pct">000</span>
+    </div>
     <div class="track"><div class="fill" id="fill"></div></div>
   </div>
   <div class="foot">your model · your machine</div>
   <style>
-    /* --- Pleated colour field (shared language with the welcome screen) --- */
+    /* --- Backdrop: dot-grid blueprint over drifting colour field + grain --- */
     .field {{
       position: absolute; inset: 0; z-index: 0; overflow: hidden;
       pointer-events: none;
@@ -275,6 +303,14 @@ def _build_splash_html() -> str:
       -webkit-mask-image: radial-gradient(ellipse 80% 65% at 50% 40%, #000 55%, transparent 100%);
       mask-image: radial-gradient(ellipse 80% 65% at 50% 40%, #000 55%, transparent 100%);
     }}
+    .dots {{
+      position: absolute; inset: -60px;
+      background-image: radial-gradient({dot_color} 1px, transparent 1.3px);
+      background-size: 26px 26px;
+      animation: dots-in 1.6s ease both, dots-drift 46s linear infinite;
+    }}
+    @keyframes dots-in {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
+    @keyframes dots-drift {{ from {{ background-position: 0 0; }} to {{ background-position: 52px 26px; }} }}
     .wb-blob {{
       position: absolute; border-radius: 50%;
       will-change: transform, opacity;
@@ -309,72 +345,101 @@ def _build_splash_html() -> str:
       33%      {{ transform: translate(2vmax, 2vmax) rotate(16deg) scale(1.18); opacity: 0.42; }}
       66%      {{ transform: translate(-4vmax, -2vmax) rotate(-8deg) scale(0.85); opacity: 0.18; }}
     }}
-    .pleats {{
-      position: absolute; inset: 0; display: flex;
-      transform: scale(1.05);
-    }}
-    .pleat {{
-      flex: 1; height: 100%;
-      background: linear-gradient(90deg,
-        rgba(255,255,255,0.5) 0%, rgba(255,255,255,0.1) 30%,
-        rgba(0,0,0,0.02) 80%, rgba(0,0,0,0.05) 100%);
-    }}
-    .soften {{
-      position: absolute; inset: 0;
-      -webkit-backdrop-filter: blur(16px);
-      backdrop-filter: blur(16px);
-    }}
-    .pleats.edge {{ mix-blend-mode: overlay; opacity: 0.6; }}
-    .pleats.edge .pleat {{
-      border-right: 1px solid rgba(255,255,255,0.4);
-      background: linear-gradient(90deg,
-        transparent 0%, rgba(255,255,255,0.1) 80%, rgba(255,255,255,0.5) 100%);
-    }}
     .grain {{
       position: absolute; inset: 0;
       opacity: 0.05; mix-blend-mode: multiply;
       background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
     }}
 
-    /* --- Content --- */
+    /* --- The instrument: 60-tick dial + orbit + satellite + conic sheen --- */
     .content {{
       position: relative; z-index: 2;
       display: flex; flex-direction: column; align-items: center; justify-content: center;
     }}
-    .logo-wrapper {{
-      position: relative; width: 130px; height: 130px;
+    .dial-wrap {{
+      position: relative; width: 240px; height: 240px;
       display: flex; align-items: center; justify-content: center;
-      margin-bottom: 20px;
-      animation: logo-reveal 0.9s cubic-bezier(0.34, 1.4, 0.64, 1) both;
+      animation: dial-in 0.9s cubic-bezier(0.34, 1.4, 0.64, 1) both;
     }}
+    /* One vertical light sweep across the instrument on entry — then never again. */
+    .dial-wrap::after {{
+      content: ""; position: absolute; inset: -8%;
+      background: linear-gradient(115deg, transparent 32%, rgba(255,255,255,0.30) 50%, transparent 68%);
+      transform: translateX(-130%);
+      animation: sweep 1.1s cubic-bezier(0.4, 0, 0.2, 1) 0.75s both;
+      pointer-events: none;
+    }}
+    @keyframes sweep {{ to {{ transform: translateX(130%); }} }}
+    .sheen {{
+      position: absolute; width: 254px; height: 254px; border-radius: 50%;
+      background: conic-gradient(from 0deg, transparent 0deg 295deg, {accent}38 340deg, transparent 360deg);
+      -webkit-mask-image: radial-gradient(farthest-side, transparent calc(100% - 26px), #000 calc(100% - 25px));
+      mask-image: radial-gradient(farthest-side, transparent calc(100% - 26px), #000 calc(100% - 25px));
+      animation: sheen-spin 7s linear infinite;
+      opacity: 0.8;
+    }}
+    @keyframes sheen-spin {{ to {{ transform: rotate(360deg); }} }}
+    .dial {{ position: absolute; width: 240px; height: 240px; overflow: visible; }}
+    .tick {{
+      stroke: {pal['fg']};
+      animation: tick-in 0.5s ease both;
+      transition: stroke 0.3s ease, stroke-opacity 0.3s ease, filter 0.3s ease;
+    }}
+    @keyframes tick-in {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
+    .tick.lit {{
+      stroke: {accent}; stroke-opacity: 1;
+      filter: drop-shadow(0 0 3px {glow_color});
+    }}
+    .orbit {{
+      fill: none; stroke: {pal['fg']}; stroke-opacity: 0.26; stroke-width: 1;
+      stroke-dasharray: 1 7;
+      transform-origin: 120px 120px;
+      animation: orbit-spin 30s linear infinite;
+    }}
+    @keyframes orbit-spin {{ to {{ transform: rotate(360deg); }} }}
+    .sat {{
+      transform-origin: 120px 120px;
+      animation: sat-spin 9s linear infinite;
+    }}
+    .sat circle {{ fill: {accent}; filter: drop-shadow(0 0 4px {glow_color}); }}
+    @keyframes sat-spin {{ to {{ transform: rotate(360deg); }} }}
+    /* Draw-on arc: paints once around the dial, then holds at half-strength. */
+    .arc {{
+      fill: none; stroke: {accent}; stroke-width: 2; stroke-linecap: round;
+      opacity: 0.55;
+      stroke-dasharray: 590.6; stroke-dashoffset: 590.6;
+      transform: rotate(-90deg); transform-origin: 120px 120px;
+      animation: arc-draw 1.2s cubic-bezier(0.65, 0, 0.35, 1) 0.25s forwards;
+      filter: drop-shadow(0 0 5px {glow_color});
+    }}
+    @keyframes arc-draw {{ to {{ stroke-dashoffset: 0; }} }}
     .halo {{
-      position: absolute; width: 92px; height: 92px; border-radius: 50%;
+      position: absolute; width: 118px; height: 118px; border-radius: 50%;
       background: radial-gradient(circle, {glow_color} 0%, transparent 70%);
       animation: halo-pulse 3.2s ease-in-out infinite;
     }}
-    /* Draw-on ring: paints once around the logo, then holds — reads as the
-       app "assembling" rather than a generic spinner. */
-    .ring {{
-      position: absolute; width: 120px; height: 120px;
-      transform: rotate(-90deg);
-    }}
-    .ring circle {{
-      fill: none; stroke: {accent}; stroke-width: 2.5; stroke-linecap: round;
-      stroke-dasharray: 352; stroke-dashoffset: 352;
-      animation: ring-draw 1.15s cubic-bezier(0.65, 0, 0.35, 1) 0.3s forwards;
-      filter: drop-shadow(0 0 6px {glow_color});
-    }}
-    @keyframes ring-draw {{ to {{ stroke-dashoffset: 0; }} }}
     .logo-img {{
-      width: 58px; height: 58px; object-fit: contain; z-index: 3;
+      position: relative; z-index: 3;
+      width: 84px; height: 84px; object-fit: contain;
       filter: drop-shadow(0 0 18px {glow_color});
       animation: breathe 3.2s ease-in-out infinite;
     }}
+    .dial-wrap.done .dial {{ animation: dial-pulse 0.9s cubic-bezier(0.34, 1.4, 0.64, 1); }}
+    @keyframes dial-pulse {{
+      0% {{ transform: scale(1); }} 40% {{ transform: scale(1.035); }} 100% {{ transform: scale(1); }}
+    }}
+
+    /* --- Wordmark + live readout --- */
     .title {{
-      margin: 14px 0 0 0;
+      margin: 8px 0 0 0;
       font-size: 27px; font-weight: 700;
       letter-spacing: 0.22em; text-indent: 0.22em;
       text-align: center;
+      animation: title-in 1.2s cubic-bezier(0.19, 1, 0.22, 1) 0.55s both;
+    }}
+    @keyframes title-in {{
+      from {{ opacity: 0; letter-spacing: 0.34em; }}
+      to   {{ opacity: 1; letter-spacing: 0.22em; }}
     }}
     .title span {{
       display: inline-block;
@@ -383,16 +448,18 @@ def _build_splash_html() -> str:
       filter: blur(5px);
       animation: letter-in 0.75s cubic-bezier(0.19, 1, 0.22, 1) both;
     }}
+    .readout {{
+      margin-top: 16px; width: 240px;
+      display: flex; justify-content: space-between; align-items: baseline;
+      opacity: 0;
+      animation: fade-in 0.8s ease-out 1.1s both;
+    }}
     .status {{
-      margin: 10px 0 0 0;
       font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
       font-size: 11.5px;
       letter-spacing: 0.08em;
       color: {pal['muted']};
-      text-align: center;
       min-height: 15px;
-      opacity: 0;
-      animation: fade-in 0.8s ease-out 1.1s both;
       transition: opacity 0.15s ease;
     }}
     /* Blinking accent caret after the stage label — echoes the brand wordmark. */
@@ -409,8 +476,14 @@ def _build_splash_html() -> str:
     /* !important: the fade-in animation's forward fill would otherwise pin
        opacity at 1 and swallow the swap dim. */
     .status.swap {{ opacity: 0.25 !important; }}
+    .pct {{
+      font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+      font-size: 11.5px; font-weight: 600;
+      letter-spacing: 0.14em;
+      color: {accent};
+    }}
     .track {{
-      margin-top: 22px; width: 200px; height: 2px;
+      margin-top: 12px; width: 240px; height: 2px;
       background: {track_bg}; border-radius: 2px; overflow: hidden;
       opacity: 0;
       animation: fade-in 0.8s ease-out 1.3s both;
@@ -428,9 +501,9 @@ def _build_splash_html() -> str:
       content: ""; position: absolute; inset: 0;
       background: linear-gradient(90deg, transparent, rgba(255,255,255,0.5), transparent);
       transform: translateX(-110%);
-      animation: sheen 1.8s ease-in-out infinite;
+      animation: fill-sheen 1.8s ease-in-out infinite;
     }}
-    @keyframes sheen {{
+    @keyframes fill-sheen {{
       60%, 100% {{ transform: translateX(110%); }}
     }}
     .foot {{
@@ -442,8 +515,8 @@ def _build_splash_html() -> str:
       opacity: 0;
       animation: fade-in 1.2s ease-out 1.5s both;
     }}
-    @keyframes logo-reveal {{
-      from {{ transform: scale(0.82); opacity: 0; }}
+    @keyframes dial-in {{
+      from {{ transform: scale(0.86); opacity: 0; }}
       to   {{ transform: scale(1); opacity: 1; }}
     }}
     @keyframes halo-pulse {{
@@ -459,20 +532,34 @@ def _build_splash_html() -> str:
     }}
     @keyframes fade-in {{ to {{ opacity: 1; }} }}
     @media (prefers-reduced-motion: reduce) {{
-      .wb-blob, .halo, .logo-img, .fill::after, .status::after {{ animation: none; }}
-      .ring circle {{ animation: none; stroke-dashoffset: 0; }}
+      .wb-blob, .dots, .sheen, .orbit, .sat, .halo, .logo-img,
+      .fill::after, .status::after, .dial-wrap::after {{ animation: none; }}
+      .arc {{ animation: none; stroke-dashoffset: 0; }}
     }}
   </style>
   <script>
     window.__splashStage = function (label, pct) {{
       var s = document.getElementById('status');
       var f = document.getElementById('fill');
+      var p = document.getElementById('pct');
       if (s && s.textContent !== label) {{
         s.classList.add('swap');
         setTimeout(function () {{ s.textContent = label; s.classList.remove('swap'); }}, 150);
       }}
-      if (f && typeof pct === 'number') {{
-        f.style.width = Math.max(4, Math.min(100, pct)) + '%';
+      if (typeof pct === 'number') {{
+        var v = Math.max(0, Math.min(100, pct));
+        if (f) f.style.width = Math.max(4, v) + '%';
+        if (p) p.textContent = ('00' + Math.round(v)).slice(-3);
+        // Ignite the instrument: ticks light in sync with real boot progress.
+        var ticks = document.querySelectorAll('.tick');
+        var lit = Math.round(v / 100 * ticks.length);
+        for (var i = 0; i < ticks.length; i++) {{
+          ticks[i].classList.toggle('lit', i < lit);
+        }}
+        if (v >= 100) {{
+          var d = document.querySelector('.dial-wrap');
+          if (d) d.classList.add('done');
+        }}
       }}
     }};
   </script>

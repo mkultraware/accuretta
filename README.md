@@ -18,7 +18,7 @@
 </div>
 
 <p align="center">
-  <img src="media/accuretta-demo-loop.gif" alt="Accuretta � local AI workspace demo" width="900">
+  <img src="media/accuretta-demo-loop.gif" alt="Accuretta � local AI workspace demo" width="900">
 </p>
 
 <p align="center">
@@ -188,6 +188,8 @@ Three standard-library tools keep token cost low on big projects: `read_skeleton
 
 Accuretta speaks the Model Context Protocol through a dependency-free stdio client built into `bridge.py`. Drop a `bridge_mcp_config.json` next to the bridge (same schema Claude Desktop uses), restart, and the server's tools appear in the model's toolbelt. Every MCP call is approval-gated by default, since an MCP server can run arbitrary commands.
 
+Browser automation (playwright-mcp) works without any vision projector: accessibility snapshots are text, anonymous layout-container noise is stripped before they hit the context, and oversized results get head/tail elision instead of a dead-end "too large" stub — so big pages don't stall the agent. Screenshots come back as a note pointing the model at the text snapshot, so you never need to load an mmproj just for the browser.
+
 ```json
 {
   "mcpServers": {
@@ -220,8 +222,9 @@ I asked the agent to tune my in-ear monitors (Linsoul 7Hz x Crinacle Zero:2) wit
 
 Picking a model in Settings (with a VRAM tier set) runs a tuner that reads the GGUF header for the model's real architecture (layer count, attention config, MoE expert count, KV head dimensions) and computes the largest context window plus the right CPU/GPU offload split for your card. No hand-picking `--n-cpu-moe`, `--ctx-size`, or `--batch-size`.
 
-- **GGUF-direct math.** KV cost per token comes from the model's actual `2 x n_layer x head_count_kv x head_dim x dtype_bytes`, not a size bucket. A Q3 of an architecture gets more context than a Q4 of the same one, because the smaller weights leave more VRAM for cache.
-- **MoE aware.** For mixture-of-experts models it works out the dense-vs-expert split and offloads only as many expert layers to CPU as needed to fit, capping at 70% of layers before it suggests a smaller quant. Speculative decoding is auto-disabled on MoE since it's net-negative there.
+- **GGUF-direct math.** KV cost per token comes from the model's actual `2 x n_layer x head_count_kv x head_dim x dtype_bytes`, not a size bucket. A Q3 of an architecture gets more context than a Q4 of the same one, because the smaller weights leave more VRAM for cache. Split K/V cache (`--cache-type-k q8_0 --cache-type-v q4_0`) is used when it buys real context — K is the quantization-sensitive half (KIVI, ICML 2024), V shrugs off 4-bit.
+- **MoE aware.** For mixture-of-experts models it works out the dense-vs-expert split and offloads only as many expert layers to CPU as needed to fit, gating the trade on a decode-speed estimate (RAM bandwidth ÷ active expert bytes) instead of a fixed cap. Speculative decoding is auto-disabled on MoE since it's net-negative there.
+- **Swap-aware.** Re-tuning while another model is loaded counts the running instance's RAM/VRAM as free — the swap releases it — so a re-tune at boot or model-switch can't talk itself into a crippled config. A sibling vision projector (mmproj) is budgeted too, and configs that still don't fit are never saved over a working one.
 - **Grow-only context.** If a re-tune comes back smaller than what you already had working, the larger value wins. Your saved context never shrinks behind your back.
 - **Re-runs on boot.** Auto-tune quietly re-runs in the background at startup and updates flags if the algorithm improved since you last saved. One toast tells you what changed.
 

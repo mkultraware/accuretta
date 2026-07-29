@@ -2343,7 +2343,7 @@
       { kind: "cmd", icon: "ph-gear-six", label: "Open Settings", action: () => { closePalette(); openSettings(); } },
       { kind: "cmd", icon: "ph-brain", label: "Open Long-term memory", action: () => { closePalette(); openSettings(); setTimeout(() => $("#btn-mem-refresh")?.scrollIntoView({ behavior: "smooth" }), 80); } },
       { kind: "cmd", icon: "ph-arrow-counter-clockwise", label: "Regenerate last reply", action: () => { closePalette(); regenerateLast(); } },
-      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / aurora / nebula / soft / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
+      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / soft / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
       { kind: "cmd", icon: "ph-browser", label: "Toggle preview pane", action: () => { closePalette(); app.classList.toggle("preview-collapsed"); } },
       { kind: "cmd", icon: "ph-camera", label: "Screenshot preview", action: () => { closePalette(); screenshotPreview(); } },
       { kind: "cmd", icon: "ph-package", label: "Export project", action: () => { closePalette(); exportProjectZip(); } },
@@ -4188,7 +4188,18 @@
           else row.appendChild(pill);
         }
         const text = pill.querySelector(".ctx-trim-text");
-        if (text) text.textContent = `${evt.dropped} message${evt.dropped === 1 ? "" : "s"} summarized`;
+        // Two very different events share this pill: a real mid-turn fold
+        // (messages compacted into the session summary) vs. a plain drop
+        // (messages simply not sent to the model). Label them honestly —
+        // calling a plain drop "summarized" made the later compaction toast
+        // look like the summarization happened twice / late.
+        if (text) text.textContent = evt.folded
+          ? `${evt.dropped} older message${evt.dropped === 1 ? "" : "s"} compacted into the session summary`
+          : `${evt.dropped} message${evt.dropped === 1 ? "" : "s"} not sent to the model (context full)`;
+        const info = pill.querySelector(".ctx-trim-info");
+        if (info) info.title = evt.folded
+          ? "These messages were folded into the rolling session summary — the model still has their content in compressed form."
+          : "Context is full and no summary fold ran, so these middle messages were left out of the prompt entirely. The model cannot see them this turn.";
         row.dataset.dropped = evt.dropped;
         // Re-render tool group head if it exists to pick up the dropped count
         const stack = row.querySelector(".tool-stack");
@@ -4968,6 +4979,10 @@
     if (app && app.classList.contains("preview-collapsed")) {
       app.classList.remove("preview-collapsed");
     }
+    document.getElementById("preview-empty")?.classList.add("hidden");
+    document.getElementById("preview-stage")?.classList.add("hidden");
+    document.getElementById("code-view")?.classList.add("hidden");
+    document.getElementById("doc-preview-pane")?.classList.add("hidden");
     const banner = document.getElementById("pycheck-banner");
     const codeEl = document.getElementById("pycheck-code")?.querySelector("code");
     if (!banner || !codeEl) return;
@@ -4975,9 +4990,7 @@
     banner.className = "pycheck-banner pending";
     banner.textContent = `checking ${displayName || rel}…`;
     codeEl.textContent = "";
-    // Ensure the inner pycheck-pane is visible (other preview functions hide it)
     document.getElementById("pycheck-pane")?.classList.remove("hidden");
-    activateTerminalTab("pycheck");
 
     let res;
     try {
@@ -6056,7 +6069,7 @@
           <span class="grow"></span>
           <div class="perm-head-actions">
             <button class="perm-quick perm-quick-deny" data-act="deny" type="button" title="Deny">Deny</button>
-            <button class="perm-quick perm-quick-approve" data-act="approve" type="button" title="Approve">Approve</button>
+            ${a.details && a.details.critical ? `` : `<button class="perm-quick perm-quick-approve" data-act="approve" type="button" title="Approve">Approve</button>`}
           </div>
           <button class="revealer-card-toggle" type="button"><i class="ph ph-caret-down"></i></button>
         </div>
@@ -6065,21 +6078,19 @@
           <div class="permissions-checklist">
             ${checklistHtml}
           </div>
-          <div class="permissions-options">
-            <label class="permission-option-label">
-              <input type="checkbox" id="perm-allow-shell">
-              <span class="custom-checkbox"></span>
-              <span>Allow shell commands</span>
-            </label>
+          ${a.details && a.details.critical ? `<div class="permissions-critical"><i class="ph ph-warning-octagon"></i> Protected operation - this can change Windows itself. It never auto-approves: press and HOLD to confirm.</div>` : ``}
+          ${a.details && a.details.allow_always ? `<div class="permissions-options">
             <label class="permission-option-label">
               <input type="checkbox" id="perm-remember-session">
               <span class="custom-checkbox"></span>
               <span>Remember this action for this session</span>
             </label>
-          </div>
+          </div>` : ``}
           <div class="permissions-actions">
             <button class="perm-btn perm-btn-cancel" data-act="deny">Deny</button>
-            <button class="perm-btn perm-btn-continue" data-act="approve">Approve</button>
+            ${a.details && a.details.critical
+              ? `<button class="perm-btn perm-btn-hold" type="button"><span class="hold-fill"></span><span class="hold-label">Hold to approve</span></button>`
+              : `<button class="perm-btn perm-btn-continue" data-act="approve">Approve</button>`}
           </div>
         </div>
       `;
@@ -6087,11 +6098,37 @@
       const head = card.querySelector(".revealer-card-head");
       head.addEventListener("click", () => card.classList.toggle("collapsed"));
       
-      const shellCheckbox = card.querySelector("#perm-allow-shell");
-      if (shellCheckbox) {
-        shellCheckbox.addEventListener("change", (e) => {
-          // Toggle shell auto-approve if needed
-        });
+      // Critical (protected) approvals: approve is press-and-HOLD (1.5s) so a
+      // single mis-click can't push through a registry/System32 change.
+      const holdBtn = card.querySelector(".perm-btn-hold");
+      if (holdBtn) {
+        let holdTimer = null;
+        const fill = holdBtn.querySelector(".hold-fill");
+        const startHold = (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          if (holdTimer) return;
+          const t0 = Date.now();
+          holdBtn.classList.add("holding");
+          holdTimer = setInterval(() => {
+            const pct = Math.min(100, ((Date.now() - t0) / 1500) * 100);
+            if (fill) fill.style.width = pct + "%";
+            if (pct >= 100) {
+              clearInterval(holdTimer);
+              holdTimer = null;
+              decideApproval(a.id, "approve", false);
+            }
+          }, 30);
+        };
+        const cancelHold = () => {
+          if (holdTimer) { clearInterval(holdTimer); holdTimer = null; }
+          holdBtn.classList.remove("holding");
+          if (fill) fill.style.width = "0%";
+        };
+        holdBtn.addEventListener("mousedown", startHold);
+        holdBtn.addEventListener("touchstart", startHold, { passive: false });
+        ["mouseup", "mouseleave", "touchend", "touchcancel"].forEach(ev =>
+          holdBtn.addEventListener(ev, cancelHold));
       }
       // Bind BOTH the head quick-actions and the body buttons. stopPropagation
       // keeps a head click from toggling the card's collapse. When "remember this
@@ -6158,6 +6195,23 @@
           c.title = evt.title;
           renderChatList();
         }
+      } else if (evt.type === "ctx_fill") {
+        // Per-round assembled-prompt size, pushed BEFORE the round streams.
+        // The 2s poll only reports the last completed round, so without this
+        // the gauge always lagged one round behind the real fill.
+        if (evt.chat_id && evt.chat_id !== state.chatId) return;
+        if (typeof evt.prompt_tokens === "number") {
+          state._lastMsgPromptTokens = evt.prompt_tokens;
+          state._ctxSource = evt.source || "estimate";
+          if (Number.isFinite(evt.capacity) && evt.capacity > 0) state._ctxCapacity = evt.capacity;
+          renderCtxGauge();
+        }
+      } else if (evt.type === "summary_folded") {
+        if (evt.chat_id && evt.chat_id !== state.chatId) return;
+        toast(`Context compacted — ${evt.folded} older message${evt.folded === 1 ? "" : "s"} folded into the session summary.`, "info", 4000, "summary-fold");
+      } else if (evt.type === "summary_fold_failed") {
+        if (evt.chat_id && evt.chat_id !== state.chatId) return;
+        toast("Context is full but compaction failed (summarizer error) — older messages are being trimmed instead. If the model starts repeating itself, send any message to retry the fold.", "warn", 8000, "summary-fold-fail");
       } else if (evt.type === "desktop:panic") {
         if (evt.on) toast("desktop automation PANICKED — all actions blocked", "warn", 6000, "desktop-panic");
         else toast("desktop automation resumed", "ok", 2000, "desktop-panic");
@@ -6218,6 +6272,50 @@
           "err", 60000, "llama-watchdog"
         );
         try { loadModels().then(renderModelPill); } catch {}
+      } else if (evt.type === "llama:auto_tuned") {
+        // Bridge auto-tuned settings for a model load. Headline carries the
+        // key numbers; the tuner notes are available behind an expandable
+        // "why these settings?" details block.
+        const nm = (evt.model || "").split(/[\\/]/).pop() || "model";
+        const parts = [];
+        if (evt.ctx) parts.push(`ctx ${Number(evt.ctx).toLocaleString()}`);
+        if (evt.n_cpu_moe) parts.push(`n-cpu-moe ${evt.n_cpu_moe}`);
+        if (evt.kv_cache_type) {
+          const kvv = evt.kv_cache_type_v && evt.kv_cache_type_v !== evt.kv_cache_type
+            ? `/${String(evt.kv_cache_type_v).toUpperCase()}` : "";
+          parts.push(`${String(evt.kv_cache_type).toUpperCase()}${kvv} KV`);
+        }
+        let html = `auto-tuned <b>${esc(nm)}</b>` +
+          (parts.length ? ` — ${esc(parts.join(" · "))}` : "");
+        if (evt.quant_downshift) html += ` · ⚠ ${esc(evt.quant_downshift)}`;
+        const notes = String(evt.notes || "").trim();
+        if (notes) {
+          const lines = notes.split(/(?<=\.)\s+/).filter(Boolean).map(esc).join("<br>");
+          html += `<details class="toast-details"><summary>why these settings?</summary>` +
+                  `<div class="toast-details-body">${lines}</div></details>`;
+        }
+        toast(html, "ok", 30000, "auto-tuned", true);
+      } else if (evt.type === "llama:auto_degraded") {
+        // Watchdog self-heal: the tuner progressively degraded settings so a
+        // crashing model can still boot.
+        toast(
+          `${esc(evt.message || "model unstable")} — auto-tune adjusted settings so it can boot.`,
+          "warn", 15000, "llama-watchdog"
+        );
+      } else if (evt.type === "sandbox:stream") {
+        const pre = document.getElementById("sandbox-log-pre");
+        if (!pre) return;
+        const line = evt.line || "";
+        const span = document.createElement("span");
+        span.textContent = line + "\n";
+        if (/\b(err(or)?|failed|failure|cannot|no such|not found|traceback|abort(ed)?|fatal|out of memory|oom|segmentation|assert(ion)?|invalid|exception|denied)\b/i.test(line))
+          span.className = "t-err";
+        else if (/\b(warning|warn|deprecated)\b/i.test(line))
+          span.className = "t-warn";
+        const codeEl = pre.querySelector("code");
+        if (codeEl) codeEl.appendChild(span);
+        else pre.appendChild(span);
+        pre.scrollTop = pre.scrollHeight;
       }
     };
     es.onerror = () => {
@@ -6378,6 +6476,7 @@
       if (sug[k] != null) update[k] = Number(sug[k]);
     }
     if (sug.kv_cache_type) update.kv_cache_type = String(sug.kv_cache_type);
+    if (sug.kv_cache_type_v != null) update.kv_cache_type_v = String(sug.kv_cache_type_v);
     if (sug.spec_strategy) update.spec_strategy = String(sug.spec_strategy);
     if (sug.flash_attn != null) update.flash_attn = !!sug.flash_attn;
     // Keep the legacy flag in sync with the strategy pick, same convention as
@@ -6392,6 +6491,7 @@
     setVal("#set-gpu", update.num_gpu);
     setVal("#set-batch", update.num_batch);
     const kv = $("#set-kv"); if (kv && update.kv_cache_type) kv.value = update.kv_cache_type;
+    const kvv = $("#set-kvv"); if (kvv && update.kv_cache_type_v != null) kvv.value = update.kv_cache_type_v;
     setVal("#set-ncmoe", update.n_cpu_moe);
     setVal("#set-ubatch", update.n_ubatch);
     setVal("#set-thread", update.num_thread);
@@ -6781,6 +6881,12 @@
     fill("#set-predict", s.num_predict);
     const kvSel = $("#set-kv");
     if (kvSel) kvSel.value = s.kv_cache_type || "q8_0";
+    const kvVSel = $("#set-kvv");
+    if (kvVSel) kvVSel.value = s.kv_cache_type_v || "";
+    fill("#set-vram-reserve", s.vram_reserve_gb ?? 0.25);
+    fill("#set-ram-reserve", s.safety_reserve_gb ?? 1.0);
+    const swHq4 = $("#sw-hybridq4");
+    if (swHq4) swHq4.classList.toggle("on", s.allow_hybrid_q4_kv !== false);
     // VRAM tier picker (auto-tune persistence — 0 = Manual)
     const vramSel = $("#set-vram-tier");
     if (vramSel) vramSel.value = String(s.vram_tier_gb ?? 0);
@@ -6831,6 +6937,9 @@
     $("#sw-red-team-enabled")?.classList.toggle("on", !!s.red_team_enabled);
     $("#sw-analysis-tools-enabled")?.classList.toggle("on", !!s.analysis_tools_enabled);
     $("#sw-rt-force-exploit")?.classList.toggle("on", !!s.rt_force_exploit);
+    $("#sw-rt-spoof-xff")?.classList.toggle("on", !!s.rt_spoof_xff);
+    $("#sw-rt-jitter")?.classList.toggle("on", s.rt_jitter !== false);
+    fill("#set-rt-proxy", s.rt_proxy || "");
     $("#sw-discord-enabled")?.classList.toggle("on", !!s.discord_enabled);
     fill("#set-discord-token", s.discord_bot_token || "");
     fill("#set-discord-owner", s.discord_owner_id || "");
@@ -6865,7 +6974,7 @@
   }
   // settings whose changes require relaunching llama-server (load-time flags)
   const LOAD_TIME_KEYS = [
-    "num_ctx", "num_gpu", "num_batch", "num_thread", "kv_cache_type", "model_path",
+    "num_ctx", "num_gpu", "num_batch", "num_thread", "kv_cache_type", "kv_cache_type_v", "model_path",
     "n_cpu_moe", "n_ubatch", "n_parallel", "flash_attn",
     "spec_strategy", "no_warmup", "enable_metrics", "llama_extra_args",
     // mmproj_path changes how the server is launched (--mmproj <path>) so it
@@ -6887,6 +6996,10 @@
       num_thread: n("#set-thread"),
       num_predict: n("#set-predict"),
       kv_cache_type: $("#set-kv")?.value || "q8_0",
+      kv_cache_type_v: $("#set-kvv")?.value || "",
+      vram_reserve_gb: Math.max(0, Number($("#set-vram-reserve")?.value || 0.25)),
+      safety_reserve_gb: Math.max(0, Number($("#set-ram-reserve")?.value || 1.0)),
+      allow_hybrid_q4_kv: $("#sw-hybridq4")?.classList.contains("on") !== false,
       n_cpu_moe: Math.max(0, n("#set-ncmoe") || 0),
       n_ubatch: Math.max(0, n("#set-ubatch") || 0),
       n_parallel: Math.max(1, n("#set-parallel") || 1),
@@ -6917,6 +7030,9 @@
       red_team_enabled: $("#sw-red-team-enabled")?.classList.contains("on") || false,
       analysis_tools_enabled: $("#sw-analysis-tools-enabled")?.classList.contains("on") || false,
       rt_force_exploit: $("#sw-rt-force-exploit")?.classList.contains("on") || false,
+      rt_proxy: ($("#set-rt-proxy")?.value || "").trim(),
+      rt_spoof_xff: $("#sw-rt-spoof-xff")?.classList.contains("on") || false,
+      rt_jitter: $("#sw-rt-jitter") ? $("#sw-rt-jitter").classList.contains("on") : true,
       discord_enabled: $("#sw-discord-enabled")?.classList.contains("on") || false,
       discord_bot_token: ($("#set-discord-token")?.value || "").trim(),
       discord_owner_id: ($("#set-discord-owner")?.value || "").trim(),
@@ -6951,16 +7067,18 @@
     closeSettings();
   }
 
-  // Seven themes: dark (default), dim (warm cappuccino), aurora, nebula,
-  // operator (phosphor CRT terminal), soft, light. THEME_CYCLE below is the
-  // source of truth for order; the toggle button walks it start→end so the
-  // first click from dark lands on the next option instead of jumping
-  // jumping straight to bright white. nextTheme() handles the cycle and
-  // accepts whatever string is in settings as the starting point.
-  const THEME_CYCLE = ["dark", "dim", "aurora", "nebula", "operator", "soft", "light"];
+  // Eight themes: dark (default), dim (warm cappuccino), retro (silver-mauve
+  // midpoint between light and dark), aurora, nebula, operator (phosphor CRT
+  // terminal), soft, light. THEME_CYCLE below is the source of truth for
+  // order; the toggle button walks it start→end so the first click from dark
+  // lands on the next option instead of jumping straight to bright white.
+  // nextTheme() handles the cycle and accepts whatever string is in settings
+  // as the starting point.
+  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "soft", "light"];
   const THEME_ICONS = {
     dark:     "ph ph-moon",
     dim:      "ph ph-moon-stars",
+    retro:     "ph ph-sun-horizon",
     aurora:   "ph ph-sparkle",
     nebula:   "ph ph-planet",
     operator: "ph ph-command",
@@ -6971,7 +7089,7 @@
     const idx = THEME_CYCLE.indexOf(cur);
     return THEME_CYCLE[(idx + 1) % THEME_CYCLE.length];
   }
-  // applyTheme accepts a theme STRING ("dark" | "dim" | "soft" | "light"). For
+  // applyTheme accepts a theme STRING (any value in THEME_CYCLE). For
   // backward-compat with old callers that passed a boolean, we coerce:
   // true → "dark", false → "light". New code should pass the string.
   function applyTheme(theme) {
@@ -7253,7 +7371,9 @@
       // count of the assembled prompt before the first turn has run.
       source = state._ctxSource === "tokenize"
         ? "tokenizer count (no completed turn yet)"
-        : "llama-server prompt_eval_count";
+        : state._ctxSource === "estimate"
+          ? "live estimate (round in flight)"
+          : "llama-server prompt_eval_count";
     } else {
       const systemPromptChars = 2500;
       const msgChars = (state.messages || []).reduce((a, m) => {
@@ -8332,6 +8452,20 @@
       saveSettings({ rt_force_exploit: on });
       toast(on ? "exploit phase forced on" : "exploit phase gate restored", "ok", 1600);
     });
+    $("#sw-rt-spoof-xff")?.addEventListener("click", (e) => {
+      e.currentTarget.classList.toggle("on");
+      saveSettings({ rt_spoof_xff: e.currentTarget.classList.contains("on") });
+      toast("xff spoof setting saved", "ok", 1500);
+    });
+    $("#sw-rt-jitter")?.addEventListener("click", (e) => {
+      e.currentTarget.classList.toggle("on");
+      saveSettings({ rt_jitter: e.currentTarget.classList.contains("on") });
+      toast("jitter setting saved", "ok", 1500);
+    });
+    $("#set-rt-proxy")?.addEventListener("change", (e) => {
+      saveSettings({ rt_proxy: (e.currentTarget.value || "").trim() });
+      toast("rt proxy saved", "ok", 1500);
+    });
     $("#btn-sandbox-setup")?.addEventListener("click", async (e) => {
       const reinstall = e.currentTarget.dataset.reinstall === "1";
       if (reinstall) {
@@ -8415,6 +8549,7 @@
     $("#sw-thinking")?.addEventListener("click", e => e.currentTarget.classList.toggle("on"));
     // advanced llama-server toggles
     $("#sw-flash")?.addEventListener("click", e => e.currentTarget.classList.toggle("on"));
+    $("#sw-hybridq4")?.addEventListener("click", e => e.currentTarget.classList.toggle("on"));
     // (#set-spec-strategy is a <select>, no click handler needed)
     $("#sw-nowarmup")?.addEventListener("click", e => e.currentTarget.classList.toggle("on"));
     $("#sw-metrics")?.addEventListener("click", e => e.currentTarget.classList.toggle("on"));
@@ -8576,6 +8711,26 @@
               next ? "warn" : "info", next ? 5000 : 3000);
       });
     }
+    // Approval mode: soft | medium | hard (Settings -> Approvals)
+    const syncApprovalMode = () => {
+      const mode = (state.settings && state.settings.approval_mode) ||
+        ((state.settings && state.settings.auto_approve_write) ? "medium" : "hard");
+      document.querySelectorAll("#seg-approval-mode .chip").forEach(c =>
+        c.classList.toggle("on", c.dataset.mode === mode));
+      const tb = $("#btn-trust-writes");
+      if (tb) tb.classList.toggle("trust-on", mode !== "hard");
+    };
+    syncApprovalMode();
+    document.querySelectorAll("#seg-approval-mode .chip").forEach(c =>
+      c.addEventListener("click", async () => {
+        const mode = c.dataset.mode;
+        try { await saveSettings({ approval_mode: mode, auto_approve_write: mode !== "hard" }); } catch (_) {}
+        syncApprovalMode();
+        toast(mode === "soft" ? "Soft mode - agent runs autonomously. Deletions, launches, desktop actions and protected ops still ask."
+          : mode === "medium" ? "Medium mode - workspace file writes save without asking; everything else asks."
+          : "Hard mode - every action asks for approval.",
+          mode === "soft" ? "warn" : "info", 4500);
+      }));
     $("#file-image")?.addEventListener("change", async (e) => {
       await addImageFiles(Array.from(e.target.files || []));
       e.target.value = "";
@@ -8948,7 +9103,7 @@
       // user knows what the tap will do, mirroring the desktop cycle.
       const cur = document.documentElement.getAttribute("data-theme") || "light";
       const next = nextTheme(cur);
-      const niceName = { dark: "Dark", dim: "Dim", aurora: "Aurora", nebula: "Nebula", operator: "Operator", soft: "Soft", light: "Light" }[next] || next;
+      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", soft: "Soft", light: "Light" }[next] || next;
       const lbl = $("#mm-theme-label");
       if (lbl) lbl.textContent = `Switch to ${niceName.toLowerCase()}`;
       mm.classList.add("open"); mmScrim.classList.add("open");
@@ -9142,15 +9297,11 @@
             codeEl.innerHTML = `$ <span class="term-cursor"></span>`;
           }
         }
-      } else if (tabId === "pycheck") {
-        const banner = document.getElementById("pycheck-banner");
-        const codeEl = document.getElementById("pycheck-code")?.querySelector("code");
-        if (banner) {
-          banner.className = "pycheck-banner pending";
-          banner.textContent = "No python check run yet. Run check from a .py file in the workspace.";
-        }
-        if (codeEl) {
-          codeEl.textContent = "";
+      } else if (tabId === "sandbox") {
+        const logPre = document.getElementById("sandbox-log-pre");
+        if (logPre) {
+          const codeEl = logPre.querySelector("code") || logPre;
+          codeEl.innerHTML = "[system] Sandbox isolated guest environment logs...<br>";
         }
       } else if (tabId === "agentlog") {
         const logPre = document.getElementById("term-agent-log-pre");
