@@ -377,13 +377,11 @@
   --border-strong: #6B6373;
   --border-subtle: #A19AA6;
 
-  /* The contrast the mauve base was missing: a warm sunset-amber accent —
-     near-complement of the 270° surfaces, so controls, links and the send
-     button finally POP instead of dissolving into monochrome purple.
-     Cool violet survives only as the --info secondary (duotone pairing). */
-  --accent:        #B45309; /* burnt amber — deep enough for white text (5.0:1) */
-  --accent-hover:  #92400E; /* hover deepens — light-surface convention */
-  --accent-subtle: rgba(180, 83, 9, 0.16);
+  /* A soft, dusty terracotta accent — complements the mauve base 
+     without being overly vibrant or jarring. */
+  --accent:        #B5704E; /* muted terracotta / clay */
+  --accent-hover:  #94593C; /* deeper clay */
+  --accent-subtle: rgba(181, 112, 78, 0.16);
   --accent-fg:     #FFFFFF;
 
   --success-subtle: rgba(34, 139, 90, 0.18);
@@ -414,8 +412,8 @@
   --btn-shadow-active: inset 0 1px 2px rgba(40, 30, 50, 0.16),
                        0 0 0 1px rgba(40, 30, 50, 0.08);
 
-  --btn-send-gradient: linear-gradient(135deg, #D97706 0%, #B45309 55%, #92400E 100%);
-  --btn-send-glow:     0 6px 20px rgba(217, 119, 6, 0.35);
+  --btn-send-gradient: linear-gradient(135deg, #CA8A67 0%, #B5704E 55%, #94593C 100%);
+  --btn-send-glow:     0 6px 20px rgba(181, 112, 78, 0.35);
 }
 
 /* Apply the gradient at the page level only — children with their own
@@ -428,6 +426,62 @@
 [data-theme="operator"] body,
 .dark body {
   background: var(--bg-gradient, var(--bg)) fixed;
+}
+
+/* ============================================================
+   NEUMORPHIC — A distinctive soft, embossed UI.
+   Uses a frosty light blue-grey (#E0E5EC) base where surfaces
+   protrude or sink using structural shadows and highlights.
+   This looks radically different from the flat light/dark themes.
+   ============================================================ */
+[data-theme="neumorphic"] {
+  /* Classic Light Neumorphism Base */
+  --bg:        #E0E5EC;
+  --bg-raised: #E0E5EC; /* Surface color matches background exactly */
+  --bg-sunken: #E0E5EC; 
+  --bg-inset:  #E0E5EC;
+
+  --glass-bg:       rgba(224, 229, 236, 0.6);
+  --glass-border:   rgba(255, 255, 255, 0.5);
+
+  /* Deep slate text for high readability */
+  --fg:        #2D3748;
+  --fg-muted:  #4A5568;
+  --fg-subtle: #718096;
+  --fg-faint:  #A0AEC0;
+  --fg-invert: #F7FAFC;
+
+  --border:        #CBD5E0;
+  --border-strong: #A0AEC0;
+  --border-subtle: #E2E8F0;
+
+  --accent:        #3182CE;
+  --accent-hover:  #2B6CB0;
+  --accent-subtle: rgba(49, 130, 206, 0.12);
+  --accent-fg:     #FFFFFF;
+
+  --success-subtle: rgba(72, 187, 120, 0.14);
+  --warning-subtle: rgba(237, 137, 54, 0.14);
+  --danger-subtle:  rgba(245, 101, 101, 0.14);
+  --info-subtle:    rgba(49, 130, 206, 0.12);
+
+  /* Neumorphic Extrusion Shadows (Dark drop + White highlight) */
+  --shadow-xs: 3px 3px 6px rgba(163, 177, 198, 0.5), -3px -3px 6px rgba(255, 255, 255, 0.7);
+  --shadow-sm: 5px 5px 10px rgba(163, 177, 198, 0.5), -5px -5px 10px rgba(255, 255, 255, 0.7);
+  --shadow-md: 7px 7px 14px rgba(163, 177, 198, 0.55), -7px -7px 14px rgba(255, 255, 255, 0.8);
+  --shadow-lg: 10px 10px 20px rgba(163, 177, 198, 0.6), -10px -10px 20px rgba(255, 255, 255, 0.9);
+  --shadow-pop: 14px 14px 28px rgba(163, 177, 198, 0.65), -14px -14px 28px rgba(255, 255, 255, 1);
+
+  /* Inset shadows for sunken wells and text fields */
+  --shadow-inset: inset 4px 4px 8px rgba(163, 177, 198, 0.6), inset -4px -4px 8px rgba(255, 255, 255, 0.8);
+
+  /* Buttons are extruded when resting, and pressed (inset) when active */
+  --btn-shadow-rest:   4px 4px 8px rgba(163, 177, 198, 0.5), -4px -4px 8px rgba(255, 255, 255, 0.7);
+  --btn-shadow-hover:  6px 6px 12px rgba(163, 177, 198, 0.6), -6px -6px 12px rgba(255, 255, 255, 0.8);
+  --btn-shadow-active: inset 4px 4px 8px rgba(163, 177, 198, 0.6), inset -4px -4px 8px rgba(255, 255, 255, 0.8);
+
+  --btn-send-gradient: linear-gradient(135deg, #4299E1 0%, #3182CE 100%);
+  --btn-send-glow:     0 6px 16px rgba(49, 130, 206, 0.35);
 }
 
 /* ============================================================
@@ -506,60 +560,60 @@
    Vibrant, highly modern dark theme with luminous highlights.
    ============================================================ */
 [data-theme="aurora"] {
-  /* Arctic polar obsidian: deep glass spruce with luminous neon northern lights */
-  --bg:        #050808;
-  --bg-raised: #0B1414;
-  --bg-sunken: #030505;
-  --bg-inset:  #122020;
+  /* Vivid Boreal Aurora - immersive dark teal and neon green */
+  --bg:        #011211;
+  --bg-raised: #032321;
+  --bg-sunken: #010A0A;
+  --bg-inset:  #053633;
 
-  --glass-bg:       rgba(11, 20, 20, 0.7);
-  --glass-border:   rgba(0, 255, 196, 0.08);
-  --ambient-orb-1:  radial-gradient(circle, rgba(0, 255, 196, 0.08) 0%, transparent 70%);
-  --ambient-orb-2:  radial-gradient(circle, rgba(0, 180, 216, 0.05) 0%, transparent 70%);
+  --glass-bg:       rgba(3, 35, 33, 0.6);
+  --glass-border:   rgba(0, 255, 196, 0.15);
+  --ambient-orb-1:  radial-gradient(circle, rgba(0, 255, 196, 0.15) 0%, transparent 70%);
+  --ambient-orb-2:  radial-gradient(circle, rgba(0, 180, 216, 0.1) 0%, transparent 70%);
 
-  --bg-gradient: linear-gradient(180deg, #091010 0%, #050808 40%, #020303 100%);
+  /* Immersive sweeping aurora light across the top */
+  --bg-gradient: radial-gradient(ellipse at top, rgba(0, 255, 196, 0.12) 0%, transparent 70%),
+                 linear-gradient(180deg, #011211 0%, #010A0A 100%);
 
-  --fg:        #E8F8F5;
-  --fg-muted:  #8DB2AD;
-  --fg-subtle: #5C827D;
-  --fg-faint:  #3A5652;
-  --fg-invert: #050808;
+  --fg:        #E0F8F5;
+  --fg-muted:  #7DB5AB;
+  --fg-subtle: #4D877E;
+  --fg-faint:  #295B54;
+  --fg-invert: #011211;
 
-  --border:        #0F1E1E;
-  --border-strong: #1D3434;
-  --border-subtle: #080C0C;
+  --border:        #0A3835;
+  --border-strong: #104F4B;
+  --border-subtle: #052623;
 
   --accent:        #00FFC4;
   --accent-hover:  #34FFD2;
-  --accent-subtle: rgba(0, 255, 196, 0.12);
-  --accent-fg:     #050808;
+  --accent-subtle: rgba(0, 255, 196, 0.15);
+  --accent-fg:     #011211;
 
   --success-subtle: rgba(106, 196, 154, 0.14);
   --warning-subtle: rgba(232, 211, 112, 0.14);
   --danger-subtle:  rgba(255, 106, 0, 0.14);
   --info-subtle:    rgba(0, 255, 196, 0.12);
 
-  --shadow-xs: 0 1px 0 rgba(0,0,0,0.4);
-  --shadow-sm: 0 1px 2px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.02);
-  --shadow-md: 0 4px 14px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.03);
-  --shadow-lg: 0 14px 40px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.04);
-  --shadow-pop: 0 24px 70px rgba(0,0,0,0.75), 0 0 0 1px rgba(255,255,255,0.05);
+  --shadow-xs: 0 1px 0 rgba(0,0,0,0.5);
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.6), 0 0 0 1px rgba(0, 255, 196, 0.05);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.7), 0 0 0 1px rgba(0, 255, 196, 0.08);
+  --shadow-lg: 0 16px 45px rgba(0,0,0,0.8), 0 0 0 1px rgba(0, 255, 196, 0.1);
+  --shadow-pop: 0 24px 80px rgba(0,0,0,0.9), 0 0 0 1px rgba(0, 255, 196, 0.15);
 
-  --shadow-inset: inset 0 1px 0 rgba(0,0,0,0.4), inset 0 0 0 1px rgba(255,255,255,0.02);
+  --shadow-inset: inset 0 2px 4px rgba(0,0,0,0.6), inset 0 0 0 1px rgba(0, 255, 196, 0.05);
 
-  --btn-shadow-rest:   inset 0 1px 0 rgba(255,255,255,0.05),
-                       0 1px 1px rgba(0,0,0,0.40),
-                       0 2px 6px rgba(0,0,0,0.40),
-                       0 0 0 1px rgba(255,255,255,0.02);
-  --btn-shadow-hover:  inset 0 1px 0 rgba(255,255,255,0.08),
-                       0 3px 8px rgba(0,0,0,0.50),
-                       0 8px 18px rgba(0,0,0,0.50),
-                       0 0 0 1px rgba(255,255,255,0.04);
-  --btn-shadow-active: inset 0 1px 3px rgba(0,0,0,0.55),
-                       0 0 0 1px rgba(255,255,255,0.02);
+  --btn-shadow-rest:   inset 0 1px 0 rgba(255,255,255,0.1),
+                       0 2px 6px rgba(0,0,0,0.50),
+                       0 0 0 1px rgba(0, 255, 196, 0.1);
+  --btn-shadow-hover:  inset 0 1px 0 rgba(255,255,255,0.15),
+                       0 4px 12px rgba(0,0,0,0.60),
+                       0 0 0 1px rgba(0, 255, 196, 0.2);
+  --btn-shadow-active: inset 0 2px 5px rgba(0,0,0,0.7),
+                       0 0 0 1px rgba(0, 255, 196, 0.05);
 
-  --btn-send-gradient: linear-gradient(135deg, #00ffc4 0%, #00b4d8 50%, #7209b7 100%);
-  --btn-send-glow:     0 6px 22px rgba(0, 255, 196, 0.35);
+  --btn-send-gradient: linear-gradient(135deg, #00ffc4 0%, #00b4d8 100%);
+  --btn-send-glow:     0 6px 24px rgba(0, 255, 196, 0.4);
 }
 
 /* ============================================================
@@ -568,33 +622,36 @@
    and luminous, glowing violet/pink/cyan stardust highlights.
    ============================================================ */
 [data-theme="nebula"] {
-  /* Cosmic midnight void: deep space violet with luminous neon lavender stardust */
-  --bg:        #050409;
-  --bg-raised: #0D0B17;
-  --bg-sunken: #020205;
-  --bg-inset:  #161329;
+  /* Deep Cosmic Nebula - immersive galactic indigo and hot pink/purple */
+  --bg:        #090514;
+  --bg-raised: #140C2E;
+  --bg-sunken: #05020B;
+  --bg-inset:  #1D1242;
 
-  --glass-bg:       rgba(13, 11, 23, 0.7);
-  --glass-border:   rgba(192, 132, 252, 0.08);
-  --ambient-orb-1:  radial-gradient(circle, rgba(217, 70, 239, 0.08) 0%, transparent 70%);
-  --ambient-orb-2:  radial-gradient(circle, rgba(6, 182, 212, 0.05) 0%, transparent 70%);
+  --glass-bg:       rgba(20, 12, 46, 0.7);
+  --glass-border:   rgba(217, 70, 239, 0.15);
+  --ambient-orb-1:  radial-gradient(circle, rgba(217, 70, 239, 0.12) 0%, transparent 70%);
+  --ambient-orb-2:  radial-gradient(circle, rgba(6, 182, 212, 0.1) 0%, transparent 70%);
 
-  --bg-gradient: linear-gradient(180deg, #0d0920 0%, #050409 40%, #020104 100%);
+  /* Immersive swirling cosmic mesh gradient */
+  --bg-gradient: radial-gradient(circle at 15% 0%, rgba(192, 132, 252, 0.12) 0%, transparent 60%),
+                 radial-gradient(circle at 85% 100%, rgba(217, 70, 239, 0.08) 0%, transparent 60%),
+                 linear-gradient(180deg, #090514 0%, #06030F 100%);
 
-  --fg:        #F4F0FF;
-  --fg-muted:  #A59FB8;
-  --fg-subtle: #736C8C;
-  --fg-faint:  #4A4561;
-  --fg-invert: #050409;
+  --fg:        #F4EEFF;
+  --fg-muted:  #A79DC4;
+  --fg-subtle: #796D9C;
+  --fg-faint:  #50466E;
+  --fg-invert: #090514;
 
-  --border:        #141024;
-  --border-strong: #261F3F;
-  --border-subtle: #090712;
+  --border:        #291A54;
+  --border-strong: #3F297A;
+  --border-subtle: #190F36;
 
-  --accent:        #C084FC;
-  --accent-hover:  #D8B4FE;
-  --accent-subtle: rgba(192, 132, 252, 0.15);
-  --accent-fg:     #050409;
+  --accent:        #E879F9;
+  --accent-hover:  #F0ABFC;
+  --accent-subtle: rgba(232, 121, 249, 0.15);
+  --accent-fg:     #090514;
 
   --success-subtle: rgba(106, 196, 154, 0.14);
   --warning-subtle: rgba(232, 211, 112, 0.14);
@@ -602,26 +659,24 @@
   --info-subtle:    rgba(192, 132, 252, 0.15);
 
   --shadow-xs: 0 1px 0 rgba(0,0,0,0.5);
-  --shadow-sm: 0 1px 2px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.01);
-  --shadow-md: 0 4px 14px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.02), 0 0 12px rgba(167, 139, 250, 0.05);
-  --shadow-lg: 0 14px 40px rgba(0,0,0,0.75), 0 0 0 1px rgba(255,255,255,0.03), 0 0 24px rgba(167, 139, 250, 0.10);
-  --shadow-pop: 0 24px 70px rgba(0,0,0,0.85), 0 0 0 1px rgba(255,255,255,0.04), 0 0 36px rgba(167, 139, 250, 0.15);
+  --shadow-sm: 0 1px 4px rgba(0,0,0,0.6), 0 0 0 1px rgba(232, 121, 249, 0.05);
+  --shadow-md: 0 6px 20px rgba(0,0,0,0.7), 0 0 0 1px rgba(232, 121, 249, 0.08);
+  --shadow-lg: 0 18px 50px rgba(0,0,0,0.8), 0 0 0 1px rgba(232, 121, 249, 0.1);
+  --shadow-pop: 0 30px 90px rgba(0,0,0,0.9), 0 0 0 1px rgba(232, 121, 249, 0.15);
 
-  --shadow-inset: inset 0 1px 0 rgba(0,0,0,0.5), inset 0 0 0 1px rgba(255,255,255,0.01);
+  --shadow-inset: inset 0 2px 4px rgba(0,0,0,0.6), inset 0 0 0 1px rgba(232, 121, 249, 0.05);
 
-  --btn-shadow-rest:   inset 0 1px 0 rgba(255,255,255,0.04),
-                       0 1px 1px rgba(0,0,0,0.50),
-                       0 2px 6px rgba(0,0,0,0.50),
-                       0 0 0 1px rgba(255,255,255,0.01);
-  --btn-shadow-hover:  inset 0 1px 0 rgba(255,255,255,0.08),
-                       0 3px 8px rgba(0,0,0,0.60),
-                       0 8px 18px rgba(0,0,0,0.60),
-                       0 0 0 1px rgba(255,255,255,0.02);
-  --btn-shadow-active: inset 0 1px 3px rgba(0,0,0,0.65),
-                       0 0 0 1px rgba(255,255,255,0.01);
+  --btn-shadow-rest:   inset 0 1px 0 rgba(255,255,255,0.1),
+                       0 2px 8px rgba(0,0,0,0.50),
+                       0 0 0 1px rgba(232, 121, 249, 0.1);
+  --btn-shadow-hover:  inset 0 1px 0 rgba(255,255,255,0.15),
+                       0 5px 15px rgba(0,0,0,0.60),
+                       0 0 0 1px rgba(232, 121, 249, 0.2);
+  --btn-shadow-active: inset 0 2px 6px rgba(0,0,0,0.7),
+                       0 0 0 1px rgba(232, 121, 249, 0.05);
 
-  --btn-send-gradient: linear-gradient(135deg, #f472b6 0%, #d946ef 50%, #06b6d4 100%);
-  --btn-send-glow:     0 6px 22px rgba(217, 70, 239, 0.40);
+  --btn-send-gradient: linear-gradient(135deg, #f472b6 0%, #d946ef 100%);
+  --btn-send-glow:     0 6px 24px rgba(217, 70, 239, 0.40);
 }
 
 /* ============================================================

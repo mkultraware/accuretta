@@ -1372,6 +1372,32 @@ button {
   color: var(--fg-muted) !important;
 }
 
+.ctx-compact-btn {
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 10px !important;
+  font-weight: 600 !important;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  line-height: 1.5;
+  color: var(--fg-muted) !important;
+  background: transparent;
+  border: 1px solid var(--border-color, rgba(128,128,128,0.35));
+  border-radius: 5px;
+  cursor: pointer;
+  vertical-align: 1px;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.ctx-compact-btn:hover {
+  color: var(--accent, #4f8cff) !important;
+  border-color: var(--accent, #4f8cff);
+  background: color-mix(in srgb, var(--accent, #4f8cff) 10%, transparent);
+}
+.ctx-compact-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
 .ctx-gauge-body {
   display: flex;
   align-items: center;
@@ -2167,12 +2193,12 @@ button {
    midpoint, so the user bubble becomes sunset amber — the warm complement
    that makes the cool mauve surfaces sing, white text, soft ember glow. */
 [data-theme="retro"] .bubble.user {
-  background: linear-gradient(135deg, #D97706 0%, #B45309 100%) !important;
+  background: var(--btn-send-gradient) !important;
   color: #FFFFFF !important;
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.18),
-    0 2px 8px rgba(120, 60, 10, 0.30),
-    0 8px 24px rgba(120, 60, 10, 0.22);
+    0 2px 8px rgba(90, 45, 30, 0.30),
+    0 8px 24px rgba(90, 45, 30, 0.22);
 }
 
 
@@ -2191,15 +2217,17 @@ button {
 
 /* aurora theme user bubble matching the custom dark spruce and neon green-cyan glow */
 [data-theme="aurora"] .bubble.user {
-  background: linear-gradient(135deg, var(--bg-inset) 0%, color-mix(in srgb, var(--bg-inset) 80%, var(--accent)) 100%) !important;
+  background: rgba(3, 35, 33, 0.75) !important;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
   color: var(--fg) !important;
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent) !important;
-  box-shadow: none !important;
+  border: 1px solid rgba(0, 255, 196, 0.3) !important;
+  box-shadow: 0 8px 24px rgba(0, 255, 196, 0.1), inset 0 1px 1px rgba(0, 255, 196, 0.25) !important;
 }
 
 [data-theme="aurora"] .bubble.user:hover {
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent) !important;
-  box-shadow: none !important;
+  border-color: rgba(0, 255, 196, 0.5) !important;
+  box-shadow: 0 12px 32px rgba(0, 255, 196, 0.15), inset 0 1px 2px rgba(0, 255, 196, 0.3) !important;
 }
 
 [data-theme="aurora"] .bubble.user p,
@@ -2236,15 +2264,17 @@ button {
 
 /* nebula theme user bubble matching the custom space violet and luminous purple-violet glow */
 [data-theme="nebula"] .bubble.user {
-  background: linear-gradient(135deg, var(--bg-raised) 0%, color-mix(in srgb, var(--bg-raised) 80%, var(--accent)) 100%) !important;
+  background: rgba(20, 12, 46, 0.75) !important;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
   color: var(--fg) !important;
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent) !important;
-  box-shadow: none !important;
+  border: 1px solid rgba(232, 121, 249, 0.25) !important;
+  box-shadow: 0 8px 32px rgba(232, 121, 249, 0.1), inset 0 1px 1px rgba(232, 121, 249, 0.2) !important;
 }
 
 [data-theme="nebula"] .bubble.user:hover {
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent) !important;
-  box-shadow: none !important;
+  border-color: rgba(232, 121, 249, 0.4) !important;
+  box-shadow: 0 12px 40px rgba(232, 121, 249, 0.15), inset 0 1px 2px rgba(232, 121, 249, 0.3) !important;
 }
 
 [data-theme="nebula"] .bubble.user p,
@@ -9019,10 +9049,22 @@ body,
 .wb-pillar {
   flex: 1;
   height: 100%;
-  background: linear-gradient(90deg,
+  background-image: linear-gradient(90deg,
     rgba(255,255,255,0.5) 0%, rgba(255,255,255,0.1) 30%,
     rgba(0,0,0,0.02) 80%, rgba(0,0,0,0.05) 100%);
+  background-color: transparent;
+  animation: pillarPulse 8s ease-in-out infinite;
 }
+
+@keyframes pillarPulse {
+  0%, 100% { background-color: transparent; }
+  50% { background-color: color-mix(in srgb, var(--accent) 12%, transparent); }
+}
+
+.wb-pillar:nth-child(2n) { animation-delay: 1.2s; animation-duration: 9s; }
+.wb-pillar:nth-child(3n) { animation-delay: 2.5s; animation-duration: 11s; }
+.wb-pillar:nth-child(5n) { animation-delay: 0.5s; animation-duration: 7s; }
+.wb-pillar:nth-child(7n) { animation-delay: 4.2s; animation-duration: 13s; }
 
 /* 3. Softening pass — melts the pleats into the colour field. */
 .wb-soften {
@@ -9419,6 +9461,33 @@ body,
   background: var(--bg-inset);
   color: var(--accent);
   border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+/* Neumorphic theme user bubble: embossed and soft, matching the UI */
+[data-theme="neumorphic"] .bubble.user {
+  background: var(--bg) !important;
+  color: var(--fg) !important;
+  box-shadow: 5px 5px 10px rgba(163, 177, 198, 0.5), -5px -5px 10px rgba(255, 255, 255, 0.7) !important;
+  border: 1px solid var(--border-subtle);
+}
+[data-theme="neumorphic"] .bubble.user p,
+[data-theme="neumorphic"] .bubble.user strong,
+[data-theme="neumorphic"] .bubble.user em,
+[data-theme="neumorphic"] .bubble.user span {
+  color: var(--fg) !important;
+  -webkit-text-fill-color: var(--fg) !important;
+}
+[data-theme="neumorphic"] .bubble.user code,
+[data-theme="neumorphic"] .bubble.user pre {
+  background: var(--bg-sunken) !important;
+  color: var(--fg) !important;
+  -webkit-text-fill-color: var(--fg) !important;
+  border: 1px solid var(--border-subtle);
+}
+[data-theme="neumorphic"] .avatar.user {
+  background: var(--bg);
+  color: var(--accent);
+  box-shadow: 3px 3px 6px rgba(163, 177, 198, 0.5), -3px -3px 6px rgba(255, 255, 255, 0.7);
 }
 
 /* ====== REVEALER DECK & CARDS (Sleek unified drawer model) ====== */
@@ -9982,7 +10051,9 @@ body,
   align-items: center;
   gap: 10px;
   padding: 8px 12px;
-  height: 32px;
+  height: auto;
+  min-height: 32px;
+  max-height: 200px;
   background: var(--bg-sunken);
   border-bottom: 1px solid var(--border-subtle);
   box-sizing: border-box;
@@ -9994,7 +10065,8 @@ body,
 .revealer-card.notifications.fade-out {
   opacity: 0;
   transform: translateY(-8px);
-  height: 0;
+  max-height: 0;
+  min-height: 0;
   padding-top: 0;
   padding-bottom: 0;
   border-bottom-color: transparent;
@@ -10003,14 +10075,16 @@ body,
 
 @keyframes toast-slide-in {
   from {
-    height: 0;
+    max-height: 0;
+    min-height: 0;
     padding-top: 0;
     padding-bottom: 0;
     opacity: 0;
     transform: translateY(-4px);
   }
   to {
-    height: 32px;
+    max-height: 200px;
+    min-height: 32px;
     padding-top: 8px;
     padding-bottom: 8px;
     opacity: 1;
@@ -10052,7 +10126,9 @@ body,
 
 .notification-text {
   color: var(--fg);
-  font-family: var(--font-sans);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .toast-text {

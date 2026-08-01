@@ -2343,7 +2343,7 @@
       { kind: "cmd", icon: "ph-gear-six", label: "Open Settings", action: () => { closePalette(); openSettings(); } },
       { kind: "cmd", icon: "ph-brain", label: "Open Long-term memory", action: () => { closePalette(); openSettings(); setTimeout(() => $("#btn-mem-refresh")?.scrollIntoView({ behavior: "smooth" }), 80); } },
       { kind: "cmd", icon: "ph-arrow-counter-clockwise", label: "Regenerate last reply", action: () => { closePalette(); regenerateLast(); } },
-      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / soft / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
+      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / soft / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
       { kind: "cmd", icon: "ph-browser", label: "Toggle preview pane", action: () => { closePalette(); app.classList.toggle("preview-collapsed"); } },
       { kind: "cmd", icon: "ph-camera", label: "Screenshot preview", action: () => { closePalette(); screenshotPreview(); } },
       { kind: "cmd", icon: "ph-package", label: "Export project", action: () => { closePalette(); exportProjectZip(); } },
@@ -3113,14 +3113,14 @@
       const idle = Math.floor((Date.now() - lastActivity) / 1000);
       const total = Math.floor((Date.now() - started) / 1000);
       if (idle < 3) return;
-      // rotate phrase every 6 seconds of continuous idleness
+      
       if (Date.now() - lastRotate > 6000) {
         if (!pool.length) pool = idlePool.slice();
         currentIdle = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
         lastRotate = Date.now();
       }
-      span.textContent = `${currentIdle}… ${total}s`;
-    }, 1000);
+      span.innerHTML = `${currentIdle}… <span style="opacity: 0.6; margin-left: 4px;">${total}s</span>`;
+    }, 250);
 
      const resp = await fetch("/api/chat", {
       method: "POST",
@@ -4018,8 +4018,11 @@
       if (evt.name === "run_powershell") {
         appendTerminalText(evt.text || "", false);
       }
-      const cards = Array.from(toolStack.querySelectorAll(".tool-line.running"));
-      const card = cards.reverse().find(c => c.dataset.name === evt.name);
+      const running = Array.from(toolStack.querySelectorAll(".tool-line.running")).filter(c => c.dataset.name === evt.name);
+      // FIFO pairing: with parallel same-name calls, the Nth result belongs to
+      // the Nth started pill (backend emits start/result in call order).
+      const doneCount = Array.from(toolStack.querySelectorAll(".tool-line.done, .tool-line.err")).filter(c => c.dataset.name === evt.name).length;
+      const card = running[doneCount] || running[0];
       if (card) {
         const span = card.querySelector("span");
         if (span) span.textContent = (evt.text || "").slice(-120);
@@ -4067,17 +4070,18 @@
             if (evt.result && typeof evt.result.deleted === "number") w.deleted = evt.result.deleted;
           }
         } else if (evt.name === "run_powershell") {
-          const c = act.commands.filter(x => x.status === "running").pop();
+          const c = act.commands.find(x => x.status === "running");
           if (c) { c.status = st; c.duration = fmtToolDuration(c.t0); }
         } else if (evt.name && evt.name.startsWith("mcp_")) {
           const runningMcp = act.mcp.filter(x => x.status === "running");
-          const m = runningMcp.reverse().find(x => x.name === evt.name) || runningMcp[0];
+          const m = runningMcp.find(x => x.name === evt.name) || runningMcp[0];
           if (m) { m.status = st; m.duration = fmtToolDuration(m.t0); }
         }
         updateRevealerDeck(row);
       }
-      const cards = Array.from(toolStack.querySelectorAll(".tool-line.running"));
-      const card = cards.reverse().find(c => c.dataset.name === evt.name);
+      const running = Array.from(toolStack.querySelectorAll(".tool-line.running")).filter(c => c.dataset.name === evt.name);
+      const doneCount = Array.from(toolStack.querySelectorAll(".tool-line.done, .tool-line.err")).filter(c => c.dataset.name === evt.name).length;
+      const card = running[doneCount] || running[0];
       if (card) {
         const isErr = evt.result && evt.result.error;
         card.classList.remove("running");
@@ -5995,6 +5999,30 @@
           </span>
         </div>
       `;
+    } else if (kind === "delete") {
+      // Show WHICH file/folder is going away — "DELETE" alone is useless for
+      // approving. details.path is the full normalized path from the bridge.
+      const path = details.path || a.command || "(unknown path)";
+      const isDir = details.dir ? "folder" : "file";
+      const short = path.length > 110 ? path.slice(0, 107) + "..." : path;
+      html += `
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-warning"></i></span>
+          <span class="permission-item-text">Delete ${isDir}: <code>${esc(short)}</code></span>
+        </div>
+      `;
+    } else if (kind === "git") {
+      // Show the real git command line — the user shouldn't need to know
+      // which verbs are dangerous by heart; the card tells them exactly what
+      // will run (push/commit/checkout/reset...) so they can eyeball it.
+      const cmd = a.command || "git ...";
+      const shortCmd = cmd.length > 90 ? cmd.slice(0, 87) + "..." : cmd;
+      html += `
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-git-branch"></i></span>
+          <span class="permission-item-text">Run: <code>${esc(shortCmd)}</code></span>
+        </div>
+      `;
     } else if (kind === "powershell" || kind === "run_powershell" || kind === "command") {
       const cmd = a.command || "";
       const shortCmd = cmd.length > 50 ? cmd.slice(0, 47) + "..." : cmd;
@@ -6273,6 +6301,12 @@
         );
         try { loadModels().then(renderModelPill); } catch {}
       } else if (evt.type === "llama:auto_tuned") {
+        // Bridge fires this at the START of a /api/models/load (the tuner runs
+        // before the spawn). If the frontend already started that reload and is
+        // showing "reloading model (...)", don't stack an "auto-tuned" toast on
+        // top — it reads as "done" while the server is still spawning. The
+        // reload completion toast covers it.
+        if (state._reloading) return;
         // Bridge auto-tuned settings for a model load. Headline carries the
         // key numbers; the tuner notes are available behind an expandable
         // "why these settings?" details block.
@@ -6836,7 +6870,9 @@
     }
     const hint = $("#set-model-hint");
     if (hint) {
-      if (state.llamaRunning && state.loadedModel) {
+      if (state._reloading) {
+        hint.textContent = "reloading — new flags applying to llama-server…";
+      } else if (state.llamaRunning && state.loadedModel) {
         const name = state.loadedModel.split(/[\\/]/).pop();
         hint.textContent = `loaded: ${name}`;
       } else if (state.modelsDir) {
@@ -6879,14 +6915,13 @@
     fill("#set-batch", s.num_batch);
     fill("#set-thread", s.num_thread);
     fill("#set-predict", s.num_predict);
+    fill("#set-max-output", s.max_output_tokens);
     const kvSel = $("#set-kv");
     if (kvSel) kvSel.value = s.kv_cache_type || "q8_0";
     const kvVSel = $("#set-kvv");
     if (kvVSel) kvVSel.value = s.kv_cache_type_v || "";
     fill("#set-vram-reserve", s.vram_reserve_gb ?? 0.25);
     fill("#set-ram-reserve", s.safety_reserve_gb ?? 1.0);
-    const swHq4 = $("#sw-hybridq4");
-    if (swHq4) swHq4.classList.toggle("on", s.allow_hybrid_q4_kv !== false);
     // VRAM tier picker (auto-tune persistence — 0 = Manual)
     const vramSel = $("#set-vram-tier");
     if (vramSel) vramSel.value = String(s.vram_tier_gb ?? 0);
@@ -6906,7 +6941,7 @@
       let strat = (s.spec_strategy || "").trim().toLowerCase();
       if (s.enable_speculative === false) {
         strat = "off";
-      } else if (!["off", "ngram-mod", "draft-mtp"].includes(strat)) {
+      } else if (!["off", "ngram-mod", "draft-mtp", "dflash", "dspark"].includes(strat)) {
         strat = "ngram-mod";
       }
       specSel.value = strat;
@@ -6995,11 +7030,11 @@
       num_batch: n("#set-batch") || 512,
       num_thread: n("#set-thread"),
       num_predict: n("#set-predict"),
+      max_output_tokens: n("#set-max-output") || 8192,
       kv_cache_type: $("#set-kv")?.value || "q8_0",
       kv_cache_type_v: $("#set-kvv")?.value || "",
       vram_reserve_gb: Math.max(0, Number($("#set-vram-reserve")?.value || 0.25)),
       safety_reserve_gb: Math.max(0, Number($("#set-ram-reserve")?.value || 1.0)),
-      allow_hybrid_q4_kv: $("#sw-hybridq4")?.classList.contains("on") !== false,
       n_cpu_moe: Math.max(0, n("#set-ncmoe") || 0),
       n_ubatch: Math.max(0, n("#set-ubatch") || 0),
       n_parallel: Math.max(1, n("#set-parallel") || 1),
@@ -7054,6 +7089,15 @@
     if (changedLoadKeys.length && payload.model_path) {
       const tid = "reload-llama";
       toast(`reloading model (${changedLoadKeys.join(", ")})…`, "info", 60000, tid);
+      // Flip every "loaded" indicator to "reloading" for the duration of the
+      // spawn — a 16 GB model can take minutes, and the old code let the hint,
+      // status line and pill keep claiming "loaded" the whole time.
+      state._reloading = true;
+      const rname = String(payload.model_path).split(/[\\/]/).pop();
+      const hint = $("#set-model-hint");
+      if (hint) hint.textContent = `reloading ${rname} (${changedLoadKeys.join(", ")})…`;
+      renderStatus();
+      renderModelPill();
       try {
         await api("/api/models/load", {
           method: "POST", headers: {"Content-Type": "application/json"},
@@ -7062,6 +7106,11 @@
         toast("model reloaded with new settings", "ok", 2500, tid);
       } catch (e) {
         toast("reload failed: " + (e.message || e), "error", 6000, tid);
+        if (hint) hint.textContent = `reload failed — ${rname}`;
+      } finally {
+        state._reloading = false;
+        renderStatus();
+        renderModelPill();
       }
     }
     closeSettings();
@@ -7074,16 +7123,17 @@
   // lands on the next option instead of jumping straight to bright white.
   // nextTheme() handles the cycle and accepts whatever string is in settings
   // as the starting point.
-  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "soft", "light"];
+  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "soft", "light"];
   const THEME_ICONS = {
-    dark:     "ph ph-moon",
-    dim:      "ph ph-moon-stars",
-    retro:     "ph ph-sun-horizon",
-    aurora:   "ph ph-sparkle",
-    nebula:   "ph ph-planet",
-    operator: "ph ph-command",
-    soft:     "ph ph-cloud",
-    light:    "ph ph-sun",
+    dark:       "ph ph-moon",
+    dim:        "ph ph-moon-stars",
+    retro:      "ph ph-sun-horizon",
+    aurora:     "ph ph-sparkle",
+    nebula:     "ph ph-planet",
+    operator:   "ph ph-command",
+    neumorphic: "ph ph-drop-half",
+    soft:       "ph ph-cloud",
+    light:      "ph ph-sun",
   };
   function nextTheme(cur) {
     const idx = THEME_CYCLE.indexOf(cur);
@@ -7246,7 +7296,13 @@
       return `<span class="bl-line bl-err">${safe}</span>`;
     if (/\b(warn(ing)?|deprecated|unsupported|fallback|skipp?ing|retry|retrying)\b/i.test(line))
       return `<span class="bl-line bl-warn">${safe}</span>`;
-    if (/(server is listening|model loaded|all slots (are )?idle|slot released|starting the main loop)/i.test(line)
+    // llama.cpp prints "model loaded" when WEIGHTS are in memory — but the
+    // server is not ready yet (KV cache init + slot setup still follow). Paint
+    // it neutral/amber so it can't be read as "done", and say what's missing.
+    if (/\bmodel loaded\b/i.test(line) && !/(server is listening|all slots)/i.test(line)) {
+      return `<span class="bl-line bl-warn">${safe} <span class="bl-key">— weights in; server still initializing (KV cache / slots)…</span></span>`;
+    }
+    if (/(server is listening|all slots (are )?idle|slot released|starting the main loop)/i.test(line)
         || (/\b(GET|POST|HEAD|PUT|DELETE)\b/.test(line) && /\b(200|201|204)\b/.test(line)))
       return `<span class="bl-line bl-ok">${safe}</span>`;
     const m = line.match(/^([a-z][a-z0-9 _.\-]{1,38}?):(?:\s|$)/i);
@@ -7304,7 +7360,9 @@
     if (!statusLine) return;
     
     const isStreaming = !!state.streaming || stateStr === "streaming";
-    const statusText = stateStr || (isStreaming ? "streaming" : "idle");
+    const statusText = state._reloading
+      ? "reloading…"
+      : (stateStr || (isStreaming ? "streaming" : "idle"));
     
     const modelName = state.settings.model || "no model loaded";
     
@@ -7527,8 +7585,16 @@
 
   // Build an offscreen 540x540 card styled with the app's own font
   // (var(--font-sans)) so html2canvas captures it, not Claude's default.
-  // Fixed espresso palette so the shared image always looks premium
-  // regardless of the active theme.
+  // Colors are resolved from the ACTIVE theme's CSS tokens at render time
+  // (getComputedStyle — var() chains inside custom properties are already
+  // substituted), so the shared image matches whatever theme is selected.
+  // Fallbacks keep the espresso palette for any token that can't resolve.
+  function _themeColor(varName, fallback) {
+    try {
+      const v = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+      return v || fallback;
+    } catch { return fallback; }
+  }
   function _savingsCardEl(logoDataUrl) {
     const provider = CLOUD_PRICING[state.costProvider];
     const saved = calcCost(state.costProvider);
@@ -7539,31 +7605,55 @@
     const sessions = (state.chats && state.chats.order && state.chats.order.length) || 0;
     const providerLabel = provider ? provider.label : state.costProvider;
     const sinceStr = _fmtSince(state._savingsSince);
+    const cBg      = _themeColor("--bg", "#2B2722");
+    const cFg      = _themeColor("--fg", "#EAE1D0");
+    const cMuted   = _themeColor("--fg-muted", "#8A8170");
+    const cSubtle  = _themeColor("--fg-subtle", "#B5AB95");
+    const cFaint   = _themeColor("--fg-faint", "#6E6555");
+    const cAccent  = _themeColor("--accent", "#B5544A");
+    const cSuccess = _themeColor("--success", "#67C28C");
+    const cBorder  = _themeColor("--border-strong", "#3D372E");
+    const cQrBg    = "#FFFFFF"; // QR always needs a light field to scan — black-on-white is universal
+    const cQrFg    = "#0A0A0A";
+    let qrDataUrl = "";
+    try {
+      if (typeof qrcode === "function") {
+        const qr = qrcode(0, "M"); // 0 = auto-size, M = error tolerance
+        qr.addData("https://github.com/mkultraware/accuretta");
+        qr.make();
+        qrDataUrl = qr.createDataURL(6, 24); // 6px modules, 24px quiet zone — big source, downscales sharp
+      }
+    } catch { qrDataUrl = ""; }
     const wrap = document.createElement("div");
     wrap.style.cssText = "position:fixed;left:-10000px;top:0;z-index:-1;";
     wrap.innerHTML = `
-      <div style="width:540px;height:540px;box-sizing:border-box;background:#2B2722;border-radius:24px;padding:46px;display:flex;flex-direction:column;font-family:var(--font-sans);">
+      <div style="width:540px;height:540px;box-sizing:border-box;background:${cBg};border-radius:24px;padding:46px;display:flex;flex-direction:column;font-family:var(--font-sans);">
         <div style="display:flex;align-items:center;justify-content:space-between;">
           <div style="display:flex;align-items:center;gap:11px;">
             ${logoDataUrl
               ? `<img src="${logoDataUrl}" alt="" style="height:30px;width:auto;display:block;">`
-              : `<span style="width:14px;height:14px;border-radius:4px;background:#B5544A;display:inline-block;"></span>`}
-            <span style="color:#EAE1D0;font-size:18px;font-weight:500;letter-spacing:-0.01em;">accuretta</span>
+              : `<span style="width:14px;height:14px;border-radius:4px;background:${cAccent};display:inline-block;"></span>`}
+            <span style="color:${cFg};font-size:18px;font-weight:500;letter-spacing:-0.01em;">accuretta</span>
           </div>
-          <span style="color:#8A8170;font-size:13px;font-weight:500;letter-spacing:0.01em;">github.com/mkultraware/accuretta</span>
+          <span style="color:${cMuted};font-size:13px;font-weight:500;letter-spacing:0.01em;">github.com/mkultraware/accuretta</span>
         </div>
         <div style="flex:1;display:flex;flex-direction:column;justify-content:center;gap:2px;">
-          <span style="color:#8A8170;font-size:13px;font-weight:500;letter-spacing:0.18em;text-transform:uppercase;">saved by going local</span>
-          <span style="color:#67C28C;font-size:82px;font-weight:500;letter-spacing:-0.035em;line-height:1.05;">${savedStr}</span>
-          <span style="color:#B5AB95;font-size:17px;margin-top:8px;">vs running the same prompts on ${esc(providerLabel)}${sinceStr ? ` · since ${esc(sinceStr)}` : ""}</span>
+          <span style="color:${cMuted};font-size:13px;font-weight:500;letter-spacing:0.18em;text-transform:uppercase;">saved by going local</span>
+          <span style="color:${cSuccess};font-size:82px;font-weight:500;letter-spacing:-0.035em;line-height:1.05;">${savedStr}</span>
+          <span style="color:${cSubtle};font-size:17px;margin-top:8px;">vs running the same prompts on ${esc(providerLabel)}${sinceStr ? ` · since ${esc(sinceStr)}` : ""}</span>
         </div>
-        <div style="display:flex;border-top:1px solid #3D372E;padding-top:18px;margin-bottom:20px;">
-          <div style="flex:1;"><div style="color:#EAE1D0;font-size:19px;font-weight:500;">${tokens}</div><div style="color:#8A8170;font-size:12px;">tokens run</div></div>
-          <div style="flex:1;"><div style="color:#EAE1D0;font-size:19px;font-weight:500;">${sessions}</div><div style="color:#8A8170;font-size:12px;">sessions</div></div>
-          <div style="flex:1;"><div style="color:#EAE1D0;font-size:19px;font-weight:500;">$0.00</div><div style="color:#8A8170;font-size:12px;">sent to a cloud</div></div>
+        <div style="display:flex;border-top:1px solid ${cBorder};padding-top:18px;margin-bottom:20px;">
+          <div style="flex:1;"><div style="color:${cFg};font-size:19px;font-weight:500;">${tokens}</div><div style="color:${cMuted};font-size:12px;">tokens run</div></div>
+          <div style="flex:1;"><div style="color:${cFg};font-size:19px;font-weight:500;">${sessions}</div><div style="color:${cMuted};font-size:12px;">sessions</div></div>
+          <div style="flex:1;"><div style="color:${cFg};font-size:19px;font-weight:500;">$0.00</div><div style="color:${cMuted};font-size:12px;">sent to a cloud</div></div>
         </div>
-        <div style="display:flex;align-items:center;">
-          <span style="color:#6E6555;font-size:13px;">your model, your machine</span>
+        <div style="display:flex;align-items:center;justify-content:space-between;">
+          <span style="color:${cFaint};font-size:13px;">your model, your machine</span>
+          ${qrDataUrl
+            ? `<div style="background:${cQrBg};padding:10px;border-radius:12px;">
+                 <img src="${qrDataUrl}" alt="Scan me — github.com/mkultraware/accuretta" style="width:78px;height:78px;display:block;">
+               </div>`
+            : ""}
         </div>
       </div>`;
     return wrap;
@@ -7602,9 +7692,10 @@
     const wrap = _savingsCardEl(logoDataUrl);
     document.body.appendChild(wrap);
     const card = wrap.firstElementChild;
+    const cardBg = _themeColor("--bg", "#2B2722");
     try {
       const canvas = await window.html2canvas(card, {
-        backgroundColor: "#2B2722",
+        backgroundColor: cardBg,
         scale: 2,
         useCORS: true,
         logging: false,
@@ -7747,8 +7838,10 @@
     if (loadedPath) {
       const fullName = String(loadedPath).split(/[\\/]/).pop();
       const shortName = shortenModelName(fullName);
-      nameEl.textContent = shortName;
-      pill.title = `${fullName} — click to change model`;
+      nameEl.textContent = state._reloading ? `${shortName} …` : shortName;
+      pill.title = state._reloading
+        ? `${fullName} — reloading with new settings…`
+        : `${fullName} — click to change model`;
     } else if (state.models && state.models.length) {
       nameEl.textContent = "select model";
       pill.title = "Click to pick a model";
@@ -7827,6 +7920,9 @@
     if (hint) hint.textContent = "loading model into llama-server...";
     // Surface the backend output so the model-load progress is visible live.
     try { toggleConsolePane(true); activateTerminalTab("backend"); } catch {}
+    state._reloading = true;
+    renderStatus();
+    renderModelPill();
     try {
       // Tuner keys were already saved by applyAutoTune above — this persists
       // just the model selection itself.
@@ -7853,6 +7949,10 @@
       if (hint) hint.textContent = prev || "";
       toast("load failed: " + (e.message || e), "error", 6000);
       return false;
+    } finally {
+      state._reloading = false;
+      renderStatus();
+      renderModelPill();
     }
   }
 
@@ -8300,6 +8400,35 @@
 
   function wireEvents() {
     $("#btn-new-chat").addEventListener("click", newChat);
+    // Manual compaction: fold older turns into the session summary now. The
+    // auto-summarizer only fires near the context limit (0.85) — this lets the
+    // user compact at a comfortable utilization, especially at task boundaries
+    // on long chats, which keeps the model's working window roomy.
+    $("#btn-compact")?.addEventListener("click", async () => {
+      const cid = state.chatId;
+      if (!cid) { toast("No active chat.", "info", 1600); return; }
+      const btn = $("#btn-compact");
+      if (btn) { btn.disabled = true; btn.textContent = "…"; }
+      try {
+        const r = await fetch("/api/compact", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: cid }),
+        }).then(x => x.json());
+        if (r && r.error) { toast("Compact: " + r.error, "warn", 3000); }
+        else {
+          const n = (r && r.folded) || 0;
+          toast(n > 0
+            ? `Compacted ${n} message${n === 1 ? "" : "s"} into the session summary.`
+            : "Context is already compact — nothing to fold.", "ok", 2400);
+          state._ctxSource = "";
+          renderCtxGauge();
+        }
+      } catch (e) {
+        toast("Compact failed: " + e, "warn", 3000);
+      }
+      if (btn) { btn.disabled = false; btn.textContent = "compact"; }
+    });
     $("#btn-settings").addEventListener("click", openSettings);
     $("#btn-settings-m")?.addEventListener("click", openSettings);
     $("#btn-close-settings").addEventListener("click", closeSettings);
@@ -8549,7 +8678,6 @@
     $("#sw-thinking")?.addEventListener("click", e => e.currentTarget.classList.toggle("on"));
     // advanced llama-server toggles
     $("#sw-flash")?.addEventListener("click", e => e.currentTarget.classList.toggle("on"));
-    $("#sw-hybridq4")?.addEventListener("click", e => e.currentTarget.classList.toggle("on"));
     // (#set-spec-strategy is a <select>, no click handler needed)
     $("#sw-nowarmup")?.addEventListener("click", e => e.currentTarget.classList.toggle("on"));
     $("#sw-metrics")?.addEventListener("click", e => e.currentTarget.classList.toggle("on"));
@@ -8789,6 +8917,27 @@
     // Network: quick prompt insert for "scan this machine"
     $("#quick-netscan-mothership")?.addEventListener("click", () => {
       const tmpl = "Run a network snapshot on this machine (call network_snapshot). Then: list the active TCP connections grouped by process, flag anything that looks unusual (unknown processes, connections to suspicious IPs/domains, unexpected open ports), summarize the recent DNS queries, and tell me whether anything warrants a closer look.";
+      $("#toolbar-overflow-menu")?.classList.remove("open");
+      send({ prompt: tmpl, invisible: true });
+    });
+
+    // Blue team: read-only host triage / persistence sweep prompt inserts.
+    // Both are strictly read-only — the tools never modify anything, and the
+    // prompts say so explicitly so the model doesn't drift toward fixes.
+    $("#quick-health-check")?.addEventListener("click", () => {
+      const tmpl = "Run a read-only health check on THIS machine (do not modify anything): " +
+        "1) parse_event_logs for the system log and application log, last 24h — look for service installs (7045), crashes (1001), shutdowns (1074); " +
+        "2) parse_event_logs for the security log too, if it's readable (if the tool says it needs elevation, just note it and move on); " +
+        "3) persistence_hunt. " +
+        "Then give a short triage: what was installed or started recently, anything running from an unusual location, and a clear verdict on whether anything warrants a closer look.";
+      $("#toolbar-overflow-menu")?.classList.remove("open");
+      send({ prompt: tmpl, invisible: true });
+    });
+
+    $("#quick-persistence-hunt")?.addEventListener("click", () => {
+      const tmpl = "Run a read-only persistence hunt on THIS machine (call persistence_hunt, do not modify anything). " +
+        "Then go through the flagged items one by one and tell me: what it is, whether it's normal or suspicious, and why. " +
+        "End with a verdict: any persistence that shouldn't be there, or a clean bill of health.";
       $("#toolbar-overflow-menu")?.classList.remove("open");
       send({ prompt: tmpl, invisible: true });
     });

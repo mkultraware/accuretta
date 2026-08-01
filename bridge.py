@@ -32,6 +32,7 @@ from typing import Any
 import webbrowser
 import base64 as _b64
 import io as _io
+import ipaddress
 import socket
 import struct
 import ssl
@@ -545,9 +546,13 @@ DEFAULT_SETTINGS = {
     "rt_jitter": True,              # small random delays between recon requests (timing anti-fingerprint)
     "allow_web_preview": True,
     # memory / performance
-    "kv_cache_type": "q8_0",        # K cache: q4_0 | q8_0 | f16 — lower = less VRAM, slightly lower quality
-    "kv_cache_type_v": "",          # V cache: "" = same as K. Split K/V is near-free savings: K is the
-                                    # sensitive half (softmax error propagation), V tolerates 4-bit fine.
+    "kv_cache_type": "q8_0",        # K cache: q4_0 | q8_0 | f16 — lower = less VRAM, slightly lower quality.
+                                    # Policy (user-confirmed): auto-tune stays q8_0 (or f16 with headroom);
+                                    # q4_0 only as a ≤12 GB VRAM escape hatch.
+    "kv_cache_type_v": "",          # V cache: "" = same as K (mirrored at spawn). Measured on this machine
+                                    # (Qwen3.6-27B, llama-perplexity): q8_0/q8_0 is +0.2% PPL (lossless);
+                                    # q8_0/q4_0 costs +1.6% AND hits a slow mixed-dtype path — the tuner
+                                    # never emits split K/V; manual override only.
     # IDE preview extras (composer toolbar toggles)
     "use_tailwind_cdn": False,      # inject Tailwind Play CDN into preview + ask model to use tailwind classes
     "ide_multifile": False,         # tell the model to emit a small folder structure (index.html / style.css / script.js / assets/)
@@ -586,11 +591,6 @@ DEFAULT_SETTINGS = {
     "vram_reserve_gb": 0.25,        # Minimal GPU-side safety (Windows compositor/desktop spikes on the same card).
                                     # Shaved off the auto-tune VRAM budget only; 0 = give the LLM everything
                                     # (the ~8% headroom still guards CUDA workspace + alignment).
-    "allow_hybrid_q4_kv": True,     # Hybrid SSM/DeltaNet models (Qwen3.5/3.6, Qwen3-Next) carry KV on
-                                    # only ~1/4 of layers; community benchmarks report q4_0 KV token-
-                                    # identical to f16 there (llama.cpp #21385) — let the tuner use it
-                                    # for ~2x context. Dense models never get auto-q4_0 except as the
-                                    # starved-context escape hatch.
     "ctx_checkpoints": 8,           # --ctx-checkpoints N: rolling snapshots of the conversation's KV state,
                                     # so hybrid/SWA models (Qwen 3.5/3.6, Qwen3-Next) can restore a cached
                                     # prefix instead of re-prefilling every turn (~45x TTFT win, llama.cpp
@@ -611,9 +611,13 @@ DEFAULT_SETTINGS = {
     "spec_strategy": "ngram-mod",   # Speculative decoding strategy. One of:
                                     #   "off"        — no speculative decoding (best for unusual models that confuse the drafter)
                                     #   "ngram-mod"  — n-gram modular draft, works on any model (default, current behavior)
-                                    #   "draft-mtp"  — uses the model's built-in MTP heads (Qwen 3.5/3.6, DeepSeek V3/R1).
-                                    #                  ~1.85x decode speedup on MTP-capable models; fails at startup on others.
+                                    #   "draft-mtp"  — uses the model's built-in MTP heads (Qwen 3.5/3.6, DeepSeek V3/R1),
+                                    #                  chained with n-gram for back-up drafts. ~1.85x decode speedup on
+                                    #                  MTP-capable models; fails at startup on others.
                                     #                  Requires llama.cpp built from master after 2026-05-16 (PR #22673).
+                                    #   "dflash"/"dspark" — self-speculative (drafts from the model's own hidden states,
+                                    #                  llama.cpp #21930). Qwen3/Llama-4-family wins; skipped on builds
+                                    #                  without the flag.
     "no_warmup": False,             # --no-warmup. Saves a few seconds at startup.
     "enable_metrics": False,        # --metrics. Exposes Prometheus metrics on /metrics. Off by default.
     "llama_extra_args": "",         # Free-form extra flags appended verbatim, e.g. "--alias my-model --rope-scaling linear".
@@ -898,7 +902,7 @@ def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: s
         "stream": False, "temperature": 0.2, "max_tokens": 1024,
     }
     try:
-        resp = llama_post("/v1/chat/completions", payload, timeout=600)
+        resp = llama_post("/v1/chat/completions", payload, timeout=_SUMMARY_CALL_TIMEOUT_S)
         txt = ((resp.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
         return txt or old_summary
     except Exception:
@@ -917,13 +921,22 @@ def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: s
 # llama-server makes every subsequent round eat a 90s timeout mid-turn.
 _SUMMARY_FAIL_BACKOFF_S = 180
 _summary_last_fail_by_chat: dict[str, float] = {}
+# Hard cap on ONE summarizer call. The summarizer runs synchronously inside
+# the turn — a 10-minute timeout would freeze the user's turn while a wedged
+# server burns. 90s is plenty for a 1024-token summary; on failure the backoff
+# above blocks the retry storm and the fold is retried later.
+_SUMMARY_CALL_TIMEOUT_S = 90
 
 
-def _maybe_roll_summary(chat: dict, ctx_limit: int) -> bool:
+def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False) -> bool:
     """Token-aware: fold the oldest un-kept turns into chat['rolling_summary']
     ONLY when the conversation actually approaches the context window. Short
     sessions keep full detail; we never spend a summary call prematurely.
-    Mutates chat in place; returns True if the summary advanced."""
+    `force=True` skips the fill gate entirely — used by manual compaction
+    (compact_history tool / /api/compact) so the user or the model can fold at
+    a comfortable 60-80% utilization before the auto-trigger (0.85) turns the
+    fold into an emergency. Mutates chat in place; returns True if the summary
+    advanced."""
     msgs = chat.get("messages", [])
     through = int(chat.get("summary_through", 0) or 0)
     tail = msgs[through:]
@@ -938,13 +951,14 @@ def _maybe_roll_summary(chat: dict, ctx_limit: int) -> bool:
     # bad char estimate. Only fall back to the char count before a chat has run
     # a turn (no real number exists yet).
     real_fill = _last_prompt_tokens_by_chat.get(chat_id, 0)
-    if real_fill > 0:
-        if real_fill <= ctx_limit * _SUMMARY_TRIGGER_FRAC:
-            return False  # plenty of headroom — don't summarize yet
-    else:
-        tail_tokens = sum(_count_msg_tokens(m) for m in tail)
-        if tail_tokens <= ctx_limit * _SUMMARY_TRIGGER_FRAC:
-            return False  # plenty of headroom — don't summarize yet
+    if not force:
+        if real_fill > 0:
+            if real_fill <= ctx_limit * _SUMMARY_TRIGGER_FRAC:
+                return False  # plenty of headroom — don't summarize yet
+        else:
+            tail_tokens = sum(_count_msg_tokens(m) for m in tail)
+            if tail_tokens <= ctx_limit * _SUMMARY_TRIGGER_FRAC:
+                return False  # plenty of headroom — don't summarize yet
     # Fold oldest turns until the remaining RAW tail is ~KEEP_FRAC of ctx. Walk
     # newest-first, keeping recent turns until the keep budget fills; the rest
     # (older) get folded into the summary.
@@ -1100,6 +1114,57 @@ def _mid_turn_fold(chat_id: str, conversation: list[dict], start_len: int,
             rebuilt.append(out)
     return {"conversation": rebuilt, "start_len": len(rebuilt),
             "folded": new_through - old_through}
+
+
+def _compact_chat(chat_id: str, force: bool = True) -> dict:
+    """Manually fold a chat's oldest turns into its rolling summary, regardless
+    of how close the context is to the auto-trigger (0.85). Shared by the
+    compact_history model tool and the /api/compact endpoint. Folding at
+    60-80% utilization keeps the model's effective attention span high (SOTA
+    harness guidance: compaction at task boundaries beats waiting for the
+    overflow emergency) — the user or model decides when the moment is.
+    Returns stats, or {"error": ...} when there's nothing to fold."""
+    if not chat_id:
+        return {"error": "no chat_id"}
+    chats = get_chats()
+    chat = chats.get("chats", {}).get(chat_id)
+    if not chat:
+        return {"error": "chat not found"}
+    chat.setdefault("id", chat_id)
+    old_through = int(chat.get("summary_through", 0) or 0)
+    msgs = chat.get("messages", [])
+    if len(msgs) - old_through <= _SUMMARY_MIN_KEEP + 2:
+        return {"note": "history is already compact — nothing left to fold",
+                "summary_through": old_through, "folded": 0}
+    ctx_limit = _llama_props_ctx() or int(get_settings().get("num_ctx") or 32768)
+    if not _maybe_roll_summary(chat, ctx_limit, force=force):
+        return {"error": "compaction did not run (summarizer call failed or no foldable history)",
+                "summary_through": old_through, "folded": 0}
+    save_json(CHATS_FILE, chats)
+    new_through = int(chat.get("summary_through", 0) or 0)
+    return {"folded": new_through - old_through, "summary_through": new_through,
+            "note": "older turns condensed into the session summary"}
+
+
+def tool_compact_history(args: dict) -> dict:
+    """Model-driven compaction: fold the oldest turns into the rolling summary
+    now. The auto-trigger only fires near the context limit (0.85 fill) — by
+    then the fold is an emergency and the model has already been working with
+    a cramped window for a while. On long tasks, call this proactively at a
+    task boundary / after a long stretch of tool work to condense history back
+    to the essentials. The summary keeps exact paths, error codes and fixes;
+    nothing is lost, only condensed."""
+    cid = _get_current_chat()
+    if not cid:
+        return {"error": "no active chat for compaction"}
+    out = _compact_chat(cid, force=True)
+    # Broadcast so the UI gauge/pill reflects the fold immediately.
+    try:
+        broadcast_event({"type": "summary_folded", "chat_id": cid,
+                         "folded": out.get("folded", 0)})
+    except Exception:
+        pass
+    return out
 
 
 def tool_pin_note(args: dict) -> dict:
@@ -2116,6 +2181,17 @@ _SOFT_PROMPT_KINDS = {"delete", "registry", "launch"}
 _SOFT_COMMAND_KINDS = {"powershell", "sandbox", "session", "git"}
 _MCP_SOFT_BLOCK = re.compile(r"delete|remove|drop|destroy|terminate|unregister", re.IGNORECASE)
 
+# git verbs that only READ the repo — the only ones soft mode may run freely.
+# Everything else (add, commit, push, pull, checkout, reset, restore, merge,
+# rebase, tag, stash, clean, rm, clone, init...) still prompts, because a
+# wrong push/commit/checkout wrecks history and the user can't be expected to
+# keep the git verb table in their head. The git tools pass their argv in
+# details, so request_approval can tell read from write without regex guesswork.
+_GIT_READONLY_VERBS = {
+    "status", "log", "diff", "show", "remote", "rev-parse",
+    "ls-files", "ls-tree", "grep", "blame",
+}
+
 
 def _approval_mode() -> str:
     """soft|medium|hard. Legacy fallback: auto_approve_write -> medium/hard."""
@@ -2215,7 +2291,16 @@ def request_approval(title: str, command: str, details: dict | None = None, time
                     if not _MCP_SOFT_BLOCK.search(kind):    # playwright runs free; delete-ish MCP still prompts
                         return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
                 elif kind in _SOFT_COMMAND_KINDS:           # shell-ish: deletions still prompt
-                    if not _is_destructive_command(command or ""):
+                    if kind == "git":
+                        # git read verbs (status/log/diff/...) may run free in
+                        # soft mode; ANY mutating git verb prompts — a wrong
+                        # push/commit/checkout rewrites history, which the
+                        # destructive regex can't catch for every verb.
+                        argv0 = (details.get("argv") or [None])[0] if isinstance(details.get("argv"), list) else None
+                        if isinstance(argv0, str) and argv0 in _GIT_READONLY_VERBS:
+                            if not _is_destructive_command(command or ""):
+                                return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
+                    elif not _is_destructive_command(command or ""):
                         return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
                 elif kind:
                     return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
@@ -3922,18 +4007,262 @@ $dns = Get-DnsClientCache |
     Select-Object -First 60 -Property Entry, Name, Type, TimeToLive
 $procs = @{}
 $ids = @($conns.OwningProcess) + @($udp.OwningProcess) | Sort-Object -Unique
+# One CIM pass for all pids (command lines + paths), then one signature pass
+# per UNIQUE path (capped; hashing big exes is the slow part).
+$cmdlines = @{}
+$pidToPath = @{}
+try {
+    $cim = Get-CimInstance Win32_Process | Where-Object { $ids -contains $_.ProcessId }
+    foreach ($p in $cim) {
+        $cmdlines[[string]$p.ProcessId] = [string]$p.CommandLine
+        if ($p.ExecutablePath) { $pidToPath[[string]$p.ProcessId] = [string]$p.ExecutablePath }
+    }
+} catch {}
+$sigCache = @{}
+$sigCount = 0
+$sigSw = [System.Diagnostics.Stopwatch]::StartNew()
+foreach ($path in @($pidToPath.Values | Sort-Object -Unique)) {
+    if ($sigCount -ge 20 -or $sigSw.ElapsedMilliseconds -gt 12000) { break }
+    $vi = $null
+    try { $vi = (Get-Item -LiteralPath $path -ErrorAction SilentlyContinue).VersionInfo } catch {}
+    $signed = $null
+    if ($vi) {
+        try {
+            $len = (Get-Item -LiteralPath $path -ErrorAction SilentlyContinue).Length
+            if ($len -lt 500MB) {
+                $sigCount++
+                $sig = Get-AuthenticodeSignature -LiteralPath $path -ErrorAction SilentlyContinue
+                if ($sig -and $sig.Status -eq 'Valid') { $signed = $true }
+                elseif ($sig -and $sig.Status -eq 'NotSigned') { $signed = $false }
+            }
+        } catch {}
+    }
+    $sigCache[$path] = @{
+        company = if ($vi -and $vi.CompanyName) { [string]$vi.CompanyName } else { '' }
+        desc = if ($vi -and $vi.FileDescription) { [string]$vi.FileDescription } else { '' }
+        signed = $signed
+    }
+}
 foreach ($procId in $ids) {
     if (-not $procId) { continue }
-    $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
-    if ($p) { $procs[[string]$procId] = $p.ProcessName }
+    $path = $pidToPath[[string]$procId]
+    $meta = if ($path -and $sigCache.ContainsKey($path)) { $sigCache[$path] } else { $null }
+    $procs[[string]$procId] = @{
+        name = (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName
+        path = $path
+        company = $(if ($meta) { $meta.company } else { '' })
+        desc = $(if ($meta) { $meta.desc } else { '' })
+        signed = $(if ($meta) { $meta.signed } else { $null })
+        cmdline = $(if ($cmdlines[[string]$procId]) { $cmdlines[[string]$procId] } else { '' })
+    }
 }
-@{
+@{ 
     tcp = @($conns)
     udp = @($udp)
     dns_cache = @($dns)
     processes = $procs
 } | ConvertTo-Json -Depth 5 -Compress
 """
+
+# ---- network snapshot enrichment -------------------------------------------
+# The raw snapshot only carries process NAMES ("EADesktop", "svchost"). Models
+# hallucinate identities from names alone — e.g. "EADesktop" reads like "ESET
+# antivirus" to an LLM. These tables give the model ground truth so it never
+# has to guess what a process or endpoint is.
+_NET_KNOWN_PROCESSES = {
+    # Windows core (case-insensitive match)
+    "svchost": "Windows service host — normal; check which service via pid/port",
+    "csrss": "Windows Client/Server Runtime — OS core, normal",
+    "lsass": "Windows Local Security Authority — OS core, normal",
+    "winlogon": "Windows logon host — OS core, normal",
+    "services": "Windows Service Control Manager — OS core, normal",
+    "smss": "Windows Session Manager — OS core, normal",
+    "dwm": "Desktop Window Manager — normal",
+    "explorer": "Windows Explorer — normal",
+    "runtimebroker": "Windows runtime broker — normal",
+    "searchindexer": "Windows Search indexer — normal",
+    "sihost": "Windows Shell Infrastructure Host — normal",
+    "taskhostw": "Windows task host — normal",
+    "fontdrvhost": "Windows font driver host — normal",
+    "ctfmon": "Windows text input framework — normal",
+    "conhost": "Windows console host — normal",
+    "msmpeng": "Microsoft Defender antivirus engine — normal",
+    "msmpsvc": "Microsoft Defender service — normal",
+    "sense": "Microsoft Defender for Endpoint — normal",
+    "spoolsv": "Windows print spooler — normal",
+    "wmiPrvSE": "Windows Management Instrumentation provider — normal",
+    "audiodg": "Windows audio device graph — normal",
+    "dllhost": "Windows COM surrogate — normal",
+    "werfault": "Windows Error Reporting — normal",
+    "dwm.exe": "Desktop Window Manager — normal",
+    "msteams": "Microsoft Teams — normal",
+    "onedrive": "Microsoft OneDrive — normal",
+    # Browsers
+    "msedge": "Microsoft Edge browser — normal",
+    "chrome": "Google Chrome browser — normal",
+    "firefox": "Mozilla Firefox browser — normal",
+    "brave": "Brave browser — normal",
+    "opera": "Opera browser — normal",
+    # Security products
+    "ekrn": "ESET security kernel — antivirus, normal",
+    "egui": "ESET GUI — antivirus, normal",
+    "MBAMService": "Malwarebytes service — normal",
+    "mbamtray": "Malwarebytes tray — normal",
+    "360tray": "360 Security tray — normal",
+    "kaspersky": "Kaspersky — normal",
+    "avp": "Kaspersky engine — normal",
+    "norton": "Norton Security — normal",
+    # Game launchers / publishers — the "EADesktop misread" class
+    "eadesktop": "EA Desktop — Electronic Arts' game launcher, NOT antivirus",
+    "eabackgroundservice": "EA background service — normal",
+    "ea anticheat": "EA AntiCheat — game protection, normal",
+    "epicgameslauncher": "Epic Games Launcher — normal",
+    "steam": "Steam — Valve's game client, normal",
+    "steamwebhelper": "Steam web helper — normal",
+    "galaxyclient": "GOG Galaxy — normal",
+    "battle.net": "Battle.net — Blizzard launcher, normal",
+    "riotclientservices": "Riot Client — normal",
+    "xboxappservices": "Xbox app services — normal",
+    "gaming services": "Xbox Gaming Services — normal",
+    "ubisoft connect": "Ubisoft Connect — normal",
+    "playnite": "Playnite game library — normal",
+    "razer central": "Razer Central — normal",
+    "nvidia web helper": "NVIDIA Web Helper — normal",
+    "nvcontainer": "NVIDIA container — normal",
+    "nvbackend": "NVIDIA backend — normal",
+    # Dev / cloud / remote tools
+    "node": "Node.js runtime — normal",
+    "python": "Python interpreter — normal",
+    "code": "Visual Studio Code — normal",
+    "docker": "Docker Desktop — normal",
+    "git": "Git — normal",
+    "ngrok": "ngrok tunnel — dev tool, normal",
+    "cloudflared": "Cloudflare tunnel — dev tool, normal",
+    "teamviewer": "TeamViewer remote access — normal",
+    "anydesk": "AnyDesk remote access — normal",
+    "rustdesk": "RustDesk remote access — normal",
+    "discord": "Discord — chat app, normal",
+    "slack": "Slack — chat app, normal",
+    "telegram": "Telegram — chat app, normal",
+    "whatsapp": "WhatsApp desktop — normal",
+    "zoom": "Zoom — meetings, normal",
+    "spotify": "Spotify — normal",
+    "obs64": "OBS Studio — streaming, normal",
+    "videoconference": "conferencing app — normal",
+    "dropbox": "Dropbox — normal",
+    "boxsync": "Box Sync — normal",
+    "citrix": "Citrix Workspace — normal",
+    "vpnui": "VPN UI — normal",
+    "openvpn": "OpenVPN — normal",
+    "wireguard": "WireGuard — normal",
+    "mullvad-daemon": "Mullvad VPN — normal",
+    "ipsec": "IPsec service — normal",
+    "lldaemon": "Logi tech daemon — normal",
+    "lgcentral": "Logitech G HUB — normal",
+    "synapse": "Razer Synapse — normal",
+    "icue": "Corsair iCUE — normal",
+    "osu": "osu! game — normal",
+    "java": "Java runtime — normal",
+    "dotnet": ".NET runtime — normal",
+    "powershell": "PowerShell — normal",
+    "pwsh": "PowerShell 7 — normal",
+    "cmd": "Command Prompt — normal",
+    "windbg": "Windows debugger — normal",
+    "procmon": "Process Monitor — normal",
+    "wireshark": "Wireshark — normal",
+    "nmap": "Nmap scanner — recon tool, normal",
+    "sqlmap": "sqlmap — recon tool, normal",
+    "metasploit": "Metasploit framework — normal",
+    "burp": "Burp Suite — normal",
+    "ffmpeg": "FFmpeg — normal",
+    "7z": "7-Zip — normal",
+    "winrar": "WinRAR — normal",
+    "pcman": "PCMan — normal",
+    "telemetry": "telemetry service — normal",
+}
+
+# Port → well-known service, so the model doesn't have to guess 443 = HTTPS.
+_NET_PORT_SERVICES = {
+    20: "FTP-data", 21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
+    67: "DHCP", 68: "DHCP", 80: "HTTP", 110: "POP3", 123: "NTP", 135: "RPC",
+    137: "NetBIOS", 138: "NetBIOS", 139: "NetBIOS", 143: "IMAP", 161: "SNMP",
+    389: "LDAP", 443: "HTTPS", 445: "SMB", 465: "SMTPS", 514: "Syslog",
+    587: "SMTP-submission", 636: "LDAPS", 853: "DoT (DNS over TLS)",
+    993: "IMAPS", 995: "POP3S", 1433: "MSSQL", 1900: "SSDP", 3074: "Xbox Live",
+    3306: "MySQL", 3389: "RDP", 5060: "SIP", 5353: "mDNS", 5355: "LLMNR",
+    5432: "PostgreSQL", 5985: "WinRM", 5986: "WinRM-TLS", 6379: "Redis",
+    8080: "HTTP-alt", 8443: "HTTPS-alt", 27015: "Steam/Game", 27036: "Steam P2P",
+    45000: "game (Steam), auth port", 47984: "Steam", 47989: "Steam",
+}
+
+# Well-known remote IP ranges so "is this Microsoft/Google/random-VPS" has an
+# answer beyond the model's priors. Kept to stable, commonly-seen blocks.
+_NET_KNOWN_RANGES = (
+    ("Microsoft", (
+        "13.104.0.0/14", "13.107.0.0/16", "20.0.0.0/8", "40.0.0.0/8",
+        "51.0.0.0/8", "52.0.0.0/8", "52.96.0.0/12", "52.112.0.0/14",
+        "52.120.0.0/14", "168.61.0.0/16", "20.190.128.0/18",
+    )),
+    ("Google", (
+        "8.8.8.0/24", "8.8.4.0/24", "142.250.0.0/15", "172.217.0.0/16",
+        "216.58.0.0/16", "35.0.0.0/8",
+    )),
+    ("AWS", ("3.0.0.0/8", "13.32.0.0/15", "15.0.0.0/8", "18.0.0.0/8",
+             "52.94.0.0/15", "54.0.0.0/8")),
+    ("Cloudflare", ("104.16.0.0/13", "172.64.0.0/13", "1.1.1.0/24",
+                    "162.159.0.0/16", "104.17.0.0/16", "173.245.48.0/20")),
+    ("Akamai", ("23.32.0.0/11", "104.64.0.0/10", "184.24.0.0/13")),
+    ("OpenAI", ("170.63.0.0/16", "23.235.32.0/20")),
+    ("Valve/Steam", ("155.133.0.0/16", "162.254.192.0/21", "208.64.200.0/22")),
+    ("Discord", ("162.159.128.0/18", "104.16.0.0/13")),
+    ("Meta", ("157.240.0.0/16", "31.13.24.0/21", "69.171.224.0/19")),
+    ("Netflix", ("45.57.128.0/17", "64.120.128.0/17")),
+    ("Apple", ("17.0.0.0/8", "144.178.0.0/16", "103.119.240.0/22")),
+    ("Epic Games", ("34.199.0.0/16", "54.148.0.0/15")),
+    ("Riot Games", ("192.64.0.0/16", "104.160.128.0/20")),
+    ("Blizzard", ("24.105.0.0/16", "137.221.0.0/16")),
+    ("Ubisoft", ("63.35.0.0/16", "15.188.0.0/16")),
+    ("GitHub", ("140.82.0.0/16", "185.199.108.0/22")),
+)
+
+# Keep per-machine cost bounded: unique process paths only, and only the first
+# few thousand bytes of any command line (models don't need argv[50]).
+_NETSNAP_MAX_CMDLINE = 300
+
+
+def _netsnap_process_label(name: str, company: str) -> str:
+    """Canonical label for a process name (case-insensitive), plus company
+    fallback. Returns "" when unknown — the model keeps raw evidence then."""
+    if not name:
+        return ""
+    key = name.strip().lower()
+    label = _NET_KNOWN_PROCESSES.get(key)
+    if label:
+        return label
+    comp = (company or "").strip()
+    if not comp or len(comp) > 48:
+        return ""
+    return f"vendor: {comp}"
+
+
+def _netsnap_ip_hint(ip: str) -> str:
+    """Who owns this IP? Matches against well-known ranges, returns '' if
+    unknown (public/unassigned) or 'private/LAN' for RFC1918/link-local."""
+    if not ip or ip in ("0.0.0.0", "::", "*", ""):
+        return ""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ""
+    if addr.is_private or addr.is_loopback or addr.is_link_local:
+        return "private/LAN"
+    if addr.is_multicast or addr.is_reserved:
+        return ""
+    for vendor, cidrs in _NET_KNOWN_RANGES:
+        for cidr in cidrs:
+            if ipaddress.ip_address(ip) in ipaddress.ip_network(cidr):
+                return vendor
+    return ""
 
 
 def _netsnap_debug_dump(stdout: str, stderr: str, exit_code=None, reason: str = "") -> str:
@@ -3957,10 +4286,177 @@ def _netsnap_debug_dump(stdout: str, stderr: str, exit_code=None, reason: str = 
         return f"<debug-dump failed: {e}>"
 
 
+# ---- host event log queries (blue team) ------------------------------------
+# Live Get-WinEvent triage for the four highest-signal event families:
+#  4624/4625  logon success/failure (Security — needs admin to read)
+#  4688       process creation (Security — needs admin)
+#  4698       scheduled task created (Security — needs admin)
+#  7045       service installed (System — readable by standard users)
+#  1074/6005/6006  System boot/shutdown/restart (System — readable)
+#  1001       crash (Application — readable)
+# The script reads whatever it can and marks each log with its access status so
+# the tool can tell the model "Security log not readable — run elevated" while
+# still delivering the System/Application half of the triage.
+_EVTLOG_PS = r'''
+$ErrorActionPreference = 'SilentlyContinue'
+$log = [string]$args[0]
+$hours = [int]$args[1]
+$limit = [int]$args[2]
+$ids = @(4624, 4625, 4688, 4698, 7045, 1074, 6005, 6006, 1001)
+$since = (Get-Date).AddHours(-$hours)
+$out = @()
+try {
+    # Probe access first: a plain read throws 'unauthorized operation' when the
+    # log ACL blocks us (FilterHashtable silently returns zero events instead,
+    # which would masquerade as 'no events' — bad triage data).
+    $null = Get-WinEvent -LogName $log -MaxEvents 1 -ErrorAction Stop
+} catch {
+    $msg = "$($_.Exception.Message)"
+    $status = if ($msg -match 'unauthorized|Access is denied') { 'denied' } else { 'error' }
+    [Console]::WriteLine('{"log":"' + $log + '","access":"' + $status + '","events":[]}')
+    exit 0
+}
+try {
+    $events = Get-WinEvent -FilterHashtable @{ LogName = $log; StartTime = $since } -MaxEvents 5000 -ErrorAction Stop
+} catch {
+    $msg = "$($_.Exception.Message)"
+    if ($msg -match 'No events were found') {
+        [Console]::WriteLine('{"log":"' + $log + '","access":"ok","events":[]}')
+    } else {
+        $status = if ($msg -match 'Access is denied') { 'denied' } else { 'error' }
+        [Console]::WriteLine('{"log":"' + $log + '","access":"' + $status + '","events":[]}')
+    }
+    exit 0
+}
+foreach ($e in $events) {
+    if ($ids -and ($ids -notcontains $e.Id)) { continue }
+    $msg = [string]$e.Message
+    if ($msg.Length -gt 900) { $msg = $msg.Substring(0, 900) + '…' }
+    $out += @{
+        id = $e.Id
+        time = $e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+        provider = [string]$e.ProviderName
+        msg = $msg
+    }
+    if ($out.Count -ge $limit) { break }
+}
+[Console]::WriteLine((ConvertTo-Json @{ log = $log; access = 'ok'; events = $out } -Compress -Depth 4))
+'''
+
+
+# ---- persistence hunt (blue team) -------------------------------------------
+# Read-only sweep of every place software hides to survive a reboot:
+#  - Run / RunOnce keys (HKLM + HKCU, incl. Wow6432Node)
+#  - Startup folders (user + all users)
+#  - Scheduled tasks (created recently, or whose action lives in a suspicious
+#    folder like Temp/Downloads/AppData)
+#  - Services whose binary lives outside C:\Windows (a service that launches
+#    from Temp or a user folder is the classic persistence move)
+#  - WMI event subscriptions (__EventFilter/__EventConsumer — almost nothing
+#    legitimate uses these; backdoors love them)
+# The script returns raw data; the Python side does the known-good filtering
+# so the model sees a short list of "worth a look" items, not a wall of noise.
+_PERSIST_PS = r'''
+$ErrorActionPreference = 'SilentlyContinue'
+$script:items = @()
+function Add-Item($cat, $loc, $name, $value) {
+    $script:items += @{ cat = $cat; loc = $loc; name = $name; value = $value }
+}
+# --- Run/RunOnce keys ---
+$runKeys = @(
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run',
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce',
+    'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run',
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
+)
+foreach ($k in $runKeys) {
+    try {
+        $props = Get-ItemProperty -Path $k -ErrorAction Stop
+        foreach ($p in $props.PSObject.Properties) {
+            if ($p.Name -match '^(PSPath|PSParentPath|PSChildName|PSDrive|PSProvider)$') { continue }
+            $v = [string]$p.Value
+            if ($v.Length -gt 300) { $v = $v.Substring(0, 300) + '…' }
+            Add-Item 'run_key' $k $p.Name $v
+        }
+    } catch {}
+}
+# --- Startup folders: resolve the real .lnk target for ground truth ---
+$startupDirs = @(
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup",
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
+)
+$shell = New-Object -ComObject WScript.Shell
+foreach ($d in $startupDirs) {
+    try {
+        foreach ($f in Get-ChildItem -LiteralPath $d -File -ErrorAction Stop) {
+            $target = $f.FullName
+            try { $target = $shell.CreateShortcut($f.FullName).TargetPath } catch {}
+            Add-Item 'startup_file' $d $f.Name $target
+        }
+    } catch {}
+}
+# --- Scheduled tasks: action path in a suspicious folder. NOT AppData/
+# ProgramData — those are where legitimate updaters and Defender live.
+$suspectParts = @('\Temp\', '\Downloads\', '\Desktop\', '$Recycle.Bin', '\Windows\Temp\')
+$cutoff = (Get-Date).AddDays(-30)
+foreach ($t in Get-ScheduledTask -ErrorAction Stop) {
+    $path = ''
+    foreach ($a in $t.Actions) {
+        if ($a.Execute) { $path = [string]$a.Execute; break }
+    }
+    if (-not $path) { continue }
+    $isSuspect = $false
+    foreach ($s in $suspectParts) { if ($path -match [regex]::Escape($s)) { $isSuspect = $true; break } }
+    if (-not $isSuspect) { continue }
+    Add-Item 'scheduled_task' ($t.TaskPath + $t.TaskName) $path ($t.State.ToString())
+}
+# --- Services launching from outside C:\Windows / Program Files (incl. x86) ---
+foreach ($s in Get-CimInstance Win32_Service -ErrorAction Stop) {
+    $bin = [string]$s.PathName
+    if (-not $bin) { continue }
+    if ($bin -match '^"?C:\\Windows\\' -or $bin -match '^"?C:\\Program Files( \(x86\))?\\' -or $bin -match '^"?C:\\ProgramData\\Microsoft\\Windows Defender\\' -or $bin -match '^\\SystemRoot\\') { continue }
+    if ($bin.Length -gt 300) { $bin = $bin.Substring(0, 300) + '…' }
+    Add-Item 'service' $s.Name $s.State $bin
+}
+# --- WMI event subscriptions ---
+$wmi = @()
+try {
+    $wmi = @(Get-WmiObject -Namespace 'root\subscription' -Class __EventFilter -ErrorAction Stop)
+    foreach ($f in $wmi) {
+        $q = [string]$f.Query
+        if ($q.Length -gt 400) { $q = $q.Substring(0, 400) + '…' }
+        Add-Item 'wmi_subscription' $f.Name '' $q
+    }
+} catch {}
+[Console]::WriteLine((ConvertTo-Json $script:items -Compress -Depth 4))
+'''
+
+
+# Event IDs the blue tools reference, so labels stay consistent across tool
+# output and the model's writeup.
+_HOST_EVT_LABELS = {
+    4624: "logon success",
+    4625: "logon failure",
+    4688: "process created",
+    4698: "scheduled task created",
+    7045: "service installed",
+    1074: "system shutdown/restart",
+    6005: "event log service started",
+    6006: "clean shutdown",
+    1001: "application crash",
+}
+
+
 def tool_network_snapshot(args: dict) -> dict:
     """Snapshot the host's current network state (no admin, no install).
     Returns active TCP connections (with owning process names), UDP listeners,
-    and the recent DNS resolver cache so the model can spot weird traffic."""
+    and the recent DNS resolver cache so the model can spot weird traffic.
+    Processes are enriched with identity ground truth (exe path, publisher
+    company, file description, Authenticode signature status, truncated
+    command line) and known remote endpoints get vendor/port hints — so the
+    model doesn't have to guess what a process or endpoint is (e.g.
+    "EADesktop" is EA's game launcher, not ESET antivirus)."""
     if os.name != "nt":
         return {"error": "network_snapshot currently only supports Windows (uses Get-NetTCPConnection)"}
     approval = request_approval(
@@ -3972,9 +4468,10 @@ def tool_network_snapshot(args: dict) -> dict:
         return {"error": f"user denied snapshot ({approval.get('status')})"}
 
     # 2 MiB cap — busy machines easily produce >16 KiB of JSON. The model never
-    # sees this raw output (only the aggregated top_processes/top_remotes), so
-    # there's no context-window cost to keeping the full payload.
-    res = _run_powershell(_NETSNAP_PS, timeout=20, max_stdout=2_000_000)
+    # sees this raw output (only the aggregated top_processes/top_remotes and
+    # the bounded process_details list), so there's no context-window cost to
+    # keeping the full payload.
+    res = _run_powershell(_NETSNAP_PS, timeout=30, max_stdout=2_000_000)
     raw_stdout = res.get("stdout") or ""
     raw_stderr = res.get("stderr") or ""
     ok_flag = res.get("ok")
@@ -4020,11 +4517,20 @@ def tool_network_snapshot(args: dict) -> dict:
     if isinstance(tcp, dict): tcp = [tcp]
     if isinstance(udp, dict): udp = [udp]
 
-    # annotate each connection with its owning process name (or "?" if gone).
+    # Processes arrive as {pid: {name, path, company, desc, signed, cmdline}}.
+    # Fold the enriched fields onto each connection, and keep a per-process
+    # detail map so the model gets identity ground truth (name → what it IS)
+    # instead of guessing from bare names ("EADesktop" ≈ "ESET"? no).
+    def _proc_meta(pid):
+        p = procs.get(str(pid))
+        return p if isinstance(p, dict) else None
+
     for c in tcp:
-        c["process"] = procs.get(str(c.get("OwningProcess")), "?")
+        m = _proc_meta(c.get("OwningProcess"))
+        c["process"] = (m or {}).get("name") or "?"
     for c in udp:
-        c["process"] = procs.get(str(c.get("OwningProcess")), "?")
+        m = _proc_meta(c.get("OwningProcess"))
+        c["process"] = (m or {}).get("name") or "?"
 
     # group by remote endpoint so destinations with many connections rise to the top.
     from collections import Counter
@@ -4034,13 +4540,36 @@ def tool_network_snapshot(args: dict) -> dict:
         port = c.get("RemotePort") or 0
         if addr and addr not in ("0.0.0.0", "::", "127.0.0.1", "::1"):
             remotes[(addr, int(port))] += 1
-    top_remotes = [{"address": a, "port": p, "count": n} for (a, p), n in remotes.most_common(30)]
+    top_remotes = []
+    for (a, p), n in remotes.most_common(30):
+        owner = _netsnap_ip_hint(a)
+        entry = {"address": a, "port": p, "count": n}
+        svc = _NET_PORT_SERVICES.get(int(p))
+        if svc:
+            entry["service"] = svc
+        if owner:
+            entry["known_owner"] = owner
+        top_remotes.append(entry)
 
     # connections per process — handy for "what is svchost talking to"
     by_proc = Counter()
     for c in tcp:
         by_proc[c.get("process") or "?"] += 1
-    top_procs = [{"process": k, "connections": v} for k, v in by_proc.most_common(20)]
+    top_procs = []
+    for k, v in by_proc.most_common(20):
+        entry = {"process": k, "connections": v}
+        # find one pid for this name so we can attach identity
+        for pid_str, meta in procs.items():
+            if isinstance(meta, dict) and (meta.get("name") or "?") == k:
+                label = _netsnap_process_label(k, meta.get("company"))
+                if label:
+                    entry["identity"] = label
+                if meta.get("signed") is True:
+                    entry["signed"] = True
+                elif meta.get("signed") is False:
+                    entry["signed"] = False
+                break
+        top_procs.append(entry)
 
     listeners = []
     for c in udp:
@@ -4048,6 +4577,36 @@ def tool_network_snapshot(args: dict) -> dict:
         if la in ("0.0.0.0", "::"):
             listeners.append(c)
     listeners = listeners[:30]
+
+    # compact per-process details for the top talkers (bounded; full cmdline
+    # truncated — models need identity, not argv). Sorted by connection count.
+    proc_details = {}
+    for pid_str, meta in procs.items():
+        if not isinstance(meta, dict):
+            continue
+        name = meta.get("name") or "?"
+        cnt = by_proc.get(name, 0)
+        if not cnt:
+            continue
+        detail = {
+            "process": name,
+            "connections": cnt,
+            "signed": meta.get("signed"),
+        }
+        label = _netsnap_process_label(name, meta.get("company"))
+        if label:
+            detail["identity"] = label
+        if meta.get("company"):
+            detail["company"] = str(meta.get("company"))[:64]
+        if meta.get("path"):
+            detail["path"] = str(meta.get("path"))[:160]
+        if meta.get("desc"):
+            detail["description"] = str(meta.get("desc"))[:80]
+        cmdline = str(meta.get("cmdline") or "").strip()
+        if cmdline:
+            detail["cmdline"] = cmdline[:_NETSNAP_MAX_CMDLINE]
+        proc_details[name] = detail
+    proc_list = sorted(proc_details.values(), key=lambda d: d["connections"], reverse=True)[:40]
 
     return {
         "platform": "windows",
@@ -4057,7 +4616,152 @@ def tool_network_snapshot(args: dict) -> dict:
         "udp_listeners": listeners,
         "top_remotes": top_remotes,
         "top_processes": top_procs,
+        "process_details": proc_list,
         "recent_dns": data.get("dns_cache") or [],
+    }
+
+
+def tool_parse_event_logs(args: dict) -> dict:
+    """Live read of Windows event logs (no saved .evtx file needed). Queries the
+    four highest-signal event families: logon success/failure (4624/4625),
+    process creation (4688), scheduled-task creation (4698), service installs
+    (7045), plus boot/shutdown and crash events. Read-only. The Security log
+    requires an elevated session; when it's not readable the tool says so and
+    still returns whatever the other logs have."""
+    if os.name != "nt":
+        return {"error": "event logs are Windows-only"}
+    log = str(args.get("log") or "System").strip().lower()
+    if log not in ("security", "system", "application"):
+        return {"error": "log must be one of: security, system, application"}
+    hours = max(1, min(int(args.get("hours") or 24), 168))
+    limit = max(1, min(int(args.get("limit") or 150), 500))
+
+    approval = request_approval(
+        title="Read event log",
+        command=f"Get-WinEvent -LogName {log} (last {hours}h)",
+        details={"kind": "event_log", "log": log, "hours": hours},
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied event log read ({approval.get('status')})"}
+
+    res = _run_powershell(
+        f"$args = @('{log}', '{hours}', '{limit}'); {_EVTLOG_PS}",
+        timeout=60, max_stdout=600_000,
+    )
+    raw = (res.get("stdout") or "").lstrip("\ufeff").strip()
+    data = None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        pass
+    if not isinstance(data, dict) or not isinstance(data.get("events"), list):
+        return {"error": f"unexpected PowerShell output: {(res.get('stderr') or raw or 'empty')[:300]}"}
+
+    access = data.get("access") or "ok"
+    events = data["events"]
+    if not events:
+        return {
+            "log": log,
+            "access": access,
+            "note": ("Security log requires elevation" if access == "denied"
+                     else "no matching events in the window"),
+            "events": [],
+        }
+    out = []
+    for e in events[:limit]:
+        if not isinstance(e, dict):
+            continue
+        rec = {
+            "event_id": e.get("id"),
+            "label": _HOST_EVT_LABELS.get(int(e.get("id") or 0), "other"),
+            "time": e.get("time"),
+            "provider": e.get("provider"),
+            "details": e.get("msg") or "",
+        }
+        out.append(rec)
+    return {"log": log, "access": access, "event_count": len(out), "events": out}
+
+
+def tool_persistence_hunt(args: dict) -> dict:
+    """Read-only sweep for persistence — places software hides so it survives a
+    reboot. Checks Run/RunOnce registry keys, startup folders, scheduled tasks
+    and services that launch from suspicious folders (Temp, Downloads, AppData,
+    user dirs), and WMI event subscriptions. Returns a short list of 'worth a
+    look' items — normal startup entries are not flagged, just listed, so the
+    model can reason over them without drowning in noise."""
+    if os.name != "nt":
+        return {"error": "persistence hunt is Windows-only"}
+    approval = request_approval(
+        title="Persistence sweep",
+        command="Read startup keys, startup folders, scheduled tasks, service paths, WMI subscriptions (read-only)",
+        details={"kind": "persistence_hunt"},
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied persistence sweep ({approval.get('status')})"}
+
+    res = _run_powershell(_PERSIST_PS, timeout=60, max_stdout=400_000)
+    raw = (res.get("stdout") or "").lstrip("\ufeff").strip()
+    data = None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        pass
+    if not isinstance(data, list):
+        return {"error": f"unexpected PowerShell output: {(res.get('stderr') or raw or 'empty')[:300]}"}
+
+    # Flag rules: WMI subscriptions are never normal; scheduled tasks are only
+    # collected when their path is already suspicious. Run keys and startup
+    # files are flagged when their target points outside standard locations
+    # (Program Files / System32 / Windows) AND isn't a known-normal vendor.
+    # Services are only collected when outside C:\Windows / Program Files, so
+    # they're all worth the model's eyes — but Defender-family and known
+    # vendors ride along un-flagged via the dictionary check below.
+    from collections import Counter
+    by_cat = Counter(i.get("cat") for i in data)
+    flagged = []
+    plain = []
+    _SUSPICIOUS_PATHS = ("\\temp\\", "\\downloads\\", "\\desktop\\", "$recycle.bin", "\\windows\\temp\\")
+
+    def _known_vendor(name: str, value: str) -> bool:
+        """Known-normal vendor if the run-key name or target matches the process
+        dictionary (steam, discord, docker, brave, ea, etc.) or points at a
+        standard install location."""
+        key = (name or "").strip().lower()
+        val = (value or "").lower()
+        for known in _NET_KNOWN_PROCESSES:
+            k = known.lower()
+            if k in key or key in k:
+                return True
+        return any(ok in val for ok in ("program files", "system32", "windows\\", "%systemroot%", "c:\\windows\\", "\\appdata\\local\\programs\\"))
+
+    for i in data:
+        if not isinstance(i, dict):
+            continue
+        item = {
+            "category": i.get("cat"),
+            "location": str(i.get("loc") or "")[:200],
+            "name": str(i.get("name") or "")[:120],
+            "value": str(i.get("value") or "")[:240],
+        }
+        plain.append(item)
+        cat = i.get("cat")
+        if cat == "wmi_subscription":
+            flagged.append(item)
+        elif cat in ("scheduled_task", "service"):
+            flagged.append(item)
+        elif cat in ("run_key", "startup_file"):
+            val = str(i.get("value") or "").lower()
+            suspect = any(k in val for k in _SUSPICIOUS_PATHS)
+            if suspect or not _known_vendor(i.get("name"), i.get("value")):
+                flagged.append(item)
+
+    return {
+        "swept": dict(by_cat),
+        "flagged": flagged[:40],
+        "all_entries": plain[:200],
+        "note": ("flagged = items worth a look (suspicious path or non-standard location); "
+                 "all_entries = everything found, for context. WMI event subscriptions "
+                 "are ALWAYS flagged — almost nothing legitimate uses them."),
     }
 
 
@@ -11420,7 +12124,7 @@ class MCPClient:
             except json.JSONDecodeError:
                 pass
 
-    def _send_request(self, method: str, params: dict = None) -> dict:
+    def _send_request(self, method: str, params: dict = None, deadline: float = 30.0) -> dict:
         self.request_id += 1
         req_id = self.request_id
         payload = {
@@ -11436,14 +12140,22 @@ class MCPClient:
         except Exception as e:
             return {"error": {"message": f"Failed to write to MCP stdin: {e}"}}
 
+        # Deadline guard: a wedged MCP server (hung tools/initialize) used to
+        # block the caller forever — `condition.wait` polls 0.1s so a hung
+        # call_tool froze the whole agent turn silently. Bound every request;
+        # the caller gets a structured error instead of a deadlock.
+        start = time.monotonic()
         with self.condition:
             while req_id not in self.responses and self.running and self.process.poll() is None:
-                self.condition.wait(timeout=0.1)
-                
+                remaining = deadline - (time.monotonic() - start)
+                if remaining <= 0:
+                    break
+                self.condition.wait(timeout=min(0.1, remaining))
+
             if req_id in self.responses:
                 return self.responses.pop(req_id)
-                
-        return {"error": {"message": "Client stopped or process crashed"}}
+
+        return {"error": {"message": f"MCP request '{method}' timed out after {deadline:.0f}s — the server may be stuck. Check the MCP server's console/logs, then restart it."}}
 
     def _send_notification(self, method: str, params: dict = None):
         payload = {
@@ -11458,13 +12170,16 @@ class MCPClient:
             pass
 
     def list_tools(self) -> dict:
-        return self._send_request("tools/list")
+        return self._send_request("tools/list", deadline=30.0)
 
     def call_tool(self, name: str, arguments: dict) -> dict:
+        # Long deadline: real MCP tool invocations (browser navigation, disk
+        # scans, long page snapshots) legitimately take minutes; only a
+        # genuinely hung server crosses this.
         return self._send_request("tools/call", {
             "name": name,
             "arguments": arguments
-        })
+        }, deadline=300.0)
 
     def stop(self):
         self.running = False
@@ -12323,6 +13038,58 @@ TOOLS: dict[str, dict] = {
         },
         "fn": tool_network_snapshot,
     },
+    "parse_event_logs": {
+        "description": (
+            "Read live Windows event logs (no saved .evtx file needed). Queries "
+            "one log for the high-signal event families: logon success/failure "
+            "(4624/4625), process creation (4688), scheduled-task creation "
+            "(4698), service installs (7045), boot/shutdown (1074/6005/6006), "
+            "and crashes (1001). log: 'security' | 'system' | 'application'. "
+            "Read-only, each call requires user approval. The Security log "
+            "needs an elevated session; when denied, the tool says so and still "
+            "returns whatever other logs had. Use with persistence_hunt for a "
+            "host triage: 'anything changed recently that shouldn't have?'"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "log": {
+                    "type": "string",
+                    "enum": ["security", "system", "application"],
+                    "description": "Which log to read (default system). Security needs elevation.",
+                },
+                "hours": {
+                    "type": "integer",
+                    "description": "Look back window in hours (default 24, max 168).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max events to return (default 150, max 500).",
+                },
+            },
+            "required": [],
+        },
+        "fn": tool_parse_event_logs,
+    },
+    "persistence_hunt": {
+        "description": (
+            "Read-only sweep for persistence on this Windows host — the places "
+            "software hides to survive a reboot. Checks Run/RunOnce registry "
+            "keys (HKLM+HKCU), startup folders, scheduled tasks and services "
+            "whose binary lives outside C:\\Windows (Temp, Downloads, AppData, "
+            "user dirs), and WMI event subscriptions. Returns a short flagged "
+            "list ('worth a look') plus the full inventory for context. WMI "
+            "event subscriptions are ALWAYS flagged — almost nothing legitimate "
+            "uses them. Each call requires user approval. Use with "
+            "parse_event_logs for a read-only host triage."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+        "fn": tool_persistence_hunt,
+    },
     "remember": {
         "description": (
             "Save a terse lesson (<= 220 chars) to long-term memory so future "
@@ -13065,6 +13832,8 @@ _TOOL_RESULT_CAPS = {
     "parse_evtx": 48000,
     "analyze_pcap": 48000,
     "check_deps": 24000,
+    "parse_event_logs": 32000,   # up to 500 log entries, each with a ~900-char message
+    "persistence_hunt": 24000,   # full inventory can be a few hundred entries
 
     "network_snapshot": 32000,
     # recon_subdomains can return a few hundred CT-log subdomains; the rest
@@ -13356,18 +14125,76 @@ _ANALYSIS_SUITE_TOOL_NAMES = {
 }
 
 
-def _active_tools(include_exploit: bool = True) -> dict:
-    """Return TOOLS filtered by current settings — desktop tools only show when
-    desktop automation is enabled, the red-team recon suite only when red team
-    mode is on, and the analysis/forensics suite only when analysis tools are
-    enabled, so a normal coding turn carries none of them (and pays no token
-    cost for tools it can't or won't use).
+# ---- lazy tool bundles -------------------------------------------------------
+# The full active suite is ~100 schemas, and llama-server's Jinja template
+# inlines the WHOLE tools array into the system message server-side — 6-10K
+# tokens per round on a full suite. SOTA harness research (MicroSkill et al.)
+# shows >90% of that spend is dead weight on any given turn. So: a small
+# always-on CORE, plus demand-loaded BUNDLES. The model calls the
+# `list_more_tools` probe (always in core) to see what exists and load what it
+# needs; a loaded bundle joins the schema for the rest of that chat. Hiding is
+# about prompt tokens ONLY — invoke_tool still resolves and runs any TOOLS
+# name, so a tool the model somehow knows stays callable either way.
+_CORE_TOOL_NAMES = {
+    # file / workspace (always needed)
+    "read_file", "write_file", "edit_file", "delete_file", "list_directory",
+    "find_files", "grep_files", "read_bytes", "file_inspect", "extract_archive",
+    "read_skeleton", "replace_ast_node", "find_references", "find_symbol",
+    "check_syntax", "run_tests", "check_deps", "run_powershell", "open_program",
+    # planning / memory / probe
+    "update_plan", "pin_note", "unpin_note", "remember", "forget", "edit_memory",
+    "list_more_tools", "compact_history",
+    # web
+    "web_search", "web_image_search", "web_fetch",
+    # interactive sessions
+    "session_start", "session_send", "session_read", "session_stop", "session_list",
+    # host visibility
+    "network_snapshot", "parse_event_logs", "persistence_hunt",
+    # HTTP header audit — ungated today; keeping it always-visible preserves
+    # existing behavior (scope-guarding would change how it runs).
+    "audit_http_headers",
+    # git essentials (the rest of git lives in the "git" bundle)
+    "git_status", "git_diff", "git_log", "git_branch",
+}
+# None = dynamic (all TOOLS keys with the given prefix, resolved at call time).
+_TOOL_BUNDLES: dict[str, set[str] | None] = {
+    "git": {
+        "git_show", "git_remote", "git_add", "git_commit", "git_push",
+        "git_pull", "git_fetch", "git_checkout", "git_restore", "git_reset",
+        "git_init", "git_clone",
+    },
+    "desktop": _DESKTOP_TOOL_NAMES,
+    "rt-recon": _RT_RECON_TOOL_NAMES,
+    "rt-exploit": _RT_EXPLOIT_TOOL_NAMES,
+    "analysis": _ANALYSIS_SUITE_TOOL_NAMES,
+    "sandbox": {"sandbox_run"},
+    "mcp": None,  # dynamic prefix: mcp_<server>_<tool>
+}
+_TOOL_BUNDLE_LOCK = threading.Lock()
+_unlocked_bundles_by_chat: dict[str, set[str]] = {}
 
-    include_exploit=False additionally drops the heavier exploit subset
-    (_RT_EXPLOIT_TOOL_NAMES) while the red-team mission is still in the recon
-    phase, so a recon turn stays cheaper. Defaults True so any caller that does
-    not thread a phase keeps the full suite (fails open on tokens, never hides a
-    tool the model might legitimately reach)."""
+
+def _unlock_bundle(chat_id: str, bundle: str) -> bool:
+    """Load a bundle's schemas for this chat. Returns True if the bundle was
+    newly unlocked (False = unknown bundle or already loaded)."""
+    if not chat_id or bundle not in _TOOL_BUNDLES:
+        return False
+    with _TOOL_BUNDLE_LOCK:
+        st = _unlocked_bundles_by_chat.setdefault(chat_id, set())
+        if bundle in st:
+            return False
+        st.add(bundle)
+    try:
+        broadcast_event({"type": "tools_unlocked", "chat_id": chat_id, "bundle": bundle})
+    except Exception:
+        pass
+    return True
+
+
+def _excluded_tools(include_exploit: bool = True) -> set[str]:
+    """The tool names hidden by CURRENT settings — the single source of truth
+    for both _active_tools and the lazy-bundle visibility filter, so the two
+    can never drift apart."""
     s = get_settings()
     excluded: set[str] = set()
     if not s.get("desktop_enabled"):
@@ -13382,17 +14209,146 @@ def _active_tools(include_exploit: bool = True) -> dict:
     # its token cost (or tempt the model to call it) before then.
     if not _sandbox_ready_cached():
         excluded.add("sandbox_run")
+    return excluded
+
+
+def _visible_tool_names(include_exploit: bool = True, chat_id: str = "") -> set[str]:
+    """Core + this chat's unlocked bundles, minus settings-gated tools and any
+    name that isn't actually registered (MCP tools disappear when their server
+    dies between unlock and request)."""
+    excluded = _excluded_tools(include_exploit)
+    visible: set[str] = set(_CORE_TOOL_NAMES)
+    if chat_id:
+        for b in _unlocked_bundles_by_chat.get(chat_id, ()):
+            btools = _TOOL_BUNDLES.get(b)
+            if btools is None:
+                if b == "mcp":
+                    visible |= {n for n in TOOLS if n.startswith("mcp_")}
+                continue
+            visible |= btools
+    return {n for n in visible if n in TOOLS and n not in excluded}
+
+
+def tool_list_more_tools(args: dict) -> dict:
+    """Probe tool for the lazy tool bundles: shows which specialized bundles
+    exist (and which are loaded), or loads one by name so its schemas join the
+    tool list for the rest of this chat."""
+    chat_id = _get_current_chat()
+    bundle = str(args.get("bundle") or "").strip().lower()
+    excluded = _excluded_tools(True)
+    enabled: dict[str, list[str]] = {}
+    for bname, btools in _TOOL_BUNDLES.items():
+        if btools is None:
+            btools = {n for n in TOOLS if n.startswith("mcp_")}
+        if not btools:
+            continue
+        # Advertise only bundles at least one of whose tools the current
+        # settings would actually load (desktop / red-team / analysis gates).
+        usable = sorted(n for n in btools if n in TOOLS and n not in excluded)
+        if usable:
+            enabled[bname] = usable
+    if not bundle:
+        loaded = set(_unlocked_bundles_by_chat.get(chat_id, ()))
+        return {
+            "note": "Call again with a bundle name (e.g. {\"bundle\": \"git\"}) to inspect its tools and load it into this chat's schema.",
+            "core": sorted(n for n in _CORE_TOOL_NAMES if n in TOOLS and n not in excluded),
+            "bundles": {b: {"tools": names, "loaded": b in loaded}
+                        for b, names in enabled.items()},
+        }
+    if bundle not in enabled:
+        return {"error": f"unknown bundle '{bundle}' — available: {sorted(enabled)}"}
+    names = enabled[bundle]
+    details = {n: (TOOLS[n].get("description", "") or "")[:400] for n in names}
+    loaded_now = _unlock_bundle(chat_id, bundle)
+    return {
+        "bundle": bundle,
+        "loaded": True,
+        "loaded_now": loaded_now,
+        "tools": details,
+        "note": ("This bundle's tools are now in the tool schema for the rest of this chat. "
+                 "Call them directly — no need to re-list."),
+    }
+
+
+TOOLS["list_more_tools"] = {
+    "description": (
+        "See and load specialized tool bundles beyond the core set. Call with no "
+        "arguments to list all available bundles and which are already loaded; call "
+        "with a bundle name to inspect that bundle's tools and load it into the schema "
+        "for this chat (its tools then work directly). Use it when the task needs a "
+        "specialized tool you don't see: git history/write ops, desktop automation, "
+        "analysis/forensics, red-team recon/exploit, the sandbox, or MCP servers. "
+        "Core tools (file I/O, grep, run_powershell, sessions, web, memory, plan, "
+        "list_more_tools itself) are always available without loading."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "bundle": {
+                "type": "string",
+                "description": "Optional bundle to inspect + load. One of: "
+                                + ", ".join(sorted(b for b in _TOOL_BUNDLES)),
+            }
+        },
+        "required": [],
+    },
+    "fn": tool_list_more_tools,
+}
+
+
+TOOLS["compact_history"] = {
+    "description": (
+        "Condense this chat's older turns into the session summary NOW (manual "
+        "compaction). The auto-summarizer only fires near the context limit; on "
+        "long tasks, call this proactively at a task boundary or after a long "
+        "stretch of tool work — it folds the oldest turns into a dense state "
+        "block (keeping exact paths, error codes, fixes) so the remaining "
+        "context holds the newest, most relevant detail. Note: the fold takes "
+        "effect from the NEXT turn (the current window is already assembled) — "
+        "call it when the next round of work is about to start, not mid-answer."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+    "fn": tool_compact_history,
+}
+
+
+def _active_tools(include_exploit: bool = True) -> dict:
+    """Return TOOLS filtered by current settings — desktop tools only show when
+    desktop automation is enabled, the red-team recon suite only when red team
+    mode is on, and the analysis/forensics suite only when analysis tools are
+    enabled, so a normal coding turn carries none of them (and pays no token
+    cost for tools it can't or won't use).
+
+    include_exploit=False additionally drops the heavier exploit subset
+    (_RT_EXPLOIT_TOOL_NAMES) while the red-team mission is still in the recon
+    phase, so a recon turn stays cheaper. Defaults True so any caller that does
+    not thread a phase keeps the full suite (fails open on tokens, never hides a
+    tool the model might legitimately reach)."""
+    excluded = _excluded_tools(include_exploit)
     if not excluded:
         return TOOLS
     return {k: v for k, v in TOOLS.items() if k not in excluded}
 
 
-def tools_for_llama(include_exploit: bool = True) -> list[dict]:
+def tools_for_llama(include_exploit: bool = True, chat_id: str | None = None) -> list[dict]:
     """Tool spec for llama-server's OpenAI-compatible /v1/chat/completions.
     Same shape as OpenAI function calling. include_exploit is threaded straight
-    to _active_tools for red-team phase gating."""
+    to _active_tools for red-team phase gating.
+
+    LAZY BUNDLES: only the core set + this chat's unlocked bundles are shipped
+    on the wire (see _CORE_TOOL_NAMES / _TOOL_BUNDLES / list_more_tools). This
+    cuts the inlined schema from ~100 tools to ~40 for a normal turn — most of
+    that 6-10K token overhead was dead weight the model never touched."""
+    chat_id = chat_id or _get_current_chat()
+    visible = _visible_tool_names(include_exploit, chat_id)
     out = []
     for name, t in _active_tools(include_exploit).items():
+        if name not in visible:
+            continue
         out.append({
             "type": "function",
             "function": {
@@ -13469,6 +14425,15 @@ TOOL_ALIASES = {
     "inspect_network": "network_snapshot",
     "list_connections": "network_snapshot",
     "sniff_network": "network_snapshot",
+    # blue-team aliases — models naturally reach for these synonyms.
+    "event_logs": "parse_event_logs",
+    "event_log": "parse_event_logs",
+    "read_event_logs": "parse_event_logs",
+    "get_winevent": "parse_event_logs",
+    "winevent": "parse_event_logs",
+    "persistence_check": "persistence_hunt",
+    "persistence_scan": "persistence_hunt",
+    "startup_audit": "persistence_hunt",
     # APK analysis aliases — models naturally reach for these synonyms.
     "apk_scan": "scan_apk",
     "analyze_apk": "scan_apk",
@@ -13528,22 +14493,37 @@ def _resolve_tool_name(name: str) -> str:
 # user message gets a fresh counter; checked inside invoke_tool to break
 # infinite loops where the model repeats the SAME tool with the SAME args
 # (typical pattern: misreads a truncated response as a transient failure
-# and retries 20+ times). threading.local keeps concurrent chats isolated.
-_tool_call_history = threading.local()
+# and retries 20+ times). Keyed by chat_id and guarded by a lock so
+# PARALLEL tool calls (fix: concurrent executor runs) share one history
+# instead of each worker thread carrying its own invisible copy — that
+# per-thread split made repeats undetectable across parallel calls and
+# let streaks leak across turns on a reused worker.
+_tool_history_lock = threading.Lock()
+_tool_call_history: dict[str, dict[str, dict]] = {}    # chat_id -> sig -> rec
+_tool_write_history: dict[str, dict[str, int]] = {}    # chat_id -> path -> count
 TOOL_REPEAT_LIMIT = 3       # 4th SAME-RESULT call in a row gets refused.
 TOOL_REPEAT_HARD_LIMIT = 20  # absolute backstop for wobbly-output tools (below max_tool_rounds).
 
-# Per-turn context — chat_id and other thread-local state that needs to be
-# reachable from deep inside tool implementations without threading them
-# through every function signature. _run_powershell reads chat_id from here
-# when it logs an entry to cmd_history.jsonl so the History drawer can show
-# which chat each command came from.
+# Per-turn context — chat_id and other state reachable from deep inside tool
+# implementations without threading the id through every function signature.
+# _run_powershell reads chat_id from here when it logs an entry to
+# cmd_history.jsonl so the History drawer can show which chat each command
+# came from.
+#
+# This is BOTH a threading.local (main-thread paths) and a contextvar: the
+# executor hop runs tools via `contextvars.copy_context().run(invoke_tool,…)`,
+# and only a contextvar survives that copy — the threading.local is empty in
+# worker threads. Before the contextvar existed, tools running in workers saw
+# chat_id="" (pin_note, cmd_history tagging silently lost it) and the
+# loop-breaker history lived per-worker-thread, invisible to other calls.
 _chat_ctx = threading.local()
+_chat_cv: "contextvars.ContextVar[str]" = contextvars.ContextVar("accuretta_chat_id", default="")
 
 
-def _reset_tool_call_history() -> None:
-    _tool_call_history.calls = {}
-    _tool_call_history.writes = {}
+def _reset_tool_call_history(chat_id: str) -> None:
+    with _tool_history_lock:
+        _tool_call_history[chat_id] = {}
+        _tool_write_history[chat_id] = {}
 
 
 # Rewrite-loop breaker: count full write_file rewrites per path per turn so a
@@ -13553,23 +14533,76 @@ def _reset_tool_call_history() -> None:
 REWRITE_LOOP_LIMIT = 2  # original write + one rewrite; the next is blocked
 
 
+# Tools that mutate a file named by their `path` argument. Used by the
+# parallel tool-execution batcher in run_chat_turn: two calls writing the SAME
+# path must not run concurrently (last-write-wins races), so they land in the
+# same serial batch.
+_WRITE_CAPABLE_TOOLS = frozenset(
+    {"write_file", "edit_file", "delete_file", "replace_ast_node"})
+
+
+# Tools that persist to shared stores (chats.json, memories) via read-modify-
+# write. Under parallel execution two of these in one batch would each load
+# stale state and drop the other's update (e.g. pin_note + update_plan in the
+# same round), so they serialize with each other within a batch.
+_CHAT_STATE_TOOLS = frozenset(
+    {"pin_note", "unpin_note", "update_plan", "remember", "forget",
+     "edit_memory", "compact_history"})
+
+
+def _call_write_target(call: dict) -> str:
+    """Normalized write target of a parsed tool call, or "" when the call is
+    not a path-mutating write (no serialization needed for those)."""
+    if call.get("name") not in _WRITE_CAPABLE_TOOLS:
+        return ""
+    a = call.get("arguments")
+    p = a.get("path") if isinstance(a, dict) else None
+    return str(p) if p else ""
+
+
+def _call_serial_key(call: dict) -> str:
+    """Batcher serialization key: same key means the calls must not run
+    concurrently. Path-writing tools key on their write target (normalized via
+    the loop-breaker's raw path form), shared-store tools key on a constant so
+    they serialize with each other; "" = no constraint (full parallelism)."""
+    tgt = _call_write_target(call)
+    if tgt:
+        # Normalize so "./x.py" and "x.py" (and case variants on Windows)
+        # serialize together — raw spelling would let the same file race.
+        try:
+            tgt = os.path.normcase(os.path.normpath(tgt))
+        except Exception:
+            pass
+        return "write:" + tgt
+    if call.get("name") in _CHAT_STATE_TOOLS:
+        return "state"
+    return ""
+
+
 def _write_count(npath: str) -> int:
-    return (getattr(_tool_call_history, "writes", None) or {}).get(npath, 0)
+    with _tool_history_lock:
+        return _tool_write_history.get(_get_current_chat(), {}).get(npath, 0)
 
 
 def _record_write(npath: str) -> None:
-    w = getattr(_tool_call_history, "writes", None)
-    if w is None:
-        w = {}
-        _tool_call_history.writes = w
-    w[npath] = w.get(npath, 0) + 1
+    cid = _get_current_chat()
+    with _tool_history_lock:
+        w = _tool_write_history.setdefault(cid, {})
+        w[npath] = w.get(npath, 0) + 1
 
 
 def _set_current_chat(chat_id: str) -> None:
     _chat_ctx.chat_id = chat_id
+    try:
+        _chat_cv.set(chat_id)
+    except Exception:
+        pass
 
 
 def _get_current_chat() -> str:
+    v = _chat_cv.get()
+    if v:
+        return v
     return getattr(_chat_ctx, "chat_id", "") or ""
 
 
@@ -13579,8 +14612,9 @@ def _tool_call_sig(canon: str, args: dict) -> str:
 
 def _tool_repeat_state(sig: str) -> tuple[int, int]:
     """(consecutive same-result streak, absolute total) for this signature."""
-    rec = (getattr(_tool_call_history, "calls", None) or {}).get(sig)
-    return (rec.get("streak", 0), rec.get("total", 0)) if rec else (0, 0)
+    with _tool_history_lock:
+        rec = _tool_call_history.get(_get_current_chat(), {}).get(sig)
+        return (rec.get("streak", 0), rec.get("total", 0)) if rec else (0, 0)
 
 
 def _record_tool_result(sig: str, result) -> None:
@@ -13592,22 +14626,21 @@ def _record_tool_result(sig: str, result) -> None:
     is what lets a model legitimately re-read a file it just edited or re-run a
     check after a fix without being falsely blocked. `total` is a high absolute
     backstop for tools whose output wobbles every call (timestamps, ids)."""
-    history = getattr(_tool_call_history, "calls", None)
-    if history is None:
-        history = {}
-        _tool_call_history.calls = history
     try:
         fp = hash(json.dumps(result, sort_keys=True, default=str)[:200000])
     except Exception:
         fp = None
-    rec = history.get(sig) or {"streak": 0, "total": 0, "fp": None}
-    rec["total"] += 1
-    if fp is not None and rec.get("fp") == fp:
-        rec["streak"] += 1
-    else:
-        rec["streak"] = 1
-        rec["fp"] = fp
-    history[sig] = rec
+    cid = _get_current_chat()
+    with _tool_history_lock:
+        history = _tool_call_history.setdefault(cid, {})
+        rec = history.get(sig) or {"streak": 0, "total": 0, "fp": None}
+        rec["total"] += 1
+        if fp is not None and rec.get("fp") == fp:
+            rec["streak"] += 1
+        else:
+            rec["streak"] = 1
+            rec["fp"] = fp
+        history[sig] = rec
 
 
 def invoke_tool(name: str, args: dict) -> dict:
@@ -14485,7 +15518,12 @@ def recommended_settings(model: str) -> dict:
             "num_gpu": 99,
             "num_batch": 512,
             "num_thread": 0,
-            "num_predict": -1,
+    "num_predict": -1,              # -1 = no explicit cap (llama-server may then run to n_ctx).
+                                    # `max_output_tokens` below is the harness-enforced ceiling.
+    "max_output_tokens": 8192,      # Hard cap on a single generation. num_predict=-1 (unbounded) lets a
+                                    # model sail to n_ctx ("re-answer forever" loops); this default ceiling
+                                    # bounds one answer, and run_chat_turn further clamps it to the reserved
+                                    # headroom so it can never overflow the slot. -1 = truly unbounded.
             "temperature": 0.7,
             "top_p": 0.9,
             "keep_alive": "30m",
@@ -14493,8 +15531,68 @@ def recommended_settings(model: str) -> dict:
     }
 
 
-def llama_post_stream(path: str, payload: dict, base: str | None = None):
-    """POST and return the raw response object — caller iterates over SSE lines."""
+# Two-phase stream timeouts (stuck-turn protection). The FIRST byte can
+# legitimately take minutes on a big window (prefill of a 130K prompt at CPU
+# speed), so its timeout is generous. Once streaming starts, generation is
+# steady-state: a multi-minute silence between tokens means the server is
+# wedged (deadlocked slot, crashed sampler) — the turn should die with a clear
+# message instead of hanging forever on `for raw in resp`.
+_LLAMA_FIRST_TOKEN_TIMEOUT_S = 300
+_LLAMA_STALL_TIMEOUT_S = 90
+
+
+class _StallGuardedStream:
+    """Response wrapper that defers the tight inter-token socket timeout until
+    AFTER the first chunk arrives. llama-server sends response headers as soon
+    as a request is accepted, then prefills — possibly for minutes on huge
+    prompts — before the first SSE event; urlopen returns at the headers, so a
+    naive swap-to-stall-timeout at that point would kill legitimate slow
+    prefills. The first readline() therefore keeps the generous first-token
+    window; the stall timeout only guards the gaps BETWEEN tokens."""
+    def __init__(self, resp, stall_t: float):
+        self._resp = resp
+        self._stall_t = stall_t
+        self._started = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self._resp.readline()
+        if line == b"":
+            raise StopIteration
+        if not self._started:
+            self._started = True
+            try:
+                self._resp.fp.raw._sock.settimeout(self._stall_t)
+            except Exception:
+                pass
+        return line
+
+    def close(self):
+        try:
+            self._resp.close()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._resp, name)
+
+
+def llama_post_stream(path: str, payload: dict, base: str | None = None,
+                      first_token_timeout_s: float | None = None,
+                      stall_timeout_s: float | None = None):
+    """POST and return the raw response object — caller iterates over SSE lines.
+
+    Two-phase read timeout: urlopen waits up to `first_token_timeout_s` for the
+    response to start (connect + prefill), then the per-read socket timeout is
+    dropped to `stall_timeout_s` for the body so a wedged server raises
+    socket.timeout mid-stream instead of hanging the turn forever. The swap is
+    deferred past the first chunk — see _StallGuardedStream."""
+    first_t = (first_token_timeout_s if first_token_timeout_s is not None
+               else _LLAMA_FIRST_TOKEN_TIMEOUT_S)
+    stall_t = (stall_timeout_s if stall_timeout_s is not None
+               else _LLAMA_STALL_TIMEOUT_S)
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"{base or LLAMA}{path}",
@@ -14502,7 +15600,10 @@ def llama_post_stream(path: str, payload: dict, base: str | None = None):
         headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         method="POST",
     )
-    return urllib.request.urlopen(req, timeout=None)
+    resp = urllib.request.urlopen(req, timeout=first_t)
+    # Tight inter-token timeout, applied lazily after the first byte — the
+    # first read may legitimately take minutes (prefill) and keeps first_t.
+    return _StallGuardedStream(resp, stall_t)
 
 
 def _is_ctx_overflow(e: Exception) -> bool:
@@ -14678,11 +15779,18 @@ you may occasionally append exactly one of these to the absolute end of your res
     # regression we saw before.
     if include_tools:
         if include_tool_list:
+            # Lazy bundles apply here too: text-tools mode (Gemma) reads this
+            # list instead of the wire schema, so it must not advertise the
+            # full suite either — same ~40-token-set core as native mode.
+            visible = _visible_tool_names(True, _get_current_chat())
             tool_lines = ["tools:"]
             for name, t in _active_tools().items():
+                if name not in visible:
+                    continue
                 params = t["parameters"].get("properties", {})
                 sig = ",".join(f"{k}:{v.get('type','any')[:3]}" for k, v in params.items())
                 tool_lines.append(f"- {name}({sig})")
+            tool_lines.append("- list_more_tools(bundle) — see/load specialized tool bundles")
             parts.append("\n".join(tool_lines))
         # Nudge the progress panel: for genuinely multi-step work the model should
         # publish a checklist so the user can watch it advance. Kept opt-in so a
@@ -14826,6 +15934,18 @@ def llama_options(settings: dict) -> dict:
     np = int(settings.get("num_predict") or -1)
     if np > 0:
         opt["max_tokens"] = np
+    else:
+        # num_predict = -1/unset means "no limit" to llama-server — and that
+        # lets a model roll to n_ctx on a runaway generation. Default cap here
+        # (max_output_tokens); run_chat_turn further clamps it to the reserved
+        # output headroom so it can never overflow the slot mid-turn.
+        try:
+            _mo = int(settings.get("max_output_tokens") or 8192)
+        except (ValueError, TypeError):
+            _mo = 8192
+        if _mo <= 0:
+            return opt  # user explicitly disabled the cap
+        opt["max_tokens"] = max(256, _mo)
     return opt
 
 
@@ -14916,11 +16036,14 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
     cancel_ev = _register_cancel(chat_id)
     # Fresh tool-call history for this turn. invoke_tool trips the loop-breaker
     # only when the same call returns the SAME result TOOL_REPEAT_LIMIT times in a
-    # row — see _record_tool_result / _tool_repeat_state for the logic.
-    _reset_tool_call_history()
-    # Stash chat_id thread-locally so deep tool callers (e.g. _run_powershell
-    # logging into cmd_history.jsonl) can tag entries with the originating
-    # chat without threading the id through every function signature.
+    # row — see _record_tool_result / _tool_repeat_state for the logic. Keyed by
+    # chat so concurrent turns never share streaks, and reset BEFORE the
+    # executor hop (workers read the same per-chat bucket via the contextvar).
+    _reset_tool_call_history(chat_id)
+    # Stash chat_id thread-locally (and in the contextvar that survives the
+    # executor hop) so deep tool callers (e.g. _run_powershell logging into
+    # cmd_history.jsonl) can tag entries with the originating chat without
+    # threading the id through every function signature.
     _set_current_chat(chat_id)
     try:
         try:
@@ -15132,6 +16255,20 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 "stream": True,
                 **llama_options(settings),
             }
+            # Output cap vs. headroom: max_tokens must never exceed what the
+            # slot has room for after the prompt. The reserve above is exactly
+            # that budget — clamping here means a runaway generation can't
+            # overflow n_ctx mid-stream (which, with --no-context-shift, errors
+            # the whole turn and loses the answer already streamed).
+            try:
+                _mo_raw = payload.get("max_tokens")
+                if _mo_raw is None:
+                    _mo_raw = settings.get("max_output_tokens") or 8192
+                _mo = int(_mo_raw)
+            except (ValueError, TypeError):
+                _mo = 8192
+            if _mo > 0:
+                payload["max_tokens"] = max(256, min(_mo, max(reserve - 1024, 256)))
             # Agentic turns need a tighter, deterministic sampling profile than
             # IDE/creative turns. The user's global sliders may be tuned for
             # design work (high temp, presence_penalty for variety) — but those
@@ -15204,6 +16341,15 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 try:
                     resp = llama_post_stream("/v1/chat/completions", payload)
                     break
+                except socket.timeout:
+                    # No first byte within the generous first-token window —
+                    # the server is prefilling something enormous or wedged.
+                    emit({"type": "error",
+                          "error": (f"llama-server produced no output within "
+                                    f"{_LLAMA_FIRST_TOKEN_TIMEOUT_S}s — it is either prefilling a very "
+                                    f"large prompt or stuck. Try the turn again; if this repeats, "
+                                    f"restart the server (Settings → Restart server).")})
+                    return None
                 except Exception as e:
                     if _ctx_attempt < 3 and _is_ctx_overflow(e):
                         pad = max(2048, int(ctx_limit * 0.12)) * (_ctx_attempt + 1)
@@ -15243,6 +16389,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # we count reasoning chars ourselves and force-close a runaway.
             think_chars = 0
             think_overflow = False
+            _loop_buf: list[str] = []
+            _loop_hits = 0
             try:
                 _think_cap = int(settings.get("thinking_budget") or 2048)
             except Exception:
@@ -15263,8 +16411,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     try:
                         obj = json.loads(data)
                     except Exception:
-                        continue
-                    # llama-server may emit a bare timings object after [DONE]
+                        continue                    # llama-server may emit a bare timings object after [DONE]
                     if "timings" in obj and "choices" not in obj:
                         t = obj["timings"]
                         last_stats = {
@@ -15299,14 +16446,33 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         # template). This harness enforcer is only a RUNAWAY guard:
                         # it fires at 2.5x the budget, so legitimate deep reasoning
                         # up to and a bit past the target is never guillotined.
-                        if _think_cap > 0 and budget_retries < 2:
-                            think_chars += len(rpiece)
-                            if think_chars / CHARS_PER_TOKEN > _think_cap * 2.5:
-                                content_buf.append("</think>")
-                                emit({"type": "delta", "content": "</think>"})
-                                reasoning_open = False
-                                think_overflow = True
-                                break
+                        think_chars += len(rpiece)
+                        # Degeneration loop detector: a stuck model repeats its
+                        # own reasoning verbatim (quantized MoE reasoners do this
+                        # mid-think). Cheap immediate-repeat test on the last 24
+                        # chunks — fires only on a true hard loop, and only after
+                        # >400 chars so legit "1. 2. 3." list patterns can't trip
+                        # it. Loop cuts share the budget_retries budget, so a
+                        # model that loops twice is bounced to the answer (or the
+                        # turn ends) instead of spinning forever.
+                        _loop_buf.append(rpiece)
+                        if len(_loop_buf) > 24:
+                            _loop_buf.pop(0)
+                        if len(_loop_buf) == 24 and _loop_buf[-6:] == _loop_buf[-12:-6]:
+                            _loop_hits += 1
+                        _in_loop = (_loop_hits >= 3 and think_chars > 400)
+                        _over_budget = (
+                            _think_cap > 0 and budget_retries < 2
+                            and think_chars / CHARS_PER_TOKEN > _think_cap * 2.5)
+                        if (_over_budget or _in_loop) and budget_retries < 2:
+                            content_buf.append("</think>")
+                            emit({"type": "delta", "content": "</think>"})
+                            reasoning_open = False
+                            think_overflow = True
+                            if _in_loop and not _over_budget:
+                                print(f"[chat] reasoning loop detected at {think_chars} chars — "
+                                      "forcing the answer", flush=True)
+                            break
                     piece = delta.get("content") or ""
                     if piece:
                         # Runaway guard: if a turn-boundary marker slips through
@@ -15370,6 +16536,22 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     if _last_prompt_tokens:
                         _last_prompt_tokens_by_chat[chat_id] = _last_prompt_tokens
                         _CTX_EST_CACHE.pop(chat_id, None)
+            except socket.timeout:
+                # Inter-token stall: llama-server stopped emitting. Do NOT keep
+                # the partial buffer for persistence — a wedged generation is
+                # not a finished answer — but do keep whatever reached the UI
+                # so far (it streamed live already).
+                _stall_txt = "".join(content_buf)
+                print(f"[chat] turn stalled: no tokens for {_LLAMA_STALL_TIMEOUT_S}s "
+                      f"(streamed {len(_stall_txt)} chars)", flush=True)
+                try:
+                    emit({"type": "error",
+                          "error": (f"llama-server went silent for {_LLAMA_STALL_TIMEOUT_S}s mid-generation — "
+                                    f"the turn was stopped. It may be a wedged slot; retry the turn, or "
+                                    f"restart the server (Settings → Restart server) if it repeats.")})
+                except Exception:
+                    pass
+                return None
             finally:
                 try:
                     resp.close()
@@ -15502,6 +16684,23 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         "content": "Continue. Complete the user's request using the tool results you just received. Do not ask for permission.",
                     })
                     continue
+                # Token-limit truncation: the stream stopped because the reply
+                # hit max_tokens (finish_reason "length"). A long report (red-
+                # team summaries, big diffs) must not die dangling — continue
+                # the SAME answer in a follow-up request, capped at 3 continuations
+                # per turn (each is a fresh request, so it cannot loop forever).
+                if (finish_reason == "length" and auto_continues < 3
+                        and rounds < max_tool_rounds):
+                    auto_continues += 1
+                    conversation.append(assistant_msg)
+                    conversation.append({
+                        "role": "system",
+                        "content": ("[automatic note] Your previous reply was cut off at the token limit. "
+                                    "Continue from exactly where it stopped and finish the remaining part of "
+                                    "the answer or code — do not repeat, do not summarize, do not ask. If you "
+                                    "were mid-tool-call, emit the rest of that call now."),
+                    })
+                    continue
                 # Mid-plan stall: tools already ran this turn and the reply
                 # announces more steps (or asks "shall I continue?") without
                 # making a tool call. Small models — Gemma especially — do
@@ -15571,74 +16770,98 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 return assistant_msg
 
             conversation.append(assistant_msg)
-            for call in parsed_calls:
-                name = call.get("name") or ""
-                args = call.get("arguments") or {}
-                emit({"type": "tool_start", "name": name, "arguments": args})
-                _ctx = contextvars.copy_context()
-                future = _tool_executor.submit(_ctx.run, invoke_tool, name, args if isinstance(args, dict) else {})
-                while not future.done():
-                    try:
-                        future.result(timeout=1.0)
-                    except Exception:
-                        pass
-                    if not future.done():
+            # PARALLEL TOOL EXECUTION: submit the whole batch to the executor
+            # first (bounded by _tool_executor's 8 workers), then collect in
+            # the model's original call order — so independent tools (grep +
+            # read + git status) run concurrently instead of serializing a
+            # 1s+ latency per call, while the conversation and UI ordering
+            # semantics stay identical. Calls that WRITE the same path can't
+            # run concurrently (last-write-wins races), so those are grouped
+            # into serial batches.
+            _batches: list[list[dict]] = []
+            for _call in parsed_calls:
+                _key = _call_serial_key(_call)
+                for _b in _batches:
+                    if not _key or not any(_call_serial_key(x) == _key for x in _b):
+                        _b.append(_call)
+                        break
+                else:
+                    _batches.append([_call])
+            for batch in _batches:
+                _futures: dict[int, object] = {}
+                for call in batch:
+                    name = call.get("name") or ""
+                    args = call.get("arguments") or {}
+                    emit({"type": "tool_start", "name": name, "arguments": args})
+                    _ctx = contextvars.copy_context()
+                    _futures[id(call)] = _tool_executor.submit(
+                        _ctx.run, invoke_tool, name, args if isinstance(args, dict) else {})
+                for call in batch:
+                    name = call.get("name") or ""
+                    args = call.get("arguments") or {}
+                    future = _futures[id(call)]
+                    while not future.done():
                         try:
-                            emit({"type": "heartbeat", "note": f"waiting for {name}…"})
+                            future.result(timeout=1.0)
                         except Exception:
                             pass
-                result = future.result()
-                emit({"type": "tool_result", "name": name, "result": result})
-                # Breach detection: a FLAG{...} in a tool response is confirmed
-                # access (cyber-range / CTF scoring). Scan the serialized result,
-                # report each distinct flag once as a per-stage breach event.
-                # Gated to target-touching tools only — otherwise reading a
-                # pentest report (or grepping notes) that documents FLAG{...}
-                # strings falsely lights the whole attack-chain rail.
-                if _is_breach_capable_tool(name):
-                    try:
-                        for _flag in _FLAG_RE.findall(json.dumps(result, ensure_ascii=False, default=str)):
-                            if _flag not in captured_flags:
-                                captured_flags.append(_flag)
-                                emit({"type": "breach", "stage": len(captured_flags),
-                                      "flag": _flag, "via": name,
-                                      "total": len(captured_flags)})
-                                print(f"[breach] stage {len(captured_flags)} — {_flag} (via {name})", flush=True)
-                                if _rt_on and _rt_mission_note(_rt_chat, fact=f"access via {name}: {_flag}"):
-                                    _rt_dirty = True
-                    except Exception:
-                        pass
-                # Mission target: the first host a red-team tool points at.
-                if _rt_on and name in _RED_TEAM_TOOL_NAMES:
-                    _t = _rt_target_from_args(name, args)
-                    if _t and _rt_mission_note(_rt_chat, target=_t):
-                        _rt_dirty = True
-                # Recon -> exploit: a validate_finding confirm (likely_real) means
-                # there is a real finding to breach, so unlock the heavier exploit
-                # subset for the rest of the run. The rt_phase event lets the UI
-                # show a subtle "exploit unlocked" marker (no attack-rail
-                # theatrics — those stay reserved for real exploitation / FLAGs).
-                if (_rt_on and name == "validate_finding"
-                        and isinstance(result, dict) and result.get("likely_real")):
-                    if _rt_mission_set_phase(_rt_chat, "exploit"):
-                        _rt_dirty = True
-                        emit({"type": "rt_phase", "phase": "exploit", "via": "validate_finding"})
-                # analysis tools produce large structured output (string lists,
-                # grep hit lists, disasm listings). Cap looser so the model can
-                # actually reason over the output. Chatty tools stay tight.
-                # compress_tool_result does line-aware head/tail elision on
-                # known bulk fields (stdout/stderr/content/etc.) BEFORE
-                # serializing, so the JSON envelope stays valid and trailing
-                # diagnostics survive — char-truncating the serialized JSON
-                # (the previous behavior) chopped mid-value and hid the bottom
-                # of every long output, where errors usually live.
-                _trunc = _tool_result_cap(name)
-                conversation.append({
-                    "role": "tool",
-                    "tool_call_id": call.get("id") or name,
-                    "name": name,
-                    "content": compress_tool_result(name, result, _trunc),
-                })
+                        if not future.done():
+                            try:
+                                emit({"type": "heartbeat", "note": f"waiting for {name}…"})
+                            except Exception:
+                                pass
+                    result = future.result()
+                    emit({"type": "tool_result", "name": name, "result": result})
+                    # Breach detection: a FLAG{...} in a tool response is confirmed
+                    # access (cyber-range / CTF scoring). Scan the serialized result,
+                    # report each distinct flag once as a per-stage breach event.
+                    # Gated to target-touching tools only — otherwise reading a
+                    # pentest report (or grepping notes) that documents FLAG{...}
+                    # strings falsely lights the whole attack-chain rail.
+                    if _is_breach_capable_tool(name):
+                        try:
+                            for _flag in _FLAG_RE.findall(json.dumps(result, ensure_ascii=False, default=str)):
+                                if _flag not in captured_flags:
+                                    captured_flags.append(_flag)
+                                    emit({"type": "breach", "stage": len(captured_flags),
+                                          "flag": _flag, "via": name,
+                                          "total": len(captured_flags)})
+                                    print(f"[breach] stage {len(captured_flags)} — {_flag} (via {name})", flush=True)
+                                    if _rt_on and _rt_mission_note(_rt_chat, fact=f"access via {name}: {_flag}"):
+                                        _rt_dirty = True
+                        except Exception:
+                            pass
+                    # Mission target: the first host a red-team tool points at.
+                    if _rt_on and name in _RED_TEAM_TOOL_NAMES:
+                        _t = _rt_target_from_args(name, args)
+                        if _t and _rt_mission_note(_rt_chat, target=_t):
+                            _rt_dirty = True
+                    # Recon -> exploit: a validate_finding confirm (likely_real) means
+                    # there is a real finding to breach, so unlock the heavier exploit
+                    # subset for the rest of the run. The rt_phase event lets the UI
+                    # show a subtle "exploit unlocked" marker (no attack-rail
+                    # theatrics — those stay reserved for real exploitation / FLAGs).
+                    if (_rt_on and name == "validate_finding"
+                            and isinstance(result, dict) and result.get("likely_real")):
+                        if _rt_mission_set_phase(_rt_chat, "exploit"):
+                            _rt_dirty = True
+                            emit({"type": "rt_phase", "phase": "exploit", "via": "validate_finding"})
+                    # analysis tools produce large structured output (string lists,
+                    # grep hit lists, disasm listings). Cap looser so the model can
+                    # actually reason over the output. Chatty tools stay tight.
+                    # compress_tool_result does line-aware head/tail elision on
+                    # known bulk fields (stdout/stderr/content/etc.) BEFORE
+                    # serializing, so the JSON envelope stays valid and trailing
+                    # diagnostics survive — char-truncating the serialized JSON
+                    # (the previous behavior) chopped mid-value and hid the bottom
+                    # of every long output, where errors usually live.
+                    _trunc = _tool_result_cap(name)
+                    conversation.append({
+                        "role": "tool",
+                        "tool_call_id": call.get("id") or name,
+                        "name": name,
+                        "content": compress_tool_result(name, result, _trunc),
+                    })
             rounds += 1
     except Exception as e:
         print(f"run_chat_turn interrupted: {e}")
@@ -17054,6 +18277,16 @@ class Handler(BaseHTTPRequestHandler):
                     chats["order"] = [x for x in chats["order"] if x != cid]
                     save_json(CHATS_FILE, chats)
                     shutil.rmtree(VERSIONS_DIR / cid, ignore_errors=True)
+                    # Free this chat's in-memory state: loop-breaker history,
+                    # unlocked bundle set, and the ctx-estimate cache. Without
+                    # this, deleting chats leaks dicts for the life of the
+                    # process (every chat ever created, one entry each).
+                    with _tool_history_lock:
+                        _tool_call_history.pop(cid, None)
+                        _tool_write_history.pop(cid, None)
+                    with _TOOL_BUNDLE_LOCK:
+                        _unlocked_bundles_by_chat.pop(cid, None)
+                    _CTX_EST_CACHE.pop(cid, None)
                     return self._send_json(200, {"ok": True})
                 return self._send_json(404, {"error": "not found"})
             if p == "/api/cmd-history":
@@ -17488,6 +18721,16 @@ class Handler(BaseHTTPRequestHandler):
             save_json(SETTINGS_FILE, cur)
             broadcast_event({"type": "settings:update"})
             return self._send_json(200, cur)
+        if p == "/api/compact":
+            # Manual compaction (frontend "compact now" button / model tool).
+            # Body: {chat_id}. Folds the oldest turns into the rolling summary
+            # regardless of context fill — the auto-trigger only fires at 0.85,
+            # and proactive compaction at task boundaries keeps the working
+            # window comfortable on long sessions.
+            chat_id = (body.get("chat_id") or "").strip()
+            if not chat_id:
+                return self._send_json(400, {"error": "chat_id required"})
+            return self._send_json(200, _compact_chat(chat_id, force=True))
         if p == "/api/workspace":
             folders = body.get("folders") or []
             folders = [normalize_path(f) for f in folders if isinstance(f, str) and f.strip()]
@@ -18221,7 +19464,11 @@ class Handler(BaseHTTPRequestHandler):
                 traceback.print_exc()
         # Native-tools turns carry the full JSON tool schemas on the wire, so
         # the abbreviated list in the prompt would duplicate them (~1.5K tokens).
-        # Text-tools mode (Gemma) attaches nothing — the list must stay.
+        # Text-tools mode (Gemma) attaches nothing — the list must stay. The
+        # prompt is built here (handler thread, pre-run_chat_turn), so pin the
+        # chat identity first — otherwise the tool list falls back to core-only
+        # and Gemma never sees bundles unlocked earlier in the session.
+        _set_current_chat(chat_id)
         system_prompt = build_system_prompt(include_tools=use_tools, chat_mode=mode,
                                             include_tool_list=not native_tools)
         # Durable mission block + pins: NOT spliced here anymore — they change
@@ -19293,7 +20540,9 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
         "num_gpu": 99,                 # all non-MoE layers on GPU
         "n_cpu_moe": 0,                # MoE-only; auto below
         "kv_cache_type": "q8_0",       # K cache — best balance
-        "kv_cache_type_v": "",         # V cache — "" = same as K (split K/V set by the dtype ladder)
+        "kv_cache_type_v": "",         # V cache — "" = same as K (mirrored at spawn). Tuner never splits
+                                       # K/V (measured: q8_0/q4_0 = +1.6% PPL AND slow path on this machine);
+                                       # q4_0 only as a ≤12 GB VRAM escape hatch (ladder below)
         "num_ctx": 32768,
         "num_batch": 512,
         "n_ubatch": 0,                 # auto in spawn
@@ -19845,92 +21094,44 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
 
     chosen_ctx, chosen_n_cpu_moe, tier_notes, _ = _solve(out["kv_cache_type"])
 
-    # -- KV dtype ladder (split K/V aware) --
-    # Rungs, in order of increasing compression / decreasing quality:
-    #   1. q8_0/q8_0 (or f16 when headroom allows) — zero measurable loss.
-    #   2. q8_0 K + q4_0 V ("k8v4") — K is the sensitive half (per-channel
-    #      outliers; noise propagates through softmax across all positions),
-    #      V is smoother and shrugs off 4-bit — the asymmetric K/V finding of
-    #      KIVI (ICML 2024, arXiv:2402.02750); llama.cpp supports the split
-    #      natively via --cache-type-k/--cache-type-v. ~23% KV savings at
-    #      ~6.5 bits/value, effectively free.
-    #   3. q4_0/q4_0 — dense models: small but real quality cost, so it stays
-    #      an escape hatch for starved context (<32k, needs a big multiplier).
-    #      Hybrid SSM/DeltaNet models (Qwen3.5/3.6, Qwen3-Next) are different:
-    #      only ~1 in 4 layers carries a KV cache at all, and community
-    #      benchmarks report q4_0 KV token-identical to f16 there (BLEU 1.000,
-    #      llama.cpp issue #21385 — single-machine measurement, not an official
-    #      validation), so for them q4_0 is ~2× context for ~free (setting:
-    #      allow_hybrid_q4_kv). Cost honesty: ANY quantized KV slows decode at
-    #      long context (per-token dequant; measured -12% at 24k, -37% at 110k
-    #      on a GB10 in the TurboQuant thread, less on discrete GPUs) — the
-    #      1.5×-context gate below exists so the trade is only taken when the
-    #      context win is large.
-    _hybrid_kv = bool(hy["hybrid"])
-    try:
-        _allow_hq4 = bool(_s_tune.get("allow_hybrid_q4_kv", True))
-    except Exception:
-        _allow_hq4 = True
-    if out["kv_cache_type"] != "f16":
-        base_ctx = chosen_ctx  # pass-1 (q8_0/q8_0) result — ladder rungs are judged against this
-        # Rung 2: split K/V. Near-free quality-wise, so it competes whenever
-        # context isn't already maxed — not just when starved.
-        if chosen_ctx < ctx_tiers[0]:
-            prev_downshift = out["quant_downshift"]
-            out["quant_downshift"] = ""
-            ctx_kv, moe_kv, kv_tier_notes, _ = _solve("q8_0", v_dtype="q4_0")
-            if ctx_kv >= int(chosen_ctx * 1.2):
-                out["kv_cache_type"] = "q8_0"
-                out["kv_cache_type_v"] = "q4_0"
-                chosen_ctx, chosen_n_cpu_moe, tier_notes = ctx_kv, moe_kv, kv_tier_notes
-                notes.append(
-                    "KV cache: split K/V — q8_0 K + q4_0 V (the V cache tolerates 4-bit "
-                    "with no measurable loss; K stays 8-bit where softmax noise would bite)."
-                )
-            else:
-                out["quant_downshift"] = prev_downshift
-        # Rung 3: full q4_0.
-        if _hybrid_kv and _allow_hq4 and out["kv_cache_type"] != "q4_0":
-            prev_downshift = out["quant_downshift"]
-            out["quant_downshift"] = ""
-            ctx_q4, moe_q4, q4_tier_notes, _ = _solve("q4_0", v_dtype="q4_0")
-            # Judged against the PASS-1 baseline (not the k8v4-boosted pick):
-            # on hybrid archs q4_0 is measured lossless, so a ≥1.5× win over
-            # the safe baseline is worth taking even past the split-K/V rung.
-            if ctx_q4 >= int(base_ctx * 1.5) and ctx_q4 > chosen_ctx:
-                out["kv_cache_type"] = "q4_0"
-                out["kv_cache_type_v"] = ""  # both sides q4_0 — keep the split field clean
-                chosen_ctx, chosen_n_cpu_moe, tier_notes = ctx_q4, moe_q4, q4_tier_notes
-                notes.append(
-                    "KV cache: q4_0 — hybrid SSM/DeltaNet arch, community-reported token-identical "
-                    "to f16 (llama.cpp #21385): only ~1/4 of layers carry KV at all. "
-                    "Set allow_hybrid_q4_kv=false to opt out."
-                )
-            else:
-                out["quant_downshift"] = prev_downshift
-        elif not _hybrid_kv and chosen_ctx < 32768 and out["kv_cache_type"] != "q4_0":
-            # Dense escape hatch (unchanged policy): q4_0 KV has a small
-            # quality cost, so below the 16k floor we accept a 1.5× gain;
-            # between 16k and 32k we demand 2×. Above 32k the conversation
-            # already has room to work.
-            gain_needed = 1.5 if chosen_ctx < 16384 else 2.0
-            prev_downshift = out["quant_downshift"]
-            out["quant_downshift"] = ""
-            ctx_q4, moe_q4, q4_tier_notes, _ = _solve("q4_0", v_dtype="q4_0")
-            if ctx_q4 >= int(chosen_ctx * gain_needed):
-                out["kv_cache_type"] = "q4_0"
-                out["kv_cache_type_v"] = ""
-                chosen_ctx, chosen_n_cpu_moe, tier_notes = ctx_q4, moe_q4, q4_tier_notes
-                notes.append(
-                    f"KV cache: switched to q4_0 — first-pass context was starved at "
-                    f"{chosen_ctx:,} tokens and q4_0 buys ≥{gain_needed:g}× context."
-                )
-            else:
-                out["quant_downshift"] = prev_downshift
-                notes.append(
-                    f"KV cache: kept {out['kv_cache_type']} — q4_0 retry only buys "
-                    f"{ctx_q4 / max(chosen_ctx, 1):.1f}× context (<{gain_needed:g}× threshold)."
-                )
+    # -- KV dtype policy --
+    # Policy (user-confirmed): K cache is q8_0 by default, f16 only when the
+    # model leaves obvious VRAM headroom (pass-1 above). The tuner NEVER emits
+    # a split K/V and NEVER q4_0 — except the escape hatch below, which exists
+    # only for GPUs with ≤12 GB VRAM where context is genuinely scarce.
+    # Why no splits/hybrid-q4 anymore — same-machine measurements (this build,
+    # llama-perplexity, Qwen3.6-27B-Q4_K_M, 5x8192 chunks, 150k-char corpus):
+    #   q8_0/q8_0  +0.2% PPL vs f16 (noise — lossless) and FAST (~4 s/pass)
+    #   q8_0/q4_0  +1.6% PPL AND slow mixed-dtype path (~184 s/pass) — the
+    #               KIVI "free V quant" claim (arXiv:2402.02750) does not hold
+    #               here; Qwen3.6-27B is hybrid-classified and still cost +1.6%
+    #   q8_0/f16   +1.8% PPL, slow path (~70 s/pass)
+    #   q4_0/f16   +2.6% PPL, slow path (~67 s/pass)
+    #   q4_0/q4_0  never measured to completion (slow path)
+    # So q8_0/q8_0 is both the accuracy pick AND the fast pick. Done.
+    if out["kv_cache_type"] != "f16" and vram <= 12.0 and chosen_ctx < 32768:
+        # Escape hatch: q4_0 only on small GPUs (≤12 GB VRAM) with starved
+        # context — below 16k we accept a 1.5× gain, between 16k and 32k we
+        # demand 2×. Above 32k the conversation already has room to work, and
+        # on bigger GPUs q8_0 KV fits — the quality cost is never worth it.
+        gain_needed = 1.5 if chosen_ctx < 16384 else 2.0
+        prev_downshift = out["quant_downshift"]
+        out["quant_downshift"] = ""
+        ctx_q4, moe_q4, q4_tier_notes, _ = _solve("q4_0", v_dtype="q4_0")
+        if ctx_q4 >= int(chosen_ctx * gain_needed):
+            out["kv_cache_type"] = "q4_0"
+            out["kv_cache_type_v"] = ""
+            chosen_ctx, chosen_n_cpu_moe, tier_notes = ctx_q4, moe_q4, q4_tier_notes
+            notes.append(
+                f"KV cache: switched to q4_0 (≤12 GB VRAM) — first-pass context was starved at "
+                f"{chosen_ctx:,} tokens and q4_0 buys ≥{gain_needed:g}× context."
+            )
+        else:
+            out["quant_downshift"] = prev_downshift
+            notes.append(
+                f"KV cache: kept {out['kv_cache_type']} — q4_0 retry only buys "
+                f"{ctx_q4 / max(chosen_ctx, 1):.1f}× context (<{gain_needed:g}× threshold)."
+            )
 
     # -- Grow-only context (min_ctx) --
     # Frontend callers pass their saved num_ctx so a re-tune never silently
@@ -20081,8 +21282,9 @@ def llama_caps(bin_path: str = "") -> dict:
     """Probe a llama-server binary's --help and report which optional flags it
     understands. Cached per (path, mtime). On probe failure assume everything
     is supported — identical to the pre-probe behavior."""
-    caps = {"n_cpu_moe": True, "override_tensor": True, "ngram_mod": True,
-            "ngram_legacy": False, "draft_mtp": True, "rope_scaling": True,
+    caps = {"n_cpu_moe": True, "override_tensor": True, "ngram_mod": False,
+            "ngram_legacy": False, "draft_mtp": True, "dflash": False,
+            "dspark": False, "rope_scaling": True,
             "flash_attn": True, "probed": False,
             # Context checkpoints: OFF unless actually seen in --help. Unlike
             # the flags above (kept True for pre-probe parity), these are new
@@ -20110,8 +21312,18 @@ def llama_caps(bin_path: str = "") -> dict:
             caps["n_cpu_moe"] = ("--n-cpu-moe" in help_txt) or ("ncmoe" in help_txt)
             caps["override_tensor"] = ("--override-tensor" in help_txt) or (" -ot" in help_txt)
             caps["ngram_mod"] = "--spec-ngram-mod-n-match" in help_txt
-            caps["ngram_legacy"] = "--spec-ngram-size-n" in help_txt
+            # Removed flags still appear in --help annotated "the argument has
+            # been removed" — exclude those so old builds keep their working
+            # legacy names and new builds don't think the old flag is real.
+            caps["ngram_legacy"] = ("--spec-ngram-size-n" in help_txt) and (
+                "the argument has been removed" not in help_txt)
             caps["draft_mtp"] = "draft-mtp" in help_txt
+            # Self-speculative decoding types (llama.cpp #21930): DFlash /
+            # DSpark draft from the model's own hidden states. Very new —
+            # fail-closed (False) until actually seen in --help, because an
+            # unknown --spec-type value hard-exits the server at boot.
+            caps["dflash"] = "dflash" in help_txt
+            caps["dspark"] = "dspark" in help_txt
             caps["rope_scaling"] = "--rope-scaling" in help_txt
             caps["flash_attn"] = ("--flash-attn" in help_txt) or ("-fa" in help_txt)
             caps["ctx_checkpoints"] = ("--ctx-checkpoints" in help_txt) or ("--swa-checkpoints" in help_txt)
@@ -20519,20 +21731,33 @@ def _apply_model_config(model_path: str) -> bool:
     floor (8192) are treated as scar tissue from crash-loops or from tunes
     measured while another instance held all the RAM — ignored and deleted
     so a fresh, honest tune replaces them instead of breaking every chat
-    (system prompt + tools alone don't fit in 4k)."""
+    (system prompt + tools alone don't fit in 4k). Same for stale KV dtype
+    entries (split K/V or q4_0 saved by older tuner versions — the tuner no
+    longer emits those; policy is q8_0/f16, q4_0 only as a ≤12 GB VRAM
+    escape hatch)."""
     cfg = _models_config().get(model_path)
     if isinstance(cfg, dict):
         saved_ctx = int(cfg.get("num_ctx") or 0)
-        if 0 < saved_ctx < 8192:
+        saved_kv = str(cfg.get("kv_cache_type") or "").strip().lower()
+        saved_kvv = str(cfg.get("kv_cache_type_v") or "").strip().lower()
+        # Split K/V (v set to anything but "" or the same as K) was emitted by
+        # older tuner versions only — the tuner never splits anymore. q4_0 K
+        # likewise came from the old hybrid/dense downshift rungs; if it's
+        # actually warranted (≤12 GB VRAM + starved ctx) a fresh tune will
+        # reproduce it. Either way: delete + re-tune.
+        stale_kv = (saved_kvv not in ("", saved_kv)) or saved_kv == "q4_0"
+        if 0 < saved_ctx < 8192 or stale_kv:
             try:
                 allc = _models_config()
                 allc.pop(model_path, None)
                 save_json(MODELS_CONFIG_FILE, allc)
             except Exception:
                 pass
+            reason = (f"ctx {saved_ctx:,} is below the usable floor (scar from a bad tune)"
+                      if 0 < saved_ctx < 8192 else
+                      f"KV dtype {saved_kv}/{saved_kvv or 'same'} is no longer auto-emitted (stale tuner config)")
             print(f"[llama] ignoring saved config for {os.path.basename(model_path)}: "
-                  f"ctx {saved_ctx:,} is below the usable floor (scar from a bad tune) — re-tuning",
-                  file=sys.stderr)
+                  f"{reason} — re-tuning", file=sys.stderr)
             return False
     if not isinstance(cfg, dict):
         return False
@@ -20977,7 +22202,7 @@ class LlamaProcess:
         _has_spec_key = isinstance(_raw_settings, dict) and "spec_strategy" in _raw_settings
         if s.get("enable_speculative") is False and not _has_spec_key:
             spec_strategy = "off"
-        elif spec_strategy not in ("off", "ngram-mod", "draft-mtp"):
+        elif spec_strategy not in ("off", "ngram-mod", "draft-mtp", "dflash", "dspark"):
             spec_strategy = "ngram-mod" if bool(s.get("enable_speculative", True)) else "off"
             
         if spec_strategy == "draft-mtp" and model_path:
@@ -21117,12 +22342,12 @@ class LlamaProcess:
             # in recent builds. The capability probe picks the flag this binary
             # actually understands; with neither, speculative turns itself off
             # instead of hard-exiting the server at startup.
-            if caps.get("ngram_mod", True):
+            if caps.get("ngram_mod", False):
                 cmd += [
                     "--spec-type", "ngram-mod",
                     "--spec-ngram-mod-n-match", "24",
-                    "--spec-draft-n-min", "48",
-                    "--spec-draft-n-max", "64",
+                    "--spec-ngram-mod-n-min", "48",
+                    "--spec-ngram-mod-n-max", "64",
                 ]
             elif caps.get("ngram_legacy"):
                 cmd += [
@@ -21151,10 +22376,45 @@ class LlamaProcess:
                     spec_n_max = max(1, int(gg_mtp["nextn_predict_layers"]))
             except Exception:
                 pass
-            cmd += [
-                "--spec-type", "draft-mtp",
-                "--spec-draft-n-max", str(spec_n_max),
-            ]
+            if caps.get("ngram_mod", False):
+                # CHAINED drafters (llama.cpp PR #20981 / #23269): MTP drafts a
+                # few high-quality tokens per step and n-gram backs it up with
+                # longer, cheaper drafts. NOTE: per-type length flags — the
+                # n-gram range lives on --spec-ngram-mod-n-*, while
+                # --spec-draft-n-max would set the MTP draft length (keep it
+                # at the model's GGUF head count, ~3). Chained runs still have
+                # ~no benefit on builds older than #23269 and a reported CUDA
+                # OOM on some setups (#23154) — spec_strategy=draft-mtp is the
+                # safe fallback if TG drops or it crashes.
+                cmd += [
+                    "--spec-type", "draft-mtp,ngram-mod",
+                    "--spec-draft-n-max", str(spec_n_max),
+                    "--spec-ngram-mod-n-match", "24",
+                    "--spec-ngram-mod-n-min", "48",
+                    "--spec-ngram-mod-n-max", "64",
+                ]
+            else:
+                cmd += [
+                    "--spec-type", "draft-mtp",
+                    "--spec-draft-n-max", str(spec_n_max),
+                ]
+        elif spec_strategy in ("dflash", "dspark"):
+            # Self-speculative decoding (llama.cpp #21930): the model drafts
+            # from its OWN hidden states — no separate draft model, no MTP
+            # heads required. Big wins on Qwen3/Llama-4-family models; other
+            # architectures may not support or benefit. Fail-closed on builds
+            # without the flag (unknown --spec-type hard-exits the server).
+            if caps.get(spec_strategy):
+                # CLI type names are prefixed draft- (draft-dflash / draft-dspark)
+                # even though the settings value is the short form.
+                cmd += ["--spec-type",
+                        {"dflash": "draft-dflash", "dspark": "draft-dspark"}.get(
+                            spec_strategy, spec_strategy)]
+                print(f"[llama] speculative decoding: {spec_strategy} (self-speculative)",
+                      file=sys.stderr)
+            else:
+                print(f"[llama] this build lacks --spec-type {spec_strategy} — spec_strategy→off",
+                      file=sys.stderr)
         # "off" emits nothing — no speculative decoding.
         # Auto-YaRN: running ctx past the model's trained context without rope
         # scaling silently degrades long-range attention on many architectures
@@ -21407,6 +22667,7 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
                         save_json(CHATS_FILE, chats)
                 except Exception:
                     traceback.print_exc()
+            _set_current_chat(chat_id)
             system_prompt = build_system_prompt(include_tools=True, chat_mode="agent",
                                                 include_tool_list=not _gm)
             # Mission block + pins are NOT spliced here — run_chat_turn appends

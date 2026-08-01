@@ -28,6 +28,7 @@
 <script src="https://unpkg.com/@phosphor-icons/web"></script>
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js" defer></script>
 <style>
   img[src^="/accuMOTION/"] {
     height: 44px !important;
@@ -51,7 +52,7 @@
         <img class="brand-mark brand-mark-light" src="/logo-mark-light.png" alt="" aria-hidden="true">
         <img class="brand-mark brand-mark-dark" src="/logo-mark-dark.png" alt="" aria-hidden="true">
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.7.0</span>
+        <span class="v" id="brand-v">v0.7.1</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -110,7 +111,10 @@
           </div>
         </div>
         <div class="ctx-gauge" id="ctx-gauge" title="working memory used">
-          <div class="ctx-gauge-title">Context memory</div>
+          <div class="ctx-gauge-title">Context memory
+            <button type="button" class="ctx-compact-btn" id="btn-compact"
+                    title="Fold older turns into the session summary now — frees context on long chats without losing detail">compact</button>
+          </div>
           <div class="ctx-gauge-body">
             <span class="ctx-gauge-label" id="ctx-gauge-label">0%</span>
             <svg viewBox="0 0 32 32" width="36" height="36" aria-hidden="true">
@@ -209,7 +213,7 @@
             <button class="chip" id="mode-agent" data-mode="agent"><i class="ph ph-terminal-window"></i>Agent</button>
             <button class="chip on" id="mode-auto" data-mode="auto"><i class="ph ph-lightning"></i>Auto</button>
             <button class="chip" id="btn-attach-image" title="Attach image — the vision model reads it and hands a description to the main model"><i class="ph ph-image"></i>Image</button>
-            <button class="chip" id="btn-trust-writes" title="Trust writes — auto-approve saving and editing files in your workspace. Registry edits, Windows system folders, and PowerShell still require approval."><i class="ph ph-pencil-simple-line"></i>Trust writes</button>
+            <button class="chip" id="btn-trust-writes" title="Trust writes — auto-approve saving and editing files in your workspace. Registry edits, Windows system folders, file deletion, PowerShell, and git operations (commit, push, checkout...) still require approval."><i class="ph ph-pencil-simple-line"></i>Trust writes</button>
             <input type="file" id="file-image" accept="image/*" multiple hidden>
             <div class="toolbar-overflow-wrap">
               <button class="toolbar-overflow" id="btn-toolbar-overflow" title="Build options"><i class="ph ph-sliders-horizontal"></i></button>
@@ -222,6 +226,9 @@
                 <div class="overflow-section-label">Red team</div>
                 <button class="chip" id="quick-recon-target" title="Authorized external recon on a target domain. Gated by an authorization prompt, then runs stealth port scan, TLS audit, HTTP fingerprint, passive subdomain enum and DNS recon, then summarizes."><i class="ph ph-crosshair"></i>Recon target (authorized)</button>
                 <button class="chip" id="quick-gain-access" title="Authorized autonomous pentest. Gated by an authorization prompt, then the model chains recon, exposure checks, weakness identification and access attempts (default creds, exposed services), captures proof, and reports. Only on systems you own or are authorized to test."><i class="ph ph-lock-key-open"></i>Find a way in (authorized)</button>
+                <div class="overflow-section-label">Blue team</div>
+                <button class="chip" id="quick-health-check" title="Read-only host triage: logon/service/scheduled-task event log review (last 24h) plus a persistence sweep, then a summary of anything worth a look. Nothing is changed."><i class="ph ph-shield-check"></i>Health check (read-only)</button>
+                <button class="chip" id="quick-persistence-hunt" title="Read-only sweep of startup keys, startup folders, scheduled tasks, services and WMI event subscriptions — flags anything hiding to survive a reboot. Nothing is changed."><i class="ph ph-shield-warning"></i>Persistence hunt (read-only)</button>
 
               </div>
             </div>
@@ -626,6 +633,11 @@
       <span class="hint">-1 = unlimited.</span>
     </div>
     <div class="form-row">
+      <label>Output cap · max_output_tokens <i class="ph ph-info" title="Harness-enforced ceiling per generation, even when num_predict is -1. Keeps runaway generations from overflowing the context window. Long replies past the cap auto-continue (up to 3x) — with num_predict set, that wins instead. -1 = truly unbounded."></i></label>
+      <input type="number" id="set-max-output" min="-1" step="256">
+      <span class="hint">8192 default. -1 = no cap.</span>
+    </div>
+    <div class="form-row">
       <label>KV cache quant · kv_cache_type <i class="ph ph-info" title="q4_0 saves ~50% VRAM vs q8_0 with tiny quality loss. f16 is best quality but uses full VRAM. Changing this restarts llama-server."></i></label>
       <select id="set-kv">
         <option value="q4_0">q4_0 · smallest VRAM</option>
@@ -635,14 +647,14 @@
       <span class="hint">lower = more context window fits in VRAM. saving reloads the model.</span>
     </div>
     <div class="form-row">
-      <label>V cache quant · kv_cache_type_v <i class="ph ph-info" title="K is the sensitive half of the KV cache (softmax error propagation); V is linearly combined and tolerates 4-bit with no measurable loss. 'same as K' mirrors kv_cache_type."></i></label>
+      <label>V cache quant · kv_cache_type_v <i class="ph ph-info" title="Manual override only — the auto-tuner never splits K/V: q8_0 K + q4_0 V measured +1.6% PPL AND a slow mixed-dtype path on this machine (llama-perplexity, Qwen3.6-27B). 'same as K' mirrors kv_cache_type."></i></label>
       <select id="set-kvv">
         <option value="">same as K</option>
-        <option value="q4_0">q4_0 · ~40% smaller KV, near-lossless</option>
+        <option value="q4_0">q4_0 · manual only, measured +1.6% PPL + slow</option>
         <option value="q8_0">q8_0</option>
         <option value="f16">f16</option>
       </select>
-      <span class="hint">q8_0 K + q4_0 V ≈ free 23% KV savings. saving reloads the model.</span>
+      <span class="hint">manual override — auto-tune always uses "same as K". saving reloads the model.</span>
     </div>
     <div class="form-row">
       <label>GPU reserve GB · vram_reserve_gb <i class="ph ph-info" title="Minimal GPU-side safety for Windows desktop/compositor spikes on the same card. 0 = give the LLM everything (the ~8% headroom still guards CUDA workspace)."></i></label>
@@ -653,10 +665,6 @@
       <label>RAM reserve GB · safety_reserve_gb <i class="ph ph-info" title="System RAM kept free for Windows when CPU-offloading experts/layers — prevents the memory thrash that bluescreens. Applies to system RAM only, never the VRAM budget."></i></label>
       <input type="number" id="set-ram-reserve" step="0.25" min="0" max="8">
       <span class="hint">1.0 default — Windows 11 anti-bluescreen floor.</span>
-    </div>
-    <div class="form-row inline">
-      <label>Hybrid q4 KV · allow_hybrid_q4_kv <i class="ph ph-info" title="Hybrid SSM/DeltaNet models (Qwen 3.5/3.6, Qwen3-Next) tolerate q4_0 KV cache with measured token-identical output (llama.cpp #21385) — the linear-attention layers absorb the noise. ON = the auto-tuner may use q4_0 KV for ~2x context on those models only. Dense models are never auto-q4_0 beyond the starved-context escape hatch."></i></label>
-      <div class="sw" id="sw-hybridq4"></div>
     </div>
 
     <div class="form-group">Auto-tune <span class="hint" style="font-size:10px;font-weight:normal;text-transform:none;letter-spacing:0;">· pick your VRAM, get sane defaults</span></div>
@@ -710,8 +718,10 @@
         <option value="off">off · no speculative decoding</option>
         <option value="ngram-mod">ngram-mod · works on any model (default)</option>
         <option value="draft-mtp">draft-mtp · uses the model's MTP heads (Qwen 3.5/3.6, DeepSeek V3/R1) · ~1.85x decode</option>
+        <option value="dflash">dflash · self-speculative from the model's own hidden states (newer builds)</option>
+        <option value="dspark">dspark · self-speculative variant (newer builds)</option>
       </select>
-      <span class="hint">draft-mtp needs a llama.cpp build from <b>2026-05-16</b> or later (PR #22673). Picking it on a model without MTP heads makes llama-server fail at startup.</span>
+      <span class="hint">draft-mtp needs a llama.cpp build from <b>2026-05-16</b> or later (PR #22673); dflash/dspark need an even newer build. Picking one the model doesn't support makes llama-server fail at startup.</span>
     </div>
     <div class="form-row inline">
       <label>Skip warmup <i class="ph ph-info" title="--no-warmup. Saves a few seconds at startup. First reply may be slightly slower."></i></label>
@@ -787,6 +797,7 @@
         <option value="aurora">Aurora</option>
         <option value="nebula">Nebula</option>
         <option value="operator">Operator</option>
+        <option value="neumorphic">Neumorphic</option>
         <option value="soft">Soft</option>
         <option value="light">Light</option>
       </select>
