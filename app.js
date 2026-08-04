@@ -126,9 +126,10 @@
       info: '<i class="ph ph-info toast-ico" style="color:var(--accent)"></i>',
       ok: '<i class="ph ph-check-circle toast-ico" style="color:var(--success)"></i>',
       warn: '<i class="ph ph-warning toast-ico" style="color:var(--warning)"></i>',
-      err: '<i class="ph ph-x-circle" style="color:var(--danger)"></i>'
+      err: '<i class="ph ph-x-circle" style="color:var(--danger)"></i>',
+      compact: '' // custom icon is embedded in the message HTML by the caller
     };
-    const iconHtml = iconMap[kind] || iconMap.info;
+    const iconHtml = iconMap[kind] != null ? iconMap[kind] : iconMap.info;
     const cleanMsg = html ? msg : esc(msg);
     el.innerHTML = `${iconHtml}<span class="toast-text">${cleanMsg}</span>`;
 
@@ -155,6 +156,18 @@
       comp.classList.add("status-error");
       setTimeout(() => comp.classList.remove("status-error"), 5000);
     }
+  }
+
+  // Squeeze-SVG shared by compaction notifications (in-progress toast and
+  // the "compacted" confirmation toast). The .compact-anim class drives the
+  // squeeze keyframes; #compact-indicator CSS rules are now inert.
+  const _COMPACT_SVG = `<svg class="compact-anim" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex:0 0 auto;color:var(--accent);vertical-align:-2px;margin-right:6px" aria-hidden="true"><path d="M4 4v16M20 4v16"/><g class="ca-left"><path d="M4 12h4m0 0l-2.5-2.5M8 12l-2.5 2.5"/></g><g class="ca-right"><path d="M20 12h-4m0 0l2.5-2.5M16 12l2.5 2.5"/></g></svg>`;
+
+  function hideToast(key) {
+    if (!key || !_toasts.has(key)) return;
+    const el = _toasts.get(key);
+    _toasts.delete(key);
+    try { el.remove(); } catch {}
   }
 
   const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({
@@ -2148,6 +2161,30 @@
     renderCostWidget();
     refreshSessionDesktopState();
     renderMessages();
+    // If the chat we just selected is the one with an ACTIVE (still-running)
+    // turn, re-attach the live agent row + the unpersisted prompt row. The
+    // stream closure keeps painting into the SAME node (deltas already wrote
+    // all the partial content into it), so this restores the partial text
+    // exactly where the model left off — no replay needed. Without this the
+    // switch wipes every token streamed so far, since the turn isn't in the
+    // persisted chat.messages until it completes.
+    if (state.liveTurn && state.liveTurn.chatId === id && state.streaming && state.liveTurn.row) {
+      const inner = $("#chat-inner");
+      // renderMessages only knows the persisted copy; the first message of a
+      // live turn isn't in it yet, so it painted the welcome screen. Remove it
+      // so the restored user bubble + live row show where the "new session"
+      // placeholder was — mirrors what send() does before appending.
+      const welcome = inner.querySelector(".welcome-screen");
+      if (welcome) welcome.remove();
+      if (state.liveTurn.userMsg && !state.liveTurn.userMsg.invisible && state.messages.indexOf(state.liveTurn.userMsg) === -1) {
+        state.messages.push(state.liveTurn.userMsg);
+        inner.appendChild(renderBubble(state.liveTurn.userMsg));
+      }
+      if (!state.liveTurn.row.isConnected) {
+        inner.appendChild(state.liveTurn.row);
+      }
+      scrollToBottom(true);
+    }
     state._versionsExpanded = false;
     loadVersions();
     renderChatList();
@@ -2343,7 +2380,7 @@
       { kind: "cmd", icon: "ph-gear-six", label: "Open Settings", action: () => { closePalette(); openSettings(); } },
       { kind: "cmd", icon: "ph-brain", label: "Open Long-term memory", action: () => { closePalette(); openSettings(); setTimeout(() => $("#btn-mem-refresh")?.scrollIntoView({ behavior: "smooth" }), 80); } },
       { kind: "cmd", icon: "ph-arrow-counter-clockwise", label: "Regenerate last reply", action: () => { closePalette(); regenerateLast(); } },
-      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / soft / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
+      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / neobrutalism / neobrutalism-dark / kinetic / soft / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
       { kind: "cmd", icon: "ph-browser", label: "Toggle preview pane", action: () => { closePalette(); app.classList.toggle("preview-collapsed"); } },
       { kind: "cmd", icon: "ph-camera", label: "Screenshot preview", action: () => { closePalette(); screenshotPreview(); } },
       { kind: "cmd", icon: "ph-package", label: "Export project", action: () => { closePalette(); exportProjectZip(); } },
@@ -2825,6 +2862,9 @@
     state.streaming = true;
     state.abortCtl = new AbortController();
     setStreamingUI(true);
+    // Same switch-away protection as send(): keep the live row reachable so
+    // selecting this chat mid-regenerate restores the partial.
+    state.liveTurn = { chatId: state.chatId, row: agentRow, userMsg: null };
     try {
       await streamChat("", agentRow, state.abortCtl.signal, [], { regenerate: true });
     } catch (e) {
@@ -2832,6 +2872,7 @@
     } finally {
       state.streaming = false;
       state.abortCtl = null;
+      state.liveTurn = null;
       setStreamingUI(false);
       renderRegenerateChip();
     }
@@ -3013,6 +3054,13 @@
     state.streaming = true;
     state.abortCtl = new AbortController();
     setStreamingUI(true);
+    // The live agent row (plus its unpersisted prompt) only exists in the
+    // closure + DOM mid-stream — the turn isn't persisted until it completes.
+    // Track it so a chat switch (which re-renders from the persisted copy)
+    // can restore the partial instead of losing it. We keep the actual DOM
+    // node: deltas keep painting into it, so re-attaching it later restores
+    // every partial token (thinking, tools, streamed answer) with no replay.
+    state.liveTurn = { chatId: state.chatId, row: agentRow, userMsg };
 
     try {
       await streamChat(withMentionRefs(text), agentRow, state.abortCtl.signal, images, opts);
@@ -3025,6 +3073,7 @@
     } finally {
       state.streaming = false;
       state.abortCtl = null;
+      state.liveTurn = null;   // turn committed; partial no longer needs restoring
       setStreamingUI(false);
       await loadChats();
       renderChatList();
@@ -3257,10 +3306,19 @@
         
         // Implicit close: if the model forgot to close the think tag but started a
         // native tool call, treat the tool call opener as the end of the thinking block.
-        const implicitCloseIdx = thinking.search(/<\/?tool_call>|<\|tool_call>|<call:[a-zA-Z0-9_\-]+>|\[TOOL_CALLS\]|```tool_call/i);
+        let implicitCloseIdx = thinking.search(/<\/?tool_call>|<\|tool_call>|<call:[a-zA-Z0-9_\-]+>|\[TOOL_CALLS\]|```tool_call/i);
         if (implicitCloseIdx > 0) {
           content += thinking.slice(implicitCloseIdx);
           thinking = thinking.slice(0, implicitCloseIdx);
+        } else {
+          // Some Qwen3.x builds drop the closing tag and glue the answer on after
+          // the template's " response" marker (e.g. "<think>…\n responsehey there").
+          // Treat "\n response" as the end of the thinking block and drop the marker.
+          const respM = thinking.match(/\n\s*response/);
+          if (respM && respM.index > 0) {
+            content += thinking.slice(respM.index + respM[0].length);
+            thinking = thinking.slice(0, respM.index);
+          }
         }
       } else {
         content = buf;
@@ -4173,37 +4231,31 @@
         note.innerHTML = `<i class="ph ph-warning"></i><span><strong>Tools off:</strong> ${esc(evt.message)}</span>`;
       }
     } else if (evt.type === "context_trimmed") {
-      // Conveyor belt elision notice — show a single pill above the agent
-      // row's tool stack. Replaces any prior pill from this turn so re-rounds
-      // don't stack pills.
-      if (row) {
-        let pill = row.querySelector(".ctx-trim-pill");
-        if (!pill) {
-          pill = document.createElement("div");
-          pill.className = "ctx-trim-pill";
-          const tip = "Conversation exceeds context window. Older middle messages aren't sent to the model to save space. Your system prompt and first message are always preserved.";
-          pill.innerHTML = `
-            <i class="ph ph-arrows-in-line-horizontal"></i>
-            <span class="ctx-trim-text"></span>
-            <i class="ph ph-info ctx-trim-info" title="${esc(tip)}"></i>`;
-          // Insert above tool-stack so it sits at the top of the agent column.
+      // Compression notice — rendered in the toast stack above the composer
+      // (where every other notification lives) with the squeeze SVG
+      // animation, not as a mid-conversation row pill. One user-facing
+      // concept: compaction. Replaces a prior toast so re-rounds don't stack.
+      const n = evt.dropped;
+      const plural = n === 1 ? "" : "s";
+      const msg = evt.folded
+        ? `${n} older message${plural} compacted into the session summary`
+        : evt.fold_pending
+          ? `Compaction queued — ${n} message${plural} will be folded on the next message`
+          : `Compaction skipped — ${n} message${plural} outside the window (context full)`;
+      // A "skipped/queued" toast right after a successful fold is redundant —
+      // the fold just compacted this wave; the trim is its tail-end backstop.
+      // One notification per compression wave, not two.
+      const justCompacted = (Date.now() - (window._lastCompactionAt || 0)) < 20000;
+      if (!evt.folded && justCompacted) {
+        if (row) {
+          row.dataset.dropped = evt.dropped;
           const stack = row.querySelector(".tool-stack");
-          if (stack && stack.parentNode) stack.parentNode.insertBefore(pill, stack);
-          else row.appendChild(pill);
+          if (stack) updateToolGroupHead(stack);
         }
-        const text = pill.querySelector(".ctx-trim-text");
-        // Two very different events share this pill: a real mid-turn fold
-        // (messages compacted into the session summary) vs. a plain drop
-        // (messages simply not sent to the model). Label them honestly —
-        // calling a plain drop "summarized" made the later compaction toast
-        // look like the summarization happened twice / late.
-        if (text) text.textContent = evt.folded
-          ? `${evt.dropped} older message${evt.dropped === 1 ? "" : "s"} compacted into the session summary`
-          : `${evt.dropped} message${evt.dropped === 1 ? "" : "s"} not sent to the model (context full)`;
-        const info = pill.querySelector(".ctx-trim-info");
-        if (info) info.title = evt.folded
-          ? "These messages were folded into the rolling session summary — the model still has their content in compressed form."
-          : "Context is full and no summary fold ran, so these middle messages were left out of the prompt entirely. The model cannot see them this turn.";
+        return;
+      }
+      toast(_COMPACT_SVG + esc(msg), "compact", 4000, "ctx-trim", true);
+      if (row) {
         row.dataset.dropped = evt.dropped;
         // Re-render tool group head if it exists to pick up the dropped count
         const stack = row.querySelector(".tool-stack");
@@ -4275,6 +4327,19 @@
         tokens: state._lastMsgTokens || 0,
         prompt_tokens: state._lastMsgPromptTokens || 0,
       };
+      // The final message belongs to the chat this turn streamed into, NOT
+      // whichever chat is selected right now. If the user switched away mid-
+      // turn, putting the message in the current view (state.messages is the
+      // in-memory copy of the SELECTED chat) would pollute that chat's bubble
+      // list. It's already persisted server-side; the safe move is to only
+      // graft it into the view when we're still looking at the streamed chat
+      // (or the turn has no live tracking, e.g. the regenerate path, which
+      // always targets the chat that's currently on screen).
+      if (state.liveTurn && state.liveTurn.chatId !== state.chatId) {
+        // user switched to a different chat mid-turn; the final message is
+        // persisted by the bridge at turn end, and loadChats() in the stream
+        // finally refreshes it — nothing to do here.
+      } else {
       // Fallback: if stats event never fired (some llama-server versions
       // don't emit timings/usage), use the streaming char estimate so the
       // cost widget isn't stuck at $0.00 after generation.
@@ -4349,6 +4414,7 @@
       }
       renderCtxGauge();
       renderRegenerateChip();
+      }
     } else if (evt.type === "notice") {
       toast(evt.note || "", "info", 3000, "ctx-notice");
     } else if (evt.type === "breach") {
@@ -6234,10 +6300,24 @@
           if (Number.isFinite(evt.capacity) && evt.capacity > 0) state._ctxCapacity = evt.capacity;
           renderCtxGauge();
         }
+      } else if (evt.type === "summary_folding") {
+        if (evt.chat_id && evt.chat_id !== state.chatId) return;
+        // Rendered as a normal notification in the toast stack above the
+        // composer (same host as all other toasts). 120s auto-dismiss is a
+        // safety net if a matching summary_folded / summary_fold_failed event
+        // is lost; hideToast on those events normally ends it earlier.
+        toast(_COMPACT_SVG + "Compacting session history…", "compact", 120000, "compact-progress", true);
+        appendAgentLog("Context compaction started — condensing older turns into the session summary.");
       } else if (evt.type === "summary_folded") {
+        window._lastCompactionAt = Date.now();
+        // Clear the in-progress toast unconditionally — a fold can end while
+        // the user is looking at a different chat; a chat-guarded early return
+        // would leave the indicator stuck.
+        hideToast("compact-progress");
         if (evt.chat_id && evt.chat_id !== state.chatId) return;
         toast(`Context compacted — ${evt.folded} older message${evt.folded === 1 ? "" : "s"} folded into the session summary.`, "info", 4000, "summary-fold");
       } else if (evt.type === "summary_fold_failed") {
+        hideToast("compact-progress");
         if (evt.chat_id && evt.chat_id !== state.chatId) return;
         toast("Context is full but compaction failed (summarizer error) — older messages are being trimmed instead. If the model starts repeating itself, send any message to retry the fold.", "warn", 8000, "summary-fold-fail");
       } else if (evt.type === "desktop:panic") {
@@ -7123,17 +7203,20 @@
   // lands on the next option instead of jumping straight to bright white.
   // nextTheme() handles the cycle and accepts whatever string is in settings
   // as the starting point.
-  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "soft", "light"];
+  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "neobrutalism", "neobrutalism-dark", "kinetic", "soft", "light"];
   const THEME_ICONS = {
-    dark:       "ph ph-moon",
-    dim:        "ph ph-moon-stars",
-    retro:      "ph ph-sun-horizon",
-    aurora:     "ph ph-sparkle",
-    nebula:     "ph ph-planet",
-    operator:   "ph ph-command",
-    neumorphic: "ph ph-drop-half",
-    soft:       "ph ph-cloud",
-    light:      "ph ph-sun",
+    dark:              "ph ph-moon",
+    dim:               "ph ph-moon-stars",
+    retro:             "ph ph-sun-horizon",
+    aurora:            "ph ph-sparkle",
+    nebula:            "ph ph-planet",
+    operator:          "ph ph-command",
+    neumorphic:        "ph ph-drop-half",
+    neobrutalism:      "ph ph-lightning",
+    "neobrutalism-dark": "ph ph-lightning-slash",
+    kinetic:           "ph ph-text-t",
+    soft:              "ph ph-cloud",
+    light:             "ph ph-sun",
   };
   function nextTheme(cur) {
     const idx = THEME_CYCLE.indexOf(cur);
@@ -9252,7 +9335,7 @@
       // user knows what the tap will do, mirroring the desktop cycle.
       const cur = document.documentElement.getAttribute("data-theme") || "light";
       const next = nextTheme(cur);
-      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", soft: "Soft", light: "Light" }[next] || next;
+      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", neumorphic: "Neumorphic", neobrutalism: "Neobrutalism", "neobrutalism-dark": "Neobrutalism Dark", kinetic: "Kinetic", soft: "Soft", light: "Light" }[next] || next;
       const lbl = $("#mm-theme-label");
       if (lbl) lbl.textContent = `Switch to ${niceName.toLowerCase()}`;
       mm.classList.add("open"); mmScrim.classList.add("open");

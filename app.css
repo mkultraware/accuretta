@@ -2,7 +2,7 @@
    Accuretta app — layout + components on top of the design system.
    Imports: /colors_and_type.css
    ============================================================ */
-@import url("/colors_and_type.css?v=6");
+@import url("/colors_and_type.css?v=7");
 
 * {
   box-sizing: border-box;
@@ -192,11 +192,11 @@ button {
   display: none;
 }
 
-:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .brand .brand-mark-light {
+:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"], [data-theme="neobrutalism-dark"], [data-theme="kinetic"]) .brand .brand-mark-light {
   display: none;
 }
 
-:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .brand .brand-mark-dark {
+:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"], [data-theme="neobrutalism-dark"], [data-theme="kinetic"]) .brand .brand-mark-dark {
   display: inline-block;
 }
 
@@ -1754,6 +1754,61 @@ button {
   width: max-content;
 }
 
+/* Compaction-in-progress pill — lives inside #toast-host, floats above the
+   composer while the rolling-summary fold runs (a synchronous local-model
+   call that can take seconds; the turn otherwise looks frozen). Arrow glyph
+   "squeezes" inward in a loop to read as compressing the session history. */
+#compact-indicator {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--bg-raised) 94%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border-strong));
+  border-radius: 999px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.08);
+  white-space: nowrap;
+  animation: compact-pill-breathe 2s ease-in-out infinite;
+}
+
+#compact-indicator.show {
+  display: inline-flex;
+}
+
+#compact-indicator svg {
+  flex-shrink: 0;
+}
+
+.compact-anim .ca-left,
+.compact-anim .ca-right {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: compact-squeeze 2s ease-in-out infinite;
+}
+
+.compact-anim .ca-right {
+  animation-name: compact-squeeze-r;
+}
+
+@keyframes compact-squeeze {
+  0%, 100% { transform: translateX(0); }
+  50% { transform: translateX(5px); }
+}
+
+@keyframes compact-squeeze-r {
+  0%, 100% { transform: translateX(0); }
+  50% { transform: translateX(-5px); }
+}
+
+@keyframes compact-pill-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.72; }
+}
+
 .toast-ico {
   flex: 0 0 auto;
   vertical-align: middle;
@@ -2077,6 +2132,28 @@ button {
   border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
+/* neobrutalism theme: highlighter-yellow user bubble with an ink
+   border and hard offset shadow — flat, loud, no glow. */
+[data-theme="neobrutalism"] .avatar.user {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border: 1px solid var(--border-strong);
+  box-shadow: 2px 2px 0 var(--border-strong);
+}
+
+[data-theme="neobrutalism-dark"] .avatar.user {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border: 1px solid var(--border-strong);
+  box-shadow: 2px 2px 0 var(--border-strong);
+}
+
+[data-theme="kinetic"] .avatar.user {
+  background: var(--bg-inset);
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
 /* Agent avatar: the Accuretta split-A brand mark. The bubble row gets the
    raw glyph, no circular background — same convention as the old black-hole
    avatar. Two <img>s ship side-by-side and CSS hides whichever doesn't
@@ -2222,12 +2299,10 @@ button {
   -webkit-backdrop-filter: blur(16px);
   color: var(--fg) !important;
   border: 1px solid rgba(0, 255, 196, 0.3) !important;
-  box-shadow: 0 8px 24px rgba(0, 255, 196, 0.1), inset 0 1px 1px rgba(0, 255, 196, 0.25) !important;
 }
 
 [data-theme="aurora"] .bubble.user:hover {
   border-color: rgba(0, 255, 196, 0.5) !important;
-  box-shadow: 0 12px 32px rgba(0, 255, 196, 0.15), inset 0 1px 2px rgba(0, 255, 196, 0.3) !important;
 }
 
 [data-theme="aurora"] .bubble.user p,
@@ -2269,12 +2344,10 @@ button {
   -webkit-backdrop-filter: blur(16px);
   color: var(--fg) !important;
   border: 1px solid rgba(232, 121, 249, 0.25) !important;
-  box-shadow: 0 8px 32px rgba(232, 121, 249, 0.1), inset 0 1px 1px rgba(232, 121, 249, 0.2) !important;
 }
 
 [data-theme="nebula"] .bubble.user:hover {
   border-color: rgba(232, 121, 249, 0.4) !important;
-  box-shadow: 0 12px 40px rgba(232, 121, 249, 0.15), inset 0 1px 2px rgba(232, 121, 249, 0.3) !important;
 }
 
 [data-theme="nebula"] .bubble.user p,
@@ -2307,6 +2380,141 @@ button {
   color: var(--accent);
   background: rgba(167, 139, 250, 0.10);
   border-color: rgba(167, 139, 250, 0.20);
+}
+
+/* neobrutalism theme user bubble: highlighter-yellow stamp with an ink
+   border and hard offset shadow, no glow. Ink-dark text on yellow. */
+[data-theme="neobrutalism"] .bubble.user {
+  background: var(--accent) !important;
+  color: var(--accent-fg) !important;
+  border: 1px solid var(--border-strong) !important;
+  box-shadow: 4px 4px 0 var(--border-strong) !important;
+}
+
+[data-theme="neobrutalism"] .bubble.user:hover {
+  transform: translate(1px, 1px);
+  box-shadow: 3px 3px 0 var(--border-strong) !important;
+}
+
+[data-theme="neobrutalism"] .bubble.user p,
+[data-theme="neobrutalism"] .bubble.user strong,
+[data-theme="neobrutalism"] .bubble.user em,
+[data-theme="neobrutalism"] .bubble.user span {
+  color: var(--accent-fg) !important;
+  -webkit-text-fill-color: var(--accent-fg) !important;
+}
+
+[data-theme="neobrutalism"] .bubble.user code,
+[data-theme="neobrutalism"] .bubble.user pre {
+  background: rgba(26, 26, 26, 0.10) !important;
+  color: var(--accent-fg) !important;
+}
+
+[data-theme="neobrutalism"] .bubble.user .code-card-body {
+  color: var(--accent-fg) !important;
+}
+
+[data-theme="neobrutalism"] .bubble.user .code-card-body .code-line::before {
+  color: color-mix(in srgb, var(--accent-fg) 45%, transparent);
+}
+
+[data-theme="neobrutalism"] .bubble.user .cc-act {
+  color: color-mix(in srgb, var(--accent-fg) 70%, transparent);
+}
+
+[data-theme="neobrutalism"] .bubble.user .cc-act:hover {
+  color: var(--accent-fg);
+  background: rgba(26, 26, 26, 0.12);
+  border-color: rgba(26, 26, 26, 0.25);
+}
+
+/* neobrutalism dark theme user bubble: acid-lime stamp on ink,
+   cream border, hard black shadow. Same chunky language as the
+   light brutalism, flipped contrast. */
+[data-theme="neobrutalism-dark"] .bubble.user {
+  background: var(--accent) !important;
+  color: var(--accent-fg) !important;
+  border: 1px solid var(--border-strong) !important;
+  box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.95) !important;
+}
+
+[data-theme="neobrutalism-dark"] .bubble.user:hover {
+  transform: translate(1px, 1px);
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.95) !important;
+}
+
+[data-theme="neobrutalism-dark"] .bubble.user p,
+[data-theme="neobrutalism-dark"] .bubble.user strong,
+[data-theme="neobrutalism-dark"] .bubble.user em,
+[data-theme="neobrutalism-dark"] .bubble.user span {
+  color: var(--accent-fg) !important;
+  -webkit-text-fill-color: var(--accent-fg) !important;
+}
+
+[data-theme="neobrutalism-dark"] .bubble.user code,
+[data-theme="neobrutalism-dark"] .bubble.user pre {
+  background: rgba(14, 14, 16, 0.14) !important;
+  color: var(--accent-fg) !important;
+}
+
+[data-theme="neobrutalism-dark"] .bubble.user .code-card-body {
+  color: var(--accent-fg) !important;
+}
+
+[data-theme="neobrutalism-dark"] .bubble.user .code-card-body .code-line::before {
+  color: color-mix(in srgb, var(--accent-fg) 45%, transparent);
+}
+
+[data-theme="neobrutalism-dark"] .bubble.user .cc-act {
+  color: color-mix(in srgb, var(--accent-fg) 70%, transparent);
+}
+
+[data-theme="neobrutalism-dark"] .bubble.user .cc-act:hover {
+  color: var(--accent-fg);
+  background: rgba(14, 14, 16, 0.14);
+  border-color: rgba(14, 14, 16, 0.25);
+}
+
+/* kinetic theme user bubble: plasma gradient surface with a
+   quiet violet border, no glow. Typography carries the motion,
+   the bubble stays calm. */
+[data-theme="kinetic"] .bubble.user {
+  background: linear-gradient(135deg, #FF4D00 0%, #FF2E6E 100%) !important;
+  color: #FFFFFF !important;
+  border: 1px solid rgba(255, 176, 60, 0.35) !important;
+  box-shadow: 0 4px 20px rgba(255, 77, 0, 0.25) !important;
+}
+
+[data-theme="kinetic"] .bubble.user p,
+[data-theme="kinetic"] .bubble.user strong,
+[data-theme="kinetic"] .bubble.user em,
+[data-theme="kinetic"] .bubble.user span {
+  color: #FFFFFF !important;
+  -webkit-text-fill-color: #FFFFFF !important;
+}
+
+[data-theme="kinetic"] .bubble.user code,
+[data-theme="kinetic"] .bubble.user pre {
+  background: rgba(0, 0, 0, 0.22) !important;
+  color: #FFFFFF !important;
+}
+
+[data-theme="kinetic"] .bubble.user .code-card-body {
+  color: #FFFFFF !important;
+}
+
+[data-theme="kinetic"] .bubble.user .code-card-body .code-line::before {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+[data-theme="kinetic"] .bubble.user .cc-act {
+  color: rgba(255, 255, 255, 0.75);
+}
+
+[data-theme="kinetic"] .bubble.user .cc-act:hover {
+  color: #FFFFFF;
+  background: rgba(0, 0, 0, 0.18);
+  border-color: rgba(255, 255, 255, 0.25);
 }
 
 .bubble.user p,

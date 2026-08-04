@@ -104,7 +104,7 @@ def _acquire_single_instance(lock_port: int = 8799) -> bool:
 
 # Themes whose splash uses a light background + the DARK-colored logo mark.
 # Mirrors app.css: :is([data-theme="light"],[data-theme="soft"]) shows .splash-logo-dark.
-_LIGHT_THEMES = {"", "light", "soft"}
+_LIGHT_THEMES = {"", "light", "soft", "neumorphic", "neobrutalism"}
 
 
 def _read_saved_theme() -> str:

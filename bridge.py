@@ -294,6 +294,12 @@ _last_prompt_tokens: int = 0
 # the real tokenizer count llama-server reports (prompt_eval_count) — the
 # ground truth for "how full is the context".
 _last_prompt_tokens_by_chat: dict[str, int] = {}
+# Per-chat "the trimmer dropped messages last round" flag. The rolling-summary
+# auto-trigger (0.85 fill) is measured on the ALREADY-TRIMMED prompt, so once
+# the trimmer bites it can never fire again (the trimmer caps fill ~25% below
+# the trigger). A drop IS the overflow signal — these flags let the next user
+# turn fold proactively instead of replaying the middle into another drop.
+_last_dropped_by_chat: dict[str, bool] = {}
 # Cache for the tokenize-based cold-start estimate (used only before a chat has
 # completed its first turn, so there is no real prompt_eval_count yet). Keyed by
 # chat_id → (fingerprint, tokens) so the 2s gauge poll doesn't re-tokenize
@@ -561,6 +567,10 @@ DEFAULT_SETTINGS = {
     "thinking_budget": 4096,        # HARNESS-enforced cap on thinking tokens (we count + force-close; the model's template can't be trusted to honor it). -1 = unlimited
     "max_tool_rounds": 120,         # how many tool-call rounds the model may run per user turn before forced stop
     "preserve_prior_thinking": False,# replay prior <think> verbatim: bloats context + re-feeds doubt on long runs, so default off
+    "summarize_history": True,      # rolling-summary compaction: fold the oldest turns into a summary
+                                    # when the context overflows instead of deleting them. False silently
+                                    # disables ALL folds — every overflow becomes a plain drop (see the
+                                    # trim-triggered fold in run_chat_turn).
     # llama-server lifecycle (bridge spawns it for us)
     "watchdog_enabled": True,       # auto-respawn llama-server on silent crash (OOM, segfault).
                                     # Circuit breaker stops trying after 3 crashes in 60s — fix
@@ -733,6 +743,18 @@ def _approx_tokens(text: str) -> int:
     return max(len(text), len(text.encode("utf-8"))) // CHARS_PER_TOKEN
 
 
+def _payload_msg_cost(m: dict, idx: int, stub_cutoff: int) -> int:
+    """Token cost of message `m` AS SENT — i.e. after
+    _sanitize_messages_for_openai's tool-result stubbing (any tool message older
+    than _TOOL_RESULT_KEEP_RECENT becomes a ~12-token elision stub). The
+    trimmer, fold trigger and fill estimates must budget what llama actually
+    receives, or they count ~2x the real payload, fire at ~35% real fill, and
+    force emergency mid-turn folds on every message."""
+    if m.get("role") == "tool" and idx < stub_cutoff:
+        return 12
+    return _count_msg_tokens(m)
+
+
 def _count_msg_tokens(msg: dict) -> int:
     content = msg.get("content") or ""
     # Vision turns: content is a list like [{type:"text",text:...},
@@ -759,17 +781,63 @@ def _count_msg_tokens(msg: dict) -> int:
     return text_tokens + _approx_tokens(extra) + 4  # role overhead
 
 
-def truncate_messages(msgs: list[dict], max_tokens: int, reserve: int = 256) -> list[dict]:
+def _conversation_token_scale(msgs: list[dict]) -> float:
+    """Correction factor that converts the char-heuristic conversation budget
+    into llama-server's real token units. One /tokenize call over the assembled
+    conversation text (same content _count_msg_tokens counts: text parts, tool
+    call JSON, flat 600-token images) returns real_tokens / char_estimate.
+    Returns 1.0 (no correction) for trivial conversations or when the server is
+    unreachable, so the trimmer degrades gracefully to the heuristic exactly as
+    before."""
+    approx = sum(_count_msg_tokens(m) for m in msgs)
+    if approx < 512:
+        return 1.0
+    parts: list[str] = []
+    img_extra = 0
+    for m in msgs:
+        content = m.get("content", "")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    parts.append(part.get("text") or "")
+                elif part.get("type") == "image_url":
+                    img_extra += 600
+        else:
+            parts.append(str(content or ""))
+        if m.get("tool_calls"):
+            parts.append(json.dumps(m["tool_calls"], ensure_ascii=False))
+        img_extra += 600 * len(m.get("images") or [])
+    joined = "\n".join(parts)
+    if not joined.strip():
+        return 1.0
+    exact = _llama_tokenize(joined)
+    if not exact or exact <= 0:
+        return 1.0
+    real = exact + img_extra
+    if real <= 0:
+        return 1.0
+    return real / approx
+
+
+def truncate_messages(msgs: list[dict], max_tokens: int, reserve: int = 256,
+                      token_scale: float = 1.0) -> list[dict]:
     """Conveyor belt: drop oldest middle messages while anchoring the system
     prompt (current goals/memory) AND the first user message (the original ask
     that frames the whole conversation). Most recent messages always keep.
 
     Layout: [system] + [first_user] + ...dropped... + [recent...]
     Reserve covers room for the next assistant reply + reasoning.
+    token_scale — multiply every per-message char estimate by this factor so the
+    budget is counted in llama-server's real token units (see
+    _conversation_token_scale). Default 1.0 keeps the old heuristic behavior.
     """
     if not msgs:
         return msgs
     budget = max_tokens - reserve
+    # Scaled count: the trimmer and llama-server's slot must agree on size.
+    _cm = lambda m: _count_msg_tokens(m) * token_scale
 
     # Anchor 1: system prompt at index 0 (if present).
     system = [msgs[0]] if msgs and msgs[0].get("role") == "system" else []
@@ -796,16 +864,16 @@ def truncate_messages(msgs: list[dict], max_tokens: int, reserve: int = 256) -> 
     # Count anchored cost first; if it already busts the budget, give up on
     # the anchor (long first message in a tiny ctx) and fall back to plain
     # tail-only behavior.
-    anchor_cost = sum(_count_msg_tokens(m) for m in system) + sum(_count_msg_tokens(m) for m in anchor)
+    anchor_cost = sum(_cm(m) for m in system) + sum(_cm(m) for m in anchor)
     if anchor_cost > budget * 0.6:
         anchor = []
-        anchor_cost = sum(_count_msg_tokens(m) for m in system)
+        anchor_cost = sum(_cm(m) for m in system)
 
     # Walk recent messages from the end backwards, keeping until budget hits.
     keep: list[dict] = []
     total = anchor_cost
     for m in reversed(middle_and_tail):
-        t = _count_msg_tokens(m)
+        t = _cm(m)
         if total + t > budget and keep:
             break
         keep.insert(0, m)
@@ -820,6 +888,14 @@ def truncate_messages(msgs: list[dict], max_tokens: int, reserve: int = 256) -> 
     # dropped. llama-server rejects orphan tool messages, so drop them here.
     while keep and keep[0].get("role") == "tool":
         keep.pop(0)
+    if len(system) + len(anchor) + len(keep) < len(msgs):
+        try:
+            print(f"TRIMDBG n={len(msgs)} keep={len(system) + len(anchor) + len(keep)} "
+                  f"budget={budget} anchor_cost={anchor_cost} "
+                  f"costs=[{','.join(str(int(_cm(m))) for m in msgs[:12])}]", flush=True)
+        except Exception:
+            print(f"TRIMDBG n={len(msgs)} keep={len(system) + len(anchor) + len(keep)} "
+                  f"budget={budget} anchor_cost={anchor_cost} (cost dump failed)", flush=True)
 
     # If the anchor is the same object as the first kept message (very short
     # convo), don't duplicate it.
@@ -846,8 +922,28 @@ def truncate_messages(msgs: list[dict], max_tokens: int, reserve: int = 256) -> 
 # real limit): compaction becomes a rare "about to overflow" safety net, not a
 # routine tax. truncate_messages is the hard backstop below it.
 _SUMMARY_MIN_KEEP = 6          # always keep at least this many recent messages raw
+_SUMMARY_MIN_KEEP_HARD = 2     # absolute floor when recent messages are giant (token-aware fold)
 _SUMMARY_TRIGGER_FRAC = 0.85
 _SUMMARY_KEEP_FRAC = 0.10     # aggressively fold most of the history, keeping only the recent tail raw
+_SUMMARY_MIN_OUTPUT_CHARS = 40  # summarizer output below this is degenerate (e.g. 11-char) — treat as failure
+_SUMMARY_REQUEST_CHARS = 200000  # cap the summarizer payload at the newest ~200K chars (~50K tokens) so it always fits ctx
+
+
+def _summary_trigger_limit(ctx_limit: int) -> int:
+    """Pre-turn fold threshold (real prompt tokens, incl. system + tools).
+    The trimmer's ceiling is ctx - reserve; the fixed 0.85 trigger was
+    UNREACHABLE whenever reserve + tool overhead exceeded 15% of ctx — on an
+    84K window the trimmer caps fill at ~82.5%, so the fold could never fire
+    first and every overflow forced a mid-turn fold instead. Fire just under
+    the trimmer's ceiling (tools approximated high so we're always a hair
+    early, never late), capped by the original 0.85 posture on large windows.
+    """
+    reserve = max(min(int(ctx_limit * 0.25), 16000), 1024)
+    ceiling = ctx_limit - reserve - 8192 - 768
+    return min(int(ctx_limit * _SUMMARY_TRIGGER_FRAC),
+               max(int(ctx_limit * 0.50), ceiling))
+
+
 _SUMMARY_INSTR = (
     "You are compressing an earlier slice of a coding-assistant conversation into a structured state block. "
     "Merge the PRIOR SUMMARY (if any) with the NEW MESSAGES into one updated state. "
@@ -893,23 +989,46 @@ def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: s
     if old_summary:
         user += f"PRIOR SUMMARY:\n{old_summary}\n\n"
     user += f"NEW MESSAGES:\n{rendered}"
+    if len(user) > _SUMMARY_REQUEST_CHARS:
+        # Deep folds render a lot of history; cap at the newest chars (~50K
+        # tokens) so the summarizer request always fits the window with room
+        # for its own output. Keep the END — the most recently folded messages
+        # are the ones the model needs freshest.
+        user = ("…(older folded messages truncated to fit the summary request)…\n"
+                + user[-_SUMMARY_REQUEST_CHARS:])
     payload = {
         "model": "local",
         "messages": [
             {"role": "system", "content": _SUMMARY_INSTR},
-            {"role": "user", "content": user[:300000]},
+            {"role": "user", "content": user},
         ],
-        "stream": False, "temperature": 0.2, "max_tokens": 1024,
+        "stream": False, "temperature": 0.2, "max_tokens": 2048,
     }
+    try:
+        # This call runs synchronously and can take 2-60s on a local model —
+        # tell the UI so it can show a live "compacting…" indicator while the
+        # fold is in flight (see #compact-indicator in app.js / app.css).
+        broadcast_event({"type": "summary_folding", "chat_id": chat_id})
+    except Exception:
+        pass
     try:
         resp = llama_post("/v1/chat/completions", payload, timeout=_SUMMARY_CALL_TIMEOUT_S)
         txt = ((resp.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
-        return txt or old_summary
-    except Exception:
+        if len(txt) < _SUMMARY_MIN_OUTPUT_CHARS:
+            # Degenerate summarizer output (the 11-char failure) would be
+            # recorded as state and poison the summary — treat it as a failure
+            # so the caller backs off and retries instead of folding with junk.
+            raise ValueError(f"summarizer returned degenerate output ({len(txt)} chars)")
+        return txt
+    except Exception as _e:
         # Surface it — a silent failure here is invisible state loss: the
         # trimmer keeps deleting the middle and the model loops with no hint
         # why. Throttled by the caller's backoff so a wedged server doesn't
         # toast-spam every round.
+        try:
+            _log_compact(chat_id, f"summarize failed: {type(_e).__name__}: {_e}")
+        except Exception:
+            pass
         try:
             broadcast_event({"type": "summary_fold_failed", "chat_id": chat_id})
         except Exception:
@@ -928,7 +1047,70 @@ _summary_last_fail_by_chat: dict[str, float] = {}
 _SUMMARY_CALL_TIMEOUT_S = 90
 
 
-def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False) -> bool:
+# ---- compaction debug log ---------------------------------------------------
+# Append-only runtime trace (data/compaction_debug.log) for the trim/fold
+# call-site arithmetic that fold_events doesn't capture: the trimmer's
+# ctx_limit / reserve / token_scale / dropped at the moment of a trim, and the
+# pre-turn / proactive fold gates. Never raises.
+_COMPACT_DEBUG_FILE = DATA / "compaction_debug.log"
+_compact_debug_lock = threading.Lock()
+
+
+def _log_compact(chat_id: str, msg: str) -> None:
+    try:
+        line = f"{time.strftime('%H:%M:%S')} [{chat_id}] {msg}\n"
+        with _compact_debug_lock:
+            with open(_COMPACT_DEBUG_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
+# ---- compaction telemetry ---------------------------------------------------
+# One JSONL line per compaction ATTEMPT in data/fold_events.jsonl: ground truth
+# for "why did the compressor fire" — the fill at decision time, which path
+# fired (auto 0.85 gate / forced pre-turn / mid-turn / manual), and how many
+# messages + tokens each fold actually moved. The fill-gate "plenty of
+# headroom" exits are deliberately NOT recorded — those are the normal
+# non-fires, and recording them would drown the signal in per-turn noise.
+
+FOLD_EVENTS_FILE = DATA / "fold_events.jsonl"
+_fold_events_lock = threading.Lock()
+
+
+def _record_fold_event(chat: dict, reason: str, force: bool, ok: bool,
+                       outcome: str, ctx_limit: int, fill: int | None,
+                       through: int, cut: int | None,
+                       folded_tokens: int | None = None) -> None:
+    """Append one compaction-attempt record. Never raises — telemetry must
+    not break the fold path it observes."""
+    try:
+        rec = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "chat_id": chat.get("id") or "",
+            "title": chat.get("title", ""),
+            "reason": reason,
+            "force": force,
+            "ok": ok,
+            "outcome": outcome,
+            "fill": fill,
+            "fill_frac": round(fill / ctx_limit, 4) if (fill or 0) > 0 else None,
+            "ctx": ctx_limit,
+            "through": through,
+            "cut": cut,
+            "folded": (cut - through) if (ok and cut is not None) else 0,
+            "folded_tokens": folded_tokens,
+            "summary_chars": len(chat.get("rolling_summary", "") or ""),
+        }
+        with _fold_events_lock:
+            with open(FOLD_EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False,
+                        reason_hint: str = "auto") -> bool:
     """Token-aware: fold the oldest un-kept turns into chat['rolling_summary']
     ONLY when the conversation actually approaches the context window. Short
     sessions keep full detail; we never spend a summary call prematurely.
@@ -941,9 +1123,15 @@ def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False) -> bool
     through = int(chat.get("summary_through", 0) or 0)
     tail = msgs[through:]
     if len(tail) <= _SUMMARY_MIN_KEEP:
+        _record_fold_event(chat, reason_hint, force, False, "tail_too_small",
+                           ctx_limit, _last_prompt_tokens_by_chat.get(chat.get("id") or "", 0),
+                           through, None)
         return False
     chat_id = chat.get("id") or ""
     if time.time() - _summary_last_fail_by_chat.get(chat_id, 0) < _SUMMARY_FAIL_BACKOFF_S:
+        _record_fold_event(chat, reason_hint, force, False, "fail_backoff",
+                           ctx_limit, _last_prompt_tokens_by_chat.get(chat_id, 0),
+                           through, None)
         return False
     # Trustworthy fill signal: llama-server's real prompt_eval_count from this
     # chat's last turn (the whole prompt — system + tools + history). That is
@@ -952,13 +1140,22 @@ def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False) -> bool
     # a turn (no real number exists yet).
     real_fill = _last_prompt_tokens_by_chat.get(chat_id, 0)
     if not force:
-        if real_fill > 0:
-            if real_fill <= ctx_limit * _SUMMARY_TRIGGER_FRAC:
-                return False  # plenty of headroom — don't summarize yet
-        else:
-            tail_tokens = sum(_count_msg_tokens(m) for m in tail)
-            if tail_tokens <= ctx_limit * _SUMMARY_TRIGGER_FRAC:
-                return False  # plenty of headroom — don't summarize yet
+        # Trigger just under the trimmer's ceiling (see _summary_trigger_limit):
+        # the fold must win the race against truncate_messages, or the trimmer
+        # drops the middle and forces mid-turn folds on every overflow.
+        trigger_limit = _summary_trigger_limit(ctx_limit)
+        # Never let a STALE or absent map skip a fold the CURRENT stored
+        # conversation genuinely needs (bridge restart, chat restored/edited,
+        # first message): the char-based tail estimate covers that. max() is
+        # safe because both numbers are ~the same units (chars/3 ≈ code tokens)
+        # and the trigger has ~2K of slack under the trimmer ceiling.
+        # Stub-aware: old tool results are elided in the outgoing payload, so
+        # count what would actually be sent (see _payload_msg_cost).
+        _stub_cutoff = len(msgs) - _TOOL_RESULT_KEEP_RECENT
+        tail_tokens = sum(_payload_msg_cost(m, through + i, _stub_cutoff)
+                          for i, m in enumerate(tail))
+        if max(real_fill, tail_tokens) <= trigger_limit:
+            return False  # plenty of headroom — don't summarize yet
     # Fold oldest turns until the remaining RAW tail is ~KEEP_FRAC of ctx. Walk
     # newest-first, keeping recent turns until the keep budget fills; the rest
     # (older) get folded into the summary.
@@ -971,6 +1168,14 @@ def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False) -> bool
             break
     # never fold so far that fewer than MIN_KEEP recent messages remain raw
     cut = min(cut, len(msgs) - _SUMMARY_MIN_KEEP)
+    # Token-aware floor: MIN_KEEP recent messages can be giant tool results
+    # that exceed the whole keep budget, leaving almost no runway after the
+    # fold. Fold further (hard floor _SUMMARY_MIN_KEEP_HARD) until the kept
+    # tail is back near the token budget.
+    tail_kept = sum(_count_msg_tokens(m) for m in msgs[cut:])
+    while cut < len(msgs) - _SUMMARY_MIN_KEEP_HARD and tail_kept > keep_budget:
+        tail_kept -= _count_msg_tokens(msgs[cut])
+        cut += 1
     if cut <= through:
         # The trigger fired (real fill is near the limit) but the raw tail alone
         # never reached keep_budget — meaning system prompt + tool schemas, not
@@ -980,21 +1185,43 @@ def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False) -> bool
         # minimum raw keep anyway: near-full is near-full.
         cut = len(msgs) - _SUMMARY_MIN_KEEP
         if cut <= through:
+            _record_fold_event(chat, reason_hint, force, False, "cannot_advance",
+                               ctx_limit, real_fill, through, None)
             return False
     new_summary = _update_rolling_summary(chat.get("rolling_summary", ""), msgs[through:cut],
                                           chat_id=chat_id)
     if new_summary is None:
         _summary_last_fail_by_chat[chat_id] = time.time()
+        _record_fold_event(chat, reason_hint, force, False, "summarize_failed",
+                           ctx_limit, real_fill, through, cut)
         return False
     if new_summary and new_summary != chat.get("rolling_summary", ""):
         chat["rolling_summary"] = new_summary
         chat["summary_through"] = cut
+        # Immediately refresh the per-chat fill so the gauge drops right after
+        # a fold instead of showing the stale pre-fold number until the next
+        # round's stats event lands (that was the visible "gauge lag").
+        try:
+            # Pass the LIVE chat object: the estimator reads the chat from disk
+            # by default, which is still pre-fold (summary_through=0) until the
+            # caller's save lands — that stale estimate poisoned the fill map
+            # and re-fired the proactive mid-turn fold on the very next round.
+            _post_fold = _estimate_context_tokens(chat_id, chat=chat)
+            if _post_fold > 0:
+                _last_prompt_tokens_by_chat[chat_id] = _post_fold
+        except Exception:
+            pass
+        _record_fold_event(chat, reason_hint, force, True, "ok", ctx_limit, real_fill,
+                           through, cut,
+                           sum(_count_msg_tokens(m) for m in msgs[through:cut]))
         try:
             broadcast_event({"type": "summary_folded", "chat_id": chat_id,
                              "folded": cut - through})
         except Exception:
             pass
         return True
+    _record_fold_event(chat, reason_hint, force, False, "no_change",
+                       ctx_limit, real_fill, through, cut)
     return False
 
 
@@ -1010,7 +1237,12 @@ _SUMMARY_SECTION_RE = re.compile(
 def _splice_rolling_summary(system_content: str, new_summary: str) -> str:
     """Replace (or append) the rolling-summary section inside an assembled
     system prompt. Used when a fold happens MID-turn: the summary the system
-    prompt was built with is stale, and the rebuild must carry the new one."""
+    prompt was built with is stale, and the rebuild must carry the new one.
+    Uses a callable replacement so backslashes in the summary text (Windows
+    paths, regexes in summarized code) are treated LITERALLY: re.sub parses
+    string replacements as templates and raises "bad escape" on them, which
+    killed the mid-turn rebuild and left the fold without its conversation
+    (compaction repeated every round)."""
     section = ""
     if new_summary:
         section = (
@@ -1018,7 +1250,7 @@ def _splice_rolling_summary(system_content: str, new_summary: str) -> str:
             "treat these as established facts — do not redo work or re-ask) ===\n" + new_summary
         )
     if _SUMMARY_SECTION_RE.search(system_content):
-        return _SUMMARY_SECTION_RE.sub(section, system_content)
+        return _SUMMARY_SECTION_RE.sub(lambda _m: section, system_content)
     return system_content + section
 
 
@@ -1096,7 +1328,10 @@ def _mid_turn_fold(chat_id: str, conversation: list[dict], start_len: int,
                 persisted["name"] = im["name"]
         chat["messages"].append(persisted)
     persisted_upto = len(conversation)
-    if not _maybe_roll_summary(chat, ctx_limit):
+    # force=True: the caller only reaches this path when the trimmer already
+    # dropped messages — that drop IS the overflow signal, so skip the 0.85
+    # fill gate (it is unreachable anyway: the trimmer caps fill below it).
+    if not _maybe_roll_summary(chat, ctx_limit, force=True, reason_hint="mid_turn"):
         save_json(CHATS_FILE, chats)
         return {"conversation": None, "start_len": persisted_upto, "folded": 0}
     save_json(CHATS_FILE, chats)
@@ -1137,7 +1372,7 @@ def _compact_chat(chat_id: str, force: bool = True) -> dict:
         return {"note": "history is already compact — nothing left to fold",
                 "summary_through": old_through, "folded": 0}
     ctx_limit = _llama_props_ctx() or int(get_settings().get("num_ctx") or 32768)
-    if not _maybe_roll_summary(chat, ctx_limit, force=force):
+    if not _maybe_roll_summary(chat, ctx_limit, force=force, reason_hint="manual"):
         return {"error": "compaction did not run (summarizer call failed or no foldable history)",
                 "summary_through": old_through, "folded": 0}
     save_json(CHATS_FILE, chats)
@@ -2397,7 +2632,7 @@ def unsubscribe(q: Queue) -> None:
 
 # Event types forwarded live but excluded from the resume ring buffer (see
 # broadcast_event). ctx_fill fires once per agentic round.
-_TRANSIENT_EVENT_TYPES = frozenset({"ctx_fill"})
+_TRANSIENT_EVENT_TYPES = frozenset({"ctx_fill", "summary_folding"})
 
 
 def broadcast_event(evt: dict) -> None:
@@ -2916,6 +3151,10 @@ def tool_write_file(args: dict) -> dict:
     content = args.get("content", "")
     if not path:
         return {"error": "missing path"}
+    if not isinstance(content, str) or not content.strip():
+        return {"error": "refused: content is empty/missing — your write_file call had no file body "
+                         "(the server's tool parser likely dropped it). Re-emit the call with the "
+                         "path AND the full content together."}
     if is_bridge_self_path(path):
         return {"error": "refused: bridge.py is the running server — edit it from your real IDE, not from a chat tool call. Restart the bridge afterward."}
     _cerr = _critical_path_gate(path, "write_file", "PROTECTED PATH - write under Windows/System32")
@@ -2925,11 +3164,22 @@ def tool_write_file(args: dict) -> dict:
         return {"error": "path outside workspace. Add folder in Workspace panel."}
     if is_ignored(path):
         return {"error": f"path ignored by .accurettaignore: {path}"}
-    # Anti-clobber: refuse a full overwrite of an existing file the model hasn't
-    # read this session (or that changed since it read) — it would be writing
-    # from a stale mental model. read_file first, or pass force=true to override.
+    # Anti-clobber: refuse to clobber an existing file the model hasn't
+    # read this session (or that changed since it read). BUT an empty (0-byte)
+    # file is an artifact, not content — very often a leftover from an earlier
+    # failed write (e.g. the model's first call got its arguments stripped by
+    # llama.cpp's parser and wrote nothing). There is nothing to protect in it,
+    # and blocking a fresh write that carries real content only deadlocks the
+    # agent in a "file exists → never read → resubmit → blocked again" loop.
+    # Only the read/force requirement applies when there is actual content to
+    # protect: refile 0-size files are safe to overwrite.
+    _existing_len = 0
+    try:
+        _existing_len = os.path.getsize(path) if os.path.isfile(path) else 0
+    except OSError:
+        pass
     if os.path.isfile(path) and not bool(args.get("force")):
-        stale = _file_staleness(path)
+        stale = ("" if _existing_len == 0 else _file_staleness(path))
         if stale:
             return {"error": (f"write blocked: this file exists and was {stale}. Call read_file on it "
                               f"first so you overwrite the CURRENT contents, not a stale assumption — "
@@ -14489,6 +14739,94 @@ def _resolve_tool_name(name: str) -> str:
     return name
 
 
+# ---- llama.cpp native tool-call failure memory ---------------------------
+# llama.cpp's native parser drops the <parameter> blocks of the Qwen3.5/3.6
+# XML tool dialect for bulky multi-arg tools (write_file is the worst hit):
+# a call comes back with its NAME but `arguments:{}`. When that happens we
+# flip to text-tools mode (parse the XML from content ourselves) — but that
+# flip was turn-local, so every new user turn paid Round 1 to rediscover the
+# loss. Remember which model ids have already shown the failure so subsequent
+# turns start in text-tools mode directly.
+_NATIVE_TOOLS_BROKEN_IDS: set[str] = set()
+
+
+def _mark_native_tools_broken() -> None:
+    """Record that llama.cpp's native parser dropped args for the active model."""
+    s = get_settings()
+    for _mid in (s.get("model"), s.get("model_path"), _llama.loaded_model()):
+        if _mid:
+            _NATIVE_TOOLS_BROKEN_IDS.add(_mid)
+
+
+def _native_tools_broken() -> bool:
+    s = get_settings()
+    return any(
+        _mid in _NATIVE_TOOLS_BROKEN_IDS
+        for _mid in (s.get("model"), s.get("model_path"), _llama.loaded_model())
+        if _mid)
+
+
+# Tolerant XML-dialect call repo. It will even complete a call whose closing
+# tags were cut off (truncated stream), which is usually fine — content text
+# lives between <parameter=...> and the NEXT tag. The one case it must NOT
+# swallow silently is a fully-open, never-closed <tool_call> with a huge body:
+# that means the model hit max_tokens/thinking mid-file and the "content"
+# captured is only a prefix of the real file. Writing that as "ok" causes the
+# exact "file got cut off mid-way" spiral. Space-bounded marker: a ready open
+# marker with NO later </tool_call> anywhere = truncated mid-call.
+_TOOL_CALL_BLOCK_RE = re.compile(
+    r"(?:<|&lt;|\\<)tool_call(?:>|&gt;|\\>)?[\s\S]*?" 
+    r"(?:<|&lt;|\\<)/tool_call(?:>|&gt;|\\>)?",
+    re.IGNORECASE)
+_TOOL_CALL_OPENER_RE = re.compile(
+    r"(?:<|&lt;|\\<)\s*[a-z]*tool_call(?:>|&gt;|\\>)?", re.IGNORECASE)
+_TOOL_CALL_CLOSER_RE = re.compile(
+    r"(?:<|&lt;|\\<)\s*/tool_call(?:>|&gt;|\\>)?", re.IGNORECASE)
+
+
+def _has_unclosed_tool_call(text: str) -> bool:
+    """True if the buffer holds a <tool_call> opener with no matching closer
+    later — i.e. the stream was cut mid-call (hit the token/thinking budget).
+    Every opener must be balanced by a closer before the next opener appears
+    (or by end-of-string); any segment from an opener to the next opener/end
+    that lacks a closer means that call never terminated."""
+    if not text:
+        return False
+    openers = list(_TOOL_CALL_OPENER_RE.finditer(text))
+    if not openers:
+        return False
+    boundaries = [o.end() for o in openers]
+    boundaries.append(-1)  # sentinel: tail after the final opener is end-of-string
+    for i, o in enumerate(openers):
+        seg_end = boundaries[i + 1] if boundaries[i + 1] >= 0 else len(text)
+        if not _TOOL_CALL_CLOSER_RE.search(text[o.end():seg_end]):
+            return True
+    return False
+
+
+def _unclosed_tool_tail(text: str) -> str:
+    """The raw text from the LAST unclosed <tool_call> opener to end-of-string
+    when the buffer ends inside a call (no closer yet). The bridge carries this
+    across rounds: the model continues writing the SAME call's body in the next
+    round, we re-attach the tail, parse once — so a file larger than any single
+    output budget still lands whole. Empty if there's no unclosed call to carry.
+    If text has a closed call followed by a truncated one, only the truncated
+    tail is returned (the finished call must not be re-carried)."""
+    if not text:
+        return ""
+    openers = list(_TOOL_CALL_OPENER_RE.finditer(text))
+    if not openers or not _has_unclosed_tool_call(text):
+        return ""
+    # Walk forwards: an opener segment with no closer before the next opener/EOF
+    # is a truncated call. Return from the LAST such opener to the end.
+    tail_start = -1
+    for i, o in enumerate(openers):
+        seg_end = openers[i + 1].start() if i + 1 < len(openers) else len(text)
+        if not _TOOL_CALL_CLOSER_RE.search(text[o.end():seg_end]):
+            tail_start = o.start()
+    return text[tail_start:] if tail_start >= 0 else ""
+
+
 # Per-turn tool-call history. Reset at the top of run_chat_turn so each
 # user message gets a fresh counter; checked inside invoke_tool to break
 # infinite loops where the model repeats the SAME tool with the SAME args
@@ -14703,6 +15041,71 @@ def invoke_tool(name: str, args: dict) -> dict:
 
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>", re.IGNORECASE)
 TOOL_CALL_FENCE_RE = re.compile(r"```tool_call\s*\n([\s\S]*?)\n```", re.IGNORECASE)
+# Live-stream suppression: when text-tools mode streams the model's raw
+# <tool_call> XML dialect as *content*, it would otherwise show up in the chat
+# bubble as gibberish (native tool deltas were invisible — this restores that
+# UX). Detect an opener, fully suppress everything until its MATCHING closer
+# (</tool_call> for a <tool_call> opener, ``` for a ```tool_call fence), or
+# end-of-stream. Tolerant of the mangled dialect seen in the wild:
+# `function="NAME">`, `<parametername="path">`, missing leading `<`.
+_TOOL_STREAM_PAIRS = (
+    (re.compile(r"(?:<|&lt;|\\<)tool_call\b", re.IGNORECASE),
+     re.compile(r"(?:</|&lt;/|\\</)tool_call\s*>?", re.IGNORECASE)),
+    (re.compile(r"```tool_call", re.IGNORECASE),
+     re.compile(r"```")),
+    (re.compile(r"<call:", re.IGNORECASE),
+     re.compile(r"</call(?::[a-zA-Z0-9_\-]+)?>", re.IGNORECASE)),
+    (re.compile(r"\[TOOL_CALLS\]\[", re.IGNORECASE),
+     re.compile(r"\}\s*\]")),
+    # Legacy JSON-form tool calls were wrapped in <tool:tool>...</tool:tool>;
+    # close on the wrapper so the whole JSON blob (including "content") is hidden.
+    (re.compile(r"<tool:tool\b"),
+     re.compile(r"</tool:tool>", re.IGNORECASE)),
+)
+# Fallback closers also accepted (tolerant of a missing </tool_call> tail).
+_TOOL_STREAM_CLOSE_RE = re.compile(r"```", re.IGNORECASE)
+
+
+def _classify_tool_stream(text: str, in_block) -> tuple[str, object]:
+    """Split a streamed content chunk into (visible_prose, next_state).
+
+    Text-tools mode streams the model's <tool_call>...<parameter>... XML as
+    regular content. Native llama.cpp tool deltas were never shown in the
+    bubble, so we suppress the XML the same way: everything between an opener
+    (one of _TOOL_STREAM_PAIRS) and its matching closer is withheld from the
+    live delta stream; the prose before/after it still shows. State (`in_block`)
+    carries across chunks because an opener may straddle two SSE deltas — it is
+    `False` when idle, otherwise the *active closer regex* for the block we are
+    inside, so a split chunk always closes on the right marker (`</tool_call>`
+    for a `<tool_call>` opener, not a stray ```). Best-effort only: a false
+    opener only hides a short snippet, and a missing closer flips back on the
+    first following closer or EOF."""
+    out: list[str] = []
+    while text:
+        if in_block is False:
+            # find the earliest opener in this chunk
+            best = None
+            for pi, (op, _) in enumerate(_TOOL_STREAM_PAIRS):
+                m = op.search(text)
+                if m and ((not best) or m.start() < best[0].start()):
+                    best = (m, pi)
+            if not best:
+                out.append(text)
+                break
+            m, pi = best
+            out.append(text[:m.start()])
+            text = text[m.end():]
+            in_block = _TOOL_STREAM_PAIRS[pi][1]
+            continue
+        # inside a tool block: find the active closer
+        cm = in_block.search(text)
+        if not cm:
+            # no closer in this chunk — whole thing is suppressed
+            break
+        text = text[cm.end():]
+        in_block = False
+        # loop re-scan for any further opener in the trailing text
+    return "".join(out), in_block
 # Extra dialects from non-OpenAI fine-tunes. Tier-2 fallback only — native
 # tool_calls on the streamed delta still wins. Patterns are anchored on
 # dialect-specific markers so they cannot collide with each other.
@@ -14725,12 +15128,13 @@ TOOL_CALL_MISTRAL_RE = re.compile(
 # model truncates. We anchor on <tool_call> + <function=NAME> and then walk
 # parameters until we hit a closer or the next tool_call/end-of-string.
 TOOL_CALL_XMLTAG_RE = re.compile(
-    r"<tool_call>\s*<function=([a-zA-Z0-9_\-\.]+)>"
+    r"<tool_call>\s*<?\s*(?:function|call)\s*=\s*\"?\s*([a-zA-Z0-9_\-\.]+)\s*\"?\s*>"
     r"([\s\S]*?)"
     r"(?:</function>\s*</tool_call>|</tool_call>|(?=<tool_call>)|$)",
     re.IGNORECASE)
 TOOL_PARAM_XMLTAG_RE = re.compile(
-    r"<parameter=([a-zA-Z0-9_\-\.]+)>\s*([\s\S]*?)\s*</parameter>",
+    r"<\s*parameter(?:\s*name)?\s*=\s*\"?\s*([a-zA-Z0-9_\-\.]+)\s*\"?\s*>"
+    r"([\s\S]*?)(?:</parameter>|</function>|</tool_call>|<tool_call>|$)",
     re.IGNORECASE)
 # Gemma 4 native tool-call dialect. Format:
 #   <|tool_call>call:NAME{key:value,key:<|"|>string<|"|>,key:42}<tool_call|>
@@ -15410,7 +15814,7 @@ def _tools_spec_overhead_tokens(tools_json: str) -> int:
     return overhead
 
 
-def _estimate_context_tokens(chat_id: str) -> int:
+def _estimate_context_tokens(chat_id: str, chat: dict | None = None) -> int:
     """Accurate context-fill estimate for a chat that hasn't completed a turn
     yet (so llama-server has not reported a real prompt_eval_count). We tokenize
     the ACTUAL assembled prompt text with the model's own tokenizer via
@@ -15423,12 +15827,13 @@ def _estimate_context_tokens(chat_id: str) -> int:
     poll doesn't re-tokenize unchanged history. Returns 0 if the chat is
     unknown."""
     chats = get_chats()
-    chat = chats.get("chats", {}).get(chat_id)
+    chat = chat or chats.get("chats", {}).get(chat_id)
     if not chat:
         return 0
     msgs = chat.get("messages", [])
     last_len = len(str(msgs[-1].get("content", ""))) if msgs else 0
-    fp = (len(msgs), last_len, len(chat.get("rolling_summary", "")),
+    fp = (len(msgs), last_len, int(chat.get("summary_through", 0) or 0),
+          len(chat.get("rolling_summary", "")),
           len(chat.get("pins") or []), len(str(chat.get("mission") or "")))
     cached = _CTX_EST_CACHE.get(chat_id)
     if cached and cached[0] == fp:
@@ -15451,10 +15856,17 @@ def _estimate_context_tokens(chat_id: str) -> int:
     parts = [sysp]
     img_count = 0
     start = int(chat.get("summary_through", 0) or 0)
-    for m in msgs[start:]:
+    stub_cutoff = len(msgs) - _TOOL_RESULT_KEEP_RECENT
+    for i, m in enumerate(msgs[start:], start=start):
         if m.get("role") not in ("user", "assistant", "tool"):
             continue
         content = m.get("content", "")
+        # Stub-aware estimate: old tool results are elided in the outgoing
+        # payload, so count the stub, not the full stored content — otherwise
+        # the estimate (and gauge/trigger) read ~2x what llama actually gets.
+        if m.get("role") == "tool" and i < stub_cutoff and isinstance(content, str):
+            parts.append("[output elided — tool result from earlier in the session]")
+            continue
         if isinstance(content, list):
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
@@ -16054,6 +16466,23 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         rounds = 0
         empty_retries = 0    # blank-reply-after-tools nudges used this turn
         auto_continues = 0   # mid-plan stall bumps used this turn (see _looks_unfinished)
+        # Carry-over of an in-flight <tool_call> truncated by the output budget.
+        # Big file writes (write_file bodies) can exceed even the expanded
+        # max_tokens — "re-emit the whole call" can never fit and loops forever.
+        # Instead hold the partial call text here, prepend it to the next
+        # round's text, and ask the model to CONTINUE the same call until it
+        # closes; extract_tool_calls then sees the whole accumulated body.
+        # Build fingerprint: stamped onto every persisted final reply so a chat
+        # can be attributed to the exact bridge code that produced it (stale
+        # server processes were masquerading as "the same old bug"). Bump the
+        # value only when the mid-call carry-over behavior changes.
+        _BUILD_TAG = "carry-over-v3"
+        _carry_call = ""
+        carry_rounds = 0     # continuation laps used this turn (bounded)
+        # Diagnostics: WHY the mid-call carry guard didn't fire (or which reason
+        # kept a round from continuing). Persisted on the final reply so a stale
+        # run can't be blamed for a behavior the live code never executed.
+        _carry_diag: list[str] = []
         # Turn-level token totals. A turn can span many rounds (tool call →
         # re-inference → …); each round reports its own eval_count/prompt tokens.
         # We sum them so the PERSISTED message reflects the whole turn's cost,
@@ -16124,6 +16553,15 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             pass
         force_no_think = False   # set when the thinking-budget enforcer aborts a runaway
         budget_retries = 0       # cap how many times we force-stop thinking per turn
+        # A tools round already hit the output cap once (finish_reason "length").
+        # The model spent the whole budget on reasoning/narration and the real
+        # work (a <tool_call> body) never got tokens — on the NEXT round force
+        # thinking OFF so every spare token goes to the actual call, not to an
+        # even longer re-plan. Qwen3.6's deepseek-format reasoning is greedy:
+        # without this, "continue writing the file" rounds just produce another
+        # thinking block that re-narrates the plan and ends exactly like the one
+        # that hit the cap in the first place.
+        tool_cap_no_think = False
         conversation = list(messages)
         # Anything appended past this index is the model's working memory
         # for THIS turn — intermediate assistant messages with tool_calls,
@@ -16169,11 +16607,77 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # +768 tokens of safety margin: the tools overhead is an estimate,
             # and --no-context-shift hard-errors the whole turn if the real prompt
             # slips over ctx. A little slack keeps us under the ceiling.
-            effective_reserve = min(reserve + tools_overhead + 768, ctx_limit - 2048)
-            trimmed = truncate_messages(conversation, ctx_limit, reserve=effective_reserve)
-            dropped = max(0, len(conversation) - len(trimmed))
+            # Stub-aware: _sanitize_messages_for_openai replaces tool results
+            # older than _TOOL_RESULT_KEEP_RECENT with ~12-token elision stubs,
+            # so llama never receives most of the stored tool payload. Budgeting
+            # the FULL unstubbed content made the trimmer fire at ~35% real
+            # fill (the stored tail is ~2x the outgoing payload), which forced
+            # an emergency mid-turn fold on every overflow — compaction on
+            # every message. Inflate the budget by exactly what the sanitizer
+            # will elide so the trim fires only when the REAL payload nears ctx.
+            _stub_cutoff = len(conversation) - _TOOL_RESULT_KEEP_RECENT
+            _stub_savings = sum(_count_msg_tokens(m) for m in conversation[:_stub_cutoff]
+                                if m.get("role") == "tool")
+            effective_reserve = max(1024, min(reserve + tools_overhead + 768 - _stub_savings,
+                                              ctx_limit - 2048))
+            # Budget the trim in the server's REAL token units: one /tokenize
+            # call over the conversation yields a correction factor for the
+            # char heuristic, so the trimmer and llama-server's slot agree
+            # (the 4-attempt overflow retry below stays a rare safety net).
+            token_scale = _conversation_token_scale(conversation)
             _fold = None
-            if dropped > 0 and use_tools and settings.get("summarize_history", True):
+            # Proactive mid-turn fold: the LAST round's REAL fill (recomputed
+            # from the actual payload — see the stats handler) is ground truth.
+            # When it has crossed the trigger, fold BEFORE the trimmer gets a
+            # chance to drop the middle. The fold is deep (keeps only ~10% of
+            # ctx as raw tail), so the round gets a real runway again. Without
+            # this the trimmer was the only trigger: every overflow forced a
+            # mid-turn fold and compression fired on every message.
+            try:
+                if (use_tools and settings.get("summarize_history", True)
+                        and _last_prompt_tokens_by_chat.get(chat_id, 0)
+                        >= _summary_trigger_limit(ctx_limit)):
+                    _log_compact(chat_id, f"proactive: map={_last_prompt_tokens_by_chat.get(chat_id, 0)} "
+                                          f"trigger={_summary_trigger_limit(ctx_limit)} ctx={ctx_limit}")
+                    _fold = _mid_turn_fold(chat_id, conversation, _start_len,
+                                           ctx_limit, _llama.is_vision_capable())
+                    if _fold:
+                        _start_len = _fold["start_len"]
+                        if _fold.get("conversation") is not None:
+                            conversation = _fold["conversation"]
+                            _roll_active = True
+                            token_scale = _conversation_token_scale(conversation)
+            except Exception:
+                traceback.print_exc()
+            trimmed = truncate_messages(conversation, ctx_limit, reserve=effective_reserve,
+                                        token_scale=token_scale)
+            dropped = max(0, len(conversation) - len(trimmed))
+            if dropped > 0:
+                _log_compact(chat_id, f"trim: dropped={dropped} ctx={ctx_limit} reserve={effective_reserve} "
+                                      f"scale={token_scale} use_tools={use_tools} "
+                                      f"summarize={settings.get('summarize_history', True)} "
+                                      f"fold_before={bool(_fold)} "
+                                      f"conv_n={len(conversation)} conv_units={int(sum(_count_msg_tokens(m) for m in conversation))} "
+                                      f"budget={int(ctx_limit - effective_reserve)}")
+            # A drop from the trimmer is NOT automatically an overflow. The
+            # walk drops two kinds of messages: (a) budget overflows — the
+            # conversation genuinely exceeded the window — and (b) orphan tool
+            # results: tool messages whose assistant tool_call parent was
+            # folded into the summary. The trimmer pops those as harmless
+            # cleanup (llama rejects parentless tool messages anyway). After a
+            # mid-turn fold the replay boundary lands mid-tool-run, so orphan
+            # pops are common right after a fold. Treating an orphan pop as an
+            # overflow made the emergency fold refold the history, which
+            # advanced the boundary into the next tool run, which created more
+            # orphans — which popped and folded again: compaction every
+            # message at ~5% fill, exactly the user-facing symptom. Only a
+            # genuine overflow (conversation fill past the trim budget, in the
+            # server's real token units) may trigger the mid-turn fold or set
+            # the dropped flag. A genuine budget trim always implies fill >=
+            # the budget, so the gate never blocks a real overflow.
+            _over_budget = (sum(_count_msg_tokens(m) for m in conversation) * token_scale
+                            > (ctx_limit - effective_reserve))
+            if dropped > 0 and use_tools and settings.get("summarize_history", True) and _over_budget:
                 # The trimmer is about to DELETE the middle of a live agentic
                 # turn — the amnesia loop. Fold into the rolling summary
                 # instead (mid-turn compaction), then re-trim against the
@@ -16187,18 +16691,28 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         if _fold.get("conversation") is not None:
                             conversation = _fold["conversation"]
                             _roll_active = True
+                            token_scale = _conversation_token_scale(conversation)
                             trimmed = truncate_messages(conversation, ctx_limit,
-                                                        reserve=effective_reserve)
+                                                        reserve=effective_reserve,
+                                                        token_scale=token_scale)
                             dropped = max(0, len(conversation) - len(trimmed))
                 except Exception:
                     traceback.print_exc()
-            if dropped > 0:
+            if dropped > 0 and _over_budget:
+                # Round-level ground truth: the trimmer had to cut. Remember it
+                # so the next user turn folds proactively pre-turn (the 0.85
+                # auto-trigger can't fire once a trim has happened — see
+                # _maybe_roll_summary / _last_dropped_by_chat).
+                _last_dropped_by_chat[chat_id] = True
                 # "folded" tells the UI whether these messages were genuinely
                 # compacted into the session summary (mid-turn fold ran) or
                 # silently elided from the prompt — the pill label must not
                 # say "summarized" for a plain drop.
                 emit({"type": "context_trimmed", "dropped": dropped, "total": len(conversation),
-                      "folded": bool(_fold and _fold.get("folded"))})
+                      "folded": bool(_fold and _fold.get("folded")),
+                      "fold_pending": bool(_fold is not None and not _fold.get("folded"))})
+            else:
+                _last_dropped_by_chat.pop(chat_id, None)
 
             # Volatile session state — mission block + pins + objective —
             # appended AFTER the history, right before generation, where
@@ -16268,6 +16782,21 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             except (ValueError, TypeError):
                 _mo = 8192
             if _mo > 0:
+                # Thinking-budget side effect: llama-server counts Qwen/reasoner
+                # <thinking> tokens against the SAME max_tokens budget. With a
+                # heavy-thinking model (thinking_budget=4096) that silently
+                # halves the room available for the ACTUAL answer — so a bulky
+                # single-tool tur1 call like write_file (whole file body inside
+                # `content`) gets cut mid-stream and a TRUNCATED file is written
+                # as an "ok". Add the thinking budget back on top so the answer
+                # keeps its full allowance; the clamp below still bounds it by
+                # the reserved context headroom so it can never overflow the slot.
+                try:
+                    _tb_plus = int(settings.get("thinking_budget") or 0)
+                except (ValueError, TypeError):
+                    _tb_plus = 0
+                if use_tools and _tb_plus > 0:
+                    _mo = _mo + _tb_plus
                 payload["max_tokens"] = max(256, min(_mo, max(reserve - 1024, 256)))
             # Agentic turns need a tighter, deterministic sampling profile than
             # IDE/creative turns. The user's global sliders may be tuned for
@@ -16299,6 +16828,12 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 # this round regardless of the model's default thinking mode.
                 tpl_kwargs["enable_thinking"] = False
                 force_no_think = False
+            if use_tools and tool_cap_no_think:
+                # A previous round hit the output cap while working with tools:
+                # skip the thinking phase this round entirely so the WHOLE budget
+                # goes to the actual output (tool-call XML body or the answer).
+                # Must win over a model that defaults to thinking on every turn.
+                tpl_kwargs["enable_thinking"] = False
             tb = settings.get("thinking_budget")
             try:
                 tb_int = int(tb) if tb is not None else 2048
@@ -16325,6 +16860,15 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # cached tools-spec overhead) lands before generation begins.
             def _emit_ctx_fill() -> None:
                 try:
+                    # Prefer the real prompt_eval_count from this chat's last
+                    # completed round — the char estimate below undercounts
+                    # tool traffic, which made the gauge read low while
+                    # compression fired on the true fill.
+                    real = _last_prompt_tokens_by_chat.get(chat_id, 0)
+                    if real > 0:
+                        emit({"type": "ctx_fill", "prompt_tokens": real,
+                              "capacity": ctx_limit, "source": "live"})
+                        return
                     est = sum(_count_msg_tokens(m) for m in payload["messages"]) + tools_overhead
                     emit({"type": "ctx_fill", "prompt_tokens": est,
                           "capacity": ctx_limit, "source": "estimate"})
@@ -16354,7 +16898,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     if _ctx_attempt < 3 and _is_ctx_overflow(e):
                         pad = max(2048, int(ctx_limit * 0.12)) * (_ctx_attempt + 1)
                         tighter = min(effective_reserve + pad, ctx_limit - 1024)
-                        trimmed = truncate_messages(conversation, ctx_limit, reserve=tighter)
+                        trimmed = truncate_messages(conversation, ctx_limit, reserve=tighter,
+                                                    token_scale=token_scale)
                         payload["messages"] = _sanitize_messages_for_openai(trimmed)
                         _emit_ctx_fill()
                         emit({"type": "notice",
@@ -16378,6 +16923,17 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             tool_calls_by_index: dict[int, dict] = {}
             last_stats: dict = {}
             finish_reason = None
+            # Text-tools mode streams the model's <tool_call> XML as *content*.
+            # Keep it out of the live bubble (native tool deltas were invisible
+            # — this restores that UX): once an opener is seen, suppress deltas
+            # until a closer (or end-of-stream) and let full_text/extract parse
+            # the call itself. If a <tool_call> was truncated LAST round and
+            # carried over, start this round ALREADY inside the block: the model
+            # continues writing the body with no opener of its own, so everything
+            # stays hidden until the carried call's closer finally lands.
+            stream_tool_suppress = False
+            if use_tools and not native_tools and _carry_call:
+                stream_tool_suppress = _TOOL_STREAM_PAIRS[0][1]
             # llama-server with --reasoning-format deepseek splits thinking into
             # its own `reasoning_content` delta. The frontend's splitThinking()
             # only recognizes inline <think>…</think>, so we re-wrap here and
@@ -16407,7 +16963,12 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
-                        break
+                        # Don't break: llama-server emits a bare timings object
+                        # AFTER [DONE] (the loop ends at the chunked-body EOF).
+                        # Breaking early left last_stats empty, so eval_count
+                        # stayed None and the per-chat fill signal (summary
+                        # trigger + ctx gauge) was never recorded.
+                        continue
                     try:
                         obj = json.loads(data)
                     except Exception:
@@ -16484,12 +17045,24 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             piece = piece[:_b.start()]
                             runaway_stop = True
                         if reasoning_open:
-                            content_buf.append("</think>")
-                            emit({"type": "delta", "content": "</think>"})
+                            content_buf.append(" response")
+                            emit({"type": "delta", "content": " response"})
                             reasoning_open = False
                         if piece:
                             content_buf.append(piece)
-                            emit({"type": "delta", "content": piece})
+                            # Text-tools mode streams the model's raw <tool_call>
+                            # XML as *content*. Native tool deltas were invisible
+                            # on the wire — so suppress the XML here too, keeping
+                            # only the prose. The call is parsed from full_text
+                            # afterward (extract_tool_calls), so hiding the live
+                            # text loses nothing.
+                            if use_tools and not native_tools:
+                                _vn, stream_tool_suppress = _classify_tool_stream(
+                                    piece, stream_tool_suppress)
+                                if _vn:
+                                    emit({"type": "delta", "content": _vn})
+                            else:
+                                emit({"type": "delta", "content": piece})
                         if runaway_stop:
                             break
                     # tool-call deltas come as partial fragments — `arguments`
@@ -16518,6 +17091,17 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         u = obj["usage"]
                         last_stats.setdefault("eval_count", u.get("completion_tokens"))
                         last_stats.setdefault("prompt_eval_count", u.get("prompt_tokens"))
+                    # llama-server (this build) does NOT send an OpenAI-style
+                    # "usage" object in streamed chunks. The FINAL chunk carries
+                    # its own "timings" (prompt_n / predicted_n) ALONGSIDE the
+                    # choices object, and data: [DONE] follows it. Without this
+                    # capture the per-chat fill signal was never recorded — the
+                    # summary trigger and the context gauge ran blind on every
+                    # single session.
+                    t = obj.get("timings")
+                    if t:
+                        last_stats.setdefault("eval_count", t.get("predicted_n"))
+                        last_stats.setdefault("prompt_eval_count", t.get("prompt_n"))
                 # if the stream ended while still inside reasoning (no answer
                 # tokens came), close the tag so the UI can render it cleanly.
                 if reasoning_open:
@@ -16525,12 +17109,38 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     emit({"type": "delta", "content": "</think>"})
                     reasoning_open = False
                 if last_stats.get("eval_count") is not None:
+                    # llama-server's timings.prompt_n is the KV-cache-INCREMENTAL
+                    # eval count (only the newly-evaluated tail when the slot
+                    # reuses the prefix) — NOT the full prompt size. Feeding it
+                    # to the gauge / summary trigger / ctx-stats made fill read
+                    # as tens of tokens after every cached round: the pre-turn
+                    # trigger never fired and ONLY the trimmer's forced mid-turn
+                    # folds ever ran — compression on every message. Recompute
+                    # the REAL full-prompt token count from the payload actually
+                    # sent, using the same /tokenize-derived scale the trimmer
+                    # uses (system + tools overhead included, like the slot).
+                    _raw_pe = last_stats.get("prompt_eval_count") or 0
+                    try:
+                        _sent_msgs = payload.get("messages") or []
+                        _real_prompt = int(sum(_count_msg_tokens(m) for m in _sent_msgs)
+                                          * token_scale) + int(tools_overhead or 0)
+                        try:
+                            _log_compact(chat_id,
+                                         f"round: n={len(_sent_msgs)} sum={int(sum(_count_msg_tokens(m) for m in _sent_msgs))} "
+                                         f"scale={token_scale:.3f} ovh={tools_overhead} raw_pe={_raw_pe} real={_real_prompt}")
+                        except Exception:
+                            pass
+                    except Exception:
+                        _real_prompt = _raw_pe
+                    last_stats["prompt_eval_count"] = _real_prompt
                     emit({"type": "stats", **last_stats})
                     # Fold this round into the turn totals for persistence.
+                    # Totals keep the RAW incremental counts (as before) —
+                    # summing full-prompt counts would multiply-count rounds.
                     turn_eval_total += last_stats.get("eval_count") or 0
-                    turn_prompt_total += last_stats.get("prompt_eval_count") or 0
+                    turn_prompt_total += _raw_pe
                     global _last_prompt_tokens
-                    _last_prompt_tokens = last_stats.get("prompt_eval_count") or 0
+                    _last_prompt_tokens = _real_prompt
                     # Per-chat truth for the gauge + summary trigger. Once set,
                     # the cold-start tokenize estimate for this chat is moot.
                     if _last_prompt_tokens:
@@ -16566,6 +17176,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     pass
                 partial = {"role": "assistant", "content": "".join(content_buf)}
                 partial["_appended_intermediate"] = list(conversation[_start_len:])
+                partial["_build"] = _BUILD_TAG
                 return partial
 
             # Thinking-budget enforcer tripped: we force-closed a runaway <think>
@@ -16592,6 +17203,87 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
 
             full_text = "".join(content_buf)
 
+            # Carry-over merge: a previous round's <tool_call> was truncated
+            # (see the mid-call guard below) and we stashed the partial text.
+            # The model was told to CONTINUE the same call without reopening
+            # tags, so this round's text is only the missing body/chunk. Prepend
+            # the stub so extract_tool_calls sees the whole accumulated call.
+            if (use_tools and not native_tools and _carry_call):
+                if not _TOOL_CALL_OPENER_RE.search(full_text):
+                    full_text = _carry_call + full_text
+                # If the model reopened the call itself, its fresh case wins;
+                # either way the carried stub is consumed this round.
+                _carry_call = ""
+
+            # Mid-call truncation guard. When llama.cpp cuts the stream at the
+            # token/thinking budget, the assistant reply can end INSIDE a
+            # <tool_call> block — the tolerant XML parser then treats the
+            # captured (partial) `content` as the whole call and WRITES A
+            # TRUNCATED FILE as "ok". The model naturally notices it later
+            # ("file got cut off mid-way") and spirals trying to re-hit the
+            # same budget. Detect it here: a <tool_call> opener with no closer
+            # anywhere = the write body was only a prefix. If the accumulated
+            # call is fully closed (never happens with a cut), nothing fires.
+            # Fix is CARRY, not re-emit: a big file can exceed even the raised
+            # budget, so re-emitting whole "fits now" still gets cut and loops
+            # forever (auto_continues×the same cap). Store the partial and have
+            # the model continue writing the SAME call in the next round.
+            if (use_tools and _has_unclosed_tool_call(full_text)
+                    and carry_rounds < 8
+                    and rounds < max_tool_rounds - 1):
+                carry_rounds += 1
+                _carry_call = _unclosed_tool_tail(full_text)
+                _carry_diag.append(f"carried call mid-stream (round {rounds}, carry {carry_rounds}, native={native_tools})")
+                if native_tools:
+                    # The reply was cut inside the XML call that native-tools
+                    # ALSO framed as a tool_call. Native parsing of a truncated
+                    # call must not run; force the text path for the rest of this
+                    # turn so the carried tail gets parsed consistently.
+                    _mark_native_tools_broken()
+                    native_tools = False
+                conversation.append({"role": "assistant", "content": full_text})
+                conversation.append({
+                    "role": "system",
+                    "content": (
+                        "[automatic note] Your previous reply was cut off by the output budget "
+                        "mid-tool-call — the <tool_call> opened but did not finish; the partial "
+                        "content was NOT executed. CONTINUE the exact same call in your next reply: "
+                        "do NOT reopen <tool_call>, do NOT repeat the function/path/parameter "
+                        "headers you already wrote. Just write the REMAINING part of the file body "
+                        "from where it stopped, then close the call normally with the matching "
+                        "closing tags (</parameter></function></tool_call>). Keep writing even if "
+                        "it is long — you may take several rounds to finish it."
+                    ),
+                })
+                emit({"type": "notice",
+                      "note": f"reply hit the output budget inside a tool call — continuing it "
+                              f"across rounds ({carry_rounds})"})
+                continue
+                # Carry budget exhausted and still mid-call: never submit a
+                # TRUNCATED write to a tool. Drop the dangling truncated tool_call
+                # tail so the extractor can't treat a partial body as a complete
+                # call (the original bug that wrote truncated files and
+                # spiralled). The model's actual text after the cut stays as
+                # the answer.
+                if use_tools and not native_tools and _has_unclosed_tool_call(full_text):
+                    _carry_diag.append(f"cut-strip: dangling tool_call stripped (round {round})")
+                    full_text = re.sub(
+                        r"(?:<|&lt;|\\<)\s*[a-z]*tool_call(?:>|&gt;|\\&gt;)?[\s\S]*?$",
+                        "", full_text, flags=re.IGNORECASE).strip()
+                else:
+                    _hit = _has_unclosed_tool_call(full_text)
+                    if _hit:
+                        _why = []
+                        if not use_tools:
+                            _why.append("use_tools off")
+                        if native_tools:
+                            _why.append("native_tools on")
+                        if carry_rounds >= 8:
+                            _why.append("carry budget exhausted")
+                        if rounds >= max_tool_rounds - 1:
+                            _why.append(f"rounds near max ({rounds})")
+                        _carry_diag.append("unclosed call NOT carried: " + "; ".join(_why) + f" (round {rounds}, carry {carry_rounds})")
+
             # assemble native tool calls
             parsed_calls: list[dict] = []
             for idx in sorted(tool_calls_by_index.keys()):
@@ -16600,6 +17292,43 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     continue
                 args = repair_tool_args(slot.get("arguments", ""))
                 parsed_calls.append({"id": slot["id"], "name": slot["name"], "arguments": args})
+
+            # llama.cpp sometimes streams a tool call with the NAME but WITHOUT
+            # its arguments — the worst-hit case is a multi-arg, bulky-content
+            # tool like write_file, where the native streamer loses the
+            # <parameter=...> blocks entirely and leaves `{}`. The model's real
+            # call (with path+content) is still sitting in `full_text`, so
+            # re-parse it here and merge the richer args over the empty name.
+            # This keeps the fix independent of llama.cpp's parser quirks.
+            _merge_fallback_used = False
+            if use_tools and parsed_calls and full_text:
+                for _pc in parsed_calls:
+                    _pc_args = _pc.get("arguments")
+                    if not isinstance(_pc_args, dict):
+                        _pc["arguments"] = {}
+                        _pc_args = _pc["arguments"]
+                    _has_real = any(
+                        v not in (None, "", [], {}) for v in _pc_args.values())
+                    if _has_real:
+                        continue
+                    for _fc in extract_tool_calls(full_text):
+                        _fname = (_fc.get("name") or _fc.get("tool") or "").lower()
+                        _fargs = _fc.get("arguments")
+                        if (_fname == (_pc.get("name") or "").lower()
+                                and isinstance(_fargs, dict)
+                                and any(v not in (None, "", [], {}) for v in _fargs.values())):
+                            _pc["arguments"] = {**_fargs, **_pc_args}
+                            _merge_fallback_used = True
+                            break
+            if _merge_fallback_used:
+                # the <tool_call> block is what produced the parsed args, so don't
+                # leak it into the bubble as raw text.
+                full_text = re.sub(
+                    r"(?:<|&lt;|\\<)?tool_call(?:>|&gt;|\\>)?[\s\S]*?"
+                    r"((?:<|&lt;|\\<)?/tool_call(?:>|&gt;|\\>)?|$)",
+                    "", full_text, flags=re.IGNORECASE)
+                full_text = re.sub(r"```tool_call[\s\S]*?(?:```|$)", "", full_text, flags=re.IGNORECASE)
+                full_text = full_text.strip()
 
             # fallback: parse tool calls emitted in content (hermes/qwen/llama/mistral/named)
             if not parsed_calls and use_tools:
@@ -16692,14 +17421,23 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 if (finish_reason == "length" and auto_continues < 3
                         and rounds < max_tool_rounds):
                     auto_continues += 1
+                    if use_tools:
+                        # The budget was spent; the next round must NOT re-enter
+                        # thinking and reproduce the plan, it must emit output.
+                        tool_cap_no_think = True
                     conversation.append(assistant_msg)
-                    conversation.append({
-                        "role": "system",
-                        "content": ("[automatic note] Your previous reply was cut off at the token limit. "
-                                    "Continue from exactly where it stopped and finish the remaining part of "
-                                    "the answer or code — do not repeat, do not summarize, do not ask. If you "
-                                    "were mid-tool-call, emit the rest of that call now."),
-                    })
+                    _cap_note = ("[automatic note] Your previous reply was cut off at the token limit. "
+                                 "Continue from exactly where it stopped and finish the remaining part of "
+                                 "the answer or code — do not repeat, do not summarize, do not ask. If you "
+                                 "were mid-tool-call, emit the rest of that call now.")
+                    if use_tools and not native_tools:
+                        # A tool turn whose thinking-verbosity cost us the whole
+                        # budget without a single call. Demand the call directly.
+                        _cap_note += (" DO NOT write a plan, do not explain your approach, do not use "
+                                      "thinking tags. Begin IMMEDIATELY with the tool call XML "
+                                      "(<tool_call>…</tool_call>) and put the entire requested file "
+                                      "body inside it.")
+                    conversation.append({"role": "system", "content": _cap_note})
                     continue
                 # Mid-plan stall: tools already ran this turn and the reply
                 # announces more steps (or asks "shall I continue?") without
@@ -16766,10 +17504,67 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 # The caller persists these so the next user turn replays the
                 # full agentic context, not just the final bubble.
                 assistant_msg["_appended_intermediate"] = list(conversation[_start_len:])
+                assistant_msg["_build"] = _BUILD_TAG
+                if _carry_diag:
+                    assistant_msg["_carry_diag"] = list(_carry_diag)
                 emit({"type": "final", "message": assistant_msg})
                 return assistant_msg
 
             conversation.append(assistant_msg)
+            # Required-args guard. llama.cpp's native parser sometimes returns a
+            # tool call with its NAME but EMPTY/missing arguments — worst case is
+            # a multi-arg, bulky-content tool like write_file (the Qwen3.5/3.6
+            # XML-dialect bug family drops the <parameter> blocks). Executing
+            # such a call is garbage-in/garbage-out: better to detect it here,
+            # tell the model exactly which call was stripped, and re-emit the
+            # call as XML text that WE parse (text-mode) — the same path that
+            # has always worked for the Gemma family.
+            _arg_loss_names: list[str] = []
+            if use_tools and parsed_calls:
+                for _pc in parsed_calls:
+                    _nm = _resolve_tool_name(_pc.get("name") or "")
+                    _spec = TOOLS.get(_nm)
+                    _reqs = (((_spec or {}).get("parameters") or {}).get("required")) or []
+                    if not _reqs:
+                        continue
+                    _a = _pc.get("arguments")
+                    if not isinstance(_a, dict) or not all(
+                            isinstance(_a.get(r), (str, int, float, list, dict))
+                            and str(_a.get(r) or "").strip() for r in _reqs):
+                        _arg_loss_names.append(_pc.get("name") or _nm)
+            if _arg_loss_names and not _merge_fallback_used \
+                    and rounds < max_tool_rounds - 1 and native_tools:
+                _names = ", ".join(f"`{n}`" for n in dict.fromkeys(_arg_loss_names))
+                conversation.append({
+                    "role": "user",
+                    "content": (
+                        "[automatic note] Your previous tool call(s) " + _names +
+                        " were received WITHOUT arguments — the server's tool parser dropped them "
+                        "(a known strict-grammar loss, not a mistake on your part). Re-emit the "
+                        "SAME call right now with the real values, in EXACTLY this XML shape "
+                        "(the bridge parses it itself):\n"
+                        "<tool_call>\n<function=write_file>\n"
+                        "<parameter=path>\nC:\\Users\\je7sk\\Documents\\Accuretta Workspace\\mona_lisa.html\n</parameter>\n"
+                        "<parameter=content>\n<the full file body here, may span lines>\n</parameter>\n"
+                        "</function>\n</tool_call>\n"
+                        "Replace the example values with the real ones; emit ONLY the call, then stop."
+                    ),
+                })
+                emit({"type": "notice",
+                      "note": f"llama.cpp dropped tool arguments for {', '.join(_arg_loss_names)} — "
+                              f"re-emitting via the text-parsed XML path"})
+                # This model's native tool parsing is broken — remember it for
+                # the rest of the session so future turns skip Round 1 instead
+                # of rediscovering the loss every time.
+                _mark_native_tools_broken()
+                # Stop handing llama-server the `tools` array for the REST of
+                # this turn: while it can see the schema, it will keep swallowing
+                # the <parameter> blocks and we'd just loop. On the text path the
+                # model's XML call lands in content and extract_tool_calls (the
+                # Gemma-class parser) decodes it — the exact interaction that
+                # has worked reliably for the Gemma family all along.
+                native_tools = False
+                continue
             # PARALLEL TOOL EXECUTION: submit the whole batch to the executor
             # first (bounded by _tool_executor's 8 workers), then collect in
             # the model's original call order — so independent tools (grep +
@@ -16862,11 +17657,17 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         "name": name,
                         "content": compress_tool_result(name, result, _trunc),
                     })
+            if tool_cap_no_think and _batches:
+                # A real tool call executed this round — the delayed-answer mode
+                # was only to protect a WRITE body from a thinking-hog. Once the
+                # call lands, release it so the model can reason about the result.
+                tool_cap_no_think = False
             rounds += 1
     except Exception as e:
         print(f"run_chat_turn interrupted: {e}")
         partial = {"role": "assistant", "content": "".join(content_buf) if 'content_buf' in locals() else ""}
         partial["_appended_intermediate"] = list(conversation[_start_len:]) if 'conversation' in locals() else []
+        partial["_build"] = ("carry-over-v3" if 'content_buf' in locals() else "")
         return partial
     finally:
         _chat_emitters.pop(chat_id, None)
@@ -19431,7 +20232,8 @@ class Handler(BaseHTTPRequestHandler):
         tools_off_reason = ""
         _s = get_settings()
         _model_ids = (_s.get("model"), _s.get("model_path"), _llama.loaded_model())
-        if use_tools and any(_is_gemma_model(m) for m in _model_ids):
+        if use_tools and (any(_is_gemma_model(m) for m in _model_ids)
+                          or _native_tools_broken()):
             native_tools = False
         # Rolling summary: fold the oldest un-kept turns into a compact summary
         # instead of letting truncate_messages delete them outright. Keeps the
@@ -19443,7 +20245,29 @@ class Handler(BaseHTTPRequestHandler):
         if get_settings().get("summarize_history", True):
             try:
                 _ctx_for_summary = _llama_props_ctx() or int(get_settings().get("num_ctx") or 32768)
-                if _maybe_roll_summary(chat, _ctx_for_summary):
+                # Force the fold when the last round had to trim: a drop is the
+                # overflow signal (the 0.85 auto-trigger is unreachable once the
+                # trimmer caps fill below it), so recover the dropped middle
+                # proactively on this message instead of replaying it into
+                # another drop.
+                _drop_force = _last_dropped_by_chat.get(chat_id, False)
+                if _drop_force:
+                    # A mid-turn fold usually already recovered that overflow —
+                    # the flag then force-folds the very next message at
+                    # 10-20% fill (the "compacts on every message" spam after a
+                    # compaction). Only force when the prompt is still
+                    # genuinely near the ceiling: a drop that wasn't recovered
+                    # leaves fill above ~70% of the trigger; a recovered one is
+                    # far below it.
+                    _fill_now = _last_prompt_tokens_by_chat.get(chat_id, 0)
+                    if _fill_now > 0 and _fill_now < _summary_trigger_limit(_ctx_for_summary) * 0.7:
+                        _drop_force = False
+                _log_compact(chat_id, f"pre_turn web: fill={_last_prompt_tokens_by_chat.get(chat_id, 0)} "
+                                      f"trigger={_summary_trigger_limit(_ctx_for_summary)} ctx={_ctx_for_summary} "
+                                      f"drop_flag={_last_dropped_by_chat.get(chat_id, False)} force={_drop_force}")
+                if _maybe_roll_summary(chat, _ctx_for_summary,
+                                       force=_drop_force,
+                                       reason_hint="pre_turn"):
                     save_json(CHATS_FILE, chats)
             except Exception:
                 traceback.print_exc()
@@ -19607,6 +20431,10 @@ class Handler(BaseHTTPRequestHandler):
                     "content": final.get("content", ""),
                     "t": now_t,
                 }
+                if final.get("_build"):
+                    msg["_build"] = final["_build"]
+                if final.get("_carry_diag"):
+                    msg["_carry_diag"] = final["_carry_diag"]
                 stats = final.get("_stats") or {}
                 if stats.get("eval_count") is not None:
                     msg["tokens"] = stats["eval_count"]
@@ -22650,6 +23478,7 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
         # off the wire and let extract_tool_calls handle the tool_code shape.
         _gm = any(_is_gemma_model(m) for m in
                   (get_settings().get("model"), get_settings().get("model_path"), _llama.loaded_model()))
+
         if use_tools:
             # Owner path: same long-session memory as the web UI — token-aware
             # rolling summary + pinned facts/fixes, replaying only the un-folded
@@ -22657,7 +23486,20 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
             ctx_limit = _llama_props_ctx() or int(get_settings().get("num_ctx") or 32768)
             if get_settings().get("summarize_history", True):
                 try:
-                    if _maybe_roll_summary(chat, ctx_limit):
+                    _drop_force = _last_dropped_by_chat.get(chat_id, False)
+                    if _drop_force:
+                        # Same gate as the web pre-turn: a mid-turn fold usually
+                        # already recovered the overflow, so don't force-fold
+                        # the very next message at low fill (toast spam).
+                        _fill_now = _last_prompt_tokens_by_chat.get(chat_id, 0)
+                        if _fill_now > 0 and _fill_now < _summary_trigger_limit(ctx_limit) * 0.7:
+                            _drop_force = False
+                    _log_compact(chat_id, f"pre_turn discord: fill={_last_prompt_tokens_by_chat.get(chat_id, 0)} "
+                                          f"trigger={_summary_trigger_limit(ctx_limit)} ctx={ctx_limit} "
+                                          f"drop_flag={_last_dropped_by_chat.get(chat_id, False)} force={_drop_force}")
+                    if _maybe_roll_summary(chat, ctx_limit,
+                                           force=_drop_force,
+                                           reason_hint="pre_turn"):
                         save_json(CHATS_FILE, chats)
                 except Exception:
                     traceback.print_exc()
@@ -22669,7 +23511,7 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
                     traceback.print_exc()
             _set_current_chat(chat_id)
             system_prompt = build_system_prompt(include_tools=True, chat_mode="agent",
-                                                include_tool_list=not _gm)
+                                                include_tool_list=not _text_tools)
             # Mission block + pins are NOT spliced here — run_chat_turn appends
             # them as a tail message after the history (cache-friendly; see the
             # volatile-tail block there). Only the rare-changing rolling summary
@@ -22698,8 +23540,9 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
                     out["name"] = m["name"]
             msgs.append(out)
 
+        _text_tools = _gm or _native_tools_broken()
         final = run_chat_turn(chat_id, msgs, use_tools=use_tools, emit=lambda e: None,
-                              native_tools=not _gm)
+                              native_tools=not _text_tools)
         if not final:
             return "(no reply — stopped or empty)"
 
@@ -22886,6 +23729,27 @@ def main():
         print(f"  vision:  {VISION_LLAMA}")
     print(f"  port:    {PORT}")
     print(f"  bind:    0.0.0.0  (reachable over LAN / Tailscale)")
+
+    # Wipe red-team evidence on every boot: recon_evidence holds hashed proof
+    # artifacts (target, request, response) — a machine-local fingerprint for
+    # an operator that would rather leave no trace. Nothing else touches it, so
+    # this runs once at startup before the HTTP server accepts any request.
+    _ev_dir = DATA / "recon_evidence"
+    if _ev_dir.exists():
+        n = 0
+        try:
+            for _f in _ev_dir.iterdir():
+                try:
+                    if _f.is_file():
+                        _f.unlink()
+                        n += 1
+                    elif _f.is_dir():
+                        shutil.rmtree(_f)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        print(f"  wiped:   {n} recon evidence artifact(s) from boot")
 
     # first-run system context scan (creates data/ACCURETTA.md if missing)
     if not SYSTEM_CONTEXT_FILE.exists():

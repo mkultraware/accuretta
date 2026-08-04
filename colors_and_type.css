@@ -424,6 +424,7 @@
 [data-theme="aurora"] body,
 [data-theme="nebula"] body,
 [data-theme="operator"] body,
+[data-theme="kinetic"] body,
 .dark body {
   background: var(--bg-gradient, var(--bg)) fixed;
 }
@@ -742,6 +743,240 @@
 
   --btn-send-gradient: linear-gradient(135deg, #4D9EFF 0%, #2F7FE6 100%);
   --btn-send-glow:     0 6px 18px rgba(77, 158, 255, 0.32);
+}
+
+/* ============================================================
+   NEOBRUTALISM — bold, chunky, unapologetic.
+   Cream paper background, near-black text, hard offset shadows
+   with zero blur, thick ink borders, and one electric yellow
+   accent. Nothing soft, nothing glowy: every surface either
+   punches out of the page or gets pressed into it.
+   ============================================================ */
+[data-theme="neobrutalism"] {
+  /* Warm paper white, not clinical grey — the canvas for ink. */
+  --bg:        #F4F0E6;
+  --bg-raised: #FCF9F0;
+  --bg-sunken: #E8E2D2;
+  --bg-inset:  #DED6C2;
+
+  --glass-bg:       rgba(252, 249, 240, 0.78);
+  --glass-border:   rgba(17, 17, 17, 0.18);
+
+  /* Ink text, full contrast. */
+  --fg:        #1A1A1A;
+  --fg-muted:  #4A4A4A;
+  --fg-subtle: #6E6E6E;
+  --fg-faint:  #9C9C9C;
+  --fg-invert: #FFFFFF;
+
+  /* Borders are ink, not tinted haze. */
+  --border:        #1A1A1A;
+  --border-strong: #000000;
+  --border-subtle: #C9C2AE;
+
+  /* Electric yellow — the loudest accent in the set, and the
+     only yellow. Reads like a highlighter on paper. */
+  --accent:        #FFD60A;
+  --accent-hover:  #FFE13D;
+  --accent-subtle: rgba(255, 214, 10, 0.28);
+  --accent-fg:     #1A1A1A;
+
+  --success-subtle: rgba(80, 160, 80, 0.16);
+  --warning-subtle: rgba(200, 130, 20, 0.16);
+  --danger-subtle:  rgba(190, 50, 40, 0.16);
+  --info-subtle:    rgba(50, 110, 190, 0.14);
+
+  /* Hard offset shadows, no blur — the neobrutalist signature. */
+  --shadow-xs: 2px 2px 0 rgba(0, 0, 0, 0.8);
+  --shadow-sm: 3px 3px 0 rgba(0, 0, 0, 0.85);
+  --shadow-md: 5px 5px 0 rgba(0, 0, 0, 0.85);
+  --shadow-lg: 8px 8px 0 rgba(0, 0, 0, 0.85);
+  --shadow-pop: 10px 10px 0 rgba(0, 0, 0, 0.9);
+
+  /* Sunken wells press inward instead of fading out. */
+  --shadow-inset: inset 2px 2px 0 rgba(0, 0, 0, 0.12), inset -1px -1px 0 rgba(255, 255, 255, 0.55);
+
+  /* Buttons are chunky stamps; active = pressed flat into the page. */
+  --btn-shadow-rest:   3px 3px 0 rgba(0, 0, 0, 0.85);
+  --btn-shadow-hover:  5px 5px 0 rgba(0, 0, 0, 0.85);
+  --btn-shadow-active: inset 2px 2px 0 rgba(0, 0, 0, 0.25);
+
+  --btn-send-gradient: linear-gradient(135deg, #FFD60A 0%, #FFC300 100%);
+  --btn-send-glow:     0 0 0 rgba(0, 0, 0, 0);
+}
+
+/* ============================================================
+   NEOBRUTALISM DARK — the chunky stamp style, flipped to ink.
+   Near-black paper, cream text, hard offset shadows with zero
+   blur, thick ink borders, and acid lime accent. Same loud
+   shapes, darker room.
+   ============================================================ */
+[data-theme="neobrutalism-dark"] {
+  /* Deep ink canvas. */
+  --bg:        #0E0E10;
+  --bg-raised: #17171A;
+  --bg-sunken: #09090B;
+  --bg-inset:  #1F1F23;
+
+  --glass-bg:       rgba(23, 23, 26, 0.78);
+  --glass-border:   rgba(244, 240, 230, 0.14);
+
+  /* Cream ink text. */
+  --fg:        #F4F0E6;
+  --fg-muted:  #A8A29A;
+  --fg-subtle: #6E6A63;
+  --fg-faint:  #4A4742;
+  --fg-invert: #0E0E10;
+
+  /* Borders are cream ink, chunky. */
+  --border:        #F4F0E6;
+  --border-strong: #FFFFFF;
+  --border-subtle: #2A2A2E;
+
+  /* Acid lime — the loudest accent in the set, and the only
+     green-family highlight. Reads like a marker on black. */
+  --accent:        #C6F000;
+  --accent-hover:  #D9FF33;
+  --accent-subtle: rgba(198, 240, 0, 0.16);
+  --accent-fg:     #0E0E10;
+
+  --success-subtle: rgba(106, 196, 154, 0.14);
+  --warning-subtle: rgba(232, 211, 112, 0.14);
+  --danger-subtle:  rgba(255, 106, 0, 0.14);
+  --info-subtle:    rgba(198, 240, 0, 0.12);
+
+  /* Hard offset shadows, no blur — same signature as light
+     brutalism, but the shadow is black on cream surfaces. */
+  --shadow-xs: 2px 2px 0 rgba(0, 0, 0, 0.9);
+  --shadow-sm: 3px 3px 0 rgba(0, 0, 0, 0.9);
+  --shadow-md: 5px 5px 0 rgba(0, 0, 0, 0.9);
+  --shadow-lg: 8px 8px 0 rgba(0, 0, 0, 0.9);
+  --shadow-pop: 10px 10px 0 rgba(0, 0, 0, 0.95);
+
+  --shadow-inset: inset 2px 2px 0 rgba(0, 0, 0, 0.6), inset -1px -1px 0 rgba(244, 240, 230, 0.08);
+
+  /* Buttons are chunky stamps; active = pressed flat. */
+  --btn-shadow-rest:   3px 3px 0 rgba(0, 0, 0, 0.95);
+  --btn-shadow-hover:  5px 5px 0 rgba(0, 0, 0, 0.95);
+  --btn-shadow-active: inset 2px 2px 0 rgba(0, 0, 0, 0.5);
+
+  --btn-send-gradient: linear-gradient(135deg, #C6F000 0%, #A8D400 100%);
+  --btn-send-glow:     0 0 0 rgba(0, 0, 0, 0);
+}
+
+/* ============================================================
+   KINETIC — typography in motion.
+   Deep graphite-violet canvas, plasma-orange accent, and the
+   signature: titles and brand text wear an animated gradient
+   sweep that slides across the letterforms. The whole theme is
+   built around text as the hero, so type gets the motion and
+   surfaces stay quiet to let it show.
+   ============================================================ */
+[data-theme="kinetic"] {
+  /* Graphite-violet ink canvas. */
+  --bg:        #0B0A12;
+  --bg-raised: #14121E;
+  --bg-sunken: #060509;
+  --bg-inset:  #1C192A;
+
+  --glass-bg:       rgba(20, 18, 30, 0.75);
+  --glass-border:   rgba(255, 138, 60, 0.14);
+
+  --bg-gradient: radial-gradient(ellipse at top, rgba(255, 77, 0, 0.10) 0%, transparent 60%),
+                 linear-gradient(180deg, #0B0A12 0%, #060509 100%);
+
+  --fg:        #F2EFE8;
+  --fg-muted:  #9C97A8;
+  --fg-subtle: #6B6678;
+  --fg-faint:  #464250;
+  --fg-invert: #0B0A12;
+
+  --border:        #211E30;
+  --border-strong: #332F47;
+  --border-subtle: #161423;
+
+  /* Plasma orange — the only true orange accent in the set.
+     The kinetic sweep below shades it toward hot pink and
+     amber, so titles carry the full plasma arc. */
+  --accent:        #FF4D00;
+  --accent-hover:  #FF7A3C;
+  --accent-subtle: rgba(255, 77, 0, 0.14);
+  --accent-fg:     #FFFFFF;
+
+  --success-subtle: rgba(106, 196, 154, 0.14);
+  --warning-subtle: rgba(232, 211, 112, 0.14);
+  --danger-subtle:  rgba(255, 106, 0, 0.14);
+  --info-subtle:    rgba(255, 122, 60, 0.12);
+
+  --shadow-xs: 0 1px 0 rgba(0, 0, 0, 0.5);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 77, 0, 0.05);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 77, 0, 0.08);
+  --shadow-lg: 0 16px 45px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 77, 0, 0.1);
+  --shadow-pop: 0 24px 80px rgba(0, 0, 0, 0.9), 0 0 0 1px rgba(255, 77, 0, 0.15);
+
+  --shadow-inset: inset 0 2px 4px rgba(0, 0, 0, 0.6), inset 0 0 0 1px rgba(255, 77, 0, 0.05);
+
+  --btn-shadow-rest:   inset 0 1px 0 rgba(255, 255, 255, 0.1),
+                       0 2px 6px rgba(0, 0, 0, 0.50),
+                       0 0 0 1px rgba(255, 77, 0, 0.1);
+  --btn-shadow-hover:  inset 0 1px 0 rgba(255, 255, 255, 0.15),
+                       0 4px 12px rgba(0, 0, 0, 0.60),
+                       0 0 0 1px rgba(255, 77, 0, 0.2);
+  --btn-shadow-active: inset 0 2px 5px rgba(0, 0, 0, 0.7),
+                       0 0 0 1px rgba(255, 77, 0, 0.05);
+
+  --btn-send-gradient: linear-gradient(135deg, #FF4D00 0%, #FF2E6E 100%);
+  --btn-send-glow:     0 6px 24px rgba(255, 77, 0, 0.4);
+}
+
+/* Kinetic typography — the moving type of the KINETIC theme.
+   The gradient sweep animates only on title-level text so it
+   reads as a design statement, not noise. */
+[data-theme="kinetic"] .brand-title,
+[data-theme="kinetic"] .welcome-title {
+  background: linear-gradient(90deg,
+    var(--accent) 0%,
+    #FF2E6E 25%,
+    #FFB03C 50%,
+    var(--accent) 75%,
+    #FF2E6E 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent !important;
+  color: transparent !important;
+  animation: kinetic-sweep 8s linear infinite;
+}
+
+[data-theme="kinetic"] .brand-subtitle {
+  background: linear-gradient(90deg,
+    var(--fg-muted) 0%,
+    #FFB03C 25%,
+    var(--fg-muted) 50%,
+    #FF4D00 75%,
+    var(--fg-muted) 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent !important;
+  color: transparent !important;
+  animation: kinetic-sweep 12s linear infinite;
+}
+
+@keyframes kinetic-sweep {
+  0%   { background-position: 0% 50%; }
+  100% { background-position: 200% 50%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="kinetic"] .brand-title,
+  [data-theme="kinetic"] .welcome-title,
+  [data-theme="kinetic"] .brand-subtitle {
+    animation: none;
+    background: none;
+    color: var(--fg) !important;
+    -webkit-text-fill-color: var(--fg) !important;
+  }
 }
 
 /* ============================================================ */
