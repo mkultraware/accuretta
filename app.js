@@ -3255,6 +3255,7 @@
         collapseWorkBlock(agentRow);
         // Settle the OSINT recon card (stop the live pulse, show the summary).
         osintCardFinalize(agentRow);
+        attackRailFinalize(agentRow);
       }
       // safety net: if the model ran tools or thought for a while but ended
       // without a visible answer, surface what we have so the user isn't
@@ -3542,17 +3543,14 @@
     if (span) span.textContent = finalLabel;
     if (icon) icon.className = "ph ph-check-circle think-check-icon done";
   }
-  // ---------- attack-chain progress rail (red-team flow) ----------
-  // A slim kill-chain visual that lights up as the model breaches. Driven
-  // entirely by events already emitted — tool_start (activity line + which
-  // stage is active) and breach (a captured FLAG advances a stage). Only shown
-  // when a red-team tool or breach fires, so ordinary coding turns never see
-  // it. Colors are theme tokens, so it adapts to every theme automatically.
+  // ---------- security assessment progress ----------
+  // The backend owns phase changes. Tool starts update the activity line only;
+  // refused calls cannot advance the engagement or imply access that never happened.
   const ATTACK_NODES = [
-    { label: "Recon",  tech: "",      icon: "ph-crosshair" },
-    { label: "Access", tech: "T1548", icon: "ph-key" },
-    { label: "Pivot",  tech: "T1190", icon: "ph-path" },
-    { label: "RCE",    tech: "T1059", icon: "ph-terminal-window" },
+    { key: "recon", label: "Recon", icon: "ph-radar" },
+    { key: "validate", label: "Validate", icon: "ph-seal-check" },
+    { key: "exploit", label: "Exploit", icon: "ph-flask" },
+    { key: "report", label: "Report", icon: "ph-file-text" },
   ];
   // Mirrors the backend _RT_EXPLOIT_TOOL_NAMES (bridge.py). These are the active
   // break-in primitives, so they DO drive the attack rail when they run — even
@@ -3561,9 +3559,13 @@
     "http_request", "recon_auth_spray", "jwt_tool", "sql_injection",
     "fuzz", "batch_probe", "tcp_send",
   ]);
+  const RT_WORKFLOW_TOOLS = new Set([
+    "validate_finding", "record_finding", "sandbox_sqlmap", "rt_generate_report",
+  ]);
   function isExploitTool(name) { return RT_EXPLOIT_TOOLS.has(name); }
   function isRedTeamTool(name) {
-    return !!name && (name.startsWith("recon_") || name === "encode_decode" || isExploitTool(name));
+    return !!name && (name.startsWith("recon_") || name === "encode_decode"
+      || isExploitTool(name) || RT_WORKFLOW_TOOLS.has(name));
   }
   // Short path helper: strip scheme+host, keep path+query, cap length.
   function arPath(u, cap = 40) {
@@ -3573,6 +3575,18 @@
   }
   function attackActivitySummary(name, args) {
     args = args || {};
+    if (name === "validate_finding") {
+      return `validating → ${arPath(args.url || args.target, 52) || "finding"}`;
+    }
+    if (name === "record_finding") {
+      return `evidence ledger → ${String(args.title || "finding").slice(0, 52)}`;
+    }
+    if (name === "sandbox_sqlmap") {
+      return `sqlmap verification → ${arPath(args.url, 48) || "target"}`;
+    }
+    if (name === "rt_generate_report") {
+      return "report → assembling evidence and findings";
+    }
     if (name === "http_request") {
       const m = (args.method || "GET").toUpperCase();
       return `http_request → ${m} ${arPath(args.url || args.target, 44) || "/"}`;
@@ -3630,41 +3644,46 @@
       el.innerHTML = `<span class="ar-cmd">${esc(summary)}</span>`;
     }
   }
-  function ensureAttackRail(row) {
+  function ensureAttackRail(row, mission = {}) {
     if (!row) return null;
     let rail = row.querySelector(".attack-rail") || document.querySelector("#revealer-deck .attack-rail");
-    if (rail) return rail;
+    if (rail) {
+      const target = rail.querySelector(".ar-target-title");
+      if (target && mission.target) target.textContent = mission.target;
+      return rail;
+    }
     const toolStack = row.querySelector(".tool-stack");
     rail = document.createElement("div");
     rail.className = "attack-rail is-running";
-    rail.dataset.flags = "0";
-    rail.dataset.active = "-1";
-    rail.dataset.recondone = "0";
+    rail.dataset.phase = mission.phase === "exploit" ? "exploit" : "recon";
+    rail.dataset.missionPhase = rail.dataset.phase;
+    rail.dataset.status = mission.status || "active";
+    rail.dataset.running = "0";
+    rail.dataset.flagsraw = "0";
     rail.dataset.start = String(Date.now());
     const nodesHtml = ATTACK_NODES.map((n, i) =>
-      `<div class="ar-node is-pending" data-i="${i}">` +
-        `<span class="ar-dot"><i class="ph ${n.icon}"></i></span>` +
+      `<div class="ar-node is-pending" data-i="${i}" data-phase="${n.key}">` +
+        `<span class="ar-dot"><i class="ph ${n.icon}"></i><span class="ar-check"><i class="ph ph-check"></i></span></span>` +
         `<span class="ar-label">${n.label}</span>` +
-        `<span class="ar-active-badge">ACTIVE</span>` +
       `</div>` +
       (i < ATTACK_NODES.length - 1 ? `<span class="ar-seg" data-s="${i}"></span>` : "")
     ).join("");
     rail.innerHTML =
       `<div class="ar-head">` +
-        `<span class="ar-title"><i class="ph ph-crosshair"></i> Attack chain</span>` +
-        // No fixed denominator — real engagements have no set number of "flags"
-        // to find (that's a CTF concept). Hidden until a FLAG{...} is actually
-        // captured, then shows a plain running count. See renderRail.
-        `<span class="ar-flags" hidden><i class="ph ph-flag"></i> <span class="ar-flag-count"></span></span>` +
+        `<div class="ar-heading"><span class="ar-kicker">Security assessment</span>` +
+        `<span class="ar-target-title">${esc(mission.target || "Authorized engagement")}</span></div>` +
+        // Evidence stays hidden until the backend observes a concrete FLAG.
+        `<span class="ar-state"><span class="ar-state-dot"></span><span class="ar-state-text">In progress</span></span>` +
       `</div>` +
       `<div class="ar-track">${nodesHtml}</div>` +
-      `<div class="ar-activity"><span class="ar-pulse"></span><span class="ar-activity-text">initializing…</span></div>` +
+      `<div class="ar-activity"><span class="ar-pulse live"></span><span class="ar-activity-text">Preparing scoped assessment</span></div>` +
       `<div class="ar-foot">` +
-        `<div class="ar-stat"><span class="ar-stat-ico"><i class="ph ph-clock"></i></span><span class="ar-stat-body"><span class="ar-stat-label">Elapsed</span><span class="ar-stat-val ar-elapsed">00:00:00</span></span></div>` +
-        `<div class="ar-stat"><span class="ar-stat-ico"><i class="ph ph-list-checks"></i></span><span class="ar-stat-body"><span class="ar-stat-label">Steps completed</span><span class="ar-stat-val ar-steps">0 / 4</span></span></div>` +
-        `<div class="ar-stat"><span class="ar-stat-ico ar-stat-ico-status"><i class="ph ph-activity"></i></span><span class="ar-stat-body"><span class="ar-stat-label">Status</span><span class="ar-stat-val ar-status">Running</span></span></div>` +
+        `<span class="ar-meta">Elapsed <strong class="ar-elapsed">00:00:00</strong></span>` +
+        `<span class="ar-meta">Phase <strong class="ar-phase">Recon</strong></span>` +
+        `<span class="ar-meta ar-flags" hidden>Evidence <strong class="ar-flag-count"></strong></span>` +
       `</div>` +
-      `<div class="ar-banner"><i class="ph ph-shield-check"></i> confirmed access — full chain breached</div>`;
+      `<div class="ar-banner"><span class="ar-banner-icon"><i class="ph ph-check"></i></span>` +
+        `<span><strong>Assessment complete</strong><small>Report generated and engagement closed</small></span></div>`;
     
     const deck = document.getElementById("revealer-deck");
     if (deck) {
@@ -3674,11 +3693,10 @@
       if (toolStack && toolStack.parentNode) toolStack.parentNode.insertBefore(rail, toolStack);
       else row.appendChild(rail);
     }
-    // Live elapsed clock — ticks while the turn streams, freezes on full breach
-    // or turn end, and self-cleans if the bubble is torn down (chat switch).
+    // Live elapsed clock freezes when the engagement closes or the turn ends.
     const tick = () => {
       if (!document.body.contains(rail)) { clearInterval(rail._timer); return; }
-      const frozen = rail.classList.contains("is-complete") || !state.streaming;
+      const frozen = rail.dataset.status === "closed" || !state.streaming;
       if (!frozen) rail.dataset.elapsed = String(Date.now() - (+rail.dataset.start || Date.now()));
       const el = rail.querySelector(".ar-elapsed");
       if (el) el.textContent = fmtElapsed(+(rail.dataset.elapsed || 0));
@@ -3686,114 +3704,141 @@
     };
     rail._timer = setInterval(tick, 1000);
     tick();
+    renderRail(rail);
     return rail;
   }
   function renderRail(rail) {
-    const flags = +rail.dataset.flags;
-    const active = +rail.dataset.active;
-    const reconDone = rail.dataset.recondone === "1";
-    // node 0 = recon (no flag; "done" once exploitation starts or any flag lands)
-    const done = [reconDone || flags >= 1, flags >= 1, flags >= 2, flags >= 3];
+    const active = Math.max(0, ATTACK_NODES.findIndex(n => n.key === rail.dataset.phase));
+    const closed = rail.dataset.status === "closed";
+    // A stage is complete only when the backend advances beyond it.
+    const done = ATTACK_NODES.map((_node, i) => closed || i < active);
     rail.querySelectorAll(".ar-node").forEach((el) => {
       const i = +el.dataset.i;
-      el.classList.toggle("is-active", i === active);
-      el.classList.toggle("is-done", done[i] && i !== active);
-      el.classList.toggle("is-pending", !done[i] && i !== active);
+      el.classList.toggle("is-active", !closed && i === active);
+      el.classList.toggle("is-done", closed || (done[i] && i !== active));
+      el.classList.toggle("is-pending", !closed && !done[i] && i !== active);
     });
     rail.querySelectorAll(".ar-seg").forEach((el) => {
       const s = +el.dataset.s;
-      el.classList.toggle("is-done", done[s]);
+      el.classList.toggle("is-done", closed || done[s]);
       // The segment leaving the active node lights up too, so progress reads as
       // flowing into the next stage (dashed = still pending).
-      el.classList.toggle("is-active", !done[s] && active === s);
+      el.classList.toggle("is-active", !closed && !done[s] && active === s);
     });
-    // Flag pill: hidden at zero (no misleading "0/N captured" on a clean
-    // target), then a plain count once something is actually captured.
+    // Keep evidence counts hidden at zero.
     const flagsRaw = +(rail.dataset.flagsraw || 0);
     const flagsWrap = rail.querySelector(".ar-flags");
     if (flagsWrap) flagsWrap.hidden = flagsRaw <= 0;
     const fc = rail.querySelector(".ar-flag-count");
-    if (fc) fc.textContent = `${flagsRaw} captured`;
-    // Footer stats. Steps = stages reached (active counts as in-progress);
-    // status tracks the live pulse and full-breach completion.
-    const complete = flags >= 3;
+    if (fc) fc.textContent = `${flagsRaw} confirmed`;
+    // Status reflects actual work, policy holds, and server-side closure.
+    const complete = closed;
     const live = rail.querySelector(".ar-pulse")?.classList.contains("live");
-    const reachedCount = active >= 0 ? Math.max(done.filter(Boolean).length, active + 1) : done.filter(Boolean).length;
-    const stepsEl = rail.querySelector(".ar-steps");
-    if (stepsEl) stepsEl.textContent = `${Math.min(4, reachedCount)} / 4`;
-    const statusEl = rail.querySelector(".ar-status");
-    if (statusEl) statusEl.textContent = complete ? "Breached" : (live ? "Running" : "Idle");
-    rail.classList.toggle("has-flags", flags > 0);
+    const phaseEl = rail.querySelector(".ar-phase");
+    if (phaseEl) phaseEl.textContent = ATTACK_NODES[active]?.label || "Recon";
+    const stateEl = rail.querySelector(".ar-state-text");
+    if (stateEl) stateEl.textContent = complete ? "Completed"
+      : rail.dataset.state === "guarded" ? "Policy guarded"
+      : live ? "In progress" : "Engagement active";
+    rail.classList.toggle("has-flags", flagsRaw > 0);
     rail.classList.toggle("is-running", live && !complete);
+    rail.classList.toggle("is-guarded", rail.dataset.state === "guarded" && !complete);
     rail.classList.toggle("is-complete", complete);
   }
   function attackRailToolStart(row, name, args) {
-    // The kill-chain visual (Recon -> Access -> Pivot -> RCE) is for an actual
-    // break-in, not passive recon/OSINT. Passive recon tools alone must NOT
-    // summon it — they render in the OSINT card / tool timeline. It appears once
-    // exploitation begins: an exploit-set tool fires (http_request, sql_injection,
-    // jwt_tool, fuzz, batch_probe, tcp_send, auth spray), encode_decode runs, or a
-    // breach lands on a chain that's already open (see attackRailBreach). Note
-    // auth spray is recon_-prefixed but is an exploit tool, so it must pass here.
+    // Tool starts update activity. They do not authorize or complete a phase.
     if (!isRedTeamTool(name)) return;
-    if (name.startsWith("recon_") && !isExploitTool(name)) return;
     const rail = ensureAttackRail(row);
     if (!rail) return;
+    rail.dataset.state = "active";
+    rail.dataset.running = String(+(rail.dataset.running || 0) + 1);
+    if (name === "validate_finding" || name === "sandbox_sqlmap") rail.dataset.phase = "validate";
+    if (name === "rt_generate_report") rail.dataset.phase = "report";
     setAttackActivity(rail, name, args);
     rail.querySelector(".ar-pulse")?.classList.add("live");
-    // exploitation began — recon is behind us; light the current stage
-    rail.dataset.recondone = "1";
-    if (+rail.dataset.active < 1) rail.dataset.active = "1";
     renderRail(rail);
-    // Recon is behind us once exploitation opens — dismiss the OSINT card
-    // entirely (smooth fade) so it doesn't linger above the attack chain.
-    const osint = osintCard(row);
-    if (osint && !osint.dataset.dismissed) {
-      osint.dataset.dismissed = "1";
-      osint.classList.add("osint-dismiss");
-      setTimeout(() => osint.remove(), 280);
+  }
+  function attackRailToolResult(row, name, result) {
+    if (!isRedTeamTool(name)) return;
+    const rail = (row && row.querySelector(".attack-rail"))
+      || document.querySelector("#revealer-deck .attack-rail");
+    if (!rail) return;
+    rail.dataset.running = String(Math.max(0, +(rail.dataset.running || 0) - 1));
+    if (+rail.dataset.running === 0) rail.querySelector(".ar-pulse")?.classList.remove("live");
+    const failed = !!(result && (result.error || result.ok === false));
+    if (result && result.scope_blocked) {
+      rail.dataset.state = "guarded";
+      const activity = rail.querySelector(".ar-activity-text");
+      if (activity) activity.textContent = "Action held by engagement policy";
+    } else if (name === "validate_finding" && (!result || result.likely_real !== true)) {
+      rail.dataset.phase = rail.dataset.missionPhase || "recon";
+    } else if (name === "sandbox_sqlmap" && (!result || result.injectable !== true)) {
+      rail.dataset.phase = rail.dataset.missionPhase || "recon";
+    } else if (name === "rt_generate_report") {
+      if (result && result.mission_status === "closed") {
+        attackRailMission(row, { status: "closed", phase: "report", report: result.report });
+        return;
+      }
+      if (failed) rail.dataset.phase = rail.dataset.missionPhase || "recon";
+    } else if (isExploitTool(name) && !failed) {
+      rail.dataset.phase = "exploit";
+      rail.dataset.missionPhase = "exploit";
     }
+    renderRail(rail);
+  }
+  function attackRailMission(row, mission) {
+    const rail = ensureAttackRail(row, mission || {});
+    if (!rail) return;
+    const target = rail.querySelector(".ar-target-title");
+    if (target && mission?.target) target.textContent = mission.target;
+    if (mission?.phase === "exploit") {
+      rail.dataset.phase = "exploit";
+      rail.dataset.missionPhase = "exploit";
+    }
+    if (mission?.status === "closed") {
+      rail.dataset.status = "closed";
+      rail.dataset.phase = "report";
+      rail.dataset.running = "0";
+      rail.querySelector(".ar-pulse")?.classList.remove("live");
+      const activity = rail.querySelector(".ar-activity-text");
+      if (activity) activity.textContent = mission.report ? "Report ready" : "Engagement closed";
+      if (rail._timer) clearInterval(rail._timer);
+    }
+    renderRail(rail);
+  }
+  function attackRailFinalize(row) {
+    const rail = (row && row.querySelector(".attack-rail"))
+      || document.querySelector("#revealer-deck .attack-rail");
+    if (!rail || rail.dataset.status === "closed") return;
+    rail.dataset.running = "0";
+    rail.querySelector(".ar-pulse")?.classList.remove("live");
+    renderRail(rail);
   }
   function attackRailBreach(row, stage) {
-    // Only advance a chain that exploitation already opened. A breach during a
-    // recon-only/OSINT run (e.g. an injection PROBE flagging a candidate) should
-    // not conjure the whole kill-chain — the finding still shows in the timeline.
     const rail = (row && row.querySelector(".attack-rail")) || document.querySelector("#revealer-deck .attack-rail");
     if (!rail) return;
     const raw = Math.max(1, parseInt(stage, 10) || 1);
-    // dataset.flags (capped at 3) drives the 4-node visual; flagsraw is the
-    // TRUE captured count shown in the pill, so a range with >3 flags isn't
-    // undercounted.
-    const s = Math.min(3, raw);
-    rail.dataset.flags = String(Math.max(+rail.dataset.flags, s));
     rail.dataset.flagsraw = String(Math.max(+(rail.dataset.flagsraw || 0), raw));
-    rail.dataset.recondone = "1";
-    rail.dataset.active = s < 3 ? String(s + 1) : "-1";
-    if (s >= 3) rail.querySelector(".ar-pulse")?.classList.remove("live");
+    rail.dataset.phase = "exploit";
+    rail.dataset.missionPhase = "exploit";
+    const activity = rail.querySelector(".ar-activity-text");
+    if (activity) activity.textContent = "Confirmed access evidence captured";
     renderRail(rail);
   }
 
-  // ---------- recon -> exploit phase marker (subtle) ----------
-  // When a finding is confirmed (validate_finding) or the override forces it,
-  // the backend unlocks the exploit-tool subset and emits rt_phase. We flag the
-  // moment quietly on whichever recon card is already on screen — no new card,
-  // no red theatrics. The attack rail still only lights on real exploitation or
-  // a FLAG capture. Pure frontend, costs no model tokens.
+  // ---------- confirmed recon -> exploit transition ----------
   function rtPhaseMarker(row, via) {
-    const deck = document.getElementById("revealer-deck");
-    const card = (row && (row.querySelector(".osint-card") || row.querySelector(".attack-rail")))
-      || deck?.querySelector(".osint-card") || deck?.querySelector(".attack-rail");
-    const label = via === "validate_finding" ? "exploit unlocked · finding confirmed" : "exploit unlocked";
-    if (card) {
-      if (card.dataset.rtPhase === "exploit") return;  // once per run
-      card.dataset.rtPhase = "exploit";
-      const head = card.querySelector(".oc-head") || card.querySelector(".ar-head");
-      if (head && !head.querySelector(".rt-phase-badge")) {
-        const b = document.createElement("span");
-        b.className = "rt-phase-badge";
-        b.innerHTML = `<i class="ph ph-lock-key-open"></i> ${esc(label)}`;
-        head.appendChild(b);
-      }
+    const rail = ensureAttackRail(row, { phase: "exploit" });
+    if (rail) {
+      rail.dataset.phase = "exploit";
+      rail.dataset.missionPhase = "exploit";
+      rail.dataset.state = "active";
+      const activity = rail.querySelector(".ar-activity-text");
+      if (activity) activity.textContent = "Finding confirmed. Exploit tools available.";
+      rail.classList.remove("phase-shift");
+      void rail.offsetWidth;
+      rail.classList.add("phase-shift");
+      renderRail(rail);
     }
     appendAgentLog(`Phase: exploit unlocked (${via || "manual"})`);
   }
@@ -3886,6 +3931,8 @@
     return "";
   }
   function osintCardToolStart(row, name, args) {
+    if ((row && row.querySelector(".attack-rail"))
+        || document.querySelector("#revealer-deck .attack-rail")) return;
     const cat = osintCatForTool(name);
     if (!cat) return;
     const card = ensureOsintCard(row);
@@ -4175,6 +4222,7 @@
         }
       }
     } else if (evt.type === "tool_result") {
+      attackRailToolResult(row, evt.name, evt.result);
       osintCardToolResult(row, evt.name, evt.result);
       if (evt.name === "web_image_search" && evt.result && evt.result.results) {
         evt.result.results.forEach(r => {
@@ -4488,6 +4536,8 @@
     } else if (evt.type === "rt_phase") {
       // Recon -> exploit gate opened. Subtle marker only (see rtPhaseMarker).
       rtPhaseMarker(row, evt.via);
+    } else if (evt.type === "rt_mission") {
+      attackRailMission(row, evt);
     } else if (evt.type === "turn_changes") {
       renderTurnChanges(row, evt);
     } else if (evt.type === "plan") {

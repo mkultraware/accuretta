@@ -289,6 +289,8 @@ _chat_desktop_disabled: set[str] = set()
 # before run_chat_turn and cleared after.
 import contextvars
 _current_chat_id: contextvars.ContextVar[str] = contextvars.ContextVar("_current_chat_id", default="")
+_current_rt_chat: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "_current_rt_chat", default=None)
 
 # per-chat SSE emitter so tools can stream progress without plumbing emit through every call
 _chat_emitters: dict[str, callable] = {}
@@ -2552,6 +2554,19 @@ def _rt_authorized_mission(chat: dict | None) -> dict | None:
     return m
 
 
+def _rt_context_chat() -> dict | None:
+    """Return the live turn state when present, otherwise the persisted chat."""
+    live = _current_rt_chat.get()
+    if isinstance(live, dict):
+        return live
+    try:
+        chat_id = _current_chat_id.get() or _get_current_chat() or ""
+        return ((get_chats().get("chats", {}) or {}).get(chat_id)
+                if chat_id else None)
+    except Exception:
+        return None
+
+
 _RT_NETWORK_CMD_RE = re.compile(
     r"\b(?:curl|wget|invoke-webrequest|iwr|invoke-restmethod|irm|nmap|sqlmap|"
     r"nikto|ffuf|gobuster|dirsearch|feroxbuster|netcat|ncat|nc|telnet|ssh|scp|"
@@ -2592,13 +2607,9 @@ def _rt_scope_block(name: str, args: dict) -> str | None:
     settings = get_settings()
     if not settings.get("red_team_enabled"):
         return "refused: red-team tools are disabled in Settings."
-    try:
-        # invoke_tool runs on a worker via copy_context(), so read the chat id
-        # from the CONTEXTVAR (propagates), not the thread-local _get_current_chat.
-        chat_id = _current_chat_id.get() or _get_current_chat() or ""
-        chat = (get_chats().get("chats", {}) or {}).get(chat_id) if chat_id else None
-    except Exception:
-        chat = None
+    # Worker calls inherit contextvars. Prefer the mutable per-turn mission so a
+    # validation in one round unlocks the next round before chats.json is saved.
+    chat = _rt_context_chat()
     mission = _rt_authorized_mission(chat)
     if not mission:
         return ("refused: this chat has no active user-authorized red-team mission. "
@@ -2693,6 +2704,31 @@ def _rt_mission_set_phase(chat: dict, phase: str) -> bool:
     m["phase"] = phase
     chat["mission"] = m
     return True
+
+
+def _rt_result_confirms_finding(name: str, result: dict | None) -> bool:
+    """Whether harness-observed output is strong enough to open exploit tools."""
+    if not isinstance(result, dict) or result.get("error"):
+        return False
+    canon = _resolve_tool_name(name)
+    if canon == "validate_finding":
+        return result.get("likely_real") is True
+    if canon == "recon_injection_probe":
+        return any(
+            isinstance(item, dict)
+            and str(item.get("severity") or "info").lower() in {"medium", "high", "critical"}
+            for item in (result.get("findings") or [])
+        )
+    if canon == "sandbox_sqlmap":
+        return result.get("injectable") is True
+    if canon == "record_finding":
+        finding = result.get("finding") or {}
+        return bool(
+            isinstance(finding, dict)
+            and finding.get("source_observed") is True
+            and str(finding.get("status") or "").lower() in {"validated", "reproduced"}
+        )
+    return False
 
 
 def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
@@ -16834,35 +16870,20 @@ def invoke_tool(name: str, args: dict) -> dict:
         # ungated there. During an active engagement they must obey the same
         # host allowlist, otherwise the model could bypass the questionnaire
         # simply by choosing a non-red-team HTTP primitive.
-        try:
-            _cid = _current_chat_id.get() or _get_current_chat() or ""
-            _chat = ((get_chats().get("chats", {}) or {}).get(_cid)
-                     if _cid else None)
-        except Exception:
-            _chat = None
+        _chat = _rt_context_chat()
         if _rt_authorized_mission(_chat):
             _blk = _rt_scope_block(canon, args or {})
             if _blk:
                 return _finish({"error": _blk, "scope_blocked": True, "tool": canon})
     elif canon in _RT_SCOPE_AWARE_COMMAND_TOOLS:
-        try:
-            _cid = _current_chat_id.get() or _get_current_chat() or ""
-            _chat = ((get_chats().get("chats", {}) or {}).get(_cid)
-                     if _cid else None)
-        except Exception:
-            _chat = None
+        _chat = _rt_context_chat()
         if _rt_authorized_mission(_chat):
             _cmd = str((args or {}).get(_RT_SCOPE_AWARE_COMMAND_TOOLS[canon]) or "")
             _blk = _rt_command_scope_block(_cmd, _chat)
             if _blk:
                 return _finish({"error": _blk, "scope_blocked": True, "tool": canon})
     elif canon.startswith("mcp_") or canon in _DESKTOP_TOOL_NAMES:
-        try:
-            _cid = _current_chat_id.get() or _get_current_chat() or ""
-            _chat = ((get_chats().get("chats", {}) or {}).get(_cid)
-                     if _cid else None)
-        except Exception:
-            _chat = None
+        _chat = _rt_context_chat()
         if _rt_authorized_mission(_chat):
             return _finish({
                 "error": ("refused: untyped MCP/desktop automation is unavailable during an active "
@@ -18429,6 +18450,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
     # cmd_history.jsonl) can tag entries with the originating chat without
     # threading the id through every function signature.
     _set_current_chat(chat_id)
+    _rt_chat_ctx_token = None
     try:
         try:
             max_tool_rounds = int(settings.get("max_tool_rounds") or 120)
@@ -18507,6 +18529,15 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             _roll_active = bool(_c0.get("rolling_summary"))
         except Exception:
             pass
+        _rt_chat_ctx_token = _current_rt_chat.set(_rt_chat if _rt_on else None)
+        if _rt_on:
+            _mission = _rt_chat.get("mission") or {}
+            emit({
+                "type": "rt_mission",
+                "status": str(_mission.get("status") or "active"),
+                "phase": str(_mission.get("phase") or "recon"),
+                "target": str(_mission.get("target") or ""),
+            })
         # Objective anchor for long-horizon drift. The red-team mission block
         # only exists for authorized runs, and pin_note depends on the model
         # choosing to call it — a plain long agentic task (APK triage, firmware
@@ -19760,6 +19791,13 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             if isinstance(_fresh.get("mission"), dict):
                                 _rt_chat["mission"] = dict(_fresh["mission"])
                                 _rt_dirty = True
+                                emit({
+                                    "type": "rt_mission",
+                                    "status": str(_fresh["mission"].get("status") or "active"),
+                                    "phase": str(_fresh["mission"].get("phase") or "recon"),
+                                    "target": str(_fresh["mission"].get("target") or ""),
+                                    "report": str(result.get("report") or "") if isinstance(result, dict) else "",
+                                })
                         except Exception:
                             pass
                     # Breach detection: a FLAG{...} in a tool response is confirmed
@@ -19786,16 +19824,14 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         _t = _rt_target_from_args(name, args)
                         if _t and _rt_mission_note(_rt_chat, target=_t):
                             _rt_dirty = True
-                    # Recon -> exploit: a validate_finding confirm (likely_real) means
-                    # there is a real finding to breach, so unlock the heavier exploit
-                    # subset for the rest of the run. The rt_phase event lets the UI
-                    # show a subtle "exploit unlocked" marker (no attack-rail
-                    # theatrics — those stay reserved for real exploitation / FLAGs).
-                    if (_rt_on and name == "validate_finding"
-                            and isinstance(result, dict) and result.get("likely_real")):
+                    # Harness-observed confirmation opens the exploit subset. The
+                    # live context makes the transition visible to the next worker
+                    # before the turn's single chats.json commit.
+                    if _rt_on and _rt_result_confirms_finding(name, result):
                         if _rt_mission_set_phase(_rt_chat, "exploit"):
                             _rt_dirty = True
-                            emit({"type": "rt_phase", "phase": "exploit", "via": "validate_finding"})
+                            emit({"type": "rt_phase", "phase": "exploit",
+                                  "via": _resolve_tool_name(name)})
                     # analysis tools produce large structured output (string lists,
                     # grep hit lists, disasm listings). Cap looser so the model can
                     # actually reason over the output. Chatty tools stay tight.
@@ -19836,6 +19872,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         partial["_turn_id"] = _turn_id if '_turn_id' in locals() else ""
         return partial
     finally:
+        if _rt_chat_ctx_token is not None:
+            _current_rt_chat.reset(_rt_chat_ctx_token)
         if not _profile_recorded:
             try:
                 _record_model_observation(
@@ -20964,6 +21002,10 @@ def tool_rt_generate_report(args: dict) -> dict:
         chat = (chats_data.get("chats", {}) or {}).get(chat_id) if chat_id else None
     except Exception:
         chat = None
+    live_chat = _current_rt_chat.get()
+    if (isinstance(chat, dict) and isinstance(live_chat, dict)
+            and isinstance(live_chat.get("mission"), dict)):
+        chat["mission"] = copy.deepcopy(live_chat["mission"])
     mission = _rt_mission_get(chat) if isinstance(chat, dict) else None
     ledger = [copy.deepcopy(x) for x in ((chat or {}).get("findings") or [])
               if isinstance(x, dict)] if isinstance(chat, dict) else []
@@ -21040,6 +21082,8 @@ def tool_rt_generate_report(args: dict) -> dict:
     if isinstance(chat, dict) and isinstance(chat.get("mission"), dict):
         chat["mission"]["status"] = "closed"
         chat["mission"]["closed_at"] = int(time.time())
+        if isinstance(live_chat, dict):
+            live_chat["mission"] = copy.deepcopy(chat["mission"])
         if isinstance(chats_data, dict):
             save_json(CHATS_FILE, chats_data)
     return {"ok": True, "report": str(path), "evidence_count": len(evidence),

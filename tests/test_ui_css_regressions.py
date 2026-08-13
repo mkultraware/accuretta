@@ -56,3 +56,33 @@ def test_reasoning_effort_mobile_control_has_touch_sized_target() -> None:
         css,
         re.DOTALL,
     )
+
+
+def test_security_assessment_uses_server_owned_phases() -> None:
+    js = _read("app.js")
+    assert all(label in js for label in (
+        'key: "recon", label: "Recon"',
+        'key: "validate", label: "Validate"',
+        'key: "exploit", label: "Exploit"',
+        'key: "report", label: "Report"',
+    ))
+    assert 'evt.type === "rt_mission"' in js
+    assert "attackRailToolResult(row, evt.name, evt.result)" in js
+    assert 'result && result.scope_blocked' in js
+    assert 'rail.dataset.status = "closed"' in js
+
+
+def test_security_assessment_is_responsive_and_motion_safe() -> None:
+    css = _css()
+    assert "Security assessment progress" in css
+    assert re.search(
+        r"@media\s*\(max-width:\s*600px\)\s*\{.*?\.attack-rail\s+\.ar-node\s*\{[^}]*"
+        r"flex-basis:\s*49px",
+        css,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{.*?\.attack-rail",
+        css,
+        re.DOTALL,
+    )

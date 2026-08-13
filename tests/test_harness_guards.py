@@ -1,3 +1,4 @@
+import contextvars
 import threading
 import unittest
 import os
@@ -694,6 +695,14 @@ class RedTeamEnforcementTests(unittest.TestCase):
         finally:
             bridge._current_chat_id.reset(token)
 
+    @contextmanager
+    def _live_rt_chat(self, chat):
+        token = bridge._current_rt_chat.set(chat)
+        try:
+            yield
+        finally:
+            bridge._current_rt_chat.reset(token)
+
     def test_tools_refuse_settings_only_without_per_chat_authorization(self):
         chat = self._chat(authorized=False)
         with self._patch_state(chat), self._active_chat():
@@ -732,6 +741,27 @@ class RedTeamEnforcementTests(unittest.TestCase):
         with self._patch_state(chat), self._active_chat():
             reason = bridge._rt_scope_block("http_request", {"url": "https://example.com/"})
         self.assertIn("exploit tools are locked", reason)
+
+    def test_live_turn_phase_unlocks_next_worker_before_disk_commit(self):
+        persisted = self._chat(phase="recon")
+        live = self._chat(phase="recon")
+        with self._patch_state(persisted), self._active_chat(), self._live_rt_chat(live):
+            worker_context = contextvars.copy_context()
+            self.assertTrue(bridge._rt_mission_set_phase(live, "exploit"))
+            reason = worker_context.run(
+                bridge._rt_scope_block, "http_request", {"url": "https://example.com/"})
+        self.assertIsNone(reason)
+        self.assertEqual(persisted["mission"]["phase"], "recon")
+
+    def test_harness_observed_findings_can_promote_the_phase(self):
+        self.assertTrue(bridge._rt_result_confirms_finding(
+            "validate_finding", {"likely_real": True}))
+        self.assertTrue(bridge._rt_result_confirms_finding(
+            "recon_injection_probe", {"findings": [{"severity": "high", "type": "reflected XSS"}]}))
+        self.assertFalse(bridge._rt_result_confirms_finding(
+            "recon_injection_probe", {"findings": [{"severity": "info", "type": "none"}]}))
+        self.assertTrue(bridge._rt_result_confirms_finding(
+            "record_finding", {"finding": {"status": "validated", "source_observed": True}}))
 
     def test_generic_network_commands_cannot_bypass_scope(self):
         chat = self._chat(phase="exploit")
@@ -801,7 +831,8 @@ class RedTeamEnforcementTests(unittest.TestCase):
         self.assertNotIn("stale", chat["mission"]["facts"])
 
     def test_report_hashes_evidence_and_closes_mission(self):
-        chat = self._chat(phase="exploit")
+        chat = self._chat(phase="recon")
+        live = self._chat(phase="exploit")
         chats = {"chats": {"rt-chat": chat}, "order": ["rt-chat"]}
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -813,12 +844,14 @@ class RedTeamEnforcementTests(unittest.TestCase):
                     patch.object(bridge, "get_settings", return_value=self.settings), \
                     patch.object(bridge, "get_chats", return_value=chats), \
                     patch.object(bridge, "save_json", side_effect=lambda _p, value: saved.append(value)), \
-                    self._active_chat():
+                    self._active_chat(), self._live_rt_chat(live):
                 result = bridge.tool_rt_generate_report({"findings": "confirmed test"})
             report = Path(result["report"]).read_text(encoding="utf-8")
         self.assertIn("sha256", report)
         self.assertIn("model-authored", report)
         self.assertEqual(chat["mission"]["status"], "closed")
+        self.assertEqual(chat["mission"]["phase"], "exploit")
+        self.assertEqual(live["mission"]["status"], "closed")
         self.assertTrue(saved)
 
 
