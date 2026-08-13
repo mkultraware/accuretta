@@ -24,7 +24,7 @@
     document.documentElement.setAttribute('data-theme', theme);
   })();
 </script>
-<link rel="stylesheet" href="/app.css?v=22">
+<link rel="stylesheet" href="/app.css?v=28">
 <script src="https://unpkg.com/@phosphor-icons/web"></script>
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer></script>
@@ -52,7 +52,7 @@
         <img class="brand-mark brand-mark-light" src="/logo-mark-light.png" alt="" aria-hidden="true">
         <img class="brand-mark brand-mark-dark" src="/logo-mark-dark.png" alt="" aria-hidden="true">
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.7.2</span>
+        <span class="v" id="brand-v">v0.7.3</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -243,6 +243,24 @@
           <div class="composer-foot">
             <span class="composer-hint">⌘⏎ send · Shift⏎ newline</span>
             <div class="composer-foot-actions">
+              <div class="effort-control hidden" id="reasoning-effort-control">
+                <button class="effort-pill" id="reasoning-effort-pill" type="button" aria-haspopup="dialog" aria-expanded="false" title="Reasoning effort for the next message">
+                  <i class="ph ph-brain"></i>
+                  <span class="effort-pill-label">Effort</span>
+                  <strong id="reasoning-effort-value">Auto</strong>
+                </button>
+                <div class="effort-popover" id="reasoning-effort-popover" role="dialog" aria-label="Reasoning effort">
+                  <div class="effort-popover-head">
+                    <span>Reasoning effort</span>
+                    <strong id="reasoning-effort-popover-value">Auto</strong>
+                  </div>
+                  <input id="reasoning-effort-slider" class="effort-slider" type="range" min="0" max="3" step="1" value="0" aria-label="Reasoning effort: auto, low, medium, or high">
+                  <div class="effort-levels" aria-hidden="true">
+                    <span>Auto</span><span>Low</span><span>Med</span><span>High</span>
+                  </div>
+                  <p id="reasoning-effort-note">Uses this model's default.</p>
+                </div>
+              </div>
               <button class="model-pill" id="model-pill" title="Click to change model"><span class="model-pill-name">select model</span><i class="ph ph-caret-down model-pill-caret"></i></button>
               <div class="model-pill-menu" id="model-pill-menu" role="listbox" aria-label="Pick a model"></div>
               <button class="btn accent hidden" id="btn-stop" title="Stop streaming"><i class="ph-fill ph-stop"></i></button>
@@ -692,6 +710,30 @@
       <span class="hint" id="autotune-notes" style="display:block;line-height:1.5;"></span>
     </div>
 
+    <div class="form-group">Model Health <span class="hint" style="font-size:10px;font-weight:normal;text-transform:none;letter-spacing:0;">&middot; learned quietly from normal use</span></div>
+    <div class="model-health-card" id="model-health-card" data-state="loading">
+      <div class="model-health-head">
+        <div class="model-health-mark"><i class="ph ph-pulse"></i></div>
+        <div class="model-health-title-wrap">
+          <strong id="model-health-title">Checking this model&hellip;</strong>
+          <span id="model-health-subtitle">Reading local performance counters</span>
+        </div>
+        <span class="model-health-badge" id="model-health-badge">collecting</span>
+      </div>
+      <div class="model-health-metrics" id="model-health-metrics" aria-live="polite">
+        <div class="model-health-metric"><span>Observed turns</span><strong>&mdash;</strong></div>
+        <div class="model-health-metric"><span>Finished</span><strong>&mdash;</strong></div>
+        <div class="model-health-metric"><span>Tool success</span><strong>&mdash;</strong></div>
+        <div class="model-health-metric"><span>Context use</span><strong>&mdash;</strong></div>
+      </div>
+      <div class="model-health-advice" id="model-health-advice">Keep using the model normally. Accuretta will surface recurring operational problems here.</div>
+      <div class="model-health-privacy"><i class="ph ph-lock-key"></i><span id="model-health-privacy">Local numbers only. No prompts, replies, commands, files, screenshots, or tool output.</span></div>
+      <div class="form-row inline model-health-toggle-row">
+        <label>Learn from normal usage</label>
+        <div class="sw" id="sw-passive-model-telemetry" role="switch" aria-checked="true" tabindex="0"></div>
+      </div>
+    </div>
+
     <div class="form-group">Advanced llama-server <span class="hint" style="font-size:10px;font-weight:normal;text-transform:none;letter-spacing:0;">· override the auto-tune · restart required</span></div>
     <div class="form-row">
       <label>CPU MoE experts · <code>--n-cpu-moe</code> <i class="ph ph-info" title="Keep N MoE expert tensors on CPU instead of GPU. The killer flag for fitting big MoE models (Qwen3 35B-A3B, GLM 4.7) on small VRAM. 0 = all on GPU. Try 20 to 30 for 35B class on a 12GB card."></i></label>
@@ -777,6 +819,16 @@
       <label>Thinking budget (tokens) <i class="ph ph-info" title="Cap how many tokens the model can spend in its <think> phase before being forced to answer. 0 = no thinking. -1 = unlimited."></i></label>
       <input type="number" id="set-think-budget" step="128" min="-1">
     </div>
+    <div class="form-row">
+      <label>Effort control detection <i class="ph ph-info" title="Auto reads the live/GGUF chat template and learns from actual reasoning output. Use an override only when a new model supports adjustable thinking but does not advertise it clearly."></i></label>
+      <select id="set-reasoning-capability">
+        <option value="auto">Auto detect</option>
+        <option value="off">Hide for this model</option>
+        <option value="budget">Force thinking budget</option>
+        <option value="native_effort">Force native effort levels</option>
+      </select>
+      <span class="hint">Auto is recommended. Overrides are an escape hatch for new or unusual local model templates.</span>
+    </div>
 
     <div class="form-group">Preview</div>
     <div class="form-row inline">
@@ -802,6 +854,9 @@
         <option value="neobrutalism-dark">Neobrutalism Dark</option>
         <option value="kinetic">Kinetic</option>
         <option value="soft">Soft</option>
+        <option value="pastel">Pastel</option>
+        <option value="velvet">Velvet</option>
+        <option value="cartograph">Cartograph</option>
         <option value="light">Light</option>
       </select>
     </div>
@@ -852,7 +907,7 @@
       <span>Red team tools</span>
     </div>
     <div class="form-row">
-      <span class="hint">adds the authorized recon / pentest suite (stealth port scan, TLS audit, exposure checks, subdomain takeover, CVE match, auth spray, evidence capture, etc.) to the model's toolset and enables the Red team buttons. off by default so normal coding turns don't carry ~13 extra tools. <b>only use against systems you own or are authorized to test.</b></span>
+      <span class="hint">makes the recon / pentest suite available and enables the Red team buttons. the tools enter a chat only after that chat passes the authorization gate with a target and scope; the bridge then enforces that scope on every call. off by default so ordinary work carries none of the extra schemas. <b>only use against systems you own or are authorized to test.</b></span>
     </div>
     <div class="form-row inline">
       <label>Enable red team tools</label>
@@ -883,6 +938,13 @@
     <div class="form-row inline">
       <label>Request timing jitter</label>
       <div class="sw" id="sw-rt-jitter"></div>
+    </div>
+    <div class="form-row inline">
+      <label>Evidence retention (days)</label>
+      <input type="number" id="set-rt-evidence-days" min="0" max="3650" step="1" value="30" style="width:90px;">
+    </div>
+    <div class="form-row">
+      <span class="hint">keeps captured proof across restarts so reports remain verifiable. use <b>0</b> to restore wipe-on-boot behavior.</span>
     </div>
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
       <span>Analysis tools</span>
@@ -1061,7 +1123,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
-<script src="/app.js?v=202607211700"></script>
+<script src="/app.js?v=202608122030"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {

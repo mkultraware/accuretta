@@ -425,6 +425,8 @@
 [data-theme="nebula"] body,
 [data-theme="operator"] body,
 [data-theme="kinetic"] body,
+[data-theme="pastel"] body,
+[data-theme="velvet"] body,
 .dark body {
   background: var(--bg-gradient, var(--bg)) fixed;
 }
@@ -978,6 +980,173 @@
     -webkit-text-fill-color: var(--fg) !important;
   }
 }
+
+/* ============================================================
+   PASTEL THEME — Soft, candy-colored, cheerful but readable.
+   ============================================================ */
+[data-theme="pastel"] {
+  --bg:        #FDFBF7;
+  --bg-raised: #FFFFFF;
+  --bg-sunken: #F5F1EB;
+  --bg-inset:  #EBE4DB;
+
+  --glass-bg:       rgba(255, 255, 255, 0.7);
+  --glass-border:   rgba(255, 182, 193, 0.3);
+
+  --fg:        #5C5466;
+  --fg-muted:  #8A8296;
+  --fg-subtle: #A39DB0;
+  --fg-faint:  #C4BFCD;
+  --fg-invert: #FFFFFF;
+
+  --border:        #F0E6F5;
+  --border-strong: #E0CBEB;
+  --border-subtle: #F9F5FA;
+
+  --accent:        #FF9ECE; /* soft cotton candy pink */
+  --accent-hover:  #FF76B6;
+  --accent-subtle: rgba(255, 158, 206, 0.15);
+  --accent-fg:     #FFFFFF;
+
+  --success-subtle: rgba(167, 232, 194, 0.25);
+  --warning-subtle: rgba(252, 228, 164, 0.3);
+  --danger-subtle:  rgba(255, 179, 186, 0.25);
+  --info-subtle:    rgba(186, 219, 255, 0.25);
+
+  --shadow-xs: 0 1px 0 rgba(255, 182, 193, 0.1);
+  --shadow-sm: 0 2px 4px rgba(200, 180, 220, 0.15), 0 0 0 1px rgba(255, 255, 255, 0.6);
+  --shadow-md: 0 4px 12px rgba(200, 180, 220, 0.2), 0 0 0 1px rgba(255, 255, 255, 0.7);
+  --shadow-lg: 0 12px 32px rgba(200, 180, 220, 0.25), 0 0 0 1px rgba(255, 255, 255, 0.8);
+  --shadow-pop: 0 20px 60px rgba(200, 180, 220, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.9);
+
+  --shadow-inset: inset 0 2px 4px rgba(200, 180, 220, 0.12), inset 0 0 0 1px rgba(255, 255, 255, 0.5);
+
+  --btn-shadow-rest:   inset 0 1px 0 rgba(255,255,255,0.8),
+                       0 2px 5px rgba(200, 180, 220, 0.15),
+                       0 0 0 1px rgba(255, 182, 193, 0.2);
+  --btn-shadow-hover:  inset 0 1px 0 rgba(255,255,255,0.9),
+                       0 4px 10px rgba(200, 180, 220, 0.2),
+                       0 0 0 1px rgba(255, 182, 193, 0.4);
+  --btn-shadow-active: inset 0 2px 4px rgba(200, 180, 220, 0.25),
+                       0 0 0 1px rgba(255, 182, 193, 0.2);
+
+  --btn-send-gradient: linear-gradient(135deg, #FF9ECE 0%, #B5D8FF 100%);
+  --btn-send-glow:     0 6px 18px rgba(255, 158, 206, 0.35);
+}
+
+/* ============================================================
+   VELVET THEME — Lush, rich, premium. No glassmorphism.
+   Deep plum base, smooth opaque surfaces, vibrant coral accent.
+   ============================================================ */
+[data-theme="velvet"] {
+  --bg:        #1A101C;
+  --bg-raised: #251728;
+  --bg-sunken: #100A11;
+  --bg-inset:  #322136;
+
+  /* Strictly no glassmorphism — fully opaque and matte */
+  --glass-bg:       #251728;
+  --glass-border:   rgba(255, 255, 255, 0.05);
+  --glass-blur:     0px;
+
+  --fg:        #F4EBF5;
+  --fg-muted:  #BAA7BC;
+  --fg-subtle: #89798C;
+  --fg-faint:  #5D515F;
+  --fg-invert: #1A101C;
+
+  --border:        #3B2740;
+  --border-strong: #4E3554;
+  --border-subtle: #241626;
+
+  /* Lush coral / peach accent */
+  --accent:        #FF7A66;
+  --accent-hover:  #FF9685;
+  --accent-subtle: rgba(255, 122, 102, 0.15);
+  --accent-fg:     #1A101C;
+
+  --success-subtle: rgba(87, 204, 153, 0.15);
+  --warning-subtle: rgba(255, 204, 92, 0.15);
+  --danger-subtle:  rgba(255, 107, 107, 0.15);
+  --info-subtle:    rgba(102, 178, 255, 0.15);
+
+  /* Extremely smooth, large, very soft shadows (premium matte feel) */
+  --shadow-xs: 0 2px 10px rgba(0,0,0,0.4);
+  --shadow-sm: 0 8px 20px rgba(0,0,0,0.45);
+  --shadow-md: 0 16px 32px rgba(0,0,0,0.5);
+  --shadow-lg: 0 24px 48px rgba(0,0,0,0.6);
+  --shadow-pop: 0 32px 64px rgba(0,0,0,0.7);
+
+  --shadow-inset: inset 0 2px 8px rgba(0,0,0,0.6);
+
+  /* Matte buttons: purely background shifts, very soft shadow, no sharp lines */
+  --btn-shadow-rest:   0 4px 12px rgba(0,0,0,0.3);
+  --btn-shadow-hover:  0 8px 16px rgba(0,0,0,0.4);
+  --btn-shadow-active: inset 0 2px 6px rgba(0,0,0,0.5);
+
+  --btn-send-gradient: linear-gradient(135deg, #FF7A66 0%, #FF5A44 100%);
+  --btn-send-glow:     0 8px 20px rgba(255, 122, 102, 0.3);
+}
+
+/* ============================================================
+   CARTOGRAPH — spatial instrument UI.
+   Black ceramic, smoked glass, warm vellum, signal orange.
+   ============================================================ */
+[data-theme="cartograph"] {
+  color-scheme: dark;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter Tight', 'Segoe UI', sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter Tight', 'Segoe UI', sans-serif;
+  --font-mono: 'SFMono-Regular', 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+
+  --bg:        #0B0E10;
+  --bg-raised: #15191C;
+  --bg-sunken: #080A0C;
+  --bg-inset:  #1B2024;
+
+  --glass-bg:       rgba(19, 23, 26, 0.84);
+  --glass-border:   rgba(255, 255, 255, 0.075);
+  --glass-blur:     28px;
+
+  --fg:        #F4F1EA;
+  --fg-muted:  #B3B0A9;
+  --fg-subtle: #7E7D78;
+  --fg-faint:  #55585A;
+  --fg-invert: #111315;
+
+  --border:        rgba(255, 255, 255, 0.085);
+  --border-strong: rgba(255, 255, 255, 0.145);
+  --border-subtle: rgba(255, 255, 255, 0.052);
+
+  --accent:        #FF6B45;
+  --accent-hover:  #FF8566;
+  --accent-subtle: rgba(255, 107, 69, 0.13);
+  --accent-fg:     #160A06;
+
+  --success-subtle: rgba(100, 210, 174, 0.13);
+  --warning-subtle: rgba(247, 195, 95, 0.14);
+  --danger-subtle:  rgba(255, 99, 99, 0.14);
+  --info-subtle:    rgba(118, 190, 255, 0.13);
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.32);
+  --shadow-sm: 0 8px 24px rgba(0, 0, 0, 0.28);
+  --shadow-md: 0 18px 48px rgba(0, 0, 0, 0.36);
+  --shadow-lg: 0 28px 72px rgba(0, 0, 0, 0.42);
+  --shadow-pop: 0 40px 120px rgba(0, 0, 0, 0.58);
+  --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+
+  --btn-shadow-rest: inset 0 1px 0 rgba(255, 255, 255, 0.045), 0 1px 2px rgba(0, 0, 0, 0.30);
+  --btn-shadow-hover: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 8px 22px rgba(0, 0, 0, 0.34);
+  --btn-shadow-active: inset 0 1px 3px rgba(0, 0, 0, 0.45);
+  --btn-send-gradient: linear-gradient(180deg, #FF8061 0%, #FF5C34 100%);
+  --btn-send-glow: 0 8px 24px rgba(255, 91, 51, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.30);
+
+  --wb-a: #D7E2DF;
+  --wb-b: #627B82;
+  --wb-c: #FF6B45;
+  --wb-strength: 0.34;
+}
+
+/* ============================================================ */
 
 /* ============================================================ */
 

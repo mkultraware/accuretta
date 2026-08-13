@@ -102,9 +102,9 @@ def _acquire_single_instance(lock_port: int = 8799) -> bool:
         return False
 
 
-# Themes whose splash uses a light background + the DARK-colored logo mark.
-# Mirrors app.css: :is([data-theme="light"],[data-theme="soft"]) shows .splash-logo-dark.
-_LIGHT_THEMES = {"", "light", "soft", "neumorphic", "neobrutalism"}
+# Themes whose splash background needs the dark-colored logo mark. Keep this in
+# sync with the actual palette luminance, including the softer and pastel sets.
+_LIGHT_THEMES = {"", "light", "soft", "pastel", "retro", "neumorphic", "neobrutalism"}
 
 
 def _read_saved_theme() -> str:
@@ -199,7 +199,7 @@ def _hue_shift(hex_color: str, dh: float) -> str:
     return "#{:02x}{:02x}{:02x}".format(*(round(c * 255) for c in (r2, g2, b2)))
 
 
-def _build_splash_html() -> str:
+def _build_legacy_splash_html() -> str:
     """Branded boot splash honoring the last saved theme. Rebuilt each launch,
     so a theme change shows next boot.
 
@@ -565,6 +565,314 @@ def _build_splash_html() -> str:
   </script>
 </body></html>"""
 
+
+def _build_splash_html() -> str:
+    """Theme-aware launch sequence built around an opening threshold.
+
+    The saved theme supplies color only; the composition deliberately avoids
+    borrowing any in-app theme's visual language. Live bridge progress drives
+    one signal line and three honest milestones.
+    """
+    theme = _read_saved_theme()
+    pal = _splash_palette(theme)
+    logo = _logo_data_uri(theme)
+    accent = pal["accent"]
+    is_light = theme in _LIGHT_THEMES
+    edge = "rgba(18, 18, 20, 0.14)" if is_light else "rgba(255, 255, 255, 0.11)"
+    soft_edge = "rgba(18, 18, 20, 0.07)" if is_light else "rgba(255, 255, 255, 0.055)"
+    shade = "rgba(12, 12, 14, 0.10)" if is_light else "rgba(0, 0, 0, 0.30)"
+    theme_label = re.sub(r"[^a-z0-9 -]", "", (theme or "light").replace("-", " ")).strip() or "light"
+    logo_html = (f'<img src="{logo}" class="logo-img" alt="">' if logo
+                 else '<span class="logo-fallback">A</span>')
+
+    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body>
+  <div class="scene" aria-hidden="true">
+    <div class="atmosphere"></div>
+    <div class="plane plane-left"></div>
+    <div class="plane plane-right"></div>
+    <div class="horizon"><span></span></div>
+    <div class="scan"></div>
+    <div class="grain"></div>
+  </div>
+
+  <header class="mast">
+    <div class="runtime"><span class="runtime-dot"></span><span>local runtime</span></div>
+    <div class="theme-label">visual profile / {theme_label}</div>
+  </header>
+
+  <main class="content">
+    <div class="brand">
+      <div class="mark">{logo_html}</div>
+      <h1>accuretta</h1>
+      <p>your model. your machine.</p>
+    </div>
+
+    <section class="boot" aria-live="polite">
+      <div class="readout">
+        <span class="status"><i></i><span id="status">Preparing local runtime</span></span>
+        <span class="pct" id="pct">0%</span>
+      </div>
+      <div class="rail"><div class="fill" id="fill"><b></b></div></div>
+      <div class="milestones">
+        <span class="milestone" data-at="18"><i></i>bridge</span>
+        <span class="milestone" data-at="55"><i></i>engine</span>
+        <span class="milestone" data-at="100"><i></i>workspace</span>
+      </div>
+    </section>
+  </main>
+
+  <footer><span>private by location</span><span>accuretta desktop</span></footer>
+
+  <style>
+    :root {{
+      --bg: {pal['bg']}; --fg: {pal['fg']}; --muted: {pal['muted']}; --accent: {accent};
+      --edge: {edge}; --edge-soft: {soft_edge}; --shade: {shade};
+      --ease: cubic-bezier(.16, 1, .3, 1);
+    }}
+    * {{ box-sizing: border-box; }}
+    html, body {{ width: 100%; height: 100%; }}
+    body {{
+      margin: 0; position: relative; overflow: hidden; display: grid; place-items: center;
+      color: var(--fg); background: var(--bg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", sans-serif;
+      user-select: none; -webkit-font-smoothing: antialiased;
+    }}
+
+    /* A threshold, not a dashboard: broad refractive planes part around one seam. */
+    .scene {{ position: absolute; inset: 0; overflow: hidden; pointer-events: none; }}
+    .atmosphere {{
+      position: absolute; inset: 0;
+      background:
+        radial-gradient(ellipse 62% 58% at 50% 48%, color-mix(in srgb, var(--accent) 11%, transparent), transparent 70%),
+        linear-gradient(180deg, color-mix(in srgb, var(--fg) 2.2%, transparent), transparent 34% 72%, var(--shade));
+      animation: atmosphere-in 1.4s var(--ease) both;
+    }}
+    .plane {{
+      position: absolute; top: -24%; bottom: -24%; width: 64%; opacity: .72;
+      will-change: transform; transition: transform .55s var(--ease), opacity .55s ease;
+    }}
+    .plane::before {{
+      content: ""; position: absolute; inset: 0;
+      background:
+        linear-gradient(112deg, transparent 16%, color-mix(in srgb, var(--accent) 8%, transparent) 46%, color-mix(in srgb, var(--fg) 5%, transparent) 50%, transparent 72%),
+        linear-gradient(90deg, transparent, var(--edge-soft), transparent);
+      border: 1px solid var(--edge-soft);
+      box-shadow: inset 0 1px 0 color-mix(in srgb, var(--fg) 5%, transparent), 0 40px 120px var(--shade);
+    }}
+    .plane-left {{
+      left: -14%; clip-path: polygon(0 0, 100% 10%, 83% 100%, 8% 88%);
+      transform: translate3d(-8%, -1%, 0) rotate(-5deg);
+      animation: plane-left-in 1.25s var(--ease) both;
+    }}
+    .plane-right {{
+      right: -14%; clip-path: polygon(17% 9%, 100% 0, 92% 89%, 0 100%);
+      transform: translate3d(8%, 1%, 0) rotate(5deg);
+      animation: plane-right-in 1.25s var(--ease) both;
+    }}
+    .plane-right::before {{ transform: scaleX(-1); }}
+    .horizon {{
+      position: absolute; z-index: 2; top: 50%; left: 50%;
+      width: min(76vw, 1120px); height: 1px;
+      transform: translate(-50%, -50%) scaleX(0);
+      background: linear-gradient(90deg, transparent, var(--edge) 20%, var(--edge) 80%, transparent);
+      animation: horizon-open 1.05s var(--ease) .18s forwards;
+    }}
+    .horizon::before {{
+      content: ""; position: absolute; left: 50%; top: -18px; width: 1px; height: 37px;
+      background: linear-gradient(transparent, var(--accent), transparent);
+      box-shadow: 0 0 28px color-mix(in srgb, var(--accent) 40%, transparent);
+    }}
+    .horizon span {{
+      position: absolute; inset: -36px 18% -36px;
+      background: radial-gradient(ellipse at center, color-mix(in srgb, var(--accent) 12%, transparent), transparent 72%);
+      filter: blur(14px);
+    }}
+    .scan {{
+      position: absolute; z-index: 3; top: 0; bottom: 0; left: -24%; width: 18%; opacity: 0;
+      background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--fg) 8%, transparent), transparent);
+      transform: skewX(-10deg); animation: scan-once 1.5s ease-in-out .48s both;
+    }}
+    .grain {{
+      position: absolute; inset: 0; opacity: .026; mix-blend-mode: soft-light;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    }}
+
+    .mast {{
+      position: absolute; z-index: 5; top: 0; left: 0; right: 0;
+      display: flex; align-items: center; justify-content: space-between; padding: 28px 32px;
+      color: var(--muted); font: 600 9px/1 ui-monospace, "SFMono-Regular", Consolas, monospace;
+      letter-spacing: .16em; text-transform: uppercase; opacity: 0;
+      animation: chrome-in .8s ease .55s forwards;
+    }}
+    .runtime {{ display: flex; align-items: center; gap: 9px; }}
+    .runtime-dot {{
+      width: 5px; height: 5px; border-radius: 50%; background: var(--accent);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 10%, transparent);
+      animation: runtime-breathe 2.4s ease-in-out infinite;
+    }}
+    .theme-label {{ opacity: .72; }}
+
+    .content {{
+      position: relative; z-index: 4; width: min(520px, calc(100vw - 64px));
+      display: flex; flex-direction: column; align-items: center; transform: translateY(-1.8vh);
+    }}
+    .brand {{ display: flex; flex-direction: column; align-items: center; text-align: center; }}
+    .mark {{
+      position: relative; width: 104px; height: 104px; display: grid; place-items: center;
+      opacity: 0; transform: translateY(18px) scale(.94); filter: blur(14px);
+      animation: mark-resolve 1.05s var(--ease) .25s forwards;
+    }}
+    .mark::before {{
+      content: ""; position: absolute; inset: -62%;
+      background: radial-gradient(circle, color-mix(in srgb, var(--accent) 20%, transparent), transparent 67%);
+      animation: mark-aura 4.8s ease-in-out infinite;
+    }}
+    .mark::after {{
+      content: ""; position: absolute; left: 50%; top: 50%; width: 142%; height: 1px;
+      transform: translate(-50%, -50%) scaleX(0);
+      background: linear-gradient(90deg, transparent, var(--accent), transparent);
+      box-shadow: 0 0 18px color-mix(in srgb, var(--accent) 45%, transparent);
+      animation: mark-seam .85s var(--ease) .42s forwards;
+    }}
+    .logo-img {{
+      position: relative; z-index: 1; width: 88px; height: 88px; object-fit: contain;
+      filter: drop-shadow(0 18px 34px var(--shade));
+    }}
+    .logo-fallback {{ position: relative; z-index: 1; font-size: 68px; font-weight: 800; color: var(--accent); }}
+    h1 {{
+      margin: 11px 0 0; font-size: clamp(38px, 4.2vw, 54px); line-height: .96;
+      font-weight: 720; letter-spacing: -.057em; opacity: 0;
+      transform: translateY(12px); filter: blur(8px);
+      animation: copy-resolve .9s var(--ease) .52s forwards;
+    }}
+    .brand p {{
+      margin: 14px 0 0; color: var(--muted); font-size: 13px; font-weight: 450; letter-spacing: .025em;
+      opacity: 0; transform: translateY(8px); animation: copy-in .7s var(--ease) .72s forwards;
+    }}
+
+    .boot {{
+      width: 100%; margin-top: 62px; opacity: 0; transform: translateY(10px);
+      animation: copy-in .75s var(--ease) .86s forwards;
+    }}
+    .readout {{
+      display: flex; align-items: center; justify-content: space-between; gap: 20px; min-height: 18px;
+      font: 500 10px/1.4 ui-monospace, "SFMono-Regular", Consolas, monospace;
+      letter-spacing: .075em; text-transform: uppercase;
+    }}
+    .status {{ display: inline-flex; align-items: center; gap: 9px; min-width: 0; color: var(--muted); }}
+    .status i {{
+      width: 14px; height: 1px; flex: 0 0 auto; background: var(--accent);
+      box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 35%, transparent);
+    }}
+    #status {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: opacity .16s ease, transform .16s ease; }}
+    #status.swap {{ opacity: 0; transform: translateY(-4px); }}
+    .pct {{ color: var(--fg); font-variant-numeric: tabular-nums; letter-spacing: .04em; }}
+    .rail {{ position: relative; margin-top: 13px; width: 100%; height: 1px; background: var(--edge); }}
+    .fill {{
+      position: absolute; left: 0; top: -1px; width: 3%; height: 3px; background: var(--accent);
+      box-shadow: 0 0 14px color-mix(in srgb, var(--accent) 36%, transparent);
+      transition: width .72s var(--ease);
+    }}
+    .fill b {{
+      position: absolute; right: -2px; top: -3px; width: 7px; height: 7px; border-radius: 50%;
+      background: var(--fg); border: 2px solid var(--accent);
+      box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 9%, transparent), 0 0 20px color-mix(in srgb, var(--accent) 45%, transparent);
+    }}
+    .milestones {{ display: grid; grid-template-columns: repeat(3, 1fr); margin-top: 14px; }}
+    .milestone {{
+      display: flex; align-items: center; gap: 7px; color: var(--muted);
+      font: 500 8px/1 ui-monospace, "SFMono-Regular", Consolas, monospace;
+      letter-spacing: .14em; text-transform: uppercase; opacity: .42;
+      transition: color .3s ease, opacity .3s ease, transform .3s var(--ease);
+    }}
+    .milestone:nth-child(2) {{ justify-self: center; }}
+    .milestone:nth-child(3) {{ justify-self: end; }}
+    .milestone i {{ width: 3px; height: 3px; border-radius: 50%; background: currentColor; }}
+    .milestone.passed {{ color: var(--accent); opacity: 1; transform: translateY(-1px); }}
+
+    footer {{
+      position: absolute; z-index: 5; left: 0; right: 0; bottom: 0;
+      display: flex; justify-content: space-between; padding: 26px 32px;
+      color: var(--muted); font: 500 8px/1 ui-monospace, "SFMono-Regular", Consolas, monospace;
+      letter-spacing: .15em; text-transform: uppercase; opacity: 0;
+      animation: chrome-in .8s ease .72s forwards;
+    }}
+
+    body.ready .plane-left {{ transform: translate3d(-15%, -1%, 0) rotate(-6deg); opacity: .48; }}
+    body.ready .plane-right {{ transform: translate3d(15%, 1%, 0) rotate(6deg); opacity: .48; }}
+    body.ready .mark {{ animation: ready-mark .48s var(--ease) both; }}
+    body.ready .horizon {{ opacity: .72; transition: opacity .32s ease; }}
+
+    @keyframes atmosphere-in {{ from {{ opacity: 0; transform: scale(1.08); }} to {{ opacity: 1; transform: scale(1); }} }}
+    @keyframes plane-left-in {{ from {{ transform: translate3d(12%, 2%, 0) rotate(-2deg); opacity: 0; }} to {{ transform: translate3d(-8%, -1%, 0) rotate(-5deg); opacity: .72; }} }}
+    @keyframes plane-right-in {{ from {{ transform: translate3d(-12%, -2%, 0) rotate(2deg); opacity: 0; }} to {{ transform: translate3d(8%, 1%, 0) rotate(5deg); opacity: .72; }} }}
+    @keyframes horizon-open {{ to {{ transform: translate(-50%, -50%) scaleX(1); }} }}
+    @keyframes scan-once {{ 0% {{ left: -24%; opacity: 0; }} 20% {{ opacity: .72; }} 100% {{ left: 112%; opacity: 0; }} }}
+    @keyframes chrome-in {{ to {{ opacity: .78; }} }}
+    @keyframes runtime-breathe {{ 0%,100% {{ opacity: .55; }} 50% {{ opacity: 1; }} }}
+    @keyframes mark-resolve {{ to {{ opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }} }}
+    @keyframes mark-seam {{ 55% {{ transform: translate(-50%, -50%) scaleX(1); opacity: 1; }} 100% {{ transform: translate(-50%, -50%) scaleX(.2); opacity: 0; }} }}
+    @keyframes mark-aura {{ 0%,100% {{ opacity: .52; transform: scale(.94); }} 50% {{ opacity: .82; transform: scale(1.06); }} }}
+    @keyframes copy-resolve {{ to {{ opacity: 1; transform: translateY(0); filter: blur(0); }} }}
+    @keyframes copy-in {{ to {{ opacity: 1; transform: translateY(0); }} }}
+    @keyframes ready-mark {{ 0% {{ transform: scale(1); }} 45% {{ transform: scale(1.055); }} 100% {{ transform: scale(1); }} }}
+
+    @media (max-width: 640px) {{
+      .mast {{ padding: 20px; }}
+      .theme-label {{ display: none; }}
+      .content {{ width: min(460px, calc(100vw - 40px)); transform: translateY(-2vh); }}
+      .mark {{ width: 86px; height: 86px; }}
+      .logo-img {{ width: 72px; height: 72px; }}
+      h1 {{ margin-top: 8px; font-size: 38px; }}
+      .boot {{ margin-top: 46px; }}
+      footer {{ padding: 20px; }}
+      footer span:first-child {{ display: none; }}
+      footer span:last-child {{ margin-left: auto; }}
+      .plane {{ width: 82%; }}
+      .plane-left {{ left: -32%; }}
+      .plane-right {{ right: -32%; }}
+      .horizon {{ width: 92vw; }}
+    }}
+    @media (max-height: 620px) {{
+      .content {{ transform: scale(.9); }}
+      .boot {{ margin-top: 38px; }}
+      .mast, footer {{ padding-top: 18px; padding-bottom: 18px; }}
+    }}
+    @media (prefers-reduced-motion: reduce) {{
+      *, *::before, *::after {{ animation: none !important; transition-duration: .01ms !important; }}
+      .mast, footer, .mark, h1, .brand p, .boot {{ opacity: 1; transform: none; filter: none; }}
+      .horizon {{ transform: translate(-50%, -50%) scaleX(1); }}
+    }}
+  </style>
+  <script>
+    window.__splashStage = function (label, pct) {{
+      var status = document.getElementById('status');
+      var fill = document.getElementById('fill');
+      var readout = document.getElementById('pct');
+      if (status && status.textContent !== label) {{
+        clearTimeout(window.__splashStatusTimer);
+        status.classList.add('swap');
+        window.__splashStatusTimer = setTimeout(function () {{
+          status.textContent = label;
+          status.classList.remove('swap');
+        }}, 160);
+      }}
+      if (typeof pct === 'number') {{
+        var value = Math.max(0, Math.min(100, pct));
+        if (fill) fill.style.width = Math.max(3, value) + '%';
+        if (readout) readout.textContent = Math.round(value) + '%';
+        var marks = document.querySelectorAll('.milestone');
+        for (var i = 0; i < marks.length; i++) {{
+          marks[i].classList.toggle('passed', value >= Number(marks[i].getAttribute('data-at')));
+        }}
+        document.body.classList.toggle('ready', value >= 100);
+      }}
+    }};
+  </script>
+</body></html>"""
+
+
 _ALREADY_RUNNING_HTML = """<body style="margin:0;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#12151c;color:#e6e6e6;font-family:system-ui,sans-serif">
   <div style="font-size:22px;font-weight:600">accuretta</div>
   <div style="margin-top:8px;font-size:13px;color:#8b93a3">already running — check your taskbar.</div>
@@ -653,6 +961,7 @@ def main() -> int:
     # (only the whole message via the copy button). Turning it on restores normal
     # selection + Ctrl+C + right-click copy. UI chrome stays unselectable via the
     # `user-select: none` CSS on buttons, the sidebar, and code line numbers.
+    splash_shown_at = time.monotonic()
     win = webview.create_window("Accuretta", html=_build_splash_html(),
                                 width=1440, height=920, min_size=(960, 640),
                                 text_select=True)
@@ -666,14 +975,18 @@ def main() -> int:
                 pass
 
         if not _port_in_use(PORT):
-            _stage("starting the bridge…", 18)
+            _stage("Starting local bridge", 18)
             threading.Thread(target=_run_bridge, daemon=True).start()
         else:
-            _stage("found a running bridge…", 40)
-        _stage("waiting for the engine…", 55)
+            _stage("Bridge already online", 40)
+        _stage("Waiting for local engine", 55)
         if _wait_ready():
-            _stage("loading your workspace…", 100)
-            time.sleep(0.35)  # let the 100% fill paint before the swap
+            _stage("Opening workspace", 100)
+            # Warm launches can finish before the opening choreography becomes
+            # legible. Guarantee a short total presentation, but never pad a
+            # genuinely slow boot beyond the final ready transition.
+            elapsed = time.monotonic() - splash_shown_at
+            time.sleep(max(0.38, 1.45 - elapsed))
             win.load_url(f"http://127.0.0.1:{PORT}")
             threading.Thread(target=_watch_bridge, args=(win,), daemon=True).start()
         else:

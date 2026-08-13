@@ -18,7 +18,7 @@
 </div>
 
 <p align="center">
-  <img src="media/accuretta-demo-loop.gif" alt="Accuretta � local AI workspace demo" width="900">
+  <img src="media/accuretta-demo-loop.gif" alt="Accuretta local AI workspace demo" width="900">
 </p>
 
 <p align="center">
@@ -94,6 +94,8 @@ It does four things:
 - lists the GGUF models it found on your drives,
 - auto-tunes the model you choose (context size, GPU offload split, cache type) before it starts the backend.
 
+There is no mandatory model benchmark during setup. Accuretta learns a small, content-free runtime profile from normal use instead: token counts, speed, tool-call/error counts, recovery/fallback use, and whether turns completed. It stores no prompt or tool-result text in that profile, adds no inference, and never delays a new user's first chat. Settings → Model & performance shows this as **Model Health**; cautious advice appears after eight observed turns, and the local learning can be paused there at any time.
+
 Click **Save & Start** and you're chatting. Your sessions, settings, workspace pointers, and memories land in a `data/` folder next to `bridge.py`. Back it up to keep them, delete it for a clean slate.
 
 ### When something breaks
@@ -123,6 +125,8 @@ Ask for a webpage and you see it render next to the chat as the model writes it.
 
 The agent has hands. It reads and writes files, runs shell commands, opens interactive shells, fetches web pages, searches the web, takes screenshots, and inspects processes and network state. Anything that changes your system (file writes, shell commands, registry edits) is gated by an approval card, so nothing destructive happens silently. Read-only work like web fetches can run on its own when you flip on **Trust writes** or approve a class of action.
 
+Host, repository, desktop, connector, sandbox, and target-touching actions also leave a bounded local provenance record in `data/action_audit.jsonl`. It records the tool, time, outcome, target, chat/authorization identity, and hashes of the arguments/result; it deliberately does not copy commands, typed text, prompts, or tool output into the log. Desktop actions return a cheap immediate observation of the active window and cursor so the model has a concrete post-action state before deciding what to do next.
+
 <p align="center">
   <img src="Approval_Gate_Plus_Discord.png" alt="An approval card in Accuretta showing a pending command, alongside the same approval arriving as a Discord message that can be approved with a reaction." width="880" />
 </p>
@@ -133,7 +137,7 @@ The agent has hands. It reads and writes files, runs shell commands, opens inter
 
 Turn on **Red team tools** in Settings and the model gains a recon and exploitation suite: stealth port scanning, TLS audit, HTTP fingerprinting, passive subdomain enumeration, DNS recon, content discovery, exposure checks, subdomain-takeover detection, CVE matching, an injection and SQL-injection prober, a request fuzzer, an auth-spray primitive, a raw HTTP client, JWT decode/forge/crack, an encoder/decoder, front-end secret scanning, CORS probing, raw TCP, and evidence capture. It's off by default so a normal coding turn doesn't carry a dozen tools it will never use.
 
-The suite is gated twice: the Settings toggle, and an authorization prompt before any run. Point it only at systems you own or have written permission to test.
+The Settings toggle only makes the suite available. Each chat must then pass a fresh authorization gate with an explicit target and scope. The bridge stores that authorization on the chat, exposes only recon tools at first, enforces the allowlist server-side on every typed request and redirect, and unlocks exploit tools only after a finding is validated (unless the user deliberately enables the force override). Finishing a report closes the mission. Evidence files are retained for 30 days by default so a restart does not erase the proof behind a report; set retention to `0` to restore wipe-on-start behavior. This is a harness-level guard, not an OS firewall, so point it only at systems you own or have written permission to test.
 
 <p align="center">
   <img src="RedTeam_Start.png" alt="The start of an authorized red-team run in Accuretta: the model confirms authorization and begins reconnaissance against a target." width="880" />
@@ -147,7 +151,7 @@ The suite is gated twice: the Settings toggle, and an authorization prompt befor
 
 ### See what's talking to your network
 
-Ask for a network snapshot and the model groups active TCP and UDP connections by process, flags anything odd, and summarizes recent DNS activity in a real table. No round trip to a cloud, no API key, no rate limit.
+Ask for a network snapshot and the model groups active TCP and UDP connections by process, flags anything odd, and summarizes recent DNS activity in a real table. A snapshot can be saved as a named known-good baseline; a later capture can return added/removed connections, listeners, DNS records, and processes. No round trip to a cloud, no API key, no rate limit.
 
 <p align="center">
   <img src="Blue_Team_Recon_NetworkSnapshot.png" alt="Accuretta running a local network snapshot and analyzing active connections grouped by process, with a summary of recent DNS activity." width="880" />
@@ -170,7 +174,7 @@ pip install pefile pyelftools yara-python
 pip install pyghidra                # needs Ghidra + JDK 21 (adoptium.net)
 ```
 
-If a package is missing, the tool returns a "install with: pip install ..." note instead of crashing.
+If a hard dependency is missing, Accuretta omits that tool from the model's schema instead of letting the model waste rounds discovering a guaranteed failure. The read-only `capability_report` tool explains what is available, what policy blocks, what is missing, and, on request, the approval, scope, side-effect, and result-size contract for every visible tool.
 
 ### Run risky things in a throwaway Linux box
 
@@ -183,6 +187,8 @@ Set up the optional **sandbox** and Accuretta provisions an isolated Ubuntu gues
 ### Agentic coding helpers
 
 Three standard-library tools keep token cost low on big projects: `read_skeleton` pulls the classes, functions, and signatures out of a 5,000-line file for a few hundred tokens; `check_syntax` runs `ast.parse` (or `node --check`) so the model verifies its own edits; and `run_tests` runs `pytest`/`npm test` and hands back only the failures and tracebacks.
+
+Accuretta tracks verification debt independently of the model's prose. A successful file edit adds that path to the structured continuity record; only a harness-observed successful syntax check for that file or a successful project test run clears it. The record survives context compaction and crash recovery, so an unverified change cannot become "done" merely because the model said so.
 
 ### Plug in MCP servers
 
@@ -244,11 +250,11 @@ Then create an app at [discord.com/developers](https://discord.com/developers/ap
 
 ## Privacy
 
-Nothing about you, your prompts, or your files leaves your computer. The bridge talks to two things on localhost: your llama-server instance and your browser. There's no telemetry, no analytics, no account, no cloud sync.
+Model inference, prompts, chat history, settings, and workspace files stay on your computer. The bridge has no telemetry, analytics, account, or cloud-sync service.
 
-The one outbound channel is the agent's own web fetch and search. When the model reads a URL, that request goes from your machine to that site, the same way your browser would. Some models ask first, others just do it as part of answering. Nothing is sent unless the model decided it needed something off the open web for the task you gave it.
+There are two deliberate sources of ordinary outbound traffic. Agent web-search and fetch tools contact the sites the model chooses for your task. The interface also loads fonts, icons, syntax highlighting, export helpers, and QR-code support from Google Fonts, unpkg, and jsDelivr; those providers receive normal web-request metadata, but not your chats or files. If those assets are blocked, core local chat still works, while the affected presentation and export features may be unavailable.
 
-If you want to check, run Wireshark next to it. The only outbound traffic you'll see is what the agent fetched. Want silence? Block the bridge process at the firewall, or unplug the network. The model runs fully offline once loaded, so you can chat all day with no internet.
+For a network-silent session, block both the bridge and its browser/webview at the firewall, or disconnect the machine after the model is loaded. Local inference and ordinary chat do not require an internet connection.
 
 ## What it doesn't do
 

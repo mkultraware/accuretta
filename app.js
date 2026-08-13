@@ -43,6 +43,8 @@
     _ctxPoll: null,
     touchedFiles: new Set(),
     imageUrlToSourceMap: new Map(),
+    reasoningCapability: { supported: false, mode: "none", source: "no_model" },
+    reasoningEffort: "auto",
   };
 
   const app = $("#app");
@@ -405,11 +407,15 @@
   // strip when no specific tool is currently running.
   const WRENCH_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>`;
 
-  // Agent avatar: the Accuretta split-A brand mark. We pre-load BOTH theme
-  // variants (dark slab on light bg, white slab on dark bg) and let CSS pick
-  // which one shows via [data-theme]. Same approach as the sidebar brand
-  // mark — keeps theme toggling instant with no fetch lag.
-  const AGENT_AVATAR_HTML = `<div class="avatar"><img class="avatar-mark avatar-mark-light" src="logo-mark-light.png" alt="" aria-hidden="true" draggable="false"><img class="avatar-mark avatar-mark-dark" src="logo-mark-dark.png" alt="" aria-hidden="true" draggable="false"></div>`;
+  // Agent avatar: the Accuretta split-A brand mark as inline SVG — no PNG
+  // fetch, and the slab fills are set in CSS per theme variant (dark slab on
+  // light themes, pale slab on dark ones) exactly like the old <img> swap.
+  // The two slabs are separate <g>s so the working animation (driven by
+  // .bubble-meta.streaming) can move them independently while the model runs.
+  const _LOGO_SLAB_D = "M164 6 L226 6 Q240 6 233.7 18.5 L111.3 261.5 Q105 274 91 274 L24 274 Q10 274 16.5 261.6 L143.5 18.4 Q150 6 164 6 Z";
+  const _LOGO_PURPLE_D = "M225 135 L260 135 Q272 135 277.2 145.8 L332.8 261.2 Q338 272 326 272 L269 272 Q257 272 253.3 260.6 L216.7 146.4 Q213 135 225 135 Z";
+  const _LOGO_SVG = (cls) => `<svg class="avatar-mark ${cls}" viewBox="0 0 348 282" aria-hidden="true" draggable="false"><g class="logo-slab"><path d="${_LOGO_SLAB_D}"/></g><g class="logo-purple"><path d="${_LOGO_PURPLE_D}"/></g></svg>`;
+  const AGENT_AVATAR_HTML = `<div class="avatar">${_LOGO_SVG("avatar-mark-light")}${_LOGO_SVG("avatar-mark-dark")}</div>`;
 
   // Render web-search chips into the head's chip strip. New searches REPLACE
   // the chip set with a fade-in animation — gives the "rotating sources" feel
@@ -2053,16 +2059,20 @@
       // get seen by the chat model directly or routed through the OCR side.
       state.visionCapable = !!r.vision_capable;
       state.loadedMmproj = r.loaded_mmproj || "";
+      state.reasoningCapability = r.reasoning_capability || { supported: false, mode: "none" };
       state.modelsList = Array.isArray(r.models) ? r.models : [];
       state.models = state.modelsList.map(m => m.name).filter(Boolean);
       if (r.error) state.modelsError = r.error;
       else if (!state.modelsDir) state.modelsError = "no models folder set — pick one above.";
       else if (!state.models.length) state.modelsError = "no .gguf files found in " + state.modelsDir;
       else state.modelsError = "";
+      renderReasoningEffort();
     } catch (e) {
       state.models = [];
       state.modelsList = [];
+      state.reasoningCapability = { supported: false, mode: "none" };
       state.modelsError = "bridge unreachable: " + (e.message || e);
+      renderReasoningEffort();
     }
   }
 
@@ -2378,9 +2388,9 @@
     const commands = [
       { kind: "cmd", icon: "ph-plus", label: "New session", action: () => { closePalette(); newChat(); } },
       { kind: "cmd", icon: "ph-gear-six", label: "Open Settings", action: () => { closePalette(); openSettings(); } },
-      { kind: "cmd", icon: "ph-brain", label: "Open Long-term memory", action: () => { closePalette(); openSettings(); setTimeout(() => $("#btn-mem-refresh")?.scrollIntoView({ behavior: "smooth" }), 80); } },
+      { kind: "cmd", icon: "ph-brain", label: "Open Long-term memory", action: () => { closePalette(); openSettings(); setTimeout(() => revealSettingsControl("#btn-mem-refresh"), 80); } },
       { kind: "cmd", icon: "ph-arrow-counter-clockwise", label: "Regenerate last reply", action: () => { closePalette(); regenerateLast(); } },
-      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / neobrutalism / neobrutalism-dark / kinetic / soft / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
+      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / neobrutalism / neobrutalism-dark / kinetic / soft / pastel / velvet / cartograph / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
       { kind: "cmd", icon: "ph-browser", label: "Toggle preview pane", action: () => { closePalette(); app.classList.toggle("preview-collapsed"); } },
       { kind: "cmd", icon: "ph-camera", label: "Screenshot preview", action: () => { closePalette(); screenshotPreview(); } },
       { kind: "cmd", icon: "ph-package", label: "Export project", action: () => { closePalette(); exportProjectZip(); } },
@@ -2594,7 +2604,18 @@
     let cascadeChips = "";
     if (m.role === "assistant") {
       const { thinking, content } = splitThinking(visible);
-      visible = content;
+      // Promote a reply whose ENTIRE text was parked inside the thinking tags
+      // (the closing tag is the very last content): splitThinking demotes
+      // everything to "thinking" and the bubble would render empty while the
+      // real answer hides inside the collapsible chip (older saved chats hit
+      // this routinely). Render the think text AS the visible answer — the
+      // chip above stays as the collapsible copy of the same content.
+      if (!content.trim() && thinking &&
+          THINK_CLOSE_RE.test((m.content || "").replace(/\s+$/, "").slice(-200))) {
+        visible = "> The model closed its reply inside its **thinking block** — full text below.\n\n" + thinking;
+      } else {
+        visible = content;
+      }
       if (thinking) {
         thoughtChip = `
           <div class="think-container done">
@@ -3182,6 +3203,7 @@
         regenerate,
         invisible: !!(opts && opts.invisible),
         mission: (opts && opts.mission) || undefined,
+        reasoning_effort: state.reasoningEffort || "auto",
       }),
       signal,
     });
@@ -3251,14 +3273,35 @@
           // All three empty-state branches render as: leading info icon +
           // italic message text. The CSS for .bubble.quiet handles the flex
           // layout, padding, and accent-tinted icon — see .quiet-icon there.
+          // The empty-bubble fallback has two distinct shapes, and they need
+          // different handling:
+          //   A) The buffer ENDS inside a *closed* think block — the model put
+          //      its whole reply (reasoning AND the answer) inside the tags
+          //      and closed them as its last tokens (Qwen-style inline thinking
+          //      blocks where the answer never leaves the block). The "thinking"
+          //      text IS the answer — promote ALL of it into the bubble instead
+          //      of the misleading "spent its budget" wall.
+          //   B) No closing tag at all — a genuine runaway: budget guillotine
+          //      or reasoning loop cut the stream, nothing real was emitted.
+          //      Keep the "spent its budget" wall with the reasoning tail.
           if (!hadTools && thinking && thinking.length > 40) {
-            const tail = thinking.length > 900 ? "…" + thinking.slice(-900) : thinking;
-          bubble.innerHTML =
-            `<i class="quiet-icon ph ph-info"></i>` +
-            `<div class="quiet-text">` +
-              `<div style="margin-bottom:6px;opacity:0.85;font-size:12px;">model spent its whole budget thinking — here's the tail</div>` +
-              `<pre style="white-space:pre-wrap;font-family:inherit;margin:0;font-style:normal;">${esc(tail)}</pre>` +
-            `</div>`;
+            if (THINK_CLOSE_RE.test((buf || "").replace(/\s+$/, "").slice(-200))) {
+              bubble.classList.add("quiet");
+              state.attentionRetry = false;   // there IS a readable reply — nothing to retry
+              bubble.innerHTML =
+                `<i class="quiet-icon ph ph-info"></i>` +
+                `<div class="quiet-text">` +
+                  renderMarkdown("> The model closed its reply inside its **thinking block** — the full text is below (the collapsed block above holds the same).\n\n" + thinking) +
+                `</div>`;
+            } else {
+              const tail = thinking.length > 900 ? "…" + thinking.slice(-900) : thinking;
+              bubble.innerHTML =
+                `<i class="quiet-icon ph ph-info"></i>` +
+                `<div class="quiet-text">` +
+                  `<div style="margin-bottom:6px;opacity:0.85;font-size:12px;">model spent its whole budget thinking — here's the tail</div>` +
+                  `<pre style="white-space:pre-wrap;font-family:inherit;margin:0;font-style:normal;">${esc(tail)}</pre>` +
+                `</div>`;
+            }
         } else {
           let msg = "No response — the model may have crashed or hit a context limit. Check the backend console for errors.";
           if (hadTools) {
@@ -3279,14 +3322,48 @@
     }
   }
 
+  // Reasoning-block closing tags, shared by splitThinking (boundary search)
+  // and the empty-bubble promote logic (did the buffer end INSIDE a closed
+  // think block?). Covers  response, </thinking>, </reasoning>,
+  // <|/thinking|>, [/think], [/reasoning], [/scratchpad].
+  const THINK_CLOSE_RE = /<\s*\/\s*(?:think|thinking|reasoning)\s*>|<\s*\|\s*\/\s*thinking\s*\|>|\[\s*\/\s*(?:thought|thinking|reasoning|scratchpad)\s*\]/i;
+
   // strip reasoning wrappers from several model families so the chat bubble
   // only shows the final answer. Accumulate thinking text into the think line.
   function splitThinking(buf) {
     // tags observed: <think>, <thinking>, <reasoning>, and <|thinking|>…<|/thinking|>.
     // bracketed reasoning tags: [thought], [thinking], [reasoning], [scratchpad]…
     // many local models (Qwen/DeepSeek/Nemotron) emit bare </think> with no opening tag,
-    // sometimes multiple times between tool rounds. rule: everything up to the LAST closing
-    // reasoning tag is thinking; everything after is the visible answer.
+    // sometimes multiple times between tool rounds.
+    //
+    // THE BOUNDARY RULE. Qwen3.x-family models (and the bridge's reasoning-
+    // wrapper) separate the think block from the answer with a bare marker
+    // LINE — "\n response" with the answer GLUED straight after (no space):
+    //     <think>planning…\n responseHere is the answer…
+    // Crucially the model (or the bridge's end-of-stream close) can ALSO emit
+    // a closing </think> AFTER the answer:
+    //     <think>planning…\n responseHere is the answer…</think>
+    // Splitting at the LAST closing tag then demotes the WHOLE answer into the
+    // think block — the bubble renders empty and the reply appears "inside the
+    // thinking" no matter which model serves it. So the last thinking→answer
+    // MARKER is the primary boundary; the closing tag only matters when no
+    // marker exists (genuine all-thinking output / budget wall).
+    //
+    // Marker lookahead: the char after "response" must START the answer — a
+    // letter, digit, or the start of a tool-call block. A space or punctuation
+    // after "response" means the word is ordinary prose ("the response was…"),
+    // and a following "s" at a word boundary (responses / responses.) is the
+    // plural, not a glued answer. Both are excluded so prose never splits the
+    // buffer.
+    const markerRe = /(?:\n\s*|\s+)response(?=[A-Za-z0-9<])(?![sS](?:\b|$))/gi;
+    let lastMarker = -1;
+    let lastMarkerEnd = -1;
+    let mm;
+    while ((mm = markerRe.exec(buf)) !== null) {
+      lastMarker = mm.index;
+      lastMarkerEnd = mm.index + mm[0].length;
+    }
+
     const closeRe = /<\/(?:think|thinking|reasoning)>|<\|\/thinking\|>|\[\/(?:thought|thinking|reasoning|scratchpad)\]/gi;
     let lastClose = -1;
     let m;
@@ -3294,7 +3371,10 @@
 
     let thinking = "";
     let content = "";
-    if (lastClose >= 0) {
+    if (lastMarker >= 0) {
+      thinking = buf.slice(0, lastMarker);
+      content = buf.slice(lastMarkerEnd);
+    } else if (lastClose >= 0) {
       thinking = buf.slice(0, lastClose);
       content = buf.slice(lastClose);
     } else {
@@ -4231,30 +4311,10 @@
         note.innerHTML = `<i class="ph ph-warning"></i><span><strong>Tools off:</strong> ${esc(evt.message)}</span>`;
       }
     } else if (evt.type === "context_trimmed") {
-      // Compression notice — rendered in the toast stack above the composer
-      // (where every other notification lives) with the squeeze SVG
-      // animation, not as a mid-conversation row pill. One user-facing
-      // concept: compaction. Replaces a prior toast so re-rounds don't stack.
-      const n = evt.dropped;
-      const plural = n === 1 ? "" : "s";
-      const msg = evt.folded
-        ? `${n} older message${plural} compacted into the session summary`
-        : evt.fold_pending
-          ? `Compaction queued — ${n} message${plural} will be folded on the next message`
-          : `Compaction skipped — ${n} message${plural} outside the window (context full)`;
-      // A "skipped/queued" toast right after a successful fold is redundant —
-      // the fold just compacted this wave; the trim is its tail-end backstop.
-      // One notification per compression wave, not two.
-      const justCompacted = (Date.now() - (window._lastCompactionAt || 0)) < 20000;
-      if (!evt.folded && justCompacted) {
-        if (row) {
-          row.dataset.dropped = evt.dropped;
-          const stack = row.querySelector(".tool-stack");
-          if (stack) updateToolGroupHead(stack);
-        }
-        return;
-      }
-      toast(_COMPACT_SVG + esc(msg), "compact", 4000, "ctx-trim", true);
+      // Automatic trimming/compaction is invisible infrastructure. Preserve
+      // the per-turn diagnostic marker for the tool-group details, but never
+      // interrupt the user with queued/skipped/folded toast chatter. Manual
+      // compact remains visible through its explicit button response.
       if (row) {
         row.dataset.dropped = evt.dropped;
         // Re-render tool group head if it exists to pick up the dropped count
@@ -6326,6 +6386,9 @@
         refreshDesktopStatus();
       } else if (evt.type === "memories:update") {
         if ($("#settings-drawer")?.classList.contains("open")) loadMemories();
+      } else if (evt.type === "reasoning_capability") {
+        state.reasoningCapability = evt.capability || { supported: false, mode: "none" };
+        renderReasoningEffort();
       } else if (evt.type === "models:update") {
         loadModels().then(() => {
           if ($("#settings-drawer")?.classList.contains("open")) populateSettingsForm();
@@ -6439,14 +6502,259 @@
   }
 
   // ---------- settings drawer ----------
+  const SETTINGS_SECTION_STATE_KEY = "accuretta:settings-sections:v1";
+  const SETTINGS_SECTIONS = [
+    {
+      id: "model",
+      title: "Model & performance",
+      subtitle: "Models, memory, speed and health",
+      icon: "ph-cpu",
+      headings: ["Model", "Auto-tune", "Model Health", "Advanced llama-server"],
+      open: true,
+    },
+    {
+      id: "generation",
+      title: "Generation",
+      subtitle: "Sampling and reasoning behavior",
+      icon: "ph-sliders-horizontal",
+      headings: ["Sampling", "Reasoning"],
+    },
+    {
+      id: "interface",
+      title: "Interface",
+      subtitle: "Preview, appearance and notifications",
+      icon: "ph-layout",
+      headings: ["Preview", "Appearance", "Notifications"],
+    },
+    {
+      id: "agent",
+      title: "Agent & safety",
+      subtitle: "Context, approvals, desktop control and memory",
+      icon: "ph-shield-check",
+      headings: ["Machine context", "Approvals", "Desktop automation", "Long-term memory"],
+    },
+    {
+      id: "security",
+      title: "Security lab",
+      subtitle: "Red team, analysis and isolated execution",
+      icon: "ph-crosshair",
+      headings: ["Red team tools", "Red team stealth", "Analysis tools", "Sandbox"],
+    },
+    {
+      id: "connections",
+      title: "Connections",
+      subtitle: "Remote access and integrations",
+      icon: "ph-plugs-connected",
+      headings: ["Discord remote bridge"],
+    },
+  ];
+
+  function settingsGroupTitle(el) {
+    const label = el.querySelector(":scope > span:not(.grow):not(.hint)");
+    if (label) return label.textContent.trim();
+    return Array.from(el.childNodes)
+      .filter(n => n.nodeType === Node.TEXT_NODE)
+      .map(n => n.textContent)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function readSettingsSectionState() {
+    try {
+      const value = JSON.parse(localStorage.getItem(SETTINGS_SECTION_STATE_KEY) || "{}");
+      return value && typeof value === "object" ? value : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function rememberSettingsSections() {
+    const next = {};
+    $$("#settings-body details.settings-section").forEach(section => {
+      next[section.dataset.settingsSection] = !!section.open;
+    });
+    try { localStorage.setItem(SETTINGS_SECTION_STATE_KEY, JSON.stringify(next)); } catch (_) {}
+  }
+
+  function initSettingsSections() {
+    const body = $("#settings-body");
+    if (!body || body.dataset.sectionsReady === "1") return;
+    body.dataset.sectionsReady = "1";
+
+    const saveRow = $("#btn-save-settings")?.closest(".form-row");
+    const chunks = [];
+    let current = null;
+    Array.from(body.children).forEach(node => {
+      if (node === saveRow) return;
+      if (node.classList?.contains("form-group")) {
+        current = { title: settingsGroupTitle(node), nodes: [node] };
+        chunks.push(current);
+      } else if (current) {
+        current.nodes.push(node);
+      }
+    });
+
+    const saved = readSettingsSectionState();
+    const fragment = document.createDocumentFragment();
+    const claimed = new Set();
+    const definitions = SETTINGS_SECTIONS.map(def => ({ ...def }));
+    const known = new Set(definitions.flatMap(def => def.headings));
+    const extras = chunks.filter(chunk => !known.has(chunk.title));
+    if (extras.length) {
+      definitions.push({
+        id: "other", title: "Other", subtitle: "Additional settings",
+        icon: "ph-dots-three-outline", headings: extras.map(x => x.title),
+      });
+    }
+
+    definitions.forEach(def => {
+      const owned = chunks.filter(chunk => def.headings.includes(chunk.title));
+      if (!owned.length) return;
+      const section = document.createElement("details");
+      section.className = "settings-section";
+      section.dataset.settingsSection = def.id;
+      section.open = Object.prototype.hasOwnProperty.call(saved, def.id)
+        ? !!saved[def.id]
+        : !!def.open;
+
+      const summary = document.createElement("summary");
+      summary.className = "settings-section-summary";
+      summary.innerHTML = `
+        <span class="settings-section-icon"><i class="ph ${def.icon}"></i></span>
+        <span class="settings-section-copy">
+          <strong>${esc(def.title)}</strong>
+          <small>${esc(def.subtitle)}</small>
+        </span>
+        <i class="ph ph-caret-down settings-section-chevron" aria-hidden="true"></i>`;
+      summary.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        section.open = !section.open;
+      });
+      section.appendChild(summary);
+
+      const content = document.createElement("div");
+      content.className = "settings-section-content";
+      owned.forEach(chunk => {
+        chunk.nodes[0].classList.add("settings-subhead");
+        chunk.nodes.forEach(node => content.appendChild(node));
+        claimed.add(chunk);
+      });
+      section.appendChild(content);
+      section.addEventListener("toggle", rememberSettingsSections);
+      fragment.appendChild(section);
+    });
+
+    body.replaceChildren(fragment);
+    if (saveRow) {
+      saveRow.classList.add("settings-savebar");
+      body.appendChild(saveRow);
+    }
+  }
+
+  function revealSettingsControl(selector) {
+    const el = typeof selector === "string" ? $(selector) : selector;
+    if (!el) return;
+    const section = el.closest("details.settings-section");
+    if (section) section.open = true;
+    requestAnimationFrame(() => el.scrollIntoView({ behavior: "smooth", block: "center" }));
+  }
+
+  function pct(value) {
+    return `${Math.round(Math.max(0, Math.min(1, Number(value) || 0)) * 100)}%`;
+  }
+
+  function renderModelHealth(data) {
+    const card = $("#model-health-card");
+    if (!card) return;
+    const turns = Math.max(0, Number(data?.turns) || 0);
+    const calls = Math.max(0, Number(data?.tool_calls) || 0);
+    const observed = data?.observed || {};
+    const enabled = data?.enabled !== false;
+    const advice = Array.isArray(data?.advice) ? data.advice.filter(Boolean) : [];
+    const context = Math.max(0, Number(data?.last_context) || 0);
+    const avgContext = Math.max(0, Number(observed.avg_peak_context_tokens) || 0);
+    const contextRatio = context ? avgContext / context : 0;
+
+    const model = data?.model || state.settings?.model || "No model selected";
+    $("#model-health-title").textContent = model;
+    $("#model-health-privacy").textContent = data?.privacy ||
+      "Local aggregate counters only. No conversation or tool content.";
+    const badge = $("#model-health-badge");
+    const subtitle = $("#model-health-subtitle");
+
+    if (!enabled) {
+      card.dataset.state = "paused";
+      badge.textContent = "paused";
+      subtitle.textContent = "Learning is turned off";
+    } else if (!data?.model) {
+      card.dataset.state = "collecting";
+      badge.textContent = "waiting";
+      subtitle.textContent = "Choose a model to begin";
+    } else if (turns < 8) {
+      card.dataset.state = "collecting";
+      badge.textContent = `${turns}/8 turns`;
+      subtitle.textContent = turns
+        ? "Learning its normal behavior"
+        : "Learning begins with your next chat";
+    } else if (advice.length) {
+      card.dataset.state = "attention";
+      badge.textContent = data?.confidence === "high" ? "high confidence" : "watching";
+      subtitle.textContent = `Based on ${turns} local turns`;
+    } else {
+      card.dataset.state = "healthy";
+      badge.textContent = data?.confidence === "high" ? "stable" : "looks good";
+      subtitle.textContent = `Based on ${turns} local turns`;
+    }
+
+    $("#model-health-metrics").innerHTML = `
+      <div class="model-health-metric"><span>Observed turns</span><strong>${turns || "&mdash;"}</strong></div>
+      <div class="model-health-metric"><span>Finished</span><strong>${turns ? pct(observed.completion_rate) : "&mdash;"}</strong></div>
+      <div class="model-health-metric"><span>Tool success</span><strong>${calls ? pct(1 - (Number(observed.tool_error_rate) || 0)) : "&mdash;"}</strong></div>
+      <div class="model-health-metric"><span>Context use</span><strong>${avgContext && context ? pct(contextRatio) : "&mdash;"}</strong></div>`;
+
+    const adviceEl = $("#model-health-advice");
+    if (!enabled) {
+      adviceEl.textContent = "Existing observations are kept locally. Turn learning back on whenever you want it to continue.";
+    } else if (turns < 8) {
+      const remaining = 8 - turns;
+      adviceEl.textContent = `No benchmark needed. Use Accuretta normally; useful advice unlocks after ${remaining} more observed turn${remaining === 1 ? "" : "s"}.`;
+    } else if (advice.length) {
+      adviceEl.innerHTML = `<ul>${advice.map(item => `<li>${esc(item)}</li>`).join("")}</ul>`;
+    } else {
+      adviceEl.textContent = "No recurring operational problems detected. Accuretta will flag a pattern here if that changes.";
+    }
+    const sw = $("#sw-passive-model-telemetry");
+    sw?.classList.toggle("on", enabled);
+    sw?.setAttribute("aria-checked", String(enabled));
+  }
+
+  async function loadModelHealth() {
+    const card = $("#model-health-card");
+    if (!card) return;
+    try {
+      renderModelHealth(await api("/api/model-health"));
+    } catch (e) {
+      card.dataset.state = "error";
+      $("#model-health-title").textContent = "Model health unavailable";
+      $("#model-health-subtitle").textContent = "The local counters could not be read";
+      $("#model-health-badge").textContent = "offline";
+      $("#model-health-advice").textContent = e?.message || "Try reopening Settings.";
+    }
+  }
+
   async function openSettings() {
+    initSettingsSections();
     $("#drawer-scrim").classList.add("open");
     $("#settings-drawer").classList.add("open");
+    const health = loadModelHealth();
     await loadModels();
     populateSettingsForm();
     loadSystemContext();
     loadDetectedVram();
     refreshSandboxStatus();
+    await health;
   }
 
   // ---------- Sandbox (WSL) ----------
@@ -7039,6 +7347,8 @@
     fill("#set-frequency", s.frequency_penalty ?? 0);
     $("#sw-thinking")?.classList.toggle("on", s.enable_thinking !== false);
     fill("#set-think-budget", s.thinking_budget ?? 2048);
+    const reasoningCap = $("#set-reasoning-capability");
+    if (reasoningCap) reasoningCap.value = s.reasoning_capability_override || "auto";
     const themeSel = $("#set-theme");
     if (themeSel) themeSel.value = s.theme || "light";
     $("#sw-web").classList.toggle("on", s.allow_web_preview !== false);
@@ -7051,10 +7361,14 @@
     $("#sw-sound-notifications")?.classList.toggle("on", s.sound_notifications !== false);
     $("#sw-red-team-enabled")?.classList.toggle("on", !!s.red_team_enabled);
     $("#sw-analysis-tools-enabled")?.classList.toggle("on", !!s.analysis_tools_enabled);
+    $("#sw-passive-model-telemetry")?.classList.toggle("on", s.passive_model_telemetry !== false);
+    $("#sw-passive-model-telemetry")?.setAttribute(
+      "aria-checked", String(s.passive_model_telemetry !== false));
     $("#sw-rt-force-exploit")?.classList.toggle("on", !!s.rt_force_exploit);
     $("#sw-rt-spoof-xff")?.classList.toggle("on", !!s.rt_spoof_xff);
     $("#sw-rt-jitter")?.classList.toggle("on", s.rt_jitter !== false);
     fill("#set-rt-proxy", s.rt_proxy || "");
+    fill("#set-rt-evidence-days", s.rt_evidence_retention_days ?? 30);
     $("#sw-discord-enabled")?.classList.toggle("on", !!s.discord_enabled);
     fill("#set-discord-token", s.discord_bot_token || "");
     fill("#set-discord-owner", s.discord_owner_id || "");
@@ -7138,16 +7452,21 @@
       frequency_penalty: n("#set-frequency"),
       enable_thinking: $("#sw-thinking")?.classList.contains("on") !== false,
       thinking_budget: n("#set-think-budget"),
+      reasoning_capability_override: $("#set-reasoning-capability")?.value || "auto",
       theme: ($("#set-theme")?.value || "light"),
       allow_web_preview: $("#sw-web").classList.contains("on"),
       desktop_enabled: $("#sw-desktop-enabled")?.classList.contains("on") || false,
       sound_notifications: $("#sw-sound-notifications")?.classList.contains("on") ?? true,
       red_team_enabled: $("#sw-red-team-enabled")?.classList.contains("on") || false,
       analysis_tools_enabled: $("#sw-analysis-tools-enabled")?.classList.contains("on") || false,
+      passive_model_telemetry: $("#sw-passive-model-telemetry")
+        ? $("#sw-passive-model-telemetry").classList.contains("on")
+        : true,
       rt_force_exploit: $("#sw-rt-force-exploit")?.classList.contains("on") || false,
       rt_proxy: ($("#set-rt-proxy")?.value || "").trim(),
       rt_spoof_xff: $("#sw-rt-spoof-xff")?.classList.contains("on") || false,
       rt_jitter: $("#sw-rt-jitter") ? $("#sw-rt-jitter").classList.contains("on") : true,
+      rt_evidence_retention_days: Math.max(0, Math.min(3650, n("#set-rt-evidence-days") || 0)),
       discord_enabled: $("#sw-discord-enabled")?.classList.contains("on") || false,
       discord_bot_token: ($("#set-discord-token")?.value || "").trim(),
       discord_owner_id: ($("#set-discord-owner")?.value || "").trim(),
@@ -7165,6 +7484,9 @@
 
     await saveSettings(payload);
     applyTheme(payload.theme || "light");
+    if (String(prev.reasoning_capability_override || "auto") !== payload.reasoning_capability_override) {
+      await loadModels();
+    }
 
     if (changedLoadKeys.length && payload.model_path) {
       const tid = "reload-llama";
@@ -7203,7 +7525,7 @@
   // lands on the next option instead of jumping straight to bright white.
   // nextTheme() handles the cycle and accepts whatever string is in settings
   // as the starting point.
-  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "neobrutalism", "neobrutalism-dark", "kinetic", "soft", "light"];
+  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "neobrutalism", "neobrutalism-dark", "kinetic", "soft", "pastel", "velvet", "cartograph", "light"];
   const THEME_ICONS = {
     dark:              "ph ph-moon",
     dim:               "ph ph-moon-stars",
@@ -7216,6 +7538,9 @@
     "neobrutalism-dark": "ph ph-lightning-slash",
     kinetic:           "ph ph-text-t",
     soft:              "ph ph-cloud",
+    pastel:            "ph ph-flower-tulip",
+    velvet:            "ph ph-crown",
+    cartograph:        "ph ph-compass",
     light:             "ph ph-sun",
   };
   function nextTheme(cur) {
@@ -7955,6 +8280,122 @@
     }
   }
 
+  const REASONING_EFFORT_KEY = "accuretta:reasoning-effort:v1";
+  const REASONING_EFFORT_LEVELS = ["auto", "low", "medium", "high"];
+  const REASONING_EFFORT_LABELS = ["Auto", "Low", "Medium", "High"];
+
+  function reasoningModelKey() {
+    return String(state.loadedModel || state.settings.model_path || state.settings.model || "")
+      .split(/[\\/]/).pop().toLowerCase();
+  }
+
+  function readReasoningEffortMap() {
+    try {
+      const data = JSON.parse(localStorage.getItem(REASONING_EFFORT_KEY) || "{}");
+      return data && typeof data === "object" ? data : {};
+    } catch (_) { return {}; }
+  }
+
+  function setReasoningEffort(level, persist = true) {
+    level = String(level || "auto").toLowerCase();
+    if (!REASONING_EFFORT_LEVELS.includes(level)) level = "auto";
+    state.reasoningEffort = level;
+    if (persist) {
+      const key = reasoningModelKey();
+      if (key) {
+        const saved = readReasoningEffortMap();
+        saved[key] = level;
+        try { localStorage.setItem(REASONING_EFFORT_KEY, JSON.stringify(saved)); } catch (_) {}
+      }
+    }
+    const idx = REASONING_EFFORT_LEVELS.indexOf(level);
+    const slider = $("#reasoning-effort-slider");
+    const label = REASONING_EFFORT_LABELS[idx];
+    if (slider) {
+      slider.value = String(idx);
+      slider.style.setProperty("--effort-fill", `${(idx / 3) * 100}%`);
+    }
+    const pillValue = $("#reasoning-effort-value");
+    const popValue = $("#reasoning-effort-popover-value");
+    if (pillValue) pillValue.textContent = label;
+    if (popValue) popValue.textContent = label;
+    const note = $("#reasoning-effort-note");
+    if (note) {
+      const cap = state.reasoningCapability || {};
+      if (level === "auto") {
+        note.textContent = "Uses the model default and your Reasoning settings.";
+      } else if (cap.mode === "native_effort") {
+        note.textContent = `Sends the model's native ${label.toLowerCase()} effort level; Accuretta still guards runaways.`;
+      } else {
+        note.textContent = `${label} changes the thinking-token allowance for this message.`;
+      }
+    }
+    const control = $("#reasoning-effort-control");
+    if (control) {
+      control.classList.remove("is-changing");
+      requestAnimationFrame(() => control.classList.add("is-changing"));
+      setTimeout(() => control.classList.remove("is-changing"), 260);
+    }
+  }
+
+  function renderReasoningEffort() {
+    const control = $("#reasoning-effort-control");
+    if (!control) return;
+    const cap = state.reasoningCapability || {};
+    const supported = !!cap.supported && cap.mode !== "none" && !!reasoningModelKey();
+    if (!supported) {
+      state.reasoningEffort = "auto";
+      control.classList.add("hidden");
+      $("#reasoning-effort-popover")?.classList.remove("open");
+      $("#reasoning-effort-pill")?.setAttribute("aria-expanded", "false");
+      return;
+    }
+    const wasHidden = control.classList.contains("hidden");
+    control.classList.remove("hidden");
+    control.dataset.mode = cap.mode || "budget";
+    const saved = readReasoningEffortMap();
+    setReasoningEffort(saved[reasoningModelKey()] || "auto", false);
+    const pill = $("#reasoning-effort-pill");
+    if (pill) pill.title = cap.description || "Reasoning effort for the next message";
+    if (wasHidden) {
+      control.classList.add("effort-arrive");
+      setTimeout(() => control.classList.remove("effort-arrive"), 420);
+    }
+  }
+
+  function wireReasoningEffort() {
+    const control = $("#reasoning-effort-control");
+    const pill = $("#reasoning-effort-pill");
+    const popover = $("#reasoning-effort-popover");
+    const slider = $("#reasoning-effort-slider");
+    if (!control || !pill || !popover || !slider) return;
+    pill.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const open = !popover.classList.contains("open");
+      popover.classList.toggle("open", open);
+      pill.setAttribute("aria-expanded", String(open));
+      if (open) slider.focus({ preventScroll: true });
+    });
+    slider.addEventListener("input", () => {
+      const idx = Math.max(0, Math.min(3, Number(slider.value) || 0));
+      setReasoningEffort(REASONING_EFFORT_LEVELS[idx]);
+    });
+    document.addEventListener("click", (event) => {
+      if (!control.contains(event.target)) {
+        popover.classList.remove("open");
+        pill.setAttribute("aria-expanded", "false");
+      }
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && popover.classList.contains("open")) {
+        popover.classList.remove("open");
+        pill.setAttribute("aria-expanded", "false");
+        pill.focus();
+      }
+    });
+    renderReasoningEffort();
+  }
+
   // Reload model list from the bridge, then re-mirror it everywhere it shows
   // (settings dropdown + pill + dropdown menu). Lifted to module scope so any
   // module-level caller (loadModelByPath, autoRetuneOnBoot) can reach it —
@@ -8433,7 +8874,7 @@
   // sidesteps the problem entirely. IDE stays hidden by CSS (no preview
   // pane at this width). The Build / Network items already live in the
   // menu, so the chips just join them.
-  const _MOBILE_TOOLBAR_IDS = ["mode-agent", "mode-auto", "btn-attach-image"];
+  const _MOBILE_TOOLBAR_IDS = ["mode-agent", "mode-auto", "btn-attach-image", "btn-trust-writes"];
   function applyMobileToolbarLayout() {
     const tools = document.querySelector(".composer-tools");
     const menu = document.getElementById("toolbar-overflow-menu");
@@ -8498,12 +8939,12 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chat_id: cid }),
         }).then(x => x.json());
-        if (r && r.error) { toast("Compact: " + r.error, "warn", 3000); }
+        if (r && r.error) { toast("Compact: " + r.error, "warn", 3000, "summary-fold-fail"); }
         else {
           const n = (r && r.folded) || 0;
           toast(n > 0
             ? `Compacted ${n} message${n === 1 ? "" : "s"} into the session summary.`
-            : "Context is already compact — nothing to fold.", "ok", 2400);
+            : "Context is already compact — nothing to fold.", "ok", 2400, "summary-fold");
           state._ctxSource = "";
           renderCtxGauge();
         }
@@ -8658,6 +9099,21 @@
       saveSettings({ analysis_tools_enabled: e.currentTarget.classList.contains("on") });
       toast("analysis tools setting saved", "ok", 1500);
     });
+    const modelHealthSwitch = $("#sw-passive-model-telemetry");
+    const toggleModelLearning = async () => {
+      if (!modelHealthSwitch) return;
+      const on = modelHealthSwitch.classList.toggle("on");
+      modelHealthSwitch.setAttribute("aria-checked", String(on));
+      await saveSettings({ passive_model_telemetry: on });
+      await loadModelHealth();
+      toast(on ? "model health learning resumed" : "model health learning paused", "ok", 1700);
+    };
+    modelHealthSwitch?.addEventListener("click", toggleModelLearning);
+    modelHealthSwitch?.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault();
+      toggleModelLearning();
+    });
     $("#sw-rt-force-exploit")?.addEventListener("click", (e) => {
       e.currentTarget.classList.toggle("on");
       const on = e.currentTarget.classList.contains("on");
@@ -8677,6 +9133,12 @@
     $("#set-rt-proxy")?.addEventListener("change", (e) => {
       saveSettings({ rt_proxy: (e.currentTarget.value || "").trim() });
       toast("rt proxy saved", "ok", 1500);
+    });
+    $("#set-rt-evidence-days")?.addEventListener("change", (e) => {
+      const days = Math.max(0, Math.min(3650, Number(e.currentTarget.value || 0)));
+      e.currentTarget.value = String(days);
+      saveSettings({ rt_evidence_retention_days: days });
+      toast(days ? `evidence retained for ${days} days` : "evidence will be wiped on restart", "ok", 1800);
     });
     $("#btn-sandbox-setup")?.addEventListener("click", async (e) => {
       const reinstall = e.currentTarget.dataset.reinstall === "1";
@@ -8850,6 +9312,7 @@
       }
     });
     wireModelMenu();
+    wireReasoningEffort();
     $("#set-model").addEventListener("change", async () => {
       const sel = $("#set-model");
       const m = sel.value;
@@ -9079,7 +9542,14 @@
       const conChips = Array.from(document.querySelectorAll("#recon-constraint-chips .recon-chip.active")).map(c => c.dataset.val);
       const conText = ($("#recon-constraint-text")?.value || "").trim();
       const constraints = [...conChips, conText].filter(Boolean).join("; ");
-      const mission = { target, scope, objective, constraints };
+      // This explicit bit is consumed by the bridge to create a per-chat
+      // authorization record. Merely enabling Red team tools in Settings is
+      // no longer enough for a model to invoke them.
+      const mission = {
+        target, scope, objective, constraints,
+        authorized: true,
+        engagement: reconObjective === "gain_access" ? "pentest" : "recon",
+      };
       reconClose();
       const reconTmpl =
         `Authorized reconnaissance on ${target}. I have confirmed I am authorized to test this target. ` +
@@ -9335,7 +9805,7 @@
       // user knows what the tap will do, mirroring the desktop cycle.
       const cur = document.documentElement.getAttribute("data-theme") || "light";
       const next = nextTheme(cur);
-      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", neumorphic: "Neumorphic", neobrutalism: "Neobrutalism", "neobrutalism-dark": "Neobrutalism Dark", kinetic: "Kinetic", soft: "Soft", light: "Light" }[next] || next;
+      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", neumorphic: "Neumorphic", neobrutalism: "Neobrutalism", "neobrutalism-dark": "Neobrutalism Dark", kinetic: "Kinetic", soft: "Soft", pastel: "Pastel", velvet: "Velvet", cartograph: "Cartograph", light: "Light" }[next] || next;
       const lbl = $("#mm-theme-label");
       if (lbl) lbl.textContent = `Switch to ${niceName.toLowerCase()}`;
       mm.classList.add("open"); mmScrim.classList.add("open");

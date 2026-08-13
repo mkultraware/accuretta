@@ -11,6 +11,7 @@ Runs on 0.0.0.0:8787 so Tailscale / LAN peers can reach it from phones.
 from __future__ import annotations
 
 import json
+import copy
 import os
 import random
 import re
@@ -33,6 +34,7 @@ import webbrowser
 import base64 as _b64
 import io as _io
 import ipaddress
+import hashlib
 import socket
 import struct
 import ssl
@@ -195,11 +197,13 @@ DATA = ROOT / "data"
 VERSIONS_DIR = DATA / "versions"
 PENDING_DIR = DATA / "pending"
 SNAPSHOTS_DIR = DATA / "snapshots"
+TURN_JOURNAL_DIR = DATA / "turn_journal"
 CHATS_FILE = DATA / "chats.json"
 SETTINGS_FILE = DATA / "settings.json"
 MODELS_CONFIG_FILE = DATA / "models_config.json"   # per-model tuned flag memory (auto-tune on load)
 WORKSPACE_FILE = DATA / "workspace.json"
 SAVINGS_FILE = DATA / "savings.json"
+MODEL_RUNTIME_FILE = DATA / "model_runtime_profiles.json"
 SYSTEM_CONTEXT_FILE = DATA / "ACCURETTA.md"
 MEMORIES_FILE = DATA / "memories.jsonl"
 MEMORIES_MAX_INJECT = 15          # how many to load into every system prompt
@@ -271,6 +275,8 @@ def safe_rglob_files(root_dir: str | Path, pattern: str, max_depth: int = 3) -> 
 # on each write so the file never grows unbounded.
 CMD_HISTORY_FILE = DATA / "cmd_history.jsonl"
 CMD_HISTORY_MAX = 2000
+ACTION_AUDIT_FILE = DATA / "action_audit.jsonl"
+ACTION_AUDIT_MAX = 4000
 IGNORE_FILE_NAME = ".accurettaignore"
 
 # per-chat ephemeral desktop kill switch.  lives in memory only — restarting
@@ -286,6 +292,8 @@ _current_chat_id: contextvars.ContextVar[str] = contextvars.ContextVar("_current
 
 # per-chat SSE emitter so tools can stream progress without plumbing emit through every call
 _chat_emitters: dict[str, callable] = {}
+_chat_live_activity: dict[str, list[dict]] = {}
+_chat_live_activity_lock = threading.Lock()
 
 # last known prompt token count from llama-server — updated after each turn
 _last_prompt_tokens: int = 0
@@ -314,9 +322,13 @@ _chat_cancels: dict[str, dict] = {}
 _chat_cancels_lock = threading.Lock()
 
 
-def _register_cancel(chat_id: str) -> threading.Event:
+def _register_cancel(chat_id: str) -> threading.Event | None:
     ev = threading.Event()
     with _chat_cancels_lock:
+        # One active turn per chat. Concurrent submissions used to overwrite
+        # the cancellation handle and race chats.json / compaction state.
+        if chat_id in _chat_cancels:
+            return None
         _chat_cancels[chat_id] = {"cancel": ev, "resp": None}
     return ev
 
@@ -372,7 +384,7 @@ _tool_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tool-")
 _tool_jobs: dict[str, dict] = {}
 _tool_jobs_lock = threading.Lock()
 
-for d in (DATA, VERSIONS_DIR, PENDING_DIR, SNAPSHOTS_DIR):
+for d in (DATA, VERSIONS_DIR, PENDING_DIR, SNAPSHOTS_DIR, TURN_JOURNAL_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 def _resolve_llama_url() -> str:
@@ -409,36 +421,173 @@ PORT = int(os.environ.get("ACCURETTA_PORT", "8787"))
 
 # ---- persistence helpers ---------------------------------------------------
 
-_FILE_LOCK = threading.Lock()
+_FILE_LOCK = threading.RLock()
+_CHATS_TX_LOCK = threading.RLock()
+
+
+class _ChatSnapshot(dict):
+    """Revision-aware chats.json snapshot.
+
+    Existing bridge code expects ``get_chats()`` to return a mutable dict and
+    later calls ``save_json(CHATS_FILE, chats)``. Replacing every caller with a
+    new store API would be the exact high-risk monolith refactor we want to
+    avoid. This dict subclass preserves that contract while remembering the
+    baseline needed to merge independent chat updates at save time.
+    """
+    def __init__(self, value: dict):
+        super().__init__(value)
+        self._baseline_chats = copy.deepcopy(value.get("chats", {}))
+        self._baseline_order = list(value.get("order", []))
+
+
+def _chat_payload_digest(value: Any) -> str:
+    """Stable digest excluding the internal revision counter."""
+    if value is None:
+        return "<missing>"
+    try:
+        payload = copy.deepcopy(value)
+        if isinstance(payload, dict):
+            payload.pop("_rev", None)
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, default=str)
+    except Exception:
+        raw = repr(value)
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
+
+
+def _normalize_chats_data(value: Any) -> dict:
+    if not isinstance(value, dict):
+        value = {"chats": {}, "order": []}
+    value.setdefault("chats", {})
+    value.setdefault("order", [])
+    if not isinstance(value["chats"], dict):
+        value["chats"] = {}
+    if not isinstance(value["order"], list):
+        value["order"] = []
+    return value
+
+
+def _write_json_atomic_unlocked(path: Path, value: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _save_chats_snapshot(snapshot: _ChatSnapshot) -> None:
+    """Merge only locally-changed chats into the latest on-disk document.
+
+    This prevents chat A's older snapshot from erasing chat B after concurrent
+    turns. Same-chat turns are separately single-flight; if a UI mutation races
+    an active turn we retain both message histories when one is a prefix and
+    otherwise keep the most recent snapshot while recording the conflict.
+    """
+    with _CHATS_TX_LOCK, _FILE_LOCK:
+        current = _normalize_chats_data(load_json(CHATS_FILE, {"chats": {}, "order": []}))
+        merged = copy.deepcopy(current)
+        base_chats = getattr(snapshot, "_baseline_chats", {}) or {}
+        snap_chats = snapshot.get("chats", {}) if isinstance(snapshot.get("chats"), dict) else {}
+        current_chats = current.get("chats", {})
+        merged_chats = merged.setdefault("chats", {})
+        changed_ids = {
+            cid for cid in set(base_chats) | set(snap_chats)
+            if _chat_payload_digest(base_chats.get(cid)) != _chat_payload_digest(snap_chats.get(cid))
+        }
+        conflicts = []
+        for cid in changed_ids:
+            before = base_chats.get(cid)
+            proposed = snap_chats.get(cid)
+            live = current_chats.get(cid)
+            live_changed = _chat_payload_digest(live) != _chat_payload_digest(before)
+            if proposed is None:
+                # A delete wins only when the chat did not gain new work after
+                # this snapshot was loaded. Otherwise preserve the live chat.
+                if not live_changed:
+                    merged_chats.pop(cid, None)
+                else:
+                    conflicts.append({"chat_id": cid, "kind": "delete_vs_update"})
+                continue
+            chosen = copy.deepcopy(proposed)
+            if live_changed and isinstance(live, dict):
+                pmsgs = chosen.get("messages") if isinstance(chosen.get("messages"), list) else []
+                lmsgs = live.get("messages") if isinstance(live.get("messages"), list) else []
+                # Preserve an independently-appended tail where histories share
+                # an exact prefix. Same-chat generation is single-flight, so
+                # this mostly covers rename/pin/settings-style UI mutations.
+                if len(pmsgs) <= len(lmsgs) and pmsgs == lmsgs[:len(pmsgs)]:
+                    for key, val in chosen.items():
+                        if key != "messages":
+                            live[key] = copy.deepcopy(val)
+                    chosen = copy.deepcopy(live)
+                elif len(lmsgs) <= len(pmsgs) and lmsgs == pmsgs[:len(lmsgs)]:
+                    pass
+                else:
+                    conflicts.append({"chat_id": cid, "kind": "divergent_update"})
+            chosen["_rev"] = max(
+                int((live or {}).get("_rev", 0) or 0) if isinstance(live, dict) else 0,
+                int((before or {}).get("_rev", 0) or 0) if isinstance(before, dict) else 0,
+            ) + 1
+            merged_chats[cid] = chosen
+
+        base_order = getattr(snapshot, "_baseline_order", []) or []
+        snap_order = snapshot.get("order", []) if isinstance(snapshot.get("order"), list) else []
+        if snap_order != base_order:
+            deleted = set(base_chats) - set(snap_chats)
+            order = [cid for cid in snap_order if cid in merged_chats]
+            order.extend(cid for cid in current.get("order", [])
+                         if cid in merged_chats and cid not in order and cid not in deleted)
+            order.extend(cid for cid in merged_chats if cid not in order)
+            merged["order"] = order
+        else:
+            merged["order"] = [cid for cid in current.get("order", []) if cid in merged_chats]
+            merged["order"].extend(cid for cid in merged_chats if cid not in merged["order"])
+        if conflicts:
+            conflict_file = DATA / "chat_conflicts.jsonl"
+            try:
+                with conflict_file.open("a", encoding="utf-8") as fh:
+                    for row in conflicts:
+                        fh.write(json.dumps({**row, "ts": int(time.time())}) + "\n")
+            except Exception:
+                pass
+        _write_json_atomic_unlocked(CHATS_FILE, merged)
+        # A caller may save the same snapshot more than once (pre-turn fold,
+        # mission seed, final persist). Advance its baseline after each save so
+        # later writes contain only changes made since this successful commit.
+        for cid, row in merged_chats.items():
+            if cid in snap_chats and isinstance(snap_chats[cid], dict):
+                snap_chats[cid]["_rev"] = row.get("_rev", snap_chats[cid].get("_rev", 0))
+        snapshot._baseline_chats = copy.deepcopy(snap_chats)
+        snapshot._baseline_order = list(snap_order)
 
 
 def load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
+    with _FILE_LOCK:
+        if not path.exists():
+            return default
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
         # Corruption recovery — rename the broken file aside instead of
         # silently returning default. Without this, a partially-written
         # chats.json (interrupted manual edit, OS hard reset, disk full
         # pre-atomicity) would erase the user's entire chat history with
         # zero diagnostic trail. The .corrupt-<ts> file is left in place
         # so the user (or a recovery script) can attempt salvage.
-        try:
-            ts = time.strftime("%Y%m%d-%H%M%S")
-            bak = path.with_name(f"{path.name}.corrupt-{ts}")
-            path.rename(bak)
-            print(f"[load_json] corrupt: {path} -> {bak.name} ({e!r})", file=sys.stderr)
-        except Exception as e2:
-            print(f"[load_json] corrupt + rename failed: {path} ({e!r}; rename: {e2!r})", file=sys.stderr)
-        return default
+            try:
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                bak = path.with_name(f"{path.name}.corrupt-{ts}")
+                path.rename(bak)
+                print(f"[load_json] corrupt: {path} -> {bak.name} ({e!r})", file=sys.stderr)
+            except Exception as e2:
+                print(f"[load_json] corrupt + rename failed: {path} ({e!r}; rename: {e2!r})", file=sys.stderr)
+            return default
 
 
 def save_json(path: Path, value: Any) -> None:
+    if path == CHATS_FILE and isinstance(value, _ChatSnapshot):
+        _save_chats_snapshot(value)
+        return
     with _FILE_LOCK:
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(path)
+        _write_json_atomic_unlocked(path, value)
 
 
 # ---- lifetime savings counters --------------------------------------------
@@ -452,6 +601,7 @@ def save_json(path: Path, value: Any) -> None:
 _SAVINGS_LOCK = threading.Lock()
 _savings_cache: dict | None = None
 _SAVINGS_DEFAULT = {"tok_in": 0, "tok_out": 0, "turns": 0, "since": 0}
+_MODEL_RUNTIME_LOCK = threading.Lock()
 
 
 def _savings_ensure_locked() -> None:
@@ -496,6 +646,135 @@ def _savings_add(tok_in: int, tok_out: int) -> dict:
     except Exception:
         pass
     return snap
+
+
+def _model_profile_key(model: str) -> str:
+    name = Path(str(model or "unknown")).name or "unknown"
+    return name[:180]
+
+
+def _record_model_observation(model: str, *, prompt_tokens: int = 0,
+                              output_tokens: int = 0, rounds: int = 0,
+                              tool_calls: int = 0, tool_errors: int = 0,
+                              peak_prompt_tokens: int = 0,
+                              elapsed_s: float = 0.0, native_fallback: bool = False,
+                              completed: bool = True) -> None:
+    """Local-only, content-free observations from normal use.
+
+    This replaces a mandatory per-model benchmark. It costs no extra inference,
+    stores no prompts/results, and can support later recommendations once enough
+    real turns have accumulated.
+    """
+    try:
+        if not get_settings().get("passive_model_telemetry", True):
+            return
+    except Exception:
+        return
+    key = _model_profile_key(model)
+    with _MODEL_RUNTIME_LOCK:
+        data = load_json(MODEL_RUNTIME_FILE, {"version": 1, "models": {}})
+        if not isinstance(data, dict):
+            data = {"version": 1, "models": {}}
+        models = data.setdefault("models", {})
+        row = models.setdefault(key, {
+            "turns": 0, "completed_turns": 0, "prompt_tokens": 0,
+            "output_tokens": 0, "rounds": 0, "tool_calls": 0,
+            "tool_errors": 0, "elapsed_s": 0.0, "native_fallback_turns": 0,
+            "peak_context_tokens": 0, "peak_context_sum": 0,
+        })
+        row["turns"] = int(row.get("turns", 0)) + 1
+        row["completed_turns"] = int(row.get("completed_turns", 0)) + int(bool(completed))
+        row["prompt_tokens"] = int(row.get("prompt_tokens", 0)) + max(0, int(prompt_tokens or 0))
+        row["output_tokens"] = int(row.get("output_tokens", 0)) + max(0, int(output_tokens or 0))
+        row["rounds"] = int(row.get("rounds", 0)) + max(0, int(rounds or 0))
+        row["tool_calls"] = int(row.get("tool_calls", 0)) + max(0, int(tool_calls or 0))
+        row["tool_errors"] = int(row.get("tool_errors", 0)) + max(0, int(tool_errors or 0))
+        _peak = max(0, int(peak_prompt_tokens or 0))
+        row["peak_context_tokens"] = max(int(row.get("peak_context_tokens", 0) or 0), _peak)
+        row["peak_context_sum"] = int(row.get("peak_context_sum", 0) or 0) + _peak
+        row["elapsed_s"] = round(float(row.get("elapsed_s", 0.0)) + max(0.0, float(elapsed_s or 0)), 3)
+        row["native_fallback_turns"] = int(row.get("native_fallback_turns", 0)) + int(bool(native_fallback))
+        row["last_seen"] = int(time.time())
+        row["last_context"] = int(_llama_props_ctx() or get_settings().get("num_ctx") or 0)
+        save_json(MODEL_RUNTIME_FILE, data)
+
+
+def _model_runtime_profiles() -> dict:
+    data = load_json(MODEL_RUNTIME_FILE, {"version": 1, "models": {}})
+    if not isinstance(data, dict):
+        data = {"version": 1, "models": {}}
+    out = copy.deepcopy(data)
+    for row in (out.get("models") or {}).values():
+        turns = max(1, int(row.get("turns", 0) or 0))
+        calls = max(1, int(row.get("tool_calls", 0) or 0))
+        elapsed = max(0.001, float(row.get("elapsed_s", 0.0) or 0.0))
+        row["observed"] = {
+            "completion_rate": round(int(row.get("completed_turns", 0)) / turns, 3),
+            "tool_error_rate": round(int(row.get("tool_errors", 0)) / calls, 3),
+            "avg_rounds": round(int(row.get("rounds", 0)) / turns, 2),
+            "output_tok_s": round(int(row.get("output_tokens", 0)) / elapsed, 2),
+            "avg_peak_context_tokens": round(int(row.get("peak_context_sum", 0) or 0) / turns, 1),
+            "native_fallback_rate": round(int(row.get("native_fallback_turns", 0)) / turns, 3),
+        }
+        row["confidence"] = "high" if turns >= 25 else "medium" if turns >= 8 else "warming_up"
+        advice = []
+        observed = row["observed"]
+        ctx = int(row.get("last_context", 0) or 0)
+        if turns >= 8:
+            if observed["native_fallback_rate"] >= 0.25:
+                advice.append("Keep text-tool repair enabled; native tool parsing has required frequent fallback.")
+            if observed["completion_rate"] < 0.8:
+                advice.append("Keep conservative defaults; incomplete turns are too frequent for automatic aggressiveness increases.")
+            if ctx and observed["avg_peak_context_tokens"] >= ctx * 0.82:
+                advice.append("Normal work approaches the context ceiling; prefer earlier compaction or smaller active tool bundles.")
+            if int(row.get("tool_calls", 0) or 0) >= 8 and observed["tool_error_rate"] >= 0.25:
+                advice.append("Tool errors are elevated; inspect capability health and action outcomes before changing model settings.")
+        row["advice"] = advice
+    return out
+
+
+def _public_model_health() -> dict:
+    """Small, path-free snapshot safe for the Settings UI.
+
+    The full runtime profile stays private to the bridge/tool layer.  This view
+    exposes only aggregate counters and conservative advice; it never contains
+    prompts, generated text, tool arguments/results, or executable paths.
+    """
+    settings = get_settings()
+    enabled = bool(settings.get("passive_model_telemetry", True))
+    model = _model_profile_key(settings.get("model_path") or settings.get("model") or "")
+    runtime_key = _model_profile_key(settings.get("model") or model)
+    try:
+        profiles = _model_runtime_profiles().get("models") or {}
+        # Turns are recorded under settings.model, while the UI should display
+        # the friendlier basename from model_path. Older settings may use either
+        # spelling, so accept both instead of silently showing zero observations.
+        row = (profiles.get(runtime_key) or profiles.get(model) or {}) if model else {}
+    except Exception:
+        row = {}
+    observed = row.get("observed") if isinstance(row.get("observed"), dict) else {}
+    return {
+        "enabled": enabled,
+        "model": model,
+        "turns": max(0, int(row.get("turns", 0) or 0)),
+        "completed_turns": max(0, int(row.get("completed_turns", 0) or 0)),
+        "tool_calls": max(0, int(row.get("tool_calls", 0) or 0)),
+        "tool_errors": max(0, int(row.get("tool_errors", 0) or 0)),
+        "last_context": max(0, int(row.get("last_context", 0) or 0)),
+        "peak_context_tokens": max(0, int(row.get("peak_context_tokens", 0) or 0)),
+        "confidence": str(row.get("confidence") or "collecting"),
+        "observed": {
+            "completion_rate": float(observed.get("completion_rate", 0) or 0),
+            "tool_error_rate": float(observed.get("tool_error_rate", 0) or 0),
+            "avg_rounds": float(observed.get("avg_rounds", 0) or 0),
+            "avg_peak_context_tokens": float(observed.get("avg_peak_context_tokens", 0) or 0),
+            "native_fallback_rate": float(observed.get("native_fallback_rate", 0) or 0),
+        },
+        "advice": [str(x)[:320] for x in (row.get("advice") or [])[:6]],
+        "next_confidence_at": 8 if int(row.get("turns", 0) or 0) < 8 else (
+            25 if int(row.get("turns", 0) or 0) < 25 else 0),
+        "privacy": "Local aggregate counters only. No prompts, replies, files, commands, screenshots, or tool output.",
+    }
 
 
 DEFAULT_SETTINGS = {
@@ -550,6 +829,7 @@ DEFAULT_SETTINGS = {
     "rt_proxy": "",                 # optional proxy for red-team HTTP tools + sqlmap, e.g. http://127.0.0.1:8080
     "rt_spoof_xff": False,          # random X-Forwarded-For/X-Real-IP on recon requests (log obfuscation)
     "rt_jitter": True,              # small random delays between recon requests (timing anti-fingerprint)
+    "rt_evidence_retention_days": 30, # keep proof across restarts for report verification; 0 = wipe on boot
     "allow_web_preview": True,
     # memory / performance
     "kv_cache_type": "q8_0",        # K cache: q4_0 | q8_0 | f16 — lower = less VRAM, slightly lower quality.
@@ -565,12 +845,14 @@ DEFAULT_SETTINGS = {
     # reasoning / thinking (Qwen3-family and other reasoner models)
     "enable_thinking": True,        # when False, suppress <think> blocks entirely via chat_template_kwargs
     "thinking_budget": 4096,        # HARNESS-enforced cap on thinking tokens (we count + force-close; the model's template can't be trusted to honor it). -1 = unlimited
+    "reasoning_capability_override": "auto",  # auto | off | budget | native_effort; escape hatch for new/odd templates
     "max_tool_rounds": 120,         # how many tool-call rounds the model may run per user turn before forced stop
     "preserve_prior_thinking": False,# replay prior <think> verbatim: bloats context + re-feeds doubt on long runs, so default off
     "summarize_history": True,      # rolling-summary compaction: fold the oldest turns into a summary
                                     # when the context overflows instead of deleting them. False silently
                                     # disables ALL folds — every overflow becomes a plain drop (see the
-                                    # trim-triggered fold in run_chat_turn).
+                                     # trim-triggered fold in run_chat_turn).
+    "passive_model_telemetry": True, # content-free local observations from real turns; no extra benchmark/inference
     # llama-server lifecycle (bridge spawns it for us)
     "watchdog_enabled": True,       # auto-respawn llama-server on silent crash (OOM, segfault).
                                     # Circuit breaker stops trying after 3 crashes in 60s — fix
@@ -676,12 +958,161 @@ def get_workspace() -> dict:
 
 
 def get_chats() -> dict:
-    c = load_json(CHATS_FILE, {"chats": {}, "order": []})
-    if not isinstance(c, dict):
-        c = {"chats": {}, "order": []}
-    c.setdefault("chats", {})
-    c.setdefault("order", [])
-    return c
+    with _CHATS_TX_LOCK:
+        c = _normalize_chats_data(load_json(CHATS_FILE, {"chats": {}, "order": []}))
+        return _ChatSnapshot(c)
+
+
+def _turn_journal_path(chat_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(chat_id or ""))[:80] or "unknown"
+    return TURN_JOURNAL_DIR / f"{safe}.json"
+
+
+def _turn_journal_begin(chat_id: str) -> str:
+    """Allocate an id; the journal file is created only after a tool succeeds."""
+    return f"{int(time.time())}-{uuid.uuid4().hex[:12]}"
+
+
+def _turn_journal_checkpoint(chat_id: str, turn_id: str, entries: list[dict],
+                             activity: list[dict] | None = None,
+                             mission: dict | None = None,
+                             verification_debt: list[dict] | None = None) -> None:
+    """Durably checkpoint completed tool work during a long autonomous turn.
+
+    Tool outputs in ``entries`` are already size-capped for model replay. A hard
+    process crash can therefore lose at most the model generation currently in
+    flight, not every tool result since the user's original prompt.
+    """
+    if not chat_id or not turn_id or not entries:
+        return
+    clean_entries = []
+    for row in entries:
+        if not isinstance(row, dict) or row.get("role") not in ("assistant", "tool"):
+            continue
+        clean = {k: copy.deepcopy(v) for k, v in row.items()
+                 if k in ("role", "content", "tool_calls", "tool_call_id", "name")}
+        clean_entries.append(clean)
+    if not clean_entries:
+        return
+    payload = {
+        "version": 1,
+        "chat_id": chat_id,
+        "turn_id": turn_id,
+        "updated": int(time.time()),
+        "entries": clean_entries,
+        "activity": [copy.deepcopy(x) for x in (activity or []) if isinstance(x, dict)][-_ACTIVITY_MAX:],
+    }
+    if isinstance(mission, dict):
+        payload["mission"] = copy.deepcopy(mission)
+    if isinstance(verification_debt, list):
+        payload["verification_debt"] = [copy.deepcopy(x) for x in verification_debt
+                                        if isinstance(x, dict)][-20:]
+    save_json(_turn_journal_path(chat_id), payload)
+
+
+def _turn_journal_clear(chat_id: str, turn_id: str = "") -> None:
+    path = _turn_journal_path(chat_id)
+    try:
+        if turn_id and path.exists():
+            row = load_json(path, {})
+            if isinstance(row, dict) and row.get("turn_id") not in (None, "", turn_id):
+                return
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _recover_turn_journals(now: float | None = None) -> dict:
+    """Recover completed tool rounds left behind by a bridge/process crash."""
+    now = time.time() if now is None else float(now)
+    stats = {"recovered": 0, "entries": 0, "stale": 0, "invalid": 0}
+    try:
+        paths = list(TURN_JOURNAL_DIR.glob("*.json"))
+    except Exception:
+        return stats
+    if not paths:
+        return stats
+    chats = get_chats()
+    dirty = False
+    cleared: list[tuple[str, str]] = []
+    for path in paths:
+        row = load_json(path, None)
+        if not isinstance(row, dict):
+            stats["invalid"] += 1
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            continue
+        chat_id = str(row.get("chat_id") or "")
+        turn_id = str(row.get("turn_id") or "")
+        updated = float(row.get("updated") or 0)
+        if not chat_id or not turn_id or now - updated > 7 * 86400:
+            stats["stale"] += 1
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            continue
+        chat = chats.get("chats", {}).get(chat_id)
+        if not isinstance(chat, dict):
+            stats["invalid"] += 1
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            continue
+        # The final chat save may have succeeded just before the process died.
+        # A turn stamp makes recovery idempotent across that crash window.
+        if any(isinstance(m, dict) and m.get("_turn_id") == turn_id
+               for m in (chat.get("messages") or [])):
+            cleared.append((chat_id, turn_id))
+            continue
+        recovered = []
+        for entry in row.get("entries") or []:
+            if not isinstance(entry, dict) or entry.get("role") not in ("assistant", "tool"):
+                continue
+            item = copy.deepcopy(entry)
+            item["t"] = int(updated or now)
+            item["_turn_id"] = turn_id
+            item["_recovered"] = True
+            if item.get("role") == "assistant":
+                item["_internal"] = True
+            recovered.append(item)
+        if not recovered:
+            cleared.append((chat_id, turn_id))
+            continue
+        recovered.append({
+            "role": "assistant",
+            "content": ("[automatic recovery note] Accuretta recovered completed tool results from "
+                        "an interrupted turn. Treat them as executed evidence, inspect the activity "
+                        "ledger, and continue only the unfinished steps."),
+            "_internal": True,
+            "_turn_id": turn_id,
+            "_recovered": True,
+            "t": int(now),
+        })
+        chat.setdefault("messages", []).extend(recovered)
+        if isinstance(row.get("activity"), list):
+            chat["activity"] = [x for x in row["activity"] if isinstance(x, dict)][-_ACTIVITY_MAX:]
+        if isinstance(row.get("mission"), dict):
+            chat["mission"] = copy.deepcopy(row["mission"])
+        if isinstance(row.get("verification_debt"), list):
+            chat["verification_debt"] = [copy.deepcopy(x) for x in row["verification_debt"]
+                                         if isinstance(x, dict)][-20:]
+        _refresh_continuity_state(chat)
+        chat["turn_recovery"] = {"turn_id": turn_id, "recovered_at": int(now),
+                                 "entries": len(recovered) - 1}
+        chat["updated"] = int(now)
+        dirty = True
+        stats["recovered"] += 1
+        stats["entries"] += len(recovered) - 1
+        cleared.append((chat_id, turn_id))
+    if dirty:
+        save_json(CHATS_FILE, chats)
+    for chat_id, turn_id in cleared:
+        _turn_journal_clear(chat_id, turn_id)
+    return stats
 
 
 # Hard cap on how many messages we retain per chat in chats.json. Trimmer at
@@ -696,35 +1127,232 @@ def _enforce_chat_retention(chat: dict) -> None:
     msgs = chat.get("messages") or []
     if len(msgs) <= CHAT_HISTORY_MAX:
         return
-    # find the first user message — that's our anchor we never drop
+    # Retention may remove only history already absorbed by the rolling
+    # summary. A single autonomous turn can exceed this soft cap before its
+    # next fold; dropping unsummarized assistant/tool messages here caused
+    # permanent one-shot amnesia.
     first_user_idx = next(
         (i for i, m in enumerate(msgs) if m.get("role") == "user"),
         None,
     )
     overflow = len(msgs) - CHAT_HISTORY_MAX
-    # drop oldest messages AFTER the first user, walking forward
-    if first_user_idx is None:
-        # no user message? just trim from the front
-        chat["messages"] = msgs[overflow:]
-        # shift the rolling-summary fold pointer by the same count — it indexes
-        # into THIS list, so dropping from the front without adjusting it would
-        # silently skip unsummarized messages on the next replay.
-        through = int(chat.get("summary_through", 0) or 0)
-        if through:
-            chat["summary_through"] = max(0, through - overflow)
+    through = max(0, min(int(chat.get("summary_through", 0) or 0), len(msgs)))
+    if through <= 0:
+        _log_compact(chat.get("id") or "",
+                     f"retention deferred: n={len(msgs)} cap={CHAT_HISTORY_MAX} unsummarized=all")
         return
-    keep_head = msgs[: first_user_idx + 1]
-    rest = msgs[first_user_idx + 1:]
-    # drop `overflow` oldest from rest
-    rest = rest[overflow:]
-    chat["messages"] = keep_head + rest
-    # The dropped region sits at indices [first_user_idx+1, +overflow). If the
-    # fold pointer indexed past it, shift it down so it still marks the same
-    # boundary message — otherwise msgs[through:] silently skips messages that
-    # were never folded into the summary (an amnesia hole on very long chats).
-    through = int(chat.get("summary_through", 0) or 0)
-    if through > first_user_idx + 1:
-        chat["summary_through"] = max(first_user_idx + 1, through - overflow)
+
+    eligible = [i for i in range(through) if i != first_user_idx]
+    drop_n = min(overflow, len(eligible))
+    if drop_n:
+        drop_idx = set(eligible[:drop_n])
+        chat["messages"] = [m for i, m in enumerate(msgs) if i not in drop_idx]
+        chat["summary_through"] = max(0, through - drop_n)
+    if len(chat["messages"]) > CHAT_HISTORY_MAX:
+        _log_compact(chat.get("id") or "",
+                     f"retention deferred: n={len(chat['messages'])} cap={CHAT_HISTORY_MAX} "
+                     f"unsummarized={len(chat['messages']) - int(chat.get('summary_through', 0) or 0)}")
+
+
+_TASK_ANCHOR_ORIGINAL_CHARS = 420
+_TASK_ANCHOR_CURRENT_CHARS = 620
+_TASK_ACK_RE = re.compile(
+    r"^(?:ok(?:ay)?|yes|yep|yeah|sure|thanks?|thank you|great|nice|cool|"
+    r"go ahead|continue|proceed|do it|sounds good|alright|all right)[.!\s]*$",
+    re.IGNORECASE,
+)
+_ACTIVITY_MAX = 16
+
+
+def _task_anchor_text(content: Any) -> str:
+    """Compact, deterministic user text suitable for the recency tail."""
+    if isinstance(content, list):
+        content = " ".join(
+            str(p.get("text") or "") for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    text = str(content or "")
+    text = re.sub(r"\[referenced-files\][\s\S]*?\[/referenced-files\]", "", text,
+                  flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _update_task_anchor(chat: dict, user_content: Any) -> bool:
+    """Persist the original ask and latest substantive instruction.
+
+    This state is deterministic and model-independent: compaction may rewrite
+    prose, but it cannot erase what the user asked or which task is active.
+    Short acknowledgements such as "go ahead" deliberately do not replace the
+    active task they refer to.
+    """
+    text = _task_anchor_text(user_content)
+    if not text:
+        return False
+    old = chat.get("task_anchor")
+    anchor = dict(old) if isinstance(old, dict) else {}
+    changed = False
+    if not anchor.get("original"):
+        anchor["original"] = text[:_TASK_ANCHOR_ORIGINAL_CHARS]
+        changed = True
+    if not _TASK_ACK_RE.fullmatch(text):
+        current = text[:_TASK_ANCHOR_CURRENT_CHARS]
+        if anchor.get("current") != current:
+            anchor["current"] = current
+            changed = True
+    elif not anchor.get("current"):
+        anchor["current"] = anchor.get("original", "")
+        changed = True
+    if changed:
+        anchor["updated"] = int(time.time())
+        chat["task_anchor"] = anchor
+    return changed
+
+
+def _tool_activity_record(name: str, args: dict, result: Any) -> dict:
+    """Small, non-sensitive progress breadcrumb derived from a tool result."""
+    args = args if isinstance(args, dict) else {}
+    target = ""
+    for key in ("path", "url", "target", "host", "domain", "session_id"):
+        val = args.get(key)
+        if val not in (None, ""):
+            target = re.sub(r"\s+", " ", str(val)).strip()[:180]
+            break
+    status = "ok"
+    detail = ""
+    if isinstance(result, dict):
+        if result.get("error"):
+            status = "error"
+            detail = re.sub(r"\s+", " ", str(result.get("error"))).strip()[:180]
+        elif result.get("ok") is False:
+            status = "failed"
+        elif result.get("exit_code") not in (None, 0):
+            status = f"exit {result.get('exit_code')}"
+        for key in ("note", "message", "summary", "report", "changed", "matches", "count"):
+            if not detail and result.get(key) not in (None, "", [], {}):
+                detail = re.sub(r"\s+", " ", str(result.get(key))).strip()[:180]
+                break
+    return {
+        "tool": _resolve_tool_name(name) if "_resolve_tool_name" in globals() else str(name),
+        "status": status,
+        "target": target,
+        "detail": detail,
+        "t": int(time.time()),
+    }
+
+
+def _render_activity_tail(activity: list[dict]) -> str:
+    lines = []
+    for item in activity[-_ACTIVITY_MAX:]:
+        if not isinstance(item, dict):
+            continue
+        line = f"- {item.get('status', 'ok')}: {item.get('tool', 'tool')}"
+        if item.get("target"):
+            line += " — " + str(item["target"])
+        if item.get("detail"):
+            line += " — " + str(item["detail"])
+        lines.append(line[:520])
+    return "\n".join(lines)
+
+
+def _build_continuity_state(chat: dict, activity: list[dict] | None = None,
+                            plan: list[dict] | None = None) -> dict:
+    """Deterministic state beside the model-authored prose summary.
+
+    A summary is useful compression but cannot be the only record of the goal,
+    verified tool outcomes, and unfinished plan. This structure is derived from
+    harness-owned state, so even a mediocre summarizer cannot invent or erase it.
+    """
+    anchor = chat.get("task_anchor") if isinstance(chat.get("task_anchor"), dict) else {}
+    activity = activity if isinstance(activity, list) else (chat.get("activity") or [])
+    plan = plan if isinstance(plan, list) else (chat.get("plan") or [])
+    pins = [str(x).strip()[:300] for x in (chat.get("pins") or []) if str(x).strip()]
+    mission = chat.get("mission") if isinstance(chat.get("mission"), dict) else {}
+    constraints = list(pins[-12:])
+    if mission:
+        for label, value in (("authorized target", mission.get("target")),
+                             ("authorized scope", mission.get("scope")),
+                             ("mission phase", mission.get("phase"))):
+            if value:
+                constraints.append(f"{label}: {value}"[:300])
+    completed, failures, artifacts = [], [], []
+    for item in activity[-_ACTIVITY_MAX:]:
+        if not isinstance(item, dict):
+            continue
+        line = f"{item.get('tool', 'tool')}: {item.get('target') or item.get('detail') or item.get('status', 'ok')}"
+        if str(item.get("status") or "ok") in ("ok", "success"):
+            completed.append(line[:320])
+        else:
+            failures.append(line[:320])
+        target = str(item.get("target") or "").strip()
+        if target and (re.match(r"^[A-Za-z]:[\\/]", target) or target.startswith(("/", "http://", "https://"))):
+            artifacts.append({"location": target[:300], "via": str(item.get("tool") or "tool")[:80],
+                              "status": str(item.get("status") or "ok")[:40]})
+    next_steps = []
+    for item in plan[:20]:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "pending")
+        title = str(item.get("title") or item.get("step") or "").strip()
+        if title and status not in ("completed", "done"):
+            next_steps.append({"status": status[:32], "step": title[:320]})
+    state = {
+        "version": 1,
+        "goal": str(anchor.get("original") or "")[:_TASK_ANCHOR_ORIGINAL_CHARS],
+        "current_task": str(anchor.get("current") or anchor.get("original") or "")[:_TASK_ANCHOR_CURRENT_CHARS],
+        "constraints": list(dict.fromkeys(constraints))[-16:],
+        "completed": completed[-12:],
+        "failures": failures[-8:],
+        "artifacts": artifacts[-12:],
+        "findings": [
+            {"id": str(x.get("id") or "")[:60], "status": str(x.get("status") or "candidate")[:32],
+             "severity": str(x.get("severity") or "info")[:16], "title": str(x.get("title") or "")[:240]}
+            for x in (chat.get("findings") or [])[-20:] if isinstance(x, dict)
+        ],
+        "verification_required": [
+            {"path": str(x.get("path") or "")[:300],
+             "via": str(x.get("via") or "edit")[:80],
+             "since": int(x.get("since") or 0)}
+            for x in (chat.get("verification_debt") or [])[-20:]
+            if isinstance(x, dict) and str(x.get("path") or "").strip()
+        ],
+        "next_steps": next_steps[:12],
+        "updated": int(time.time()),
+    }
+    return state
+
+
+def _refresh_continuity_state(chat: dict, activity: list[dict] | None = None,
+                              plan: list[dict] | None = None) -> dict:
+    state = _build_continuity_state(chat, activity=activity, plan=plan)
+    chat["continuity"] = state
+    return state
+
+
+def _render_continuity_state(state: dict) -> str:
+    if not isinstance(state, dict):
+        return ""
+    lines = []
+    if state.get("goal"):
+        lines.append("goal: " + str(state["goal"]))
+    if state.get("current_task") and state.get("current_task") != state.get("goal"):
+        lines.append("current task: " + str(state["current_task"]))
+    for item in state.get("constraints") or []:
+        lines.append("constraint: " + str(item))
+    for item in state.get("completed") or []:
+        lines.append("completed (tool-backed): " + str(item))
+    for item in state.get("failures") or []:
+        lines.append("failed/unresolved: " + str(item))
+    for item in state.get("next_steps") or []:
+        if isinstance(item, dict):
+            lines.append(f"next ({item.get('status', 'pending')}): {item.get('step', '')}")
+    for item in state.get("findings") or []:
+        if isinstance(item, dict):
+            lines.append(f"finding ({item.get('status', 'candidate')}/{item.get('severity', 'info')}): "
+                         f"{item.get('id', '')} {item.get('title', '')}")
+    for item in state.get("verification_required") or []:
+        if isinstance(item, dict) and item.get("path"):
+            lines.append(f"verification required: {item.get('path')} (changed via {item.get('via', 'edit')})")
+    return "\n".join(line[:700] for line in lines if line.strip())
 
 
 # ---- token counting (approximation) ----------------------------------------
@@ -743,14 +1371,15 @@ def _approx_tokens(text: str) -> int:
     return max(len(text), len(text.encode("utf-8"))) // CHARS_PER_TOKEN
 
 
-def _payload_msg_cost(m: dict, idx: int, stub_cutoff: int) -> int:
-    """Token cost of message `m` AS SENT — i.e. after
-    _sanitize_messages_for_openai's tool-result stubbing (any tool message older
-    than _TOOL_RESULT_KEEP_RECENT becomes a ~12-token elision stub). The
-    trimmer, fold trigger and fill estimates must budget what llama actually
-    receives, or they count ~2x the real payload, fire at ~35% real fill, and
-    force emergency mid-turn folds on every message."""
-    if m.get("role") == "tool" and idx < stub_cutoff:
+def _payload_msg_cost(m: dict, idx: int, stub_cutoff: int,
+                      stub_old_tools: bool = True) -> int:
+    """Token cost of message `m` as sent.
+
+    In the bounded fallback path, old tool messages become ~12-token stubs. In
+    rolling-summary mode they remain full until folded. Every caller declares
+    which wire shape it is budgeting so trimming and llama see the same cost.
+    """
+    if stub_old_tools and m.get("role") == "tool" and idx < stub_cutoff:
         return 12
     return _count_msg_tokens(m)
 
@@ -843,20 +1472,19 @@ def truncate_messages(msgs: list[dict], max_tokens: int, reserve: int = 256,
     system = [msgs[0]] if msgs and msgs[0].get("role") == "system" else []
     rest = msgs[len(system):]
 
-    # Anchor 2: the first user message in `rest` (the original request). We
-    # also pull the assistant reply that immediately follows it, because tool
-    # call / tool result pairs must stay together to be valid OpenAI history.
+    # Anchor 2: ONLY the first user message in `rest` (the original request).
+    # Do not absorb every following assistant/tool message into the anchor: in
+    # a one-shot autonomous run there is no second user message, so that made
+    # the entire run one giant indivisible anchor. Once it crossed 60% of the
+    # budget the fallback discarded the anchor and, because no tail remained,
+    # retained only the final message. Tool-call/result integrity is protected
+    # independently at the kept-tail boundary below.
     anchor: list[dict] = []
     anchor_end = 0
     for i, m in enumerate(rest):
         if m.get("role") == "user":
             anchor = [m]
             anchor_end = i + 1
-            # include directly-following assistant + tool messages that pair
-            # with this first user turn (avoid splitting a tool_call/result).
-            while anchor_end < len(rest) and rest[anchor_end].get("role") in ("assistant", "tool"):
-                anchor.append(rest[anchor_end])
-                anchor_end += 1
             break
 
     middle_and_tail = rest[anchor_end:]
@@ -951,12 +1579,44 @@ _SUMMARY_INSTR = (
     "## ACTIVE TASK:\n(Briefly state what we are trying to accomplish right now)\n"
     "## COMPLETED:\n(Bullet points of what has already worked)\n"
     "## ROADBLOCKS:\n(Exact error codes, failed attempts, or outstanding bugs)\n"
-    "## FILES IN USE:\n(Exact absolute paths of files currently being modified)\n\n"
+    "## DECISIONS AND CONSTRAINTS:\n(User requirements and settled technical choices that must not be undone)\n"
+    "## FILES IN USE:\n(Exact absolute paths of files currently being modified)\n"
+    "## VERIFICATION:\n(Tests, commands, and checks already run, with their outcomes)\n"
+    "## NEXT ACTION:\n(The exact unfinished step the assistant should perform next)\n\n"
     "Output ONLY the new markdown state block and nothing else."
+)
+_SUMMARY_REQUIRED_HEADINGS = (
+    "## ACTIVE TASK:", "## COMPLETED:", "## ROADBLOCKS:",
+    "## DECISIONS AND CONSTRAINTS:", "## FILES IN USE:",
+    "## VERIFICATION:", "## NEXT ACTION:",
 )
 
 
+def _validate_summary_output(text: str) -> tuple[bool, str]:
+    """Reject malformed fold output before it replaces known-good state."""
+    text = str(text or "").strip()
+    if len(text) < _SUMMARY_MIN_OUTPUT_CHARS:
+        return False, f"degenerate output ({len(text)} chars)"
+    missing = [heading for heading in _SUMMARY_REQUIRED_HEADINGS if heading not in text]
+    if missing:
+        return False, "missing section(s): " + ", ".join(missing)
+    positions = [text.index(heading) for heading in _SUMMARY_REQUIRED_HEADINGS]
+    if positions != sorted(positions):
+        return False, "sections are out of order"
+    active = text.split("## ACTIVE TASK:", 1)[1].split("## COMPLETED:", 1)[0].strip()
+    next_action = text.split("## NEXT ACTION:", 1)[1].strip()
+    if not active or not next_action:
+        return False, "active task or next action is empty"
+    return True, "ok"
+
+
 def _render_msgs_for_summary(slice_msgs: list[dict]) -> str:
+    def _excerpt(text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        half = max(1, (limit - 80) // 2)
+        return text[:half] + "\n...[middle elided for compaction]...\n" + text[-half:]
+
     out = []
     for m in slice_msgs:
         role = m.get("role")
@@ -967,35 +1627,41 @@ def _render_msgs_for_summary(slice_msgs: list[dict]) -> str:
             c = " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
         c = str(c or "")
         if role == "tool":
-            c = "[tool result] " + c[:500]
+            c = "[tool result] " + _excerpt(c, 4000)
         elif m.get("tool_calls"):
             names = ", ".join((tc.get("function", {}) or {}).get("name", "") for tc in m.get("tool_calls", []))
-            c = (c[:600] + f" [called tools: {names}]").strip()
+            c = (_excerpt(c, 1600) + f" [called tools: {names}]").strip()
         else:
-            c = c[:1200]
+            c = _excerpt(c, 2400 if role == "user" else 1600)
         if c.strip():
             out.append(f"{role}: {c}")
     return "\n".join(out)
 
 
-def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: str = "") -> str | None:
+def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: str = "",
+                            notify: bool = True, ctx_limit: int | None = None) -> str | None:
     """One non-streaming model call: merge old summary + new slice into an
     updated summary. Returns None on failure (callers treat that as 'fold did
     not happen' — distinct from an unchanged summary, which is a no-op)."""
     rendered = _render_msgs_for_summary(slice_msgs)
     if not rendered.strip():
         return old_summary
-    user = ""
-    if old_summary:
-        user += f"PRIOR SUMMARY:\n{old_summary}\n\n"
-    user += f"NEW MESSAGES:\n{rendered}"
-    if len(user) > _SUMMARY_REQUEST_CHARS:
-        # Deep folds render a lot of history; cap at the newest chars (~50K
-        # tokens) so the summarizer request always fits the window with room
-        # for its own output. Keep the END — the most recently folded messages
-        # are the ones the model needs freshest.
-        user = ("…(older folded messages truncated to fit the summary request)…\n"
-                + user[-_SUMMARY_REQUEST_CHARS:])
+    # Always preserve the prior state. Apply the cap only to newly folded
+    # messages; slicing the combined string could erase established state on a
+    # sufficiently deep later fold.
+    prefix = f"PRIOR SUMMARY:\n{old_summary}\n\n" if old_summary else ""
+    request_chars = _SUMMARY_REQUEST_CHARS
+    if ctx_limit:
+        # The summarizer uses the same model slot. Scale its input to the live
+        # context instead of assuming the fixed 200K-char ceiling fits every
+        # model. Two chars/token is conservative for JSON/code-heavy history;
+        # leave roughly 4K tokens for instructions, template, and output.
+        request_chars = min(request_chars, max(12000, (ctx_limit - 4096) * 2))
+    new_budget = max(2000, request_chars - len(prefix) - 32)
+    if len(rendered) > new_budget:
+        rendered = ("…(older new messages elided to fit the compaction request)…\n"
+                    + rendered[-new_budget:])
+    user = prefix + f"NEW MESSAGES:\n{rendered}"
     payload = {
         "model": "local",
         "messages": [
@@ -1008,17 +1674,19 @@ def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: s
         # This call runs synchronously and can take 2-60s on a local model —
         # tell the UI so it can show a live "compacting…" indicator while the
         # fold is in flight (see #compact-indicator in app.js / app.css).
-        broadcast_event({"type": "summary_folding", "chat_id": chat_id})
+        if notify:
+            broadcast_event({"type": "summary_folding", "chat_id": chat_id})
     except Exception:
         pass
     try:
         resp = llama_post("/v1/chat/completions", payload, timeout=_SUMMARY_CALL_TIMEOUT_S)
         txt = ((resp.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
-        if len(txt) < _SUMMARY_MIN_OUTPUT_CHARS:
+        valid, why = _validate_summary_output(txt)
+        if not valid:
             # Degenerate summarizer output (the 11-char failure) would be
             # recorded as state and poison the summary — treat it as a failure
             # so the caller backs off and retries instead of folding with junk.
-            raise ValueError(f"summarizer returned degenerate output ({len(txt)} chars)")
+            raise ValueError(f"summarizer output rejected: {why}")
         return txt
     except Exception as _e:
         # Surface it — a silent failure here is invisible state loss: the
@@ -1030,7 +1698,8 @@ def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: s
         except Exception:
             pass
         try:
-            broadcast_event({"type": "summary_fold_failed", "chat_id": chat_id})
+            if notify:
+                broadcast_event({"type": "summary_fold_failed", "chat_id": chat_id})
         except Exception:
             pass
         return None
@@ -1040,11 +1709,20 @@ def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: s
 # llama-server makes every subsequent round eat a 90s timeout mid-turn.
 _SUMMARY_FAIL_BACKOFF_S = 180
 _summary_last_fail_by_chat: dict[str, float] = {}
-# Hard cap on ONE summarizer call. The summarizer runs synchronously inside
-# the turn — a 10-minute timeout would freeze the user's turn while a wedged
-# server burns. 90s is plenty for a 1024-token summary; on failure the backoff
-# above blocks the retry storm and the fold is retried later.
-_SUMMARY_CALL_TIMEOUT_S = 90
+# Automatic folds can legitimately happen more than once during a very long
+# unattended turn, but each fold does not need its own pair of UI messages.
+# Keep full telemetry while rate-limiting only user-facing automatic notices.
+# Manual compaction always remains visible.
+_SUMMARY_NOTICE_INTERVAL_S = 300
+_summary_last_notice_by_chat: dict[str, float] = {}
+_context_trim_last_notice_by_chat: dict[str, float] = {}
+_summary_fold_lock = threading.Lock()
+_summary_folds_inflight: set[str] = set()
+# Hard cap on one synchronous summarizer call. Local models and hardware vary
+# widely, and preserving a long autonomous run matters more than making the
+# fold feel instant. Five minutes gives a slow model room to finish while still
+# bounding a genuinely wedged server; failure backoff prevents retry storms.
+_SUMMARY_CALL_TIMEOUT_S = 300
 
 
 # ---- compaction debug log ---------------------------------------------------
@@ -1109,8 +1787,32 @@ def _record_fold_event(chat: dict, reason: str, force: bool, ok: bool,
         pass
 
 
-def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False,
-                        reason_hint: str = "auto") -> bool:
+def _align_fold_cut(msgs: list[dict], through: int, cut: int) -> int:
+    """Keep the summary boundary out of an assistant/tool transaction.
+
+    If the proposed raw tail starts with a tool result, prefer folding the rest
+    of that result batch too. When doing so would leave too little recent raw
+    history, keep the parent assistant call and the complete result batch raw.
+    This prevents a successful fold from manufacturing orphan cleanup and from
+    losing a result that landed on the opposite side of the summary boundary.
+    """
+    if cut <= through or cut >= len(msgs) or msgs[cut].get("role") != "tool":
+        return cut
+    forward = cut
+    while forward < len(msgs) and msgs[forward].get("role") == "tool":
+        forward += 1
+    if len(msgs) - forward >= _SUMMARY_MIN_KEEP_HARD:
+        return forward
+    backward = cut - 1
+    while backward > through and msgs[backward].get("role") == "tool":
+        backward -= 1
+    if msgs[backward].get("role") == "assistant":
+        return backward
+    return cut
+
+
+def _maybe_roll_summary_unlocked(chat: dict, ctx_limit: int, force: bool = False,
+                                 reason_hint: str = "auto") -> bool:
     """Token-aware: fold the oldest un-kept turns into chat['rolling_summary']
     ONLY when the conversation actually approaches the context window. Short
     sessions keep full detail; we never spend a summary call prematurely.
@@ -1149,11 +1851,15 @@ def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False,
         # first message): the char-based tail estimate covers that. max() is
         # safe because both numbers are ~the same units (chars/3 ≈ code tokens)
         # and the trigger has ~2K of slack under the trimmer ceiling.
-        # Stub-aware: old tool results are elided in the outgoing payload, so
-        # count what would actually be sent (see _payload_msg_cost).
+        # With rolling compaction enabled, old tool results stay live until the
+        # fold preserves them in the summary. Count their full cost so one-shot
+        # tool runs grow toward this same threshold instead of silently
+        # plateauing behind age-based stubs.
         _stub_cutoff = len(msgs) - _TOOL_RESULT_KEEP_RECENT
-        tail_tokens = sum(_payload_msg_cost(m, through + i, _stub_cutoff)
-                          for i, m in enumerate(tail))
+        tail_units = sum(_payload_msg_cost(m, through + i, _stub_cutoff,
+                                           stub_old_tools=False)
+                         for i, m in enumerate(tail))
+        tail_tokens = tail_units * _conversation_token_scale(tail)
         if max(real_fill, tail_tokens) <= trigger_limit:
             return False  # plenty of headroom — don't summarize yet
     # Fold oldest turns until the remaining RAW tail is ~KEEP_FRAC of ctx. Walk
@@ -1176,6 +1882,7 @@ def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False,
     while cut < len(msgs) - _SUMMARY_MIN_KEEP_HARD and tail_kept > keep_budget:
         tail_kept -= _count_msg_tokens(msgs[cut])
         cut += 1
+    cut = _align_fold_cut(msgs, through, cut)
     if cut <= through:
         # The trigger fired (real fill is near the limit) but the raw tail alone
         # never reached keep_budget — meaning system prompt + tool schemas, not
@@ -1188,8 +1895,21 @@ def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False,
             _record_fold_event(chat, reason_hint, force, False, "cannot_advance",
                                ctx_limit, real_fill, through, None)
             return False
+    cut = _align_fold_cut(msgs, through, cut)
+    if cut <= through:
+        _record_fold_event(chat, reason_hint, force, False, "cannot_align_boundary",
+                           ctx_limit, real_fill, through, None)
+        return False
+    # Automatic compaction is infrastructure, not chat content. Keep it silent
+    # and observable in fold_events/compaction_debug; only an explicit manual
+    # compact action gets user-facing start/completion/failure notifications.
+    _now = time.time()
+    _notify = reason_hint == "manual"
+    if _notify:
+        _summary_last_notice_by_chat[chat_id] = _now
     new_summary = _update_rolling_summary(chat.get("rolling_summary", ""), msgs[through:cut],
-                                          chat_id=chat_id)
+                                          chat_id=chat_id, notify=_notify,
+                                          ctx_limit=ctx_limit)
     if new_summary is None:
         _summary_last_fail_by_chat[chat_id] = time.time()
         _record_fold_event(chat, reason_hint, force, False, "summarize_failed",
@@ -1198,6 +1918,7 @@ def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False,
     if new_summary and new_summary != chat.get("rolling_summary", ""):
         chat["rolling_summary"] = new_summary
         chat["summary_through"] = cut
+        _refresh_continuity_state(chat)
         # Immediately refresh the per-chat fill so the gauge drops right after
         # a fold instead of showing the stale pre-fold number until the next
         # round's stats event lands (that was the visible "gauge lag").
@@ -1215,14 +1936,44 @@ def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False,
                            through, cut,
                            sum(_count_msg_tokens(m) for m in msgs[through:cut]))
         try:
-            broadcast_event({"type": "summary_folded", "chat_id": chat_id,
-                             "folded": cut - through})
+            if _notify:
+                broadcast_event({"type": "summary_folded", "chat_id": chat_id,
+                                 "folded": cut - through})
         except Exception:
             pass
         return True
     _record_fold_event(chat, reason_hint, force, False, "no_change",
                        ctx_limit, real_fill, through, cut)
     return False
+
+
+def _maybe_roll_summary(chat: dict, ctx_limit: int, force: bool = False,
+                        reason_hint: str = "auto") -> bool:
+    """Serialize folds per chat so duplicate requests cannot race the pointer.
+
+    UI double-submits and web/Discord overlap used to be able to launch two
+    summarizer calls over the same `summary_through` boundary. Whichever saved
+    last could move the pointer backward or generate a second fold wave. The
+    lock is deliberately per-chat: unrelated chats may still compact in
+    parallel on machines with the capacity for it.
+    """
+    chat_id = str(chat.get("id") or "")
+    if not chat_id:
+        return _maybe_roll_summary_unlocked(chat, ctx_limit, force, reason_hint)
+    with _summary_fold_lock:
+        if chat_id in _summary_folds_inflight:
+            _record_fold_event(
+                chat, reason_hint, force, False, "already_inflight", ctx_limit,
+                _last_prompt_tokens_by_chat.get(chat_id, 0),
+                int(chat.get("summary_through", 0) or 0), None,
+            )
+            return False
+        _summary_folds_inflight.add(chat_id)
+    try:
+        return _maybe_roll_summary_unlocked(chat, ctx_limit, force, reason_hint)
+    finally:
+        with _summary_fold_lock:
+            _summary_folds_inflight.discard(chat_id)
 
 
 # Matches the "=== EARLIER IN THIS SESSION ===" block both call sites splice
@@ -1351,7 +2102,8 @@ def _mid_turn_fold(chat_id: str, conversation: list[dict], start_len: int,
             "folded": new_through - old_through}
 
 
-def _compact_chat(chat_id: str, force: bool = True) -> dict:
+def _compact_chat(chat_id: str, force: bool = True,
+                  reason_hint: str = "manual") -> dict:
     """Manually fold a chat's oldest turns into its rolling summary, regardless
     of how close the context is to the auto-trigger (0.85). Shared by the
     compact_history model tool and the /api/compact endpoint. Folding at
@@ -1361,6 +2113,10 @@ def _compact_chat(chat_id: str, force: bool = True) -> dict:
     Returns stats, or {"error": ...} when there's nothing to fold."""
     if not chat_id:
         return {"error": "no chat_id"}
+    if reason_hint == "manual":
+        with _chat_cancels_lock:
+            if chat_id in _chat_cancels:
+                return {"error": "this session is currently working; let the active turn compact itself or stop it before compacting manually"}
     chats = get_chats()
     chat = chats.get("chats", {}).get(chat_id)
     if not chat:
@@ -1372,7 +2128,7 @@ def _compact_chat(chat_id: str, force: bool = True) -> dict:
         return {"note": "history is already compact — nothing left to fold",
                 "summary_through": old_through, "folded": 0}
     ctx_limit = _llama_props_ctx() or int(get_settings().get("num_ctx") or 32768)
-    if not _maybe_roll_summary(chat, ctx_limit, force=force, reason_hint="manual"):
+    if not _maybe_roll_summary(chat, ctx_limit, force=force, reason_hint=reason_hint):
         return {"error": "compaction did not run (summarizer call failed or no foldable history)",
                 "summary_through": old_through, "folded": 0}
     save_json(CHATS_FILE, chats)
@@ -1392,13 +2148,7 @@ def tool_compact_history(args: dict) -> dict:
     cid = _get_current_chat()
     if not cid:
         return {"error": "no active chat for compaction"}
-    out = _compact_chat(cid, force=True)
-    # Broadcast so the UI gauge/pill reflects the fold immediately.
-    try:
-        broadcast_event({"type": "summary_folded", "chat_id": cid,
-                         "folded": out.get("folded", 0)})
-    except Exception:
-        pass
+    out = _compact_chat(cid, force=True, reason_hint="model")
     return out
 
 
@@ -1432,8 +2182,9 @@ def tool_pin_note(args: dict) -> dict:
 def tool_update_plan(args: dict) -> dict:
     """Show/update the docked task-progress checklist the user sees. Call once at
     the start of a multi-step task with all steps, then call again to flip a
-    step's status as you go. Statuses: pending | active | done. Pure UI signal —
-    stored on the chat and streamed to the panel; costs no model context."""
+    step's status as you go. Statuses: pending | active | done. Stored on the
+    chat, streamed to the panel, and re-injected as a compact recency-tail
+    checkpoint so long one-shot runs retain what is done and what remains."""
     raw = args.get("steps") or []
     if not isinstance(raw, list) or not raw:
         return {"error": "steps must be a non-empty list of {title, status}"}
@@ -1462,6 +2213,111 @@ def tool_update_plan(args: dict) -> dict:
     return {"ok": True, "steps": len(steps), "done": done, "active": next(
         (s["title"] for s in steps if s["status"] == "active"), None),
         "note": "Plan shown to the user. Flip each step to 'done' as you finish it."}
+
+
+_FINDING_STATUSES = {"candidate", "validated", "reproduced", "mitigated", "false_positive"}
+_FINDING_SEVERITIES = {"info", "low", "medium", "high", "critical"}
+
+
+def _finding_artifact(path_text: str) -> dict | None:
+    if not path_text:
+        return None
+    try:
+        path = Path(normalize_path(path_text)).resolve()
+        evidence_root = (DATA / "recon_evidence").resolve()
+        allowed = is_in_workspace(str(path)) or path == evidence_root or evidence_root in path.parents
+        if not allowed or not path.is_file():
+            return None
+        size = path.stat().st_size
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return {"path": str(path), "bytes": size, "sha256": digest.hexdigest()}
+    except Exception:
+        return None
+
+
+def tool_record_finding(args: dict) -> dict:
+    """Create/update a structured finding backed by harness-observed evidence."""
+    cid = _current_chat_id.get() or _get_current_chat()
+    if not cid:
+        return {"error": "no active chat"}
+    title = re.sub(r"\s+", " ", str(args.get("title") or "")).strip()[:180]
+    if not title:
+        return {"error": "title required"}
+    requested = str(args.get("status") or "candidate").lower()
+    status = requested if requested in _FINDING_STATUSES else "candidate"
+    severity = str(args.get("severity") or "info").lower()
+    severity = severity if severity in _FINDING_SEVERITIES else "info"
+    source_tool = _resolve_tool_name(str(args.get("source_tool") or ""))
+    artifact = _finding_artifact(str(args.get("artifact_path") or ""))
+    chats = get_chats()
+    chat = chats.get("chats", {}).get(cid)
+    if not isinstance(chat, dict):
+        return {"error": "active chat not found"}
+    with _chat_live_activity_lock:
+        live_activity = list(_chat_live_activity.get(cid) or [])
+    activity = list(chat.get("activity") or []) + live_activity
+    source_ok = any(
+        isinstance(row, dict) and row.get("tool") == source_tool
+        and str(row.get("status") or "ok") in ("ok", "success")
+        for row in activity
+    ) if source_tool else False
+    downgraded = ""
+    if status in ("validated", "reproduced") and not (source_ok or artifact):
+        downgraded = (f"requested status '{status}' was downgraded: no successful harness-observed "
+                      "source_tool or verifiable artifact supports it")
+        status = "candidate"
+    finding_id = str(args.get("finding_id") or "").strip()
+    findings = [x for x in (chat.get("findings") or []) if isinstance(x, dict)]
+    existing = None
+    if finding_id:
+        existing = next((x for x in findings if x.get("id") == finding_id), None)
+    if existing is None:
+        target = str(args.get("target") or "").strip()[:240]
+        existing = next((x for x in findings
+                         if str(x.get("title") or "").lower() == title.lower()
+                         and str(x.get("target") or "") == target), None)
+    now = int(time.time())
+    is_new = existing is None
+    row = existing if existing is not None else {
+        "id": f"F-{now}-{uuid.uuid4().hex[:6]}", "created": now,
+    }
+    row.update({
+        "title": title,
+        "severity": severity,
+        "status": status,
+        "confidence": max(0, min(100, int(args.get("confidence") or 0))),
+        "target": str(args.get("target") or row.get("target") or "")[:240],
+        "description": str(args.get("description") or row.get("description") or "")[:2000],
+        "evidence": str(args.get("evidence") or row.get("evidence") or "")[:3000],
+        "source_tool": source_tool,
+        "source_observed": bool(source_ok),
+        "updated": now,
+    })
+    if artifact:
+        row["artifact"] = artifact
+    if is_new:
+        findings.append(row)
+    chat["findings"] = findings[-200:]
+    save_json(CHATS_FILE, chats)
+    return {"ok": True, "finding": copy.deepcopy(row), "downgraded": downgraded,
+            "total_findings": len(chat["findings"]),
+            "note": "Finding stored in this session's evidence ledger."}
+
+
+def tool_list_findings(args: dict) -> dict:
+    cid = _current_chat_id.get() or _get_current_chat()
+    if not cid:
+        return {"error": "no active chat"}
+    chat = (get_chats().get("chats", {}) or {}).get(cid) or {}
+    findings = [copy.deepcopy(x) for x in (chat.get("findings") or []) if isinstance(x, dict)]
+    status = str(args.get("status") or "").lower()
+    if status:
+        findings = [x for x in findings if str(x.get("status") or "").lower() == status]
+    return {"count": len(findings), "findings": findings,
+            "states": sorted(_FINDING_STATUSES)}
 
 
 def tool_unpin_note(args: dict) -> dict:
@@ -1523,7 +2379,7 @@ def _rt_target_from_args(name: str, args: dict) -> str:
     """Pull the target host from a red-team tool's arguments, if any."""
     if not isinstance(args, dict):
         return ""
-    for k in ("url", "base_url", "target", "host", "endpoint", "origin"):
+    for k in ("url", "base_url", "target", "host", "domain", "endpoint", "origin"):
         v = args.get(k)
         if isinstance(v, str) and v.strip():
             return _rt_url_host(v)
@@ -1570,12 +2426,31 @@ def _rt_is_local_host(host: str) -> bool:
     return False
 
 
+def _rt_resolves_to_local(host: str) -> bool:
+    """Catch hostname aliases that resolve onto this machine/private loopback."""
+    host = (host or "").strip().strip("[]")
+    if _rt_is_local_host(host):
+        return True
+    try:
+        addresses = {row[4][0] for row in socket.getaddrinfo(host, None)}
+    except Exception:
+        return False
+    for raw in addresses:
+        try:
+            ip = ipaddress.ip_address(raw)
+            if ip.is_loopback or ip.is_unspecified:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def _rt_endpoint_from_args(args: dict) -> tuple[str, int | None]:
     """(host, port) a red-team tool is aimed at. port None when unspecified."""
     if not isinstance(args, dict):
         return "", None
     raw = ""
-    for k in ("url", "base_url", "target", "host", "endpoint", "origin"):
+    for k in ("url", "base_url", "target", "host", "domain", "endpoint", "origin"):
         v = args.get(k)
         if isinstance(v, str) and v.strip():
             raw = v.strip()
@@ -1617,42 +2492,139 @@ def _rt_scope_out_tokens(chat: dict | None) -> list[str]:
     return toks
 
 
+def _rt_scope_in_tokens(chat: dict | None) -> list[str]:
+    """Authoritative in-scope allowlist.
+
+    An explicit ``in:`` segment wins. If the user leaves that field blank, the
+    confirmed mission target is the only allowed host. This is intentionally
+    allowlist-based: an ``out:`` denylist alone cannot stop model drift to a
+    host the questionnaire never mentioned.
+    """
+    m = _rt_mission_get(chat) if isinstance(chat, dict) else None
+    if not m:
+        return []
+    scope = str(m.get("scope") or "")
+    low = scope.lower()
+    seg = ""
+    if "in:" in low:
+        start = low.index("in:") + 3
+        end = low.find("out:", start)
+        seg = scope[start:end if end >= 0 else None]
+    if not seg.strip():
+        seg = str(m.get("target") or "")
+    toks = []
+    for t in re.split(r"[,\s|]+", seg):
+        t = t.strip().strip("/()[]{}'\"").lower()
+        t = re.sub(r"^https?://", "", t)
+        if "/" in t and not re.fullmatch(r"[0-9a-f:.]+/\d{1,3}", t):
+            t = t.split("/", 1)[0]
+        if t and t not in ("out", "in", "scope"):
+            toks.append(t)
+    return toks
+
+
 def _rt_tok_matches(tok: str, host: str, port: int | None) -> bool:
     tok = tok.strip()
     if not tok:
         return False
     if tok.isdigit():                      # bare port
         return port is not None and int(tok) == port
+    if "/" in tok:                        # IPv4/IPv6 CIDR
+        try:
+            return ipaddress.ip_address(host) in ipaddress.ip_network(tok, strict=False)
+        except ValueError:
+            return False
     if ":" in tok:                         # host:port
         th, tp = tok.rsplit(":", 1)
         if tp.isdigit():
+            th = th.lstrip("*.")
             return (host == th or host.endswith("." + th)) and port == int(tp)
+    tok = tok.lstrip("*.")
     return host == tok or host.endswith("." + tok)   # host / parent domain
 
 
+def _rt_authorized_mission(chat: dict | None) -> dict | None:
+    m = _rt_mission_get(chat) if isinstance(chat, dict) else None
+    if not m or m.get("authorized") is not True:
+        return None
+    if str(m.get("status") or "active").lower() != "active":
+        return None
+    return m
+
+
+_RT_NETWORK_CMD_RE = re.compile(
+    r"\b(?:curl|wget|invoke-webrequest|iwr|invoke-restmethod|irm|nmap|sqlmap|"
+    r"nikto|ffuf|gobuster|dirsearch|feroxbuster|netcat|ncat|nc|telnet|ssh|scp|"
+    r"sftp|ftp|dig|nslookup|host|openssl\s+s_client|test-netconnection|tnc)\b",
+    re.IGNORECASE,
+)
+
+
+def _rt_command_scope_block(command: str, chat: dict | None) -> str | None:
+    """Scope network-capable generic shell commands during an engagement."""
+    if not _rt_authorized_mission(chat):
+        return None
+    scrub = re.sub(r"/mnt/[a-z]/\S+", " ", str(command or "").lower())
+    hosts = set(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", scrub))
+    hosts |= {h for h in re.findall(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", scrub)
+              if not h.endswith((".py", ".js", ".txt", ".gz", ".xz", ".img", ".bin",
+                                 ".zip", ".tar", ".json", ".md", ".html", ".css",
+                                 ".apk", ".so", ".elf", ".yar", ".pcap", ".evtx"))}
+    if _RT_NETWORK_CMD_RE.search(scrub) and not hosts:
+        return ("refused: this active red-team mission uses a network-capable generic command, "
+                "but its destination is not a literal host the harness can scope-check. Use the "
+                "typed red-team tool for this action or include the in-scope host explicitly.")
+    allowed = _rt_scope_in_tokens(chat)
+    denied = _rt_scope_out_tokens(chat)
+    for host in hosts:
+        pm = re.search(re.escape(host) + r"[^\d]{1,12}(?:-p\s*|port[=\s:])(\d{2,5})", scrub)
+        port = int(pm.group(1)) if pm else None
+        if any(_rt_tok_matches(tok, host, port) for tok in denied):
+            return f"refused: generic command references out-of-scope host {host}."
+        if not any(_rt_tok_matches(tok, host, port) for tok in allowed):
+            return (f"refused: generic command references {host}, which is not in the "
+                    f"user-authorized scope ({', '.join(allowed) or 'no targets'}).")
+    return None
+
+
 def _rt_scope_block(name: str, args: dict) -> str | None:
-    """Refusal reason if this red-team call is aimed at accuretta's own infra or
-    an out-of-scope host/port; None if it is allowed."""
+    """Server-side authorization, phase, and scope guard for red-team tools."""
+    settings = get_settings()
+    if not settings.get("red_team_enabled"):
+        return "refused: red-team tools are disabled in Settings."
+    try:
+        # invoke_tool runs on a worker via copy_context(), so read the chat id
+        # from the CONTEXTVAR (propagates), not the thread-local _get_current_chat.
+        chat_id = _current_chat_id.get() or _get_current_chat() or ""
+        chat = (get_chats().get("chats", {}) or {}).get(chat_id) if chat_id else None
+    except Exception:
+        chat = None
+    mission = _rt_authorized_mission(chat)
+    if not mission:
+        return ("refused: this chat has no active user-authorized red-team mission. "
+                "Open the Red team gate, confirm authorization, and submit a target first.")
+    if name in _RT_EXPLOIT_TOOL_NAMES and not _rt_incl_exploit_for(chat, settings):
+        return ("refused: exploit tools are locked during recon. Confirm a real finding with "
+                "validate_finding first, or explicitly enable the force-exploit override.")
+
     host, port = _rt_endpoint_from_args(args)
     if not host:
         return None
-    if _rt_is_local_host(host) and port in _rt_self_ports():
+    if port in _rt_self_ports() and _rt_resolves_to_local(host):
         svc = "bridge" if int(port) == int(PORT) else "llama.cpp server"
         return (f"refused: {host}:{port} is accuretta's OWN {svc}. Red-team tools "
                 f"never touch the app's own infrastructure. Aim at the target "
                 f"(e.g. the challenge on its own port), not localhost:{port}.")
-    try:
-        # invoke_tool runs on a worker via copy_context(), so read the chat id
-        # from the CONTEXTVAR (propagates), not the thread-local _get_current_chat.
-        chat_id = _current_chat_id.get() or ""
-        chat = (get_chats().get("chats", {}) or {}).get(chat_id) if chat_id else None
-    except Exception:
-        chat = None
     for tok in _rt_scope_out_tokens(chat):
         if _rt_tok_matches(tok, host, port):
             where = f"{host}:{port}" if port else host
             return (f"refused: {where} is OUT OF SCOPE (you marked '{tok}' out of "
                     f"scope). Stay on the in-scope target.")
+    allowed = _rt_scope_in_tokens(chat)
+    if not any(_rt_tok_matches(tok, host, port) for tok in allowed):
+        where = f"{host}:{port}" if port else host
+        return (f"refused: {where} is not in the user-authorized scope "
+                f"({', '.join(allowed) or 'no targets'}). Return to the confirmed target.")
     return None
 
 
@@ -1724,24 +2696,37 @@ def _rt_mission_set_phase(chat: dict, phase: str) -> bool:
 
 
 def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
-    """Seed the mission from the scope/auth panel (Step 3). Objective flows
-    through _rt_mission_seed, target/scope through _rt_mission_note, constraints
-    as an established fact so _rt_mission_render carries them into the sysprompt.
-    Only fills what the panel provided; returns True if anything changed."""
-    changed = False
-    obj = str(panel.get("objective") or "").strip()
-    if obj and _rt_mission_seed(chat, obj):
-        changed = True
-    target = str(panel.get("target") or "").strip()
-    if target and _rt_mission_note(chat, target=target):
-        changed = True
-    scope = str(panel.get("scope") or "").strip()
-    if scope and _rt_mission_note(chat, scope=scope):
-        changed = True
+    """Create a fresh server-side mission from the authorization panel.
+
+    Settings merely make the capability available. The explicit panel
+    confirmation creates the per-chat authorization record that invoke_tool
+    enforces. Starting another engagement replaces stale target/scope/facts so
+    authority from an earlier run cannot leak into the next one.
+    """
+    if panel.get("authorized") is not True:
+        return False
+    target = _rt_url_host(str(panel.get("target") or "").strip())
+    if not target:
+        return False
+    scope = str(panel.get("scope") or "").strip() or f"in: {target}"
+    objective = str(panel.get("objective") or "").strip()
     constraints = str(panel.get("constraints") or "").strip()
-    if constraints and _rt_mission_note(chat, fact="constraints: " + constraints):
-        changed = True
-    return changed
+    facts = ["constraints: " + constraints[:180]] if constraints else []
+    mission = {
+        "target": target[:120],
+        "scope": scope[:300],
+        "objective": objective[:300],
+        "facts": facts,
+        "phase": "recon",
+        "status": "active",
+        "authorized": True,
+        "authorization_source": "ui_gate",
+        "authorization_id": uuid.uuid4().hex[:16],
+        "authorized_at": int(time.time()),
+        "ts": int(time.time()),
+    }
+    chat["mission"] = mission
+    return True
 
 
 def _rt_incl_exploit_for(chat: dict | None, settings: dict | None = None) -> bool:
@@ -4697,6 +5682,71 @@ _HOST_EVT_LABELS = {
     1001: "application crash",
 }
 
+_BLUE_BASELINE_DIR = DATA / "blue_team_baselines"
+
+
+def _blue_baseline_id(value: Any) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip()).strip(".-")[:64]
+
+
+def _network_snapshot_signature(snapshot: dict) -> dict:
+    """Stable, compact state used for host drift comparison."""
+    tcp = set()
+    for row in snapshot.get("tcp_connections") or []:
+        if not isinstance(row, dict):
+            continue
+        tcp.add("|".join(str(row.get(k) or "") for k in
+                         ("process", "LocalAddress", "LocalPort", "RemoteAddress",
+                          "RemotePort", "State")))
+    udp = set()
+    for row in snapshot.get("udp_listeners") or []:
+        if not isinstance(row, dict):
+            continue
+        udp.add("|".join(str(row.get(k) or "") for k in
+                         ("process", "LocalAddress", "LocalPort")))
+    dns = set()
+    for row in snapshot.get("recent_dns") or []:
+        if isinstance(row, dict):
+            # PowerShell field names vary by Windows release. Canonical JSON
+            # remains deterministic and is capped before persistence.
+            dns.add(json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)[:500])
+        elif row not in (None, ""):
+            dns.add(str(row)[:500])
+    processes = {str(row.get("process") or "") for row in (snapshot.get("process_details") or [])
+                 if isinstance(row, dict) and row.get("process")}
+    return {"captured": int(time.time()), "tcp": sorted(tcp), "udp": sorted(udp),
+            "dns": sorted(dns), "processes": sorted(processes)}
+
+
+def _network_baseline_apply(snapshot: dict, args: dict) -> None:
+    """Optionally save/compare a host snapshot without polluting model prose."""
+    current = _network_snapshot_signature(snapshot)
+    compare_id = _blue_baseline_id(args.get("compare_baseline"))
+    if compare_id:
+        path = _BLUE_BASELINE_DIR / f"{compare_id}.json"
+        old = load_json(path, None)
+        if not isinstance(old, dict):
+            snapshot["comparison_error"] = f"baseline not found: {compare_id}"
+        else:
+            diff = {"baseline_id": compare_id, "baseline_captured": old.get("captured")}
+            changed = False
+            for key in ("tcp", "udp", "dns", "processes"):
+                old_set = set(old.get(key) or [])
+                now_set = set(current.get(key) or [])
+                added = sorted(now_set - old_set)
+                removed = sorted(old_set - now_set)
+                diff[f"added_{key}"] = added[:100]
+                diff[f"removed_{key}"] = removed[:100]
+                diff[f"{key}_delta_count"] = len(now_set) - len(old_set)
+                changed = changed or bool(added or removed)
+            diff["changed"] = changed
+            snapshot["comparison"] = diff
+    save_id = _blue_baseline_id(args.get("save_baseline"))
+    if save_id:
+        _BLUE_BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+        save_json(_BLUE_BASELINE_DIR / f"{save_id}.json", current)
+        snapshot["baseline_saved"] = {"id": save_id, "captured": current["captured"]}
+
 
 def tool_network_snapshot(args: dict) -> dict:
     """Snapshot the host's current network state (no admin, no install).
@@ -4858,7 +5908,7 @@ def tool_network_snapshot(args: dict) -> dict:
         proc_details[name] = detail
     proc_list = sorted(proc_details.values(), key=lambda d: d["connections"], reverse=True)[:40]
 
-    return {
+    snapshot = {
         "platform": "windows",
         "tcp_count": len(tcp),
         "udp_count": len(udp),
@@ -4869,6 +5919,11 @@ def tool_network_snapshot(args: dict) -> dict:
         "process_details": proc_list,
         "recent_dns": data.get("dns_cache") or [],
     }
+    try:
+        _network_baseline_apply(snapshot, args or {})
+    except Exception as e:
+        snapshot["baseline_error"] = str(e)[:240]
+    return snapshot
 
 
 def tool_parse_event_logs(args: dict) -> dict:
@@ -5792,6 +6847,22 @@ def _remember_profile(host: str, profile: dict) -> None:
         _PROFILE_BY_HOST[host] = (profile, time.time())
 
 
+class _ScopeCheckedRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects normally, except across an active RT scope boundary."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            chat_id = _current_chat_id.get() or _get_current_chat() or ""
+            chat = ((get_chats().get("chats", {}) or {}).get(chat_id)
+                    if chat_id else None)
+        except Exception:
+            chat = None
+        if _rt_authorized_mission(chat):
+            block = _rt_scope_block("redirect", {"url": newurl})
+            if block:
+                raise urllib.error.URLError(block)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _browser_headers(profile: dict, *, referer: str | None = None,
                      accept_html: bool = True) -> dict:
     """Materialize a profile + per-request bits into a real header dict.
@@ -5862,7 +6933,8 @@ def _open_with_rotation(url: str, *, timeout: float = 15.0,
             headers.update(extra_headers)
         try:
             req = urllib.request.Request(url, data=data, method=method, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            opener = urllib.request.build_opener(_ScopeCheckedRedirect())
+            with opener.open(req, timeout=timeout) as resp:
                 status = getattr(resp, "status", 200) or 200
                 ctype = (resp.headers.get("Content-Type") or "").lower()
                 raw = resp.read(max_bytes)
@@ -6337,6 +7409,27 @@ def _gate_action(title: str, command: str, details: dict | None = None) -> dict 
     if _desktop_panic.is_set():
         return {"error": "panic/kill switch was flipped after approval — action aborted."}
     return None
+
+
+def _desktop_post_state() -> dict:
+    """Cheap immediate observation after an action; never invokes a model."""
+    state: dict[str, Any] = {"observed_at": int(time.time())}
+    if _HAVE_PGW:
+        try:
+            w = _pgw.getActiveWindow()
+            if w:
+                state["active_window"] = str(getattr(w, "title", ""))[:240]
+                state["window_box"] = [int(w.left), int(w.top), int(w.width), int(w.height)]
+        except Exception:
+            pass
+    if _HAVE_PYAUTOGUI:
+        try:
+            pos = pyautogui.position()
+            state["cursor"] = [int(pos.x), int(pos.y)]
+        except Exception:
+            pass
+    state["note"] = "immediate host observation; use describe_screen when visual confirmation matters"
+    return state
 
 
 def tool_desktop_launch_app(args: dict) -> dict:
@@ -9864,8 +10957,13 @@ def tool_recon_http_fingerprint(args: dict) -> dict:
             loc = e.headers.get("Location")
             final_headers = {k: v for k, v in e.headers.items()}
             if loc and 300 <= e.code < 400 and len(chain) < 5:
+                next_url = urllib.parse.urljoin(cur, loc)
+                block = _rt_scope_block("redirect", {"url": next_url})
+                if block:
+                    return {"error": block, "scope_blocked": True,
+                            "url": url, "redirect_from": cur, "redirect_to": next_url}
                 chain.append({"from": cur, "status": e.code, "to": loc})
-                cur = urllib.parse.urljoin(cur, loc)
+                cur = next_url
                 continue
             break
         except Exception as e:
@@ -10166,6 +11264,8 @@ def _recon_fetch(url: str, timeout: float = 8.0, max_bytes: int = 8000,
     _handlers = [urllib.request.HTTPSHandler(context=ctx)]
     if not follow:
         _handlers.insert(0, _ReconNoRedirect())
+    else:
+        _handlers.insert(0, _ScopeCheckedRedirect())
     _ph = _rt_proxy_handler()
     if _ph:
         _handlers.append(_ph)
@@ -10848,7 +11948,7 @@ def _recon_try_login(url, mode, user, pw, opts, timeout):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    _spray_handlers = [urllib.request.HTTPSHandler(context=ctx)]
+    _spray_handlers = [_ScopeCheckedRedirect(), urllib.request.HTTPSHandler(context=ctx)]
     _ph = _rt_proxy_handler()
     if _ph:
         _spray_handlers.append(_ph)
@@ -10960,7 +12060,11 @@ def tool_recon_capture_evidence(args: dict) -> dict:
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+    _capture_handlers = [_ScopeCheckedRedirect(), urllib.request.HTTPSHandler(context=ctx)]
+    _ph = _rt_proxy_handler()
+    if _ph:
+        _capture_handlers.append(_ph)
+    opener = urllib.request.build_opener(*_capture_handlers)
     req = urllib.request.Request(url, headers={"User-Agent": _RECON_UA})
     ctype = ""
     try:
@@ -11145,7 +12249,12 @@ def tool_http_request(args: dict) -> dict:
         req_headers.update(headers)  # caller-supplied headers/cookies win
         try:
             req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            _request_handlers = [_ScopeCheckedRedirect()]
+            _ph = _rt_proxy_handler()
+            if _ph:
+                _request_handlers.append(_ph)
+            opener = urllib.request.build_opener(*_request_handlers)
+            with opener.open(req, timeout=timeout) as resp:
                 status = getattr(resp, "status", 200) or 200
                 resp_headers, set_cookie = _headers_of(resp.headers)
                 raw = resp.read(1024 * 1024)
@@ -11770,14 +12879,21 @@ def tool_scan_js_secrets(args: dict) -> dict:
     js_urls = list(dict.fromkeys(js_urls))[:20]
 
     sources = [(url + " (html)", html)]
+    skipped_out_of_scope = []
 
     def fetch_js(ju):
+        block = _rt_scope_block("scan_js_secrets", {"url": ju})
+        if block:
+            return (ju, "", block)
         r = _recon_fetch(ju, timeout=timeout, max_bytes=900000)
-        return (ju, r.get("body", "") or "")
+        return (ju, r.get("body", "") or "", "")
 
     if js_urls:
         with ThreadPoolExecutor(max_workers=6, thread_name_prefix="jssec") as ex:
-            for ju, body in ex.map(fetch_js, js_urls):
+            for ju, body, scope_note in ex.map(fetch_js, js_urls):
+                if scope_note:
+                    skipped_out_of_scope.append(ju)
+                    continue
                 if body:
                     sources.append((ju, body))
 
@@ -11801,7 +12917,9 @@ def tool_scan_js_secrets(args: dict) -> dict:
                              "match": (v[:60] + "…") if len(v) > 60 else v, "source": src_label,
                              "note": "generic assignment — verify it is a real secret, not a placeholder"})
 
-    return {"url": url, "js_files_scanned": len(sources) - 1, "finding_count": len(findings),
+    return {"url": url, "js_files_scanned": len(sources) - 1,
+            "skipped_out_of_scope": skipped_out_of_scope,
+            "finding_count": len(findings),
             "findings": findings[:200],
             "note": ("secrets found — verify each grants access before reporting; some client-side "
                      "keys (Firebase/Supabase/Google) are public by design."
@@ -11835,7 +12953,11 @@ def tool_cors_probe(args: dict) -> dict:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         req = urllib.request.Request(url, headers={"User-Agent": _rt_ua(), "Origin": origin})
-        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+        _cors_handlers = [_ScopeCheckedRedirect(), urllib.request.HTTPSHandler(context=ctx)]
+        _ph = _rt_proxy_handler()
+        if _ph:
+            _cors_handlers.append(_ph)
+        opener = urllib.request.build_opener(*_cors_handlers)
         try:
             resp = opener.open(req, timeout=timeout)
             return {k.lower(): v for k, v in resp.headers.items()}
@@ -11953,92 +13075,204 @@ def tool_tcp_send(args: dict) -> dict:
 
 
 # --- Tool 5: check_deps ---
+_DEPENDENCY_MANIFEST_PRIORITY = (
+    "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock",
+    "Pipfile.lock", "poetry.lock", "uv.lock", "Cargo.lock", "composer.lock",
+    "packages.lock.json", "gradle.lockfile", "requirements.txt", "go.mod",
+    "package.json", "Cargo.toml",
+)
+
+
+def _parse_dependency_manifest(target: Path, ecosystem_hint: str = "") -> tuple[str, list[dict], list[str]]:
+    """Return ecosystem, exact resolved packages, and unresolved declarations.
+
+    OSV version queries require an exact version. Treating ``^1.2`` or
+    ``>=1.2`` as if 1.2 were installed created both false positives and false
+    negatives, so ranges are reported honestly and never queried as facts.
+    """
+    import tomllib
+    name = target.name.lower()
+    content = target.read_text(encoding="utf-8")
+    packages: list[dict] = []
+    unresolved: list[str] = []
+    ecosystem = ecosystem_hint or ""
+
+    if name in ("package-lock.json", "npm-shrinkwrap.json"):
+        ecosystem = "npm"
+        data = json.loads(content)
+        for key, meta in (data.get("packages") or {}).items():
+            if not key or "node_modules/" not in key or not isinstance(meta, dict):
+                continue
+            pkg_name = meta.get("name") or key.rsplit("node_modules/", 1)[-1]
+            version = str(meta.get("version") or "").strip()
+            if pkg_name and version:
+                packages.append({"name": pkg_name, "version": version})
+        if not packages:  # package-lock v1
+            def walk(deps: dict):
+                for pkg_name, meta in (deps or {}).items():
+                    if not isinstance(meta, dict):
+                        continue
+                    version = str(meta.get("version") or "").strip()
+                    if version:
+                        packages.append({"name": pkg_name, "version": version})
+                    walk(meta.get("dependencies") or {})
+            walk(data.get("dependencies") or {})
+    elif name == "pnpm-lock.yaml":
+        ecosystem = "npm"
+        # Dependency snapshot keys contain the resolved version even when the
+        # importer declaration is a range. Supports pnpm lockfile v6-v9 shapes.
+        for raw in content.splitlines():
+            line = raw.strip()
+            if line.startswith(("lockfileVersion", "settings", "importers", "packages:", "snapshots:")):
+                continue
+            key_match = re.match(r"^['\"]?(.+?)['\"]?\s*:\s*(?:\{\})?\s*$", line)
+            if not key_match:
+                continue
+            key = key_match.group(1).split("(", 1)[0].lstrip("/")
+            match = re.match(r"(?P<pkg>@[^/]+/[^@]+|[^@/][^@]*)@(?P<ver>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$", key)
+            if match:
+                packages.append({"name": match.group("pkg"), "version": match.group("ver")})
+    elif name == "yarn.lock":
+        ecosystem = "npm"
+        current_pkg = ""
+        for raw in content.splitlines():
+            if raw and not raw[0].isspace() and raw.rstrip().endswith(":"):
+                selector = raw.rstrip()[:-1].split(",", 1)[0].strip().strip("'\"")
+                if selector.startswith("@"):
+                    at = selector.find("@", 1)
+                else:
+                    at = selector.find("@")
+                current_pkg = selector[:at] if at > 0 else ""
+                continue
+            m = re.match(r"\s+(?:version\s+['\"]([^'\"]+)['\"]|resolution:\s*['\"](?:@?[^'\"]+@)?npm:([^'\"]+)['\"])", raw)
+            version = (m.group(1) or m.group(2)) if m else ""
+            if current_pkg and re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version or ""):
+                packages.append({"name": current_pkg, "version": version})
+    elif name == "package.json":
+        ecosystem = "npm"
+        data = json.loads(content)
+        deps = {**(data.get("dependencies") or {}), **(data.get("devDependencies") or {})}
+        for pkg_name, raw in deps.items():
+            version = str(raw).strip()
+            if re.fullmatch(r"v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
+                packages.append({"name": pkg_name, "version": version.lstrip("v")})
+            else:
+                unresolved.append(f"{pkg_name}: {version}")
+    elif name in ("pipfile.lock",):
+        ecosystem = "PyPI"
+        data = json.loads(content)
+        for section in ("default", "develop"):
+            for pkg_name, meta in (data.get(section) or {}).items():
+                raw = meta.get("version") if isinstance(meta, dict) else meta
+                version = str(raw or "").strip()
+                if version.startswith("=="):
+                    packages.append({"name": pkg_name, "version": version[2:]})
+                else:
+                    unresolved.append(f"{pkg_name}: {version or 'unresolved'}")
+    elif name in ("poetry.lock", "uv.lock"):
+        ecosystem = "PyPI"
+        data = tomllib.loads(content)
+        for meta in data.get("package") or []:
+            if isinstance(meta, dict) and meta.get("name") and meta.get("version"):
+                packages.append({"name": str(meta["name"]), "version": str(meta["version"])})
+    elif name == "requirements.txt" or ecosystem_hint.lower() == "pypi":
+        ecosystem = "PyPI"
+        for raw in content.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line or line.startswith(("-r", "--", "git+", "http:" , "https:")):
+                continue
+            match = re.match(r"^([A-Za-z0-9_.-]+)(?:\[[^]]+\])?\s*={2,3}\s*([^\s;]+)", line)
+            if match:
+                packages.append({"name": match.group(1), "version": match.group(2)})
+            else:
+                unresolved.append(line[:160])
+    elif name == "go.mod" or ecosystem_hint.lower() == "go":
+        ecosystem = "Go"
+        for match in re.finditer(r"(?:^|\n)\s*(?:require\s+)?([A-Za-z0-9_.\-/]+)\s+v([^\s)]+)", content):
+            # go.mod is a minimum-version declaration, not necessarily the
+            # selected build list after MVS. Never present it as installed fact.
+            unresolved.append(f"{match.group(1)}: v{match.group(2)} (go.mod declaration; run `go list -m all` for resolved versions)")
+    elif name == "cargo.lock":
+        ecosystem = "crates.io"
+        data = tomllib.loads(content)
+        for meta in data.get("package") or []:
+            if isinstance(meta, dict) and meta.get("name") and meta.get("version"):
+                packages.append({"name": str(meta["name"]), "version": str(meta["version"])})
+    elif name == "cargo.toml" or ecosystem_hint.lower() == "crates.io":
+        ecosystem = "crates.io"
+        data = tomllib.loads(content)
+        for section, deps in data.items():
+            if "dependencies" not in str(section).lower() or not isinstance(deps, dict):
+                continue
+            for pkg_name, raw in deps.items():
+                version = str(raw.get("version") or "") if isinstance(raw, dict) else str(raw)
+                if re.fullmatch(r"=?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
+                    packages.append({"name": pkg_name, "version": version.lstrip("=")})
+                else:
+                    unresolved.append(f"{pkg_name}: {version or 'path/git dependency'}")
+    elif name == "composer.lock":
+        ecosystem = "Packagist"
+        data = json.loads(content)
+        for section in ("packages", "packages-dev"):
+            for meta in data.get(section) or []:
+                if not isinstance(meta, dict):
+                    continue
+                pkg_name = str(meta.get("name") or "").strip()
+                version = str(meta.get("version") or "").strip().lstrip("v")
+                if pkg_name and version:
+                    packages.append({"name": pkg_name, "version": version})
+    elif name == "packages.lock.json":
+        ecosystem = "NuGet"
+        data = json.loads(content)
+        for framework in (data.get("dependencies") or {}).values():
+            if not isinstance(framework, dict):
+                continue
+            for pkg_name, meta in framework.items():
+                version = str((meta or {}).get("resolved") or "") if isinstance(meta, dict) else ""
+                if pkg_name and version:
+                    packages.append({"name": pkg_name, "version": version})
+    elif name == "gradle.lockfile":
+        ecosystem = "Maven"
+        for raw in content.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            match = re.match(r"([^:=\s]+):([^:=\s]+):([^=\s]+)=", line)
+            if match:
+                packages.append({"name": f"{match.group(1)}:{match.group(2)}",
+                                 "version": match.group(3)})
+    else:
+        raise ValueError(f"Unsupported manifest type: {name}")
+
+    unique = {(p["name"], p["version"]): p for p in packages}
+    return ecosystem, list(unique.values()), list(dict.fromkeys(unresolved))
+
+
 def tool_check_deps(args: dict) -> dict:
-    """Check dependency manifests against OSV.dev vulnerabilities."""
+    """Check exact, resolved dependency versions against OSV.dev."""
     raw_path = args.get("path")
     if not raw_path:
         return {"error": "path required"}
-        
     target = Path(normalize_path(raw_path))
     if not target.exists():
         return {"error": "path not found"}
-        
     if target.is_dir():
-        # Auto-detect manifest
-        manifests = ["package.json", "requirements.txt", "go.mod", "Cargo.toml", "Pipfile.lock"]
-        found = None
-        for m in manifests:
-            if (target / m).exists():
-                target = target / m
-                found = True
-                break
-        if not found:
+        target = next((target / name for name in _DEPENDENCY_MANIFEST_PRIORITY
+                       if (target / name).exists()), target)
+        if target.is_dir():
             return {"error": f"No supported dependency manifest found in {target}"}
-
+    if not is_in_workspace(str(target)):
+        return {"error": "Path is outside workspace bounds."}
     manifest_name = target.name.lower()
-    ecosystem = args.get("ecosystem")
-    packages = []
-    
     try:
-        content = target.read_text(encoding="utf-8")
-        
-        if manifest_name == "requirements.txt" or (ecosystem and ecosystem.lower() == "pypi"):
-            ecosystem = "PyPI"
-            for line in content.splitlines():
-                line = line.split("#")[0].strip()
-                if not line: continue
-                m = re.match(r"^([A-Za-z0-9_\-]+)(?:>=|==)([\w\.]+)", line)
-                if m:
-                    packages.append({"name": m.group(1), "version": m.group(2)})
-                    
-        elif manifest_name == "package.json" or (ecosystem and ecosystem.lower() == "npm"):
-            ecosystem = "npm"
-            data = json.loads(content)
-            deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
-            for name, ver in deps.items():
-                ver = re.sub(r"^[\^~>=<]+", "", ver) # strip semver modifiers
-                packages.append({"name": name, "version": ver})
-                
-        elif manifest_name == "go.mod" or (ecosystem and ecosystem.lower() == "go"):
-            ecosystem = "Go"
-            in_require = False
-            for line in content.splitlines():
-                line = line.strip()
-                if line == "require (":
-                    in_require = True
-                    continue
-                if in_require and line == ")":
-                    in_require = False
-                    continue
-                if in_require or line.startswith("require "):
-                    m = re.search(r"([A-Za-z0-9_\-\./]+)\s+v([\w\.\-]+)", line)
-                    if m:
-                        packages.append({"name": m.group(1), "version": m.group(2)})
-                        
-        elif manifest_name == "cargo.toml" or (ecosystem and ecosystem.lower() == "crates.io"):
-            ecosystem = "crates.io"
-            in_deps = False
-            for line in content.splitlines():
-                line = line.strip()
-                if line.startswith("["):
-                    in_deps = "dependencies" in line
-                    continue
-                if in_deps and "=" in line:
-                    parts = line.split("=", 1)
-                    name = parts[0].strip()
-                    ver_part = parts[1].strip()
-                    m = re.search(r"version\s*=\s*[\"']([^\"']+)[\"']", ver_part)
-                    if m:
-                        packages.append({"name": name, "version": m.group(1)})
-                    elif ver_part.startswith('"') or ver_part.startswith("'"):
-                        packages.append({"name": name, "version": ver_part.strip("\"'")})
-        else:
-            return {"error": f"Unsupported manifest type: {manifest_name}"}
+        ecosystem, packages, unresolved = _parse_dependency_manifest(
+            target, str(args.get("ecosystem") or ""))
     except Exception as e:
         return {"error": f"Failed parsing manifest: {e}"}
-
     if not packages:
-        return {"error": "No packages found to check"}
+        return {
+            "error": "No exact resolved package versions found; use a lockfile or pin versions before querying OSV.",
+            "path": str(target),
+            "unresolved_declarations": unresolved[:200],
+        }
 
     # Query OSV.dev batch API
     queries = []
@@ -12096,12 +13330,259 @@ def tool_check_deps(args: dict) -> dict:
         "vulnerable_count": vulnerable_count,
         "packages": vulnerable_packages,
         "clean_packages": clean_packages,
-        "risk_summary": f"Found {vulnerable_count} vulnerable packages out of {len(packages)} checked."
+        "unresolved_declarations": unresolved[:200],
+        "evidence_quality": ("lockfile/exact versions" if not unresolved else
+                             "exact versions checked; ranges/unresolved declarations were not guessed"),
+        "risk_summary": (f"Found {vulnerable_count} vulnerable packages out of {len(packages)} "
+                         f"exact versions checked; {len(unresolved)} unresolved declaration(s) skipped.")
     }
 
 # =====================================================================
 # AGENTIC CODING TOOLS
 # =====================================================================
+
+_PROJECT_MAP_SKIP_DIRS = {
+    ".git", ".hg", ".svn", ".idea", ".vscode", "node_modules", "vendor",
+    ".venv", "venv", "env", "__pycache__", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", "dist", "build", "coverage", ".next", ".nuxt", "target",
+}
+_PROJECT_MAP_IMPORTANT = {
+    "readme.md", "package.json", "pyproject.toml", "requirements.txt", "setup.py",
+    "cargo.toml", "go.mod", "pom.xml", "build.gradle", "dockerfile",
+    "docker-compose.yml", "docker-compose.yaml", "makefile", "justfile",
+    "tsconfig.json", "vite.config.js", "vite.config.ts", "next.config.js",
+    "pytest.ini", "tox.ini", ".github", "src", "app", "tests", "test",
+}
+
+
+def tool_project_map(args: dict) -> dict:
+    """Return a compact, deterministic map of a repository in one call."""
+    root = Path(normalize_path(args.get("path") or ""))
+    if not root.exists() or not root.is_dir():
+        return {"error": "project directory not found"}
+    if not is_in_workspace(str(root)):
+        return {"error": "Path is outside workspace bounds."}
+    try:
+        max_files = max(100, min(50000, int(args.get("max_files") or 15000)))
+    except (TypeError, ValueError):
+        max_files = 15000
+
+    ext_counts: dict[str, int] = {}
+    dir_counts: dict[str, int] = {}
+    files: list[tuple[Path, int]] = []
+    important: list[str] = []
+    tests: list[str] = []
+    truncated = False
+    for current, dirs, names in os.walk(root):
+        current_p = Path(current)
+        dirs[:] = [d for d in dirs
+                   if d.lower() not in _PROJECT_MAP_SKIP_DIRS
+                   and not is_ignored(str(current_p / d))]
+        for name in names:
+            path = current_p / name
+            if is_ignored(str(path)):
+                continue
+            try:
+                rel = path.relative_to(root).as_posix()
+                size = path.stat().st_size
+            except Exception:
+                continue
+            files.append((path, size))
+            top = rel.split("/", 1)[0]
+            dir_counts[top] = dir_counts.get(top, 0) + 1
+            ext = path.suffix.lower() or "[no extension]"
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+            low = name.lower()
+            if (low in _PROJECT_MAP_IMPORTANT or top.lower() in _PROJECT_MAP_IMPORTANT
+                    or rel.lower() in _PROJECT_MAP_IMPORTANT):
+                if len(important) < 80:
+                    important.append(rel)
+            if (low.startswith("test_") or low.endswith(("_test.py", ".test.js", ".spec.js",
+                                                          ".test.ts", ".spec.ts"))
+                    or "/tests/" in "/" + rel.lower() + "/"):
+                if len(tests) < 80:
+                    tests.append(rel)
+            if len(files) >= max_files:
+                truncated = True
+                break
+        if truncated:
+            break
+
+    likely_commands: list[str] = []
+    package = root / "package.json"
+    if package.exists():
+        try:
+            scripts = json.loads(package.read_text(encoding="utf-8")).get("scripts") or {}
+            for name in ("test", "lint", "typecheck", "check", "build"):
+                if name in scripts:
+                    likely_commands.append(f"npm run {name}")
+        except Exception:
+            pass
+    if (root / "pyproject.toml").exists() or (root / "pytest.ini").exists() or tests:
+        if any(p.suffix.lower() == ".py" for p, _ in files):
+            likely_commands.append("python -m pytest")
+    if (root / "Cargo.toml").exists():
+        likely_commands += ["cargo test", "cargo clippy"]
+    if (root / "go.mod").exists():
+        likely_commands.append("go test ./...")
+    if (root / "pom.xml").exists():
+        likely_commands.append("mvn test")
+
+    source_exts = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs",
+                   ".c", ".h", ".cpp", ".hpp", ".cs", ".rb", ".php", ".swift",
+                   ".kt", ".kts", ".html", ".css", ".scss"}
+    largest = sorted(((p, size) for p, size in files if p.suffix.lower() in source_exts),
+                     key=lambda item: item[1], reverse=True)[:20]
+    return {
+        "root": str(root),
+        "files_scanned": len(files),
+        "truncated": truncated,
+        "languages_by_file_count": dict(sorted(ext_counts.items(), key=lambda x: x[1], reverse=True)[:20]),
+        "top_level": dict(sorted(dir_counts.items(), key=lambda x: x[1], reverse=True)[:30]),
+        "important_paths": sorted(dict.fromkeys(important))[:80],
+        "test_paths": sorted(dict.fromkeys(tests))[:80],
+        "largest_source_files": [
+            {"path": p.relative_to(root).as_posix(), "bytes": size} for p, size in largest
+        ],
+        "likely_verification_commands": list(dict.fromkeys(likely_commands)),
+        "next": ("Read the README and relevant manifest, then use read_skeleton on the largest or "
+                 "task-relevant source files. Verify changes with check_syntax/run_tests."),
+    }
+
+
+def _capability_health(chat_id: str = "") -> dict:
+    """Truthful local capability inventory; no tools are executed."""
+    settings = get_settings()
+    schema_issues = []
+    for name, spec in TOOLS.items():
+        if not isinstance(spec, dict) or not callable(spec.get("fn")):
+            schema_issues.append({"tool": name, "issue": "missing callable handler"})
+            continue
+        params = spec.get("parameters")
+        if not isinstance(params, dict) or params.get("type") != "object":
+            schema_issues.append({"tool": name, "issue": "parameters must be an object schema"})
+            continue
+        props = params.get("properties") or {}
+        for req in params.get("required") or []:
+            if req not in props:
+                schema_issues.append({"tool": name, "issue": f"required field not declared: {req}"})
+
+    py_caps = {
+        "desktop_automation": bool(_HAVE_PYAUTOGUI),
+        "image_processing": bool(_HAVE_PIL),
+        "apk_deep_metadata": bool(_HAVE_ANDROGUARD),
+        "native_pe": bool(_HAVE_PEFILE),
+        "native_elf": bool(_HAVE_PYELFTOOLS or _HAVE_ELFTOOLS),
+        "disassembly": bool(_HAVE_CAPSTONE),
+        "ghidra": bool(_HAVE_PYGHIDRA),
+        "yara": bool(_HAVE_YARA),
+        "evtx": bool(_HAVE_EVTX_RUST or _HAVE_EVTX_PY),
+        "pcap": bool(_HAVE_DPKT),
+        "squashfs": bool(_HAVE_SQUASHFS),
+    }
+    external = {
+        "git": shutil.which("git") or "",
+        "node": shutil.which("node") or "",
+        "powershell": shutil.which("pwsh") or shutil.which("powershell") or "",
+        "jadx": _resolve_jadx_bin() or "",
+        "java": shutil.which("java") or "",
+    }
+    try:
+        chat = (get_chats().get("chats", {}) or {}).get(chat_id) if chat_id else None
+    except Exception:
+        chat = None
+    visible = _visible_tool_names(_rt_incl_exploit_for(chat, settings), chat_id) if "_visible_tool_names" in globals() else set()
+    unavailable = (_unavailable_runtime_tools()
+                   if "_unavailable_runtime_tools" in globals() else {})
+    recommendations = []
+    if settings.get("desktop_enabled") and not py_caps["desktop_automation"]:
+        recommendations.append("Install pyautogui to enable agentic desktop input; screenshots still need Pillow.")
+    if settings.get("analysis_tools_enabled"):
+        if not py_caps["yara"]:
+            recommendations.append("Install yara-python for rule-based file triage.")
+        if not py_caps["pcap"]:
+            recommendations.append("Install dpkt for PCAP analysis.")
+        if not py_caps["evtx"]:
+            recommendations.append("Install evtx or python-evtx for Windows event-log analysis.")
+        if not py_caps["ghidra"]:
+            recommendations.append("Install pyghidra plus Ghidra/JDK 21 for decompilation; binary triage still works without it.")
+    try:
+        current_profile = (_model_runtime_profiles().get("models", {}) or {}).get(
+            _model_profile_key(settings.get("model") or ""), {})
+    except Exception:
+        current_profile = {}
+    return {
+        "ok": not schema_issues,
+        "generated": int(time.time()),
+        "registered_tools": len(TOOLS),
+        "visible_tools": len(visible),
+        "schema_issues": schema_issues,
+        "unavailable_tools": unavailable,
+        "python_capabilities": py_caps,
+        "external_programs": {k: {"available": bool(v), "path": v} for k, v in external.items()},
+        "feature_groups": {
+            "ide": {"enabled": True},
+            "system_agent": {"enabled": bool(settings.get("desktop_enabled")),
+                             "panic": _desktop_panic.is_set()},
+            "blue_team_analysis": {"enabled": bool(settings.get("analysis_tools_enabled"))},
+            "red_team": {"enabled": bool(settings.get("red_team_enabled")),
+                         "authorized_this_chat": bool(_rt_authorized_mission(chat))},
+            "sandbox": {"available": bool(_sandbox_ready_cached())},
+        },
+        "current_model_runtime": current_profile,
+        "model_tuning_policy": ("Normal work supplies content-free observations. Advice begins after 8 turns; "
+                                "no setting is changed automatically and no first-run benchmark is required."),
+        "recommendations": recommendations,
+        "note": ("Availability is checked without executing project or target code. A tool may still fail on a "
+                 "specific input; its result remains the source of truth."),
+    }
+
+
+def _tool_contract_row(name: str, visible: set[str], unavailable: dict[str, str]) -> dict:
+    git_mutating = name.startswith("git_") and name not in {
+        "git_status", "git_diff", "git_log", "git_show", "git_remote", "git_branches"
+    }
+    if name in _WRITE_CAPABLE_TOOLS:
+        side_effect, scope, approval = "workspace mutation", "workspace", "policy gated"
+    elif name in _DESKTOP_TOOL_NAMES:
+        side_effect, scope, approval = "host UI/action", "desktop allowlist", "policy gated"
+    elif name.startswith(("recon_", "rt_")):
+        side_effect, scope, approval = "target network traffic", "authorized mission allowlist", "mission/phase gated"
+    elif name.startswith("sandbox_"):
+        side_effect, scope, approval = "sandbox process/network", "authorized mission + guest", "policy gated"
+    elif name.startswith("mcp_"):
+        side_effect, scope, approval = "connector defined", "connector defined", "connector/policy"
+    elif name in _ACTION_AUDIT_ALWAYS or git_mutating:
+        side_effect, scope, approval = "host/repository action", "workspace or host", "policy gated"
+    elif name in _CHAT_STATE_TOOLS or name in {"record_finding"}:
+        side_effect, scope, approval = "session state", "current chat", "none"
+    else:
+        side_effect, scope, approval = "read only", "workspace/local data", "none"
+    return {
+        "tool": name,
+        "exposed": name in visible,
+        "available": name not in unavailable,
+        "unavailable_reason": unavailable.get(name, ""),
+        "approval": approval,
+        "scope": scope,
+        "side_effect": side_effect,
+        "result_cap_chars": int(_tool_result_cap(name)),
+        "result_compaction": "bulk-field aware" if name in _ANALYSIS_TOOL_NAMES else "bounded JSON",
+        "self_test": "schema/handler validated",
+    }
+
+
+def tool_capability_report(args: dict) -> dict:
+    """Show which Accuretta capabilities can actually work on this machine."""
+    chat_id = str(args.get("chat_id") or _current_chat_id.get() or _get_current_chat() or "")
+    report = _capability_health(chat_id)
+    detail = str(args.get("detail") or "summary").lower()
+    if detail in ("visible", "all"):
+        visible = _visible_tool_names(True, chat_id)
+        unavailable = report.get("unavailable_tools") or {}
+        names = sorted(TOOLS if detail == "all" else visible)
+        report["tool_contracts"] = [_tool_contract_row(n, visible, unavailable) for n in names]
+    return report
 
 def tool_read_skeleton(args: dict) -> dict:
     file_path = normalize_path(args.get("path", ""))
@@ -12279,16 +13760,32 @@ def tool_check_syntax(args: dict) -> dict:
 
 
 def tool_run_tests(args: dict) -> dict:
-    command = args.get("command", "")
+    command = str(args.get("command") or "").strip()
     cwd = normalize_path(args.get("cwd", str(ROOT)))
-    
+    if not command:
+        return {"error": "test command required"}
     if not is_in_workspace(cwd):
         return {"error": "CWD is outside workspace bounds."}
-    
-    # Approval gating tests might be needed if they run arbitrary scripts, but typically tests are safe.
-    # We will just run them.
+    threat = bridge_self_threat(command)
+    if threat:
+        return {"error": f"refused: {threat}"}
+    catastrophic = _catastrophic_cmd(command)
+    if catastrophic:
+        return {"error": f"refused: this command {catastrophic}", "catastrophic": True}
+    # Tests execute repository code and can mutate files or launch subprocesses.
+    # Route them through the same approval policy as shell work: soft mode stays
+    # autonomous, while medium/hard modes honor the user's chosen gate.
+    approval = request_approval(
+        title="Run project verification",
+        command=command,
+        details={"kind": "test", "cwd": cwd},
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied test command ({approval.get('status')})"}
     try:
-        res = subprocess.run(shlex.split(command), cwd=cwd, capture_output=True, text=True)
+        res = subprocess.run(shlex.split(command, posix=os.name != "nt"), cwd=cwd,
+                             capture_output=True, text=True, timeout=max(
+                                 1, min(int(args.get("timeout") or 600), 3600)))
         output = res.stdout + "\n" + res.stderr
         
         failures = [
@@ -12307,6 +13804,14 @@ def tool_run_tests(args: dict) -> dict:
             return {"result": summary}
         return {"error": "Tests failed", "details": summary}
         
+    except subprocess.TimeoutExpired as e:
+        def _timeout_text(value) -> str:
+            if isinstance(value, bytes):
+                return value.decode("utf-8", "replace")
+            return str(value or "")
+        return {"error": f"tests timed out after {e.timeout}s",
+                "output_tail": (_timeout_text(e.stdout) + "\n" +
+                                _timeout_text(e.stderr))[-2000:]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -12588,6 +14093,39 @@ def _load_mcp_servers():
 
 TOOLS: dict[str, dict] = {
 
+    "project_map": {
+        "description": (
+            "Map a repository in one deterministic, read-only call: language/file counts, "
+            "top-level layout, manifests and entry paths, tests, largest source files, and "
+            "likely verification commands. Use this FIRST when entering an unfamiliar repo; "
+            "it replaces many blind list/read rounds and leaves more context for reasoning."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Repository root directory."},
+                "max_files": {"type": "integer", "description": "Scan cap, default 15000, max 50000."},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_project_map,
+    },
+    "capability_report": {
+        "description": (
+            "Read-only health inventory of Accuretta's IDE, system-agent, blue-team, red-team, "
+            "sandbox, optional Python packages, and external programs. Use when choosing a workflow "
+            "or after a missing-dependency error; it does not run project or target code."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "detail": {"type": "string", "enum": ["summary", "visible", "all"],
+                           "description": "summary is compact; visible/all include per-tool approval, scope, side-effect, and output contracts."}
+            },
+            "required": [],
+        },
+        "fn": tool_capability_report,
+    },
     "read_skeleton": {
         "description": "Read the skeleton (classes, functions, signatures, docstrings) of a source file.",
         "parameters": {
@@ -12618,6 +14156,39 @@ TOOLS: dict[str, dict] = {
             "required": ["steps"],
         },
         "fn": tool_update_plan,
+    },
+    "record_finding": {
+        "description": (
+            "Create or update a structured red-team, blue-team, code-audit, or system finding. "
+            "The ledger distinguishes candidate/validated/reproduced/mitigated/false-positive states. "
+            "Validated or reproduced claims require a successful source_tool observed by the harness "
+            "or an existing workspace/evidence artifact, which is hashed automatically."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "finding_id": {"type": "string", "description": "Existing finding id to update."},
+                "title": {"type": "string"},
+                "severity": {"type": "string", "enum": ["info", "low", "medium", "high", "critical"]},
+                "status": {"type": "string", "enum": ["candidate", "validated", "reproduced", "mitigated", "false_positive"]},
+                "confidence": {"type": "integer", "description": "0-100."},
+                "target": {"type": "string"},
+                "description": {"type": "string"},
+                "evidence": {"type": "string", "description": "Short exact evidence, not unsupported narrative."},
+                "source_tool": {"type": "string", "description": "Tool that produced the evidence."},
+                "artifact_path": {"type": "string", "description": "Existing workspace or recon-evidence file to hash."},
+            },
+            "required": ["title"],
+        },
+        "fn": tool_record_finding,
+    },
+    "list_findings": {
+        "description": "Read the current session's structured evidence/finding ledger, optionally filtered by status.",
+        "parameters": {
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+        },
+        "fn": tool_list_findings,
     },
     "pin_note": {
         "description": "Pin a fact, decision, or fix to THIS session so it stays in context permanently and is never trimmed. Use it the moment you fix a bug (record the root cause + the fix), make a design decision, or the user states a constraint — so you never undo it or repeat the mistake.",
@@ -12655,7 +14226,8 @@ TOOLS: dict[str, dict] = {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Test command to execute."},
-                "cwd": {"type": "string", "description": "Directory to run tests in."}
+                "cwd": {"type": "string", "description": "Directory to run tests in."},
+                "timeout": {"type": "integer", "description": "Timeout seconds, default 600, max 3600."}
             },
             "required": ["command"],
         },
@@ -13027,7 +14599,11 @@ TOOLS: dict[str, dict] = {
         "fn": tool_recon_capture_evidence,
     },
     "check_deps": {
-        "description": "Check dependency manifests against OSV.dev vulnerabilities. No approval needed.",
+        "description": (
+            "Check exact resolved dependency versions against OSV.dev. Prefers npm/Python/Cargo "
+            "lockfiles; version ranges are reported as unresolved instead of being guessed as installed "
+            "versions. Read-only; requires internet access to OSV."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -13279,12 +14855,16 @@ TOOLS: dict[str, dict] = {
             "connections (with owning process names), UDP listeners, top remote "
             "destinations, and the recent DNS resolver cache. No admin required, "
             "no install. Use to spot weird traffic — unknown processes phoning "
-            "home, unexpected open ports, suspicious resolved domains. Windows-only "
-            "for now. Each call requires user approval."
+            "home, unexpected open ports, suspicious resolved domains. Can save a "
+            "named local baseline and compare a later snapshot for drift. Windows-only "
+            "for now. Each capture requires user approval."
         ),
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "save_baseline": {"type": "string", "description": "Optional short baseline name to save this snapshot under."},
+                "compare_baseline": {"type": "string", "description": "Optional prior baseline name; returns added/removed connections, listeners, DNS entries, and processes."},
+            },
         },
         "fn": tool_network_snapshot,
     },
@@ -14058,7 +15638,7 @@ _ANALYSIS_TOOL_NAMES = {
     "recon_content_discovery", "recon_check_exposure", "recon_subdomain_takeover",
     "recon_cve_match", "recon_injection_probe", "recon_open_services",
     "recon_auth_spray", "recon_capture_evidence",
-    "read_skeleton", "check_syntax", "run_tests",
+    "project_map", "read_skeleton", "check_syntax", "run_tests",
     # git diffs and logs are bulky-by-design too — the model needs to read the
     # whole patch to write a sane commit message or to verify a push payload.
     "git_diff", "git_log", "git_show", "git_status",
@@ -14355,6 +15935,13 @@ _RT_RECON_TOOL_NAMES = {
 # _active_tools, mission-target detection at tool-result time) key off this
 # union; the split above only drives per-phase gating.
 _RED_TEAM_TOOL_NAMES = _RT_RECON_TOOL_NAMES | _RT_EXPLOIT_TOOL_NAMES
+_RT_SCOPE_AWARE_GENERIC_TOOLS = {"web_fetch", "audit_http_headers"}
+_RT_SCOPE_AWARE_COMMAND_TOOLS = {
+    "run_powershell": "command",
+    "session_start": "command",
+    "session_send": "input",
+    "sandbox_run": "command",
+}
 
 # Reverse-engineering / forensics / firmware analysis suite — gated behind
 # `analysis_tools_enabled` so a normal coding turn doesn't carry the schema
@@ -14389,10 +15976,10 @@ _CORE_TOOL_NAMES = {
     # file / workspace (always needed)
     "read_file", "write_file", "edit_file", "delete_file", "list_directory",
     "find_files", "grep_files", "read_bytes", "file_inspect", "extract_archive",
-    "read_skeleton", "replace_ast_node", "find_references", "find_symbol",
+    "project_map", "capability_report", "read_skeleton", "replace_ast_node", "find_references", "find_symbol",
     "check_syntax", "run_tests", "check_deps", "run_powershell", "open_program",
     # planning / memory / probe
-    "update_plan", "pin_note", "unpin_note", "remember", "forget", "edit_memory",
+    "update_plan", "record_finding", "list_findings", "pin_note", "unpin_note", "remember", "forget", "edit_memory",
     "list_more_tools", "compact_history",
     # web
     "web_search", "web_image_search", "web_fetch",
@@ -14406,10 +15993,33 @@ _CORE_TOOL_NAMES = {
     # git essentials (the rest of git lives in the "git" bundle)
     "git_status", "git_diff", "git_log", "git_branch",
 }
+_SMALL_CTX_CORE_TOOL_NAMES = {
+    # The irreducible coding loop. On <=16K windows the former 44-tool core
+    # consumed most of the context before the first user token arrived.
+    "project_map", "capability_report", "read_file", "write_file", "edit_file", "list_directory",
+    "find_files", "grep_files", "check_syntax", "run_tests", "run_powershell",
+    "update_plan", "record_finding", "list_findings", "pin_note", "unpin_note", "list_more_tools",
+    "compact_history", "git_status", "git_diff",
+}
+_TINY_CTX_CORE_TOOL_NAMES = {
+    "project_map", "read_file", "write_file", "edit_file", "list_directory",
+    "grep_files", "check_syntax", "run_powershell", "update_plan",
+    "list_more_tools", "compact_history",
+}
 # None = dynamic (all TOOLS keys with the given prefix, resolved at call time).
 _TOOL_BUNDLES: dict[str, set[str] | None] = {
+    "workspace-extra": {
+        "delete_file", "read_bytes", "file_inspect", "extract_archive",
+        "read_skeleton", "replace_ast_node", "find_references", "find_symbol",
+        "find_files", "check_deps", "run_tests", "open_program",
+    },
+    "web": {"web_search", "web_image_search", "web_fetch", "audit_http_headers"},
+    "memory": {"remember", "forget", "edit_memory", "pin_note", "unpin_note"},
+    "sessions": {"session_start", "session_send", "session_read", "session_stop", "session_list"},
+    "host": {"network_snapshot", "parse_event_logs", "persistence_hunt"},
     "git": {
-        "git_show", "git_remote", "git_add", "git_commit", "git_push",
+        "git_status", "git_diff", "git_log", "git_branch", "git_show", "git_remote",
+        "git_add", "git_commit", "git_push",
         "git_pull", "git_fetch", "git_checkout", "git_restore", "git_reset",
         "git_init", "git_clone",
     },
@@ -14422,6 +16032,19 @@ _TOOL_BUNDLES: dict[str, set[str] | None] = {
 }
 _TOOL_BUNDLE_LOCK = threading.Lock()
 _unlocked_bundles_by_chat: dict[str, set[str]] = {}
+
+
+def _base_core_tool_names() -> set[str]:
+    """Choose a schema core that leaves actual room for the conversation."""
+    try:
+        ctx = _llama_props_ctx() or int(get_settings().get("num_ctx") or 32768)
+    except Exception:
+        ctx = 32768
+    if ctx <= 8192:
+        return _TINY_CTX_CORE_TOOL_NAMES
+    if ctx <= 16384:
+        return _SMALL_CTX_CORE_TOOL_NAMES
+    return _CORE_TOOL_NAMES
 
 
 def _unlock_bundle(chat_id: str, bundle: str) -> bool:
@@ -14441,7 +16064,34 @@ def _unlock_bundle(chat_id: str, bundle: str) -> bool:
     return True
 
 
-def _excluded_tools(include_exploit: bool = True) -> set[str]:
+def _unavailable_runtime_tools() -> dict[str, str]:
+    """Strict dependency failures that would make a tool fail every call."""
+    missing: dict[str, str] = {}
+    if not _HAVE_PYAUTOGUI or not _HAVE_PIL:
+        for n in ("screenshot", "describe_screen", "desktop_click",
+                  "desktop_type_text", "desktop_press_keys", "desktop_launch_app"):
+            missing[n] = "desktop automation requires pyautogui and Pillow"
+    if not _HAVE_PGW:
+        for n in ("list_windows", "desktop_focus_window", "desktop_close_window"):
+            missing[n] = "window control requires pygetwindow"
+    if not _HAVE_SQUASHFS:
+        missing["extract_squashfs"] = "requires PySquashfsImage"
+    if not _HAVE_CAPSTONE:
+        missing["disasm_at"] = "requires capstone"
+    if not _resolve_jadx_bin():
+        missing["decompile_apk"] = "requires JADX"
+    if not _HAVE_PYGHIDRA:
+        missing["ghidra_analyze"] = "requires pyghidra and Ghidra/JDK"
+    if not _HAVE_YARA:
+        missing["yara_scan"] = "requires yara-python"
+    if not (_HAVE_EVTX_RUST or _HAVE_EVTX_PY):
+        missing["parse_evtx"] = "requires evtx or python-evtx"
+    if not _HAVE_DPKT:
+        missing["analyze_pcap"] = "requires dpkt"
+    return missing
+
+
+def _excluded_tools(include_exploit: bool = True, chat_id: str = "") -> set[str]:
     """The tool names hidden by CURRENT settings — the single source of truth
     for both _active_tools and the lazy-bundle visibility filter, so the two
     can never drift apart."""
@@ -14451,14 +16101,29 @@ def _excluded_tools(include_exploit: bool = True) -> set[str]:
         excluded |= _DESKTOP_TOOL_NAMES
     if not s.get("red_team_enabled"):
         excluded |= _RED_TEAM_TOOL_NAMES
-    elif not include_exploit:
-        excluded |= _RT_EXPLOIT_TOOL_NAMES
+    else:
+        chat = None
+        if chat_id:
+            try:
+                chat = (get_chats().get("chats", {}) or {}).get(chat_id)
+            except Exception:
+                chat = None
+        # The global toggle makes the capability available; a fresh per-chat
+        # UI authorization record makes the red-team schemas visible.
+        if not _rt_authorized_mission(chat):
+            excluded |= _RED_TEAM_TOOL_NAMES
+        elif not include_exploit:
+            excluded |= _RT_EXPLOIT_TOOL_NAMES
     if not s.get("analysis_tools_enabled"):
         excluded |= _ANALYSIS_SUITE_TOOL_NAMES
     # The sandbox tool is only useful once the guest is provisioned; don't pay
     # its token cost (or tempt the model to call it) before then.
     if not _sandbox_ready_cached():
         excluded.add("sandbox_run")
+    # Do not spend scarce context advertising tools which are guaranteed to
+    # fail on this machine. capability_report remains visible and explains
+    # exactly what is missing and how to restore the capability.
+    excluded |= set(_unavailable_runtime_tools())
     return excluded
 
 
@@ -14466,9 +16131,24 @@ def _visible_tool_names(include_exploit: bool = True, chat_id: str = "") -> set[
     """Core + this chat's unlocked bundles, minus settings-gated tools and any
     name that isn't actually registered (MCP tools disappear when their server
     dies between unlock and request)."""
-    excluded = _excluded_tools(include_exploit)
-    visible: set[str] = set(_CORE_TOOL_NAMES)
+    excluded = _excluded_tools(include_exploit, chat_id)
+    visible: set[str] = set(_base_core_tool_names())
+    active_rt = False
     if chat_id:
+        try:
+            _chat = (get_chats().get("chats", {}) or {}).get(chat_id)
+        except Exception:
+            _chat = None
+        # An authorized gate launch is itself the user's request to use the
+        # suite. Auto-load recon for that mission; unlock exploit schemas when
+        # the phase gate opens. Requiring a small model to discover and call a
+        # separate bundle-loader before following the one-click workflow made
+        # the supposedly autonomous path unreliable.
+        active_rt = bool(_rt_authorized_mission(_chat))
+        if active_rt:
+            visible |= _RT_RECON_TOOL_NAMES
+            if include_exploit:
+                visible |= _RT_EXPLOIT_TOOL_NAMES
         for b in _unlocked_bundles_by_chat.get(chat_id, ()):
             btools = _TOOL_BUNDLES.get(b)
             if btools is None:
@@ -14476,6 +16156,9 @@ def _visible_tool_names(include_exploit: bool = True, chat_id: str = "") -> set[
                     visible |= {n for n in TOOLS if n.startswith("mcp_")}
                 continue
             visible |= btools
+    if active_rt:
+        visible -= _DESKTOP_TOOL_NAMES
+        visible = {n for n in visible if not n.startswith("mcp_")}
     return {n for n in visible if n in TOOLS and n not in excluded}
 
 
@@ -14485,7 +16168,7 @@ def tool_list_more_tools(args: dict) -> dict:
     tool list for the rest of this chat."""
     chat_id = _get_current_chat()
     bundle = str(args.get("bundle") or "").strip().lower()
-    excluded = _excluded_tools(True)
+    excluded = _excluded_tools(True, chat_id)
     enabled: dict[str, list[str]] = {}
     for bname, btools in _TOOL_BUNDLES.items():
         if btools is None:
@@ -14501,7 +16184,7 @@ def tool_list_more_tools(args: dict) -> dict:
         loaded = set(_unlocked_bundles_by_chat.get(chat_id, ()))
         return {
             "note": "Call again with a bundle name (e.g. {\"bundle\": \"git\"}) to inspect its tools and load it into this chat's schema.",
-            "core": sorted(n for n in _CORE_TOOL_NAMES if n in TOOLS and n not in excluded),
+            "core": sorted(n for n in _base_core_tool_names() if n in TOOLS and n not in excluded),
             "bundles": {b: {"tools": names, "loaded": b in loaded}
                         for b, names in enabled.items()},
         }
@@ -14526,10 +16209,11 @@ TOOLS["list_more_tools"] = {
         "arguments to list all available bundles and which are already loaded; call "
         "with a bundle name to inspect that bundle's tools and load it into the schema "
         "for this chat (its tools then work directly). Use it when the task needs a "
-        "specialized tool you don't see: git history/write ops, desktop automation, "
+        "specialized tool you don't see: workspace/code intelligence, web, memory, "
+        "interactive sessions, host triage, git history/write ops, desktop automation, "
         "analysis/forensics, red-team recon/exploit, the sandbox, or MCP servers. "
-        "Core tools (file I/O, grep, run_powershell, sessions, web, memory, plan, "
-        "list_more_tools itself) are always available without loading."
+        "On small context windows the core is intentionally lean; load only the bundle "
+        "the current task needs so schemas do not crowd out the actual work."
     ),
     "parameters": {
         "type": "object",
@@ -14566,7 +16250,7 @@ TOOLS["compact_history"] = {
 }
 
 
-def _active_tools(include_exploit: bool = True) -> dict:
+def _active_tools(include_exploit: bool = True, chat_id: str = "") -> dict:
     """Return TOOLS filtered by current settings — desktop tools only show when
     desktop automation is enabled, the red-team recon suite only when red team
     mode is on, and the analysis/forensics suite only when analysis tools are
@@ -14578,7 +16262,7 @@ def _active_tools(include_exploit: bool = True) -> dict:
     phase, so a recon turn stays cheaper. Defaults True so any caller that does
     not thread a phase keeps the full suite (fails open on tokens, never hides a
     tool the model might legitimately reach)."""
-    excluded = _excluded_tools(include_exploit)
+    excluded = _excluded_tools(include_exploit, chat_id)
     if not excluded:
         return TOOLS
     return {k: v for k, v in TOOLS.items() if k not in excluded}
@@ -14596,7 +16280,7 @@ def tools_for_llama(include_exploit: bool = True, chat_id: str | None = None) ->
     chat_id = chat_id or _get_current_chat()
     visible = _visible_tool_names(include_exploit, chat_id)
     out = []
-    for name, t in _active_tools(include_exploit).items():
+    for name, t in _active_tools(include_exploit, chat_id).items():
         if name not in visible:
             continue
         out.append({
@@ -14615,6 +16299,9 @@ def tools_for_llama(include_exploit: bool = True, chat_id: str | None = None) ->
 # them so a single typo doesn't burn an entire tool round on "unknown tool".
 TOOL_ALIASES = {
 
+    "repo_map": "project_map",
+    "repository_map": "project_map",
+    "map_project": "project_map",
     "skeleton": "read_skeleton",
     "ast": "read_skeleton",
     "syntax": "check_syntax",
@@ -14879,6 +16566,47 @@ _WRITE_CAPABLE_TOOLS = frozenset(
     {"write_file", "edit_file", "delete_file", "replace_ast_node"})
 
 
+def _verification_key(path: Any) -> str:
+    try:
+        return os.path.normcase(os.path.normpath(str(path or "").strip()))
+    except Exception:
+        return str(path or "").strip().lower()
+
+
+def _update_verification_debt(debt: list[dict], name: str, args: dict,
+                              result: Any) -> tuple[list[dict], bool]:
+    """Track changed paths until the harness observes a relevant check pass.
+
+    This is deliberately evidence based: prose such as "looks good" cannot
+    clear the record.  A successful per-file syntax check clears that path; a
+    successful project test command clears the remaining workspace edit debt.
+    """
+    current = [dict(x) for x in (debt or []) if isinstance(x, dict) and x.get("path")]
+    canon = _resolve_tool_name(name)
+    ok = not (isinstance(result, dict) and (
+        result.get("error") or result.get("ok") is False
+        or result.get("exit_code") not in (None, 0)
+    ))
+    if not ok:
+        return current[-20:], False
+    before = json.dumps(current, sort_keys=True, default=str)
+    if canon in _WRITE_CAPABLE_TOOLS:
+        path = str((result.get("path") if isinstance(result, dict) else "")
+                   or (args or {}).get("path") or "").strip()
+        if path:
+            key = _verification_key(path)
+            current = [x for x in current if _verification_key(x.get("path")) != key]
+            current.append({"path": path[:300], "via": canon, "since": int(time.time())})
+    elif canon == "check_syntax":
+        key = _verification_key((args or {}).get("path"))
+        if key:
+            current = [x for x in current if _verification_key(x.get("path")) != key]
+    elif canon == "run_tests":
+        current = []
+    current = current[-20:]
+    return current, before != json.dumps(current, sort_keys=True, default=str)
+
+
 # Tools that persist to shared stores (chats.json, memories) via read-modify-
 # write. Under parallel execution two of these in one batch would each load
 # stale state and drop the other's update (e.g. pin_note + update_plan in the
@@ -14886,6 +16614,105 @@ _WRITE_CAPABLE_TOOLS = frozenset(
 _CHAT_STATE_TOOLS = frozenset(
     {"pin_note", "unpin_note", "update_plan", "remember", "forget",
      "edit_memory", "compact_history"})
+
+
+# Durable, content-minimised provenance for actions that can change files,
+# processes, applications, repositories, or external targets.  Arguments and
+# outputs are represented by hashes; commands, typed text, prompt content, and
+# tool output are never copied into the audit log.
+_ACTION_AUDIT_LOCK = threading.Lock()
+_ACTION_AUDIT_ALWAYS = frozenset({
+    "run_powershell", "session_start", "session_send", "session_stop",
+    "open_program", "network_snapshot", "parse_event_logs",
+    "hunt_persistence", "git_init", "git_clone", "git_add", "git_commit",
+    "git_checkout", "git_branch", "git_merge", "git_pull", "git_push",
+    "git_stash", "git_restore", "git_clean",
+})
+
+
+def _is_audited_action_tool(name: str) -> bool:
+    return bool(
+        name in _WRITE_CAPABLE_TOOLS
+        or name in _DESKTOP_TOOL_NAMES
+        or name in _ACTION_AUDIT_ALWAYS
+        or name.startswith(("sandbox_", "recon_", "rt_", "mcp_"))
+    )
+
+
+def _action_audit_target(args: dict) -> str:
+    """Return a useful target without query strings, credentials, or content."""
+    if not isinstance(args, dict):
+        return ""
+    for key in ("path", "dest", "target", "host", "domain", "url", "session_id"):
+        raw = str(args.get(key) or "").strip()
+        if not raw:
+            continue
+        if "://" in raw:
+            try:
+                u = urllib.parse.urlsplit(raw)
+                host = u.hostname or ""
+                port = f":{u.port}" if u.port else ""
+                return f"{u.scheme}://{host}{port}{u.path}"[:240]
+            except Exception:
+                return "[url]"
+        return re.sub(r"\s+", " ", raw)[:240]
+    return ""
+
+
+def _record_action_audit(name: str, args: dict, result: Any) -> None:
+    """Append a bounded local action record. Logging must never block work."""
+    if not _is_audited_action_tool(name):
+        return
+    try:
+        encoded_args = json.dumps(args or {}, sort_keys=True, ensure_ascii=False,
+                                  default=str).encode("utf-8", errors="replace")
+        encoded_result = json.dumps(result, sort_keys=True, ensure_ascii=False,
+                                    default=str).encode("utf-8", errors="replace")
+        status = "ok"
+        if isinstance(result, dict):
+            if result.get("scope_blocked"):
+                status = "scope_blocked"
+            elif result.get("loop_breaker"):
+                status = "loop_blocked"
+            elif result.get("error"):
+                status = "error"
+            elif result.get("ok") is False:
+                status = "failed"
+            elif result.get("exit_code") not in (None, 0):
+                status = f"exit_{result.get('exit_code')}"
+        chat_id = _current_chat_id.get() or _get_current_chat() or ""
+        entry = {
+            "t": int(time.time()),
+            "chat_id": chat_id,
+            "tool": name,
+            "status": status,
+            "target": _action_audit_target(args or {}),
+            "args_sha256": hashlib.sha256(encoded_args).hexdigest(),
+            "result_sha256": hashlib.sha256(encoded_result).hexdigest(),
+        }
+        try:
+            chat = ((get_chats().get("chats", {}) or {}).get(chat_id)
+                    if chat_id else None)
+            mission = chat.get("mission") if isinstance(chat, dict) else None
+            if isinstance(mission, dict) and mission.get("authorization_id"):
+                entry["authorization_id"] = str(mission["authorization_id"])[:100]
+                entry["phase"] = str(mission.get("phase") or "")[:30]
+        except Exception:
+            pass
+        DATA.mkdir(parents=True, exist_ok=True)
+        with _ACTION_AUDIT_LOCK:
+            with open(ACTION_AUDIT_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            try:
+                with open(ACTION_AUDIT_FILE, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                if len(lines) > ACTION_AUDIT_MAX + 300:
+                    with open(ACTION_AUDIT_FILE, "w", encoding="utf-8") as f:
+                        f.writelines(lines[-ACTION_AUDIT_MAX:])
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def _call_write_target(call: dict) -> str:
@@ -14987,13 +16814,63 @@ def invoke_tool(name: str, args: dict) -> dict:
     if not t:
         # Surface the available names so a repair-retry round can fix a typo.
         return {"error": f"unknown tool: {name}", "available": sorted(TOOLS.keys())}
+    def _finish(result: dict) -> dict:
+        if (canon in _DESKTOP_TOOL_NAMES
+                and canon not in ("screenshot", "describe_screen", "list_windows")
+                and isinstance(result, dict) and not result.get("error")
+                and result.get("ok") is not False):
+            result.setdefault("post_state", _desktop_post_state())
+        _record_action_audit(canon, args or {}, result)
+        return result
     # HARD scope guard for red-team tools: refuse accuretta's own bridge/llama
     # ports and any user-declared out-of-scope host/port BEFORE running. The
     # model's judgement is advisory; this is not.
     if canon in _RED_TEAM_TOOL_NAMES:
         _blk = _rt_scope_block(canon, args or {})
         if _blk:
-            return {"error": _blk, "scope_blocked": True, "tool": canon}
+            return _finish({"error": _blk, "scope_blocked": True, "tool": canon})
+    elif canon in _RT_SCOPE_AWARE_GENERIC_TOOLS:
+        # Generic fetch/header tools are useful outside red-team work and stay
+        # ungated there. During an active engagement they must obey the same
+        # host allowlist, otherwise the model could bypass the questionnaire
+        # simply by choosing a non-red-team HTTP primitive.
+        try:
+            _cid = _current_chat_id.get() or _get_current_chat() or ""
+            _chat = ((get_chats().get("chats", {}) or {}).get(_cid)
+                     if _cid else None)
+        except Exception:
+            _chat = None
+        if _rt_authorized_mission(_chat):
+            _blk = _rt_scope_block(canon, args or {})
+            if _blk:
+                return _finish({"error": _blk, "scope_blocked": True, "tool": canon})
+    elif canon in _RT_SCOPE_AWARE_COMMAND_TOOLS:
+        try:
+            _cid = _current_chat_id.get() or _get_current_chat() or ""
+            _chat = ((get_chats().get("chats", {}) or {}).get(_cid)
+                     if _cid else None)
+        except Exception:
+            _chat = None
+        if _rt_authorized_mission(_chat):
+            _cmd = str((args or {}).get(_RT_SCOPE_AWARE_COMMAND_TOOLS[canon]) or "")
+            _blk = _rt_command_scope_block(_cmd, _chat)
+            if _blk:
+                return _finish({"error": _blk, "scope_blocked": True, "tool": canon})
+    elif canon.startswith("mcp_") or canon in _DESKTOP_TOOL_NAMES:
+        try:
+            _cid = _current_chat_id.get() or _get_current_chat() or ""
+            _chat = ((get_chats().get("chats", {}) or {}).get(_cid)
+                     if _cid else None)
+        except Exception:
+            _chat = None
+        if _rt_authorized_mission(_chat):
+            return _finish({
+                "error": ("refused: untyped MCP/desktop automation is unavailable during an active "
+                          "red-team mission because the harness cannot prove its network scope. Use "
+                          "the typed scope-aware red-team tools instead."),
+                "scope_blocked": True,
+                "tool": canon,
+            })
     # Loop-breaker (result-aware). Refuse only when the SAME call has returned the
     # SAME result TOOL_REPEAT_LIMIT times running — genuinely stuck, nothing
     # moving. A changed result resets the streak (see _record_tool_result), so a
@@ -15014,7 +16891,7 @@ def invoke_tool(name: str, args: dict) -> dict:
             suggestions.append("if you need a deeper level, pass the subdirectory as `path`")
         suggestion_blob = (". " + "; ".join(suggestions)) if suggestions else ""
         reason = ("returned the SAME result" if stuck else "been called")
-        return {
+        return _finish({
             "error": (
                 f"refused: {canon} has {reason} {n} times this turn with the SAME "
                 f"arguments and nothing changed. Repeating won't help — change the "
@@ -15025,14 +16902,14 @@ def invoke_tool(name: str, args: dict) -> dict:
             "repeat_count": n,
             "tool": canon,
             "loop_breaker": True,
-        }
+        })
     try:
         result = t["fn"](args or {})
     except Exception as e:
         traceback.print_exc()
         result = {"error": str(e)}
     _record_tool_result(sig, result)
-    return result
+    return _finish(result)
 
 
 # ---- tool-call parsing (fallback for models w/o native tools) -------------
@@ -15167,10 +17044,17 @@ TOOL_CALL_SELFCLOSING_RE = re.compile(
 # calls "silently failed" before (nothing parsed it, so it leaked to chat).
 TOOL_CALL_TOOLCODE_RE = re.compile(r"```(?:tool_code|python)\s*\n?([\s\S]*?)```",
                                    re.IGNORECASE)
-# A bare/bracketed single python call: name(...) or [name(...)]. Non-greedy to
-# the first ")", so calls with a ")" inside a string arg are only caught by the
-# fenced form above — acceptable, since Gemma emits the fence for real calls.
-TOOL_CALL_PYFUNC_RE = re.compile(r"\[?\s*([a-zA-Z_]\w*)\s*\(([^()]*)\)\s*\]?")
+# A bare/bracketed single python call: name(...) or [name(...)]. MUST be its
+# own line — an unanchored match grabs prose parentheticals ("without using
+# update_plan (this is one-step)") and turns MODEL NARRATION into a phantom
+# tool call that errors, derails the round, and poisons the conversation.
+# Mis-parse risk is asymmetric: a prose false-negative is harmless (the
+# fenced ```tool_code``` form and the XML dialects still catch real calls),
+# while a prose false-positive breaks the whole turn. Non-greedy to the first
+# ")", so calls with a ")" inside a string arg are only caught by the fenced
+# form above — acceptable, since Gemma emits the fence for real calls.
+TOOL_CALL_PYFUNC_RE = re.compile(
+    r"(?m)^[ \t]*\[?\s*(?:print\s*\(\s*)?([a-zA-Z_]\w*)\s*\(([^()]*)\)\s*\)?\s*\]?[ \t]*(?:\r?\n|$)")
 # Heuristic: model emitted tool-call syntax but no parser matched it.
 # When this fires with zero parsed calls, the reply is almost certainly
 # a hallucination from a chat-template mismatch.
@@ -15205,7 +17089,7 @@ def _parse_python_tool_call(expr: str) -> dict | None:
         name = node.func.attr
     else:
         return None
-    tools = _active_tools()
+    tools = _active_tools(True, _get_current_chat())
     if name not in tools:
         return None
 
@@ -15213,21 +17097,30 @@ def _parse_python_tool_call(expr: str) -> dict | None:
         try:
             return ast.literal_eval(v)
         except Exception:
-            try:
-                return ast.get_source_segment(src, v)
-            except Exception:
-                return None
+            return _FAIL
 
     args: dict = {}
     for kw in node.keywords:
         if kw.arg:
-            args[kw.arg] = _lit(kw.value)
+            val = _lit(kw.value)
+            if val is _FAIL:
+                return None  # non-literal expression — prose, not a call
+            args[kw.arg] = val
     if node.args:
         props = list(tools[name]["parameters"].get("properties", {}).keys())
         for i, a in enumerate(node.args):
+            val = _lit(a)
+            if val is _FAIL:
+                return None  # non-literal expression — prose, not a call
             if i < len(props):
-                args[props[i]] = _lit(a)
+                args[props[i]] = val
     return {"name": name, "arguments": args}
+
+
+# Sentinel: ast.literal_eval failure (BinOp, Name, Call — any non-literal
+# expression). Real tool calls always pass literal values; a "call" with an
+# expression argument is almost certainly prose like "run_grep (in src)".
+_FAIL = object()
 
 # Cyber-range / CTF breach marker. A FLAG{...} captured in a tool response is
 # treated as confirmed access by run_chat_turn's breach detection.
@@ -15444,12 +17337,18 @@ def _find_balanced_json_objects(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def extract_tool_calls(text: str) -> list[dict]:
+def extract_tool_calls(text: str, python_calls: bool = True) -> list[dict]:
     """Parse tool calls from free text. Tries multiple dialects so models
     that weren't fine-tuned on the OpenAI/llama-server schema can still
     drive the agent loop. All paths normalize to {name, arguments}.
     Native tool_calls on the streamed delta still take precedence; this
-    only runs when that field came back empty."""
+    only runs when that field came back empty.
+
+    python_calls=False disables the bare python-call prose scan (case 7b).
+    Native-tools models emit calls as structured deltas, never as bare
+    `name(...)` lines — scanning their prose for "update_plan (...)" only
+    manufactures phantom calls out of narration. The fenced/XML dialects
+    always run: they're unambiguous block syntax, not configurable prose."""
     calls: list[dict] = []
     seen = set()
 
@@ -15571,12 +17470,16 @@ def extract_tool_calls(text: str) -> list[dict]:
 
     # 7b. Gemma / CodeGemma python-style calls: a ```tool_code``` fence, or a
     # bare/bracketed name(...) line. _parse_python_tool_call only accepts calls
-    # that name a real active tool, so incidental python in prose is ignored.
+    # that name a real active tool AND pass only literal arguments, so
+    # incidental python in prose is ignored. Skipped entirely when the caller
+    # says this model speaks native tool deltas — a bare `name(...)` line
+    # there is prose by definition.
     _py_candidates: list[str] = [m.group(1) for m in TOOL_CALL_TOOLCODE_RE.finditer(text)]
-    # scan for bare calls in the text with the fenced regions blanked out so we
-    # don't double-count what the fence already captured.
-    _defenced = TOOL_CALL_TOOLCODE_RE.sub(" ", text)
-    _py_candidates += [m.group(0) for m in TOOL_CALL_PYFUNC_RE.finditer(_defenced)]
+    if python_calls:
+        # scan for bare calls in the text with the fenced regions blanked out
+        # so we don't double-count what the fence already captured.
+        _defenced = TOOL_CALL_TOOLCODE_RE.sub(" ", text)
+        _py_candidates += [m.group(0) for m in TOOL_CALL_PYFUNC_RE.finditer(_defenced)]
     for _cand in _py_candidates:
         parsed = _parse_python_tool_call(_cand.strip().strip("[]").strip())
         if parsed:
@@ -15692,6 +17595,25 @@ def llama_post(path: str, payload: dict, base: str | None = None, timeout: float
 # Cache /props readings — the value never changes for a running server,
 # and we'd rather not hit it every turn just to read n_ctx_slot.
 _LLAMA_PROPS_CTX_CACHE: tuple[str, int] | None = None  # (base, ctx)
+_LLAMA_PROPS_DATA_CACHE: tuple[str, dict] | None = None
+_REASONING_CAP_CACHE: dict[tuple, dict] = {}
+
+
+def _llama_props_data() -> dict:
+    """Return a cached /props snapshot for the currently running server."""
+    global _LLAMA_PROPS_DATA_CACHE
+    base = LLAMA
+    if _LLAMA_PROPS_DATA_CACHE and _LLAMA_PROPS_DATA_CACHE[0] == base:
+        return _LLAMA_PROPS_DATA_CACHE[1]
+    try:
+        with urllib.request.urlopen(f"{base}/props", timeout=2) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if isinstance(data, dict):
+            _LLAMA_PROPS_DATA_CACHE = (base, data)
+            return data
+    except Exception:
+        pass
+    return {}
 
 def _llama_props_ctx() -> int | None:
     """Return the llama-server's actual slot context size, or None if we
@@ -15701,8 +17623,7 @@ def _llama_props_ctx() -> int | None:
     if _LLAMA_PROPS_CTX_CACHE and _LLAMA_PROPS_CTX_CACHE[0] == base:
         return _LLAMA_PROPS_CTX_CACHE[1]
     try:
-        with urllib.request.urlopen(f"{base}/props", timeout=2) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        data = _llama_props_data()
         # llama-server exposes the slot ctx under default_generation_settings
         # as `n_ctx`, and at the top level as `n_ctx`. Try a few keys.
         ctx = (
@@ -15720,8 +17641,10 @@ def _llama_props_ctx() -> int | None:
 
 def _llama_props_ctx_invalidate() -> None:
     """Call after stopping/restarting llama-server so the next turn re-polls."""
-    global _LLAMA_PROPS_CTX_CACHE, _TOOLS_OVERHEAD_CACHE, _RT_TRAIL_SYS_CACHE
+    global _LLAMA_PROPS_CTX_CACHE, _LLAMA_PROPS_DATA_CACHE, _TOOLS_OVERHEAD_CACHE, _RT_TRAIL_SYS_CACHE
     _LLAMA_PROPS_CTX_CACHE = None
+    _LLAMA_PROPS_DATA_CACHE = None
+    _REASONING_CAP_CACHE.clear()
     _TOOLS_OVERHEAD_CACHE = ("", 0)
     _RT_TRAIL_SYS_CACHE = None
 
@@ -15834,7 +17757,9 @@ def _estimate_context_tokens(chat_id: str, chat: dict | None = None) -> int:
     last_len = len(str(msgs[-1].get("content", ""))) if msgs else 0
     fp = (len(msgs), last_len, int(chat.get("summary_through", 0) or 0),
           len(chat.get("rolling_summary", "")),
-          len(chat.get("pins") or []), len(str(chat.get("mission") or "")))
+          len(chat.get("pins") or []), len(str(chat.get("mission") or "")),
+          len(str(chat.get("task_anchor") or "")), len(str(chat.get("plan") or "")),
+          len(str(chat.get("activity") or "")))
     cached = _CTX_EST_CACHE.get(chat_id)
     if cached and cached[0] == fp:
         return cached[1]
@@ -15857,6 +17782,12 @@ def _estimate_context_tokens(chat_id: str, chat: dict | None = None) -> int:
     img_count = 0
     start = int(chat.get("summary_through", 0) or 0)
     stub_cutoff = len(msgs) - _TOOL_RESULT_KEEP_RECENT
+    # Normal rolling-summary mode keeps full tool evidence until compaction.
+    # Age stubs remain the bounded-memory fallback when summarization is off.
+    try:
+        _stub_old_tools = not bool(get_settings().get("summarize_history", True))
+    except Exception:
+        _stub_old_tools = False
     for i, m in enumerate(msgs[start:], start=start):
         if m.get("role") not in ("user", "assistant", "tool"):
             continue
@@ -15864,7 +17795,8 @@ def _estimate_context_tokens(chat_id: str, chat: dict | None = None) -> int:
         # Stub-aware estimate: old tool results are elided in the outgoing
         # payload, so count the stub, not the full stored content — otherwise
         # the estimate (and gauge/trigger) read ~2x what llama actually gets.
-        if m.get("role") == "tool" and i < stub_cutoff and isinstance(content, str):
+        if (_stub_old_tools and m.get("role") == "tool" and i < stub_cutoff
+                and isinstance(content, str)):
             parts.append("[output elided — tool result from earlier in the session]")
             continue
         if isinstance(content, list):
@@ -15884,7 +17816,7 @@ def _estimate_context_tokens(chat_id: str, chat: dict | None = None) -> int:
     # the end here. Position barely moves the token count, but this keeps the
     # estimate structurally honest about what gets sent.
     try:
-        if get_settings().get("rt_mission_state", True):
+        if get_settings().get("rt_mission_state", True) and _rt_authorized_mission(chat):
             _m = _rt_mission_render(chat)
             if _m:
                 parts.append(_m)
@@ -15892,13 +17824,21 @@ def _estimate_context_tokens(chat_id: str, chat: dict | None = None) -> int:
         pass
     for p in (chat.get("pins") or []):
         parts.append(str(p))
+    anchor = chat.get("task_anchor") or {}
+    if isinstance(anchor, dict):
+        parts.extend(str(anchor.get(k) or "") for k in ("original", "current"))
+    for p in (chat.get("plan") or []):
+        if isinstance(p, dict):
+            parts.append(f"{p.get('status', 'pending')}: {p.get('title', '')}")
+    if chat.get("rolling_summary"):
+        parts.append(_render_activity_tail(chat.get("activity") or []))
 
     joined = "\n".join(parts)
     exact = _llama_tokenize(joined)
     total = exact if exact is not None else int(len(joined) / CHARS_PER_TOKEN)
     try:
         total += _tools_spec_overhead_tokens(json.dumps(
-            tools_for_llama(_rt_incl_exploit_for(chat, get_settings())), ensure_ascii=False))
+            tools_for_llama(_rt_incl_exploit_for(chat, get_settings()), chat_id), ensure_ascii=False))
     except Exception:
         pass
     total += img_count * 600  # vision tokens, matching _count_msg_tokens
@@ -16196,7 +18136,7 @@ you may occasionally append exactly one of these to the absolute end of your res
             # full suite either — same ~40-token-set core as native mode.
             visible = _visible_tool_names(True, _get_current_chat())
             tool_lines = ["tools:"]
-            for name, t in _active_tools().items():
+            for name, t in _active_tools(True, _get_current_chat()).items():
                 if name not in visible:
                     continue
                 params = t["parameters"].get("properties", {})
@@ -16210,14 +18150,23 @@ you may occasionally append exactly one of these to the absolute end of your res
         parts.append(
             "task plan: for a multi-step request (roughly 3+ distinct steps), call update_plan ONCE up front "
             "with the whole checklist, mark the step you're on 'active', and flip each to 'done' as you finish it. "
-            "Skip it for simple one-step asks. It is a UI signal only — do not narrate it in your reply."
+            "Skip it for simple one-step asks. The harness keeps this checklist in long-run context; do not "
+            "duplicate or narrate it in your reply. When entering an unfamiliar repository, call project_map "
+            "once before opening files blindly."
         )
         # CTF-tuned red-team models (e.g. RavenX-CyberAgent) narrate CTF framing
         # from training priors — "0/3 flags captured", "objective: 3 flags" —
         # even against a real target with nothing to find. Kill it: real
         # engagements have no flag count. A FLAG{...} matters only if a tool
         # result literally contains that string.
-        if settings.get("red_team_enabled"):
+        try:
+            _bp_cid = _get_current_chat()
+            _bp_chat = ((get_chats().get("chats", {}) or {}).get(_bp_cid)
+                        if _bp_cid else None)
+            _bp_rt_active = bool(_rt_authorized_mission(_bp_chat))
+        except Exception:
+            _bp_rt_active = False
+        if settings.get("red_team_enabled") and _bp_rt_active:
             parts.append(
                 "red-team note: real engagements are NOT CTFs. never report a flag "
                 "count or progress like \"N/3\"/\"X of Y flags\"; never assume a "
@@ -16425,7 +18374,7 @@ def _looks_unfinished(text: str, finish_reason: str = None) -> bool:
 
 
 def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
-                  native_tools: bool = True):
+                  native_tools: bool = True, reasoning_effort: str = "auto"):
     """
     messages: list of {role, content, [tool_calls], [tool_call_id]}
     emit(event_dict): pushes a chunk to the caller (SSE producer).
@@ -16443,9 +18392,32 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
     if not model:
         emit({"type": "error", "error": "no model selected. Pick one in Settings."})
         return None
+    requested_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    reasoning_capability = _reasoning_capability(
+        _llama.loaded_model() or settings.get("model_path") or model, settings)
 
-    _chat_emitters[chat_id] = emit
     cancel_ev = _register_cancel(chat_id)
+    if cancel_ev is None:
+        emit({"type": "error", "error": "this session already has a turn running; wait for it to finish or stop it first"})
+        return None
+    _turn_id = _turn_journal_begin(chat_id)
+    # Passive model telemetry must count failures as well as successes.  The
+    # old success-only write path made every model look 100% reliable because
+    # timeouts, disconnects, and exhausted recovery paths simply vanished from
+    # the denominator.  Initialise the counters before any request can return;
+    # the finally block records an incomplete observation unless the normal
+    # final-message path already committed one.
+    turn_started_at = time.time()
+    turn_prompt_total = 0
+    turn_eval_total = 0
+    turn_peak_prompt = 0
+    rounds = 0
+    turn_tool_calls = 0
+    turn_tool_errors = 0
+    _profile_recorded = False
+    _chat_emitters[chat_id] = emit
+    with _chat_live_activity_lock:
+        _chat_live_activity[chat_id] = []
     # Fresh tool-call history for this turn. invoke_tool trips the loop-breaker
     # only when the same call returns the SAME result TOOL_REPEAT_LIMIT times in a
     # row — see _record_tool_result / _tool_repeat_state for the logic. Keyed by
@@ -16502,16 +18474,36 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         # is enabled. Pins are snapshotted alongside: both ride as a TAIL message
         # (below) instead of a system-prompt splice, so llama.cpp's cached prompt
         # prefix stays byte-identical when they change mid-session.
-        _rt_on = bool(settings.get("red_team_enabled") and settings.get("rt_mission_state", True))
+        _rt_on = False
         _rt_chat: dict = {}
         _rt_dirty = False
         _pins_tail: list = []
+        _plan_tail: list[dict] = []
+        _activity_tail: list[dict] = []
+        _activity_dirty = False
+        _task_state: dict = {}
+        _continuity_state: dict = {}
+        _findings_tail: list[dict] = []
+        _verification_debt: list[dict] = []
+        _verification_dirty = False
         _roll_active = False
         try:
             _c0 = get_chats().get("chats", {}).get(chat_id) or {}
             if settings.get("rt_mission_state", True) and isinstance(_c0.get("mission"), dict):
                 _rt_chat["mission"] = dict(_c0["mission"])
+            _rt_on = bool(settings.get("red_team_enabled")
+                          and settings.get("rt_mission_state", True)
+                          and _rt_authorized_mission(_c0))
             _pins_tail = [str(p) for p in (_c0.get("pins") or [])]
+            _plan_tail = [dict(p) for p in (_c0.get("plan") or []) if isinstance(p, dict)]
+            _activity_tail = [dict(a) for a in (_c0.get("activity") or []) if isinstance(a, dict)][-_ACTIVITY_MAX:]
+            if isinstance(_c0.get("task_anchor"), dict):
+                _task_state = dict(_c0["task_anchor"])
+            _verification_debt = [dict(x) for x in (_c0.get("verification_debt") or [])
+                                  if isinstance(x, dict)][-20:]
+            _continuity_state = _build_continuity_state(
+                _c0, activity=_activity_tail, plan=_plan_tail)
+            _findings_tail = [dict(x) for x in (_c0.get("findings") or []) if isinstance(x, dict)][-20:]
             _roll_active = bool(_c0.get("rolling_summary"))
         except Exception:
             pass
@@ -16537,11 +18529,15 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             _uc = re.sub(r"\s+", " ", str(_uc or "")).strip()
             if _uc:
                 _user_texts.append(_uc)
-        _objective = _user_texts[0][:240] if _user_texts else ""
-        _current_task = ""
-        for _uc in reversed(_user_texts[:-1]):   # skip the live turn's prompt
-            if len(_uc) >= 40:
-                _current_task = _uc[:240]
+        _objective = str(_task_state.get("original") or "")[:_TASK_ANCHOR_ORIGINAL_CHARS]
+        if not _objective and _user_texts:
+            _objective = _user_texts[0][:_TASK_ANCHOR_ORIGINAL_CHARS]
+        _current_task = str(_task_state.get("current") or "")[:_TASK_ANCHOR_CURRENT_CHARS]
+        if not _current_task:
+            for _uc in reversed(_user_texts):
+                if not _TASK_ACK_RE.fullmatch(_uc):
+                    _current_task = _uc[:_TASK_ANCHOR_CURRENT_CHARS]
+                    break
                 break
         # Long-session detector: past the reliable attention span the objective
         # anchor rides the tail EVERY round, not just on the exact round the
@@ -16552,6 +18548,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         except Exception:
             pass
         force_no_think = False   # set when the thinking-budget enforcer aborts a runaway
+        reasoning_seen_this_turn = False
         budget_retries = 0       # cap how many times we force-stop thinking per turn
         # A tools round already hit the output cap once (finish_reason "length").
         # The model spent the whole budget on reasoning/narration and the real
@@ -16580,6 +18577,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # conversation the server happily holds at 32K — and tool results
             # the model discovered earlier in the turn vanish from history.
             ctx_limit = _llama_props_ctx() or int(settings.get("num_ctx") or 32768)
+            _reasoning_cfg = _resolve_reasoning_request(
+                requested_reasoning_effort, reasoning_capability, settings, ctx_limit)
             # Reserve headroom for the response + thinking, but CAP it: 25% of a
             # 262K window is ~65K wasted on headroom no answer needs. Capping at
             # ~16K hands that context back to the conversation on large windows
@@ -16598,26 +18597,29 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             tools_overhead = 0
             if use_tools and native_tools:
                 try:
-                    _tools_json = json.dumps(tools_for_llama(_rt_incl_exploit), ensure_ascii=False)
+                    _round_tools = tools_for_llama(_rt_incl_exploit, chat_id)
+                    _tools_json = json.dumps(_round_tools, ensure_ascii=False)
                     tools_overhead = _tools_spec_overhead_tokens(_tools_json)
                 except Exception:
+                    _round_tools = []
                     tools_overhead = 4096  # conservative fallback
             # Floor the messages budget at 2048 tokens — even if tools overhead
             # is huge, we still need room for at least the system + last user.
             # +768 tokens of safety margin: the tools overhead is an estimate,
             # and --no-context-shift hard-errors the whole turn if the real prompt
             # slips over ctx. A little slack keeps us under the ceiling.
-            # Stub-aware: _sanitize_messages_for_openai replaces tool results
-            # older than _TOOL_RESULT_KEEP_RECENT with ~12-token elision stubs,
-            # so llama never receives most of the stored tool payload. Budgeting
-            # the FULL unstubbed content made the trimmer fire at ~35% real
-            # fill (the stored tail is ~2x the outgoing payload), which forced
-            # an emergency mid-turn fold on every overflow — compaction on
-            # every message. Inflate the budget by exactly what the sanitizer
-            # will elide so the trim fires only when the REAL payload nears ctx.
+            # Rolling-summary mode keeps complete tool evidence in the outgoing
+            # prompt until a fold preserves it, so the real context grows toward
+            # the compaction threshold in both iterative and one-shot work. If
+            # summarization is disabled, retain the proven age-stub fallback and
+            # inflate its trim budget by exactly what the sanitizer will elide;
+            # this preserves the fold-storm fix for that fallback path.
+            summarize_enabled = bool(use_tools and settings.get("summarize_history", True))
+            stub_old_tools = not summarize_enabled
             _stub_cutoff = len(conversation) - _TOOL_RESULT_KEEP_RECENT
-            _stub_savings = sum(_count_msg_tokens(m) for m in conversation[:_stub_cutoff]
-                                if m.get("role") == "tool")
+            _stub_savings = (sum(_count_msg_tokens(m) for m in conversation[:_stub_cutoff]
+                                 if m.get("role") == "tool")
+                             if stub_old_tools else 0)
             effective_reserve = max(1024, min(reserve + tools_overhead + 768 - _stub_savings,
                                               ctx_limit - 2048))
             # Budget the trim in the server's REAL token units: one /tokenize
@@ -16634,7 +18636,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # this the trimmer was the only trigger: every overflow forced a
             # mid-turn fold and compression fired on every message.
             try:
-                if (use_tools and settings.get("summarize_history", True)
+                if (summarize_enabled
                         and _last_prompt_tokens_by_chat.get(chat_id, 0)
                         >= _summary_trigger_limit(ctx_limit)):
                     _log_compact(chat_id, f"proactive: map={_last_prompt_tokens_by_chat.get(chat_id, 0)} "
@@ -16677,7 +18679,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # the budget, so the gate never blocks a real overflow.
             _over_budget = (sum(_count_msg_tokens(m) for m in conversation) * token_scale
                             > (ctx_limit - effective_reserve))
-            if dropped > 0 and use_tools and settings.get("summarize_history", True) and _over_budget:
+            if dropped > 0 and summarize_enabled and _over_budget:
                 # The trimmer is about to DELETE the middle of a live agentic
                 # turn — the amnesia loop. Fold into the rolling summary
                 # instead (mid-turn compaction), then re-trim against the
@@ -16696,6 +18698,14 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                                                         reserve=effective_reserve,
                                                         token_scale=token_scale)
                             dropped = max(0, len(conversation) - len(trimmed))
+                            # Judge the rebuilt post-fold prompt, not the stale
+                            # overflowing pre-fold conversation. Boundary orphan
+                            # cleanup after a successful fold must not set the
+                            # next-turn force flag or emit another trim notice.
+                            _over_budget = (
+                                sum(_count_msg_tokens(m) for m in conversation)
+                                * token_scale > (ctx_limit - effective_reserve)
+                            )
                 except Exception:
                     traceback.print_exc()
             if dropped > 0 and _over_budget:
@@ -16708,9 +18718,14 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 # compacted into the session summary (mid-turn fold ran) or
                 # silently elided from the prompt — the pill label must not
                 # say "summarized" for a plain drop.
-                emit({"type": "context_trimmed", "dropped": dropped, "total": len(conversation),
-                      "folded": bool(_fold and _fold.get("folded")),
-                      "fold_pending": bool(_fold is not None and not _fold.get("folded"))})
+                _trim_now = time.time()
+                if (_trim_now - _context_trim_last_notice_by_chat.get(chat_id, 0)
+                        >= _SUMMARY_NOTICE_INTERVAL_S):
+                    _context_trim_last_notice_by_chat[chat_id] = _trim_now
+                    emit({"type": "context_trimmed", "dropped": dropped,
+                          "total": len(conversation),
+                          "folded": bool(_fold and _fold.get("folded")),
+                          "fold_pending": bool(_fold is not None and not _fold.get("folded"))})
             else:
                 _last_dropped_by_chat.pop(chat_id, None)
 
@@ -16727,10 +18742,17 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # recency end, so no separate echo is needed.
             # Mutates the per-round `trimmed` copy ONLY — never `conversation` —
             # so it is never persisted or double-counted.
+            try:
+                _session_long_now = (_session_long or
+                                     sum(_count_msg_tokens(_m) for _m in conversation)
+                                     > _RT_ATTN_SPAN)
+            except Exception:
+                _session_long_now = _session_long
             _tail_secs: list = []
             _mission_shown = False
             if use_tools:
-                _mtxt = _rt_mission_render(_rt_chat) if settings.get("rt_mission_state", True) else ""
+                _mtxt = (_rt_mission_render(_rt_chat)
+                         if _rt_on and settings.get("rt_mission_state", True) else "")
                 if _mtxt:
                     _tail_secs.append(
                         "=== MISSION (authorized run — hold this; do NOT drift off-task) ===\n"
@@ -16740,6 +18762,29 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     _tail_secs.append(
                         "=== PINNED FOR THIS SESSION (established facts/fixes — do NOT undo or repeat) ===\n"
                         + "\n".join(f"- {p}" for p in _pins_tail))
+                if _plan_tail:
+                    _plan_lines = []
+                    for _p in _plan_tail[:12]:
+                        _st = str(_p.get("status") or "pending")
+                        _title = str(_p.get("title") or "").strip()
+                        if _title:
+                            _plan_lines.append(f"- {_st}: {_title}")
+                    if _plan_lines:
+                        _tail_secs.append(
+                            "=== ACTIVE PLAN (authoritative progress — continue the active/pending work; "
+                            "do not redo done steps) ===\n" + "\n".join(_plan_lines))
+                if _activity_tail and (_roll_active or _session_long_now):
+                    _activity_text = _render_activity_tail(_activity_tail)
+                    if _activity_text:
+                        _tail_secs.append(
+                            "=== RECENT TOOL LEDGER (harness-recorded outcomes — do not claim more "
+                            "than these results prove) ===\n" + _activity_text)
+                if _continuity_state and (_roll_active or _session_long_now):
+                    _continuity_text = _render_continuity_state(_continuity_state)
+                    if _continuity_text:
+                        _tail_secs.append(
+                            "=== STRUCTURED CONTINUITY (harness-owned facts; authoritative over a prose "
+                            "summary if they conflict) ===\n" + _continuity_text)
             # General long-horizon anchor (no red-team mission in play) — fires
             # for tools AND plain chats once the session is long enough that
             # folds or the trimmer can hide what we're working on: the exact
@@ -16747,7 +18792,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # the original ask AND the latest substantive instruction so
             # mid-session task switches survive compaction.
             if (not _mission_shown) and (_objective or _current_task) and (
-                    dropped > 0 or _roll_active or _session_long):
+                    dropped > 0 or _roll_active or _session_long_now):
                 _obj_lines = []
                 if _objective:
                     _obj_lines.append("original ask: " + _objective)
@@ -16765,7 +18810,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
 
             payload = {
                 "model": model or "local",
-                "messages": _sanitize_messages_for_openai(trimmed),
+                "messages": _sanitize_messages_for_openai(
+                    trimmed, stub_old_tools=stub_old_tools),
                 "stream": True,
                 **llama_options(settings),
             }
@@ -16792,7 +18838,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 # keeps its full allowance; the clamp below still bounds it by
                 # the reserved context headroom so it can never overflow the slot.
                 try:
-                    _tb_plus = int(settings.get("thinking_budget") or 0)
+                    _tb_plus = int(_reasoning_cfg.get("budget") or 0)
                 except (ValueError, TypeError):
                     _tb_plus = 0
                 if use_tools and _tb_plus > 0:
@@ -16820,9 +18866,16 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # these into the Jinja chat template: lets us toggle thinking mode
             # per-request and cap thinking tokens so the model can't spin forever.
             tpl_kwargs: dict = {}
-            enable_thinking = settings.get("enable_thinking")
+            enable_thinking = _reasoning_cfg.get("enabled")
             if enable_thinking is not None:
                 tpl_kwargs["enable_thinking"] = bool(enable_thinking)
+            if _reasoning_cfg.get("native_effort"):
+                # llama.cpp exposes model-native effort through template kwargs
+                # using the exact variable declared by that model's template.
+                # Muse Glimmer, for example, calls it `reasoning_strength`.
+                _native_param = str(
+                    reasoning_capability.get("native_parameter") or "reasoning_effort")
+                tpl_kwargs[_native_param] = _reasoning_cfg["native_effort"]
             if force_no_think:
                 # Previous round blew the thinking budget — force a direct answer
                 # this round regardless of the model's default thinking mode.
@@ -16834,7 +18887,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 # goes to the actual output (tool-call XML body or the answer).
                 # Must win over a model that defaults to thinking on every turn.
                 tpl_kwargs["enable_thinking"] = False
-            tb = settings.get("thinking_budget")
+            tb = _reasoning_cfg.get("budget")
             try:
                 tb_int = int(tb) if tb is not None else 2048
             except Exception:
@@ -16843,13 +18896,15 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 tpl_kwargs["thinking_budget"] = tb_int
             if tpl_kwargs:
                 payload["chat_template_kwargs"] = tpl_kwargs
+            payload.update(_reasoning_payload_overrides(
+                _reasoning_cfg, reasoning_capability))
             # Hard turn-boundary stops. Belt-and-suspenders for models (Qwen3.6
             # Q4 seen doing this) that sail past their own end-of-turn token and
             # re-answer forever — llama-server halts server-side the instant one
             # of these literal markers appears, instead of running to n_ctx.
             payload["stop"] = list(_TURN_BOUNDARY_STOPS)
             if use_tools and native_tools:
-                payload["tools"] = tools_for_llama(_rt_incl_exploit)
+                payload["tools"] = _round_tools
                 payload["tool_choice"] = "auto"
 
             # Lead the context gauge: push the assembled prompt size BEFORE the
@@ -16900,7 +18955,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         tighter = min(effective_reserve + pad, ctx_limit - 1024)
                         trimmed = truncate_messages(conversation, ctx_limit, reserve=tighter,
                                                     token_scale=token_scale)
-                        payload["messages"] = _sanitize_messages_for_openai(trimmed)
+                        payload["messages"] = _sanitize_messages_for_openai(
+                            trimmed, stub_old_tools=stub_old_tools)
                         _emit_ctx_fill()
                         emit({"type": "notice",
                               "note": "prompt exceeded the context window — trimmed older turns and retrying"})
@@ -16948,7 +19004,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             _loop_buf: list[str] = []
             _loop_hits = 0
             try:
-                _think_cap = int(settings.get("thinking_budget") or 2048)
+                _think_cap = int(_reasoning_cfg.get("budget") if _reasoning_cfg.get("budget") is not None else 2048)
             except Exception:
                 _think_cap = 2048
 
@@ -16997,6 +19053,20 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     # reasoning first — wrap as <think>…</think> for the UI
                     rpiece = delta.get("reasoning_content") or delta.get("reasoning") or ""
                     if rpiece:
+                        if not reasoning_seen_this_turn:
+                            reasoning_seen_this_turn = True
+                            _mark_model_reasoning_observed(
+                                _llama.loaded_model() or settings.get("model_path") or model)
+                            observed_cap = dict(reasoning_capability)
+                            if not observed_cap.get("supported"):
+                                observed_cap = {
+                                    "supported": True, "mode": "budget",
+                                    "source": "observed_output",
+                                    "levels": list(_REASONING_LEVELS),
+                                    "description": "Accuretta observed a reasoning stream and can adjust its guarded token budget.",
+                                }
+                            emit({"type": "reasoning_capability",
+                                  "capability": observed_cap})
                         if not reasoning_open:
                             content_buf.append("<think>")
                             emit({"type": "delta", "content": "<think>"})
@@ -17139,6 +19209,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     # summing full-prompt counts would multiply-count rounds.
                     turn_eval_total += last_stats.get("eval_count") or 0
                     turn_prompt_total += _raw_pe
+                    turn_peak_prompt = max(turn_peak_prompt, int(_real_prompt or 0))
                     global _last_prompt_tokens
                     _last_prompt_tokens = _real_prompt
                     # Per-chat truth for the gauge + summary trigger. Once set,
@@ -17177,6 +19248,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 partial = {"role": "assistant", "content": "".join(content_buf)}
                 partial["_appended_intermediate"] = list(conversation[_start_len:])
                 partial["_build"] = _BUILD_TAG
+                partial["_turn_id"] = _turn_id
                 return partial
 
             # Thinking-budget enforcer tripped: we force-closed a runaway <think>
@@ -17311,7 +19383,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         v not in (None, "", [], {}) for v in _pc_args.values())
                     if _has_real:
                         continue
-                    for _fc in extract_tool_calls(full_text):
+                    for _fc in extract_tool_calls(full_text, python_calls=not native_tools):
                         _fname = (_fc.get("name") or _fc.get("tool") or "").lower()
                         _fargs = _fc.get("arguments")
                         if (_fname == (_pc.get("name") or "").lower()
@@ -17332,7 +19404,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
 
             # fallback: parse tool calls emitted in content (hermes/qwen/llama/mistral/named)
             if not parsed_calls and use_tools:
-                for c in extract_tool_calls(full_text):
+                for c in extract_tool_calls(full_text, python_calls=not native_tools):
                     name = c.get("name") or c.get("tool")
                     args = c.get("arguments") or c.get("args") or {}
                     if not isinstance(args, dict):
@@ -17343,7 +19415,6 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             "name": name,
                             "arguments": args,
                         })
-                
                 if parsed_calls:
                     # Strip fallback tool-call blocks so they don't leak into the UI as clear text
                     full_text = re.sub(r"(?:<|&lt;|\\<)?tool_call(?:>|&gt;|\\>)?[\s\S]*?((?:<|&lt;|\\<)?/tool_call(?:>|&gt;|\\>)?|$)", "", full_text, flags=re.IGNORECASE)
@@ -17390,6 +19461,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         ),
                     })
 
+            turn_tool_calls += len(parsed_calls)
             assistant_msg = {"role": "assistant", "content": full_text}
             if parsed_calls:
                 assistant_msg["tool_calls"] = [
@@ -17499,15 +19571,39 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 # the merged mission onto chat["mission"] (one save).
                 if _rt_dirty and _rt_chat.get("mission"):
                     assistant_msg["_mission_updates"] = dict(_rt_chat["mission"])
+                if _activity_dirty:
+                    assistant_msg["_activity_updates"] = list(_activity_tail[-_ACTIVITY_MAX:])
+                    assistant_msg["_continuity_updates"] = dict(_continuity_state)
+                if _verification_dirty:
+                    assistant_msg["_verification_updates"] = list(_verification_debt[-20:])
                 # Intermediate working memory for this turn: every tool result
                 # and intermediate-assistant-with-tool-calls the loop appended.
                 # The caller persists these so the next user turn replays the
                 # full agentic context, not just the final bubble.
                 assistant_msg["_appended_intermediate"] = list(conversation[_start_len:])
                 assistant_msg["_build"] = _BUILD_TAG
+                assistant_msg["_turn_id"] = _turn_id
                 if _carry_diag:
                     assistant_msg["_carry_diag"] = list(_carry_diag)
                 emit({"type": "final", "message": assistant_msg})
+                try:
+                    _record_model_observation(
+                        model,
+                        prompt_tokens=turn_prompt_total,
+                        output_tokens=turn_eval_total,
+                        rounds=max(1, rounds + 1),
+                        tool_calls=turn_tool_calls,
+                        tool_errors=turn_tool_errors,
+                        peak_prompt_tokens=turn_peak_prompt,
+                        elapsed_s=time.time() - turn_started_at,
+                        native_fallback=not native_tools,
+                        completed=True,
+                    )
+                except Exception:
+                    # Passive profiling is advisory. A damaged/unwritable
+                    # profile must never turn a completed chat into a failure.
+                    pass
+                _profile_recorded = True
                 return assistant_msg
 
             conversation.append(assistant_msg)
@@ -17544,7 +19640,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         "SAME call right now with the real values, in EXACTLY this XML shape "
                         "(the bridge parses it itself):\n"
                         "<tool_call>\n<function=write_file>\n"
-                        "<parameter=path>\nC:\\Users\\je7sk\\Documents\\Accuretta Workspace\\mona_lisa.html\n</parameter>\n"
+                        "<parameter=path>\nC:\\Users\\you\\Documents\\Accuretta Workspace\\mona_lisa.html\n</parameter>\n"
                         "<parameter=content>\n<the full file body here, may span lines>\n</parameter>\n"
                         "</function>\n</tool_call>\n"
                         "Replace the example values with the real ones; emit ONLY the call, then stop."
@@ -17574,9 +19670,19 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # run concurrently (last-write-wins races), so those are grouped
             # into serial batches.
             _batches: list[list[dict]] = []
-            for _call in parsed_calls:
+            # A report closes the engagement. Always execute it after every
+            # other call in the round and alone, so a parallel exploit cannot
+            # race the server-side close gate.
+            _ordered_calls = ([c for c in parsed_calls if _resolve_tool_name(c.get("name") or "") != "rt_generate_report"]
+                              + [c for c in parsed_calls if _resolve_tool_name(c.get("name") or "") == "rt_generate_report"])
+            for _call in _ordered_calls:
+                if _resolve_tool_name(_call.get("name") or "") == "rt_generate_report":
+                    _batches.append([_call])
+                    continue
                 _key = _call_serial_key(_call)
                 for _b in _batches:
+                    if any(_resolve_tool_name(x.get("name") or "") == "rt_generate_report" for x in _b):
+                        continue
                     if not _key or not any(_call_serial_key(x) == _key for x in _b):
                         _b.append(_call)
                         break
@@ -17606,7 +19712,56 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             except Exception:
                                 pass
                     result = future.result()
+                    if (isinstance(result, dict) and
+                            (result.get("error") or result.get("ok") is False or
+                             result.get("exit_code") not in (None, 0))):
+                        turn_tool_errors += 1
                     emit({"type": "tool_result", "name": name, "result": result})
+                    _activity_tail.append(_tool_activity_record(name, args, result))
+                    _activity_tail = _activity_tail[-_ACTIVITY_MAX:]
+                    with _chat_live_activity_lock:
+                        _chat_live_activity[chat_id] = list(_activity_tail)
+                    _activity_dirty = True
+                    _verification_debt, _debt_changed = _update_verification_debt(
+                        _verification_debt, name, args, result)
+                    if _debt_changed:
+                        _verification_dirty = True
+                    _continuity_state = _build_continuity_state(
+                        {"task_anchor": _task_state, "pins": _pins_tail,
+                         "mission": _rt_chat.get("mission") if _rt_chat else {},
+                         "findings": _findings_tail,
+                         "verification_debt": _verification_debt},
+                        activity=_activity_tail, plan=_plan_tail)
+                    # Session-state tools write chats.json inside the worker.
+                    # Refresh the in-memory tail immediately so a pin or plan
+                    # update made during a long one-shot run is visible on the
+                    # very next inference round, not only after the user sends
+                    # another message.
+                    if _resolve_tool_name(name) in ("pin_note", "unpin_note", "update_plan",
+                                                    "record_finding", "list_findings"):
+                        try:
+                            _fresh = (get_chats().get("chats", {}) or {}).get(chat_id) or {}
+                            _pins_tail = [str(p) for p in (_fresh.get("pins") or [])]
+                            _plan_tail = [dict(p) for p in (_fresh.get("plan") or [])
+                                          if isinstance(p, dict)]
+                            _findings_tail = [dict(x) for x in (_fresh.get("findings") or [])
+                                              if isinstance(x, dict)][-20:]
+                            _continuity_state = _build_continuity_state(
+                                {"task_anchor": _task_state, "pins": _pins_tail,
+                                 "mission": _rt_chat.get("mission") if _rt_chat else {},
+                                 "findings": _findings_tail,
+                                 "verification_debt": _verification_debt},
+                                activity=_activity_tail, plan=_plan_tail)
+                        except Exception:
+                            pass
+                    if _rt_on and _resolve_tool_name(name) == "rt_generate_report":
+                        try:
+                            _fresh = (get_chats().get("chats", {}) or {}).get(chat_id) or {}
+                            if isinstance(_fresh.get("mission"), dict):
+                                _rt_chat["mission"] = dict(_fresh["mission"])
+                                _rt_dirty = True
+                        except Exception:
+                            pass
                     # Breach detection: a FLAG{...} in a tool response is confirmed
                     # access (cyber-range / CTF scoring). Scan the serialized result,
                     # report each distinct flag once as a per-stage breach event.
@@ -17657,6 +19812,16 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         "name": name,
                         "content": compress_tool_result(name, result, _trunc),
                     })
+                    try:
+                        _turn_journal_checkpoint(
+                            chat_id, _turn_id, list(conversation[_start_len:]),
+                            activity=_activity_tail,
+                            mission=(_rt_chat.get("mission") if _rt_chat else None),
+                            verification_debt=_verification_debt,
+                        )
+                    except Exception as _journal_error:
+                        print(f"[turn-journal] checkpoint failed for {chat_id}: {_journal_error}",
+                              file=sys.stderr)
             if tool_cap_no_think and _batches:
                 # A real tool call executed this round — the delayed-answer mode
                 # was only to protect a WRITE body from a thinking-hog. Once the
@@ -17668,9 +19833,28 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         partial = {"role": "assistant", "content": "".join(content_buf) if 'content_buf' in locals() else ""}
         partial["_appended_intermediate"] = list(conversation[_start_len:]) if 'conversation' in locals() else []
         partial["_build"] = ("carry-over-v3" if 'content_buf' in locals() else "")
+        partial["_turn_id"] = _turn_id if '_turn_id' in locals() else ""
         return partial
     finally:
+        if not _profile_recorded:
+            try:
+                _record_model_observation(
+                    model,
+                    prompt_tokens=turn_prompt_total,
+                    output_tokens=turn_eval_total,
+                    rounds=rounds,
+                    tool_calls=turn_tool_calls,
+                    tool_errors=turn_tool_errors,
+                    peak_prompt_tokens=turn_peak_prompt,
+                    elapsed_s=time.time() - turn_started_at,
+                    native_fallback=not native_tools,
+                    completed=False,
+                )
+            except Exception:
+                pass
         _chat_emitters.pop(chat_id, None)
+        with _chat_live_activity_lock:
+            _chat_live_activity.pop(chat_id, None)
         _unregister_cancel(chat_id)
 
 
@@ -17694,14 +19878,16 @@ def _preserve_prior_thinking(text: str) -> str:
     return _PRIOR_THINK_RE.sub(_rewrite, text)
 
 
-def _sanitize_messages_for_openai(msgs: list[dict]) -> list[dict]:
+def _sanitize_messages_for_openai(msgs: list[dict],
+                                  stub_old_tools: bool = True) -> list[dict]:
     """llama-server's OpenAI endpoint is stricter about message shape than
     Ollama. Strip local-only fields (`t`, `_stats`), coerce tool messages to
     the `{role:'tool', tool_call_id, content}` shape, and ensure assistant
-    tool_calls have a string `arguments` field. Also ages old tool results:
-    any tool message older than the last _TOOL_RESULT_KEEP_RECENT messages is
-    replaced with a compact stub (see that constant) — the stored chat JSON is
-    never touched, only the outgoing payload."""
+    tool_calls have a string `arguments` field. When `stub_old_tools` is true,
+    tool messages older than the last _TOOL_RESULT_KEEP_RECENT messages become
+    compact outgoing stubs; stored chat JSON is never changed. Normal rolling-
+    summary mode passes false so evidence remains live until compaction folds
+    it. The stub path remains the bounded fallback when compaction is off."""
     try:
         preserve_thinking = bool(get_settings().get("preserve_prior_thinking", False))
     except Exception:
@@ -17745,7 +19931,7 @@ def _sanitize_messages_for_openai(msgs: list[dict]) -> list[dict]:
             clean["tool_call_id"] = m.get("tool_call_id") or m.get("name") or "tool"
             if m.get("name"):
                 clean["name"] = m["name"]
-            if i < stub_cutoff and isinstance(clean["content"], str):
+            if stub_old_tools and i < stub_cutoff and isinstance(clean["content"], str):
                 tool_name = m.get("name") or tc_names.get(m.get("tool_call_id") or "")
                 if tool_name:
                     clean["content"] = (f"[output elided — {tool_name} result from earlier in the "
@@ -18588,34 +20774,13 @@ def _sandbox_ready_cached(ttl: float = 30.0) -> bool:
 
 
 def _sandbox_scope_block(command: str) -> str | None:
-    """Best-effort OUT-OF-SCOPE check for sandbox commands during an active RT
-    mission. sandbox_run is a generic bash pipe, so scope can't be enforced by
-    argument like the typed RT tools - extract host-like tokens from the
-    command text and refuse when one matches the mission's out: list. Only
-    fires when an explicit out list was declared (no false positives otherwise).
-    """
+    """Allowlist-check generic guest commands during an active RT mission."""
     try:
         chat_id = _current_chat_id.get() or ""
         chat = (get_chats().get("chats", {}) or {}).get(chat_id) if chat_id else None
     except Exception:
         chat = None
-    toks = _rt_scope_out_tokens(chat)
-    if not toks:
-        return None
-    scrub = re.sub(r"/mnt/[a-z]/\S+", " ", command.lower())
-    hosts = set(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", scrub))
-    hosts |= {h for h in re.findall(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", scrub)
-              if not h.endswith((".py", ".js", ".txt", ".gz", ".xz", ".img", ".bin",
-                                 ".zip", ".tar", ".json", ".md", ".html", ".css",
-                                 ".apk", ".so", ".elf", ".yar", ".pcap", ".evtx"))}
-    for h in hosts:
-        pm = re.search(re.escape(h) + r"[^\d]{1,12}(?:-p\s*|port[=\s])(\d{2,5})", scrub)
-        port = int(pm.group(1)) if pm else None
-        for tok in toks:
-            if _rt_tok_matches(tok, h, port):
-                return (f"refused: sandbox command references {h}, which is OUT OF SCOPE "
-                        f"(mission marks '{tok}' out). Stay on the in-scope target.")
-    return None
+    return _rt_command_scope_block(command, chat)
 
 
 def tool_sandbox_run(args: dict) -> dict:
@@ -18792,21 +20957,26 @@ def tool_rt_generate_report(args: dict) -> dict:
         return {"error": "red team tools are disabled. Enable them in Settings."}
     title = (args.get("title") or "Red Team Engagement Report").strip()
     body = (args.get("findings") or "").strip()
-    if not body:
-        return {"error": "findings markdown required"}
+    chats_data = None
     try:
         chat_id = _current_chat_id.get() or ""
-        chat = (get_chats().get("chats", {}) or {}).get(chat_id) if chat_id else None
+        chats_data = get_chats()
+        chat = (chats_data.get("chats", {}) or {}).get(chat_id) if chat_id else None
     except Exception:
         chat = None
     mission = _rt_mission_get(chat) if isinstance(chat, dict) else None
+    ledger = [copy.deepcopy(x) for x in ((chat or {}).get("findings") or [])
+              if isinstance(x, dict)] if isinstance(chat, dict) else []
+    if not body and not ledger:
+        return {"error": "no structured findings or findings markdown available"}
     ev_dir = DATA / "recon_evidence"
     evidence = []
     try:
         if ev_dir.exists():
             for f in sorted(ev_dir.iterdir()):
                 if f.is_file():
-                    evidence.append(f"| `{f.name}` | {f.stat().st_size} bytes |")
+                    digest = hashlib.sha256(f.read_bytes()).hexdigest()
+                    evidence.append(f"| `{f.name}` | {f.stat().st_size} bytes | `{digest}` |")
     except Exception:
         pass
     lines = [f"# {title}", "",
@@ -18817,15 +20987,65 @@ def tool_rt_generate_report(args: dict) -> dict:
             if mission.get(k):
                 lines.append(f"- **{k}:** {mission[k]}")
         lines.append("")
-    lines += ["## Findings", "", body, ""]
+    lines += [
+        "## Verification status", "",
+        "The findings narrative is model-authored. A claim is confirmed only when it cites a "
+        "captured artifact or reproducible tool output; the report builder does not promote an "
+        "unsupported claim into evidence. The structured ledger below preserves the exact status "
+        "enforced by the harness.", "",
+    ]
+    if ledger:
+        def _md(value: Any, cap: int = 300) -> str:
+            return re.sub(r"\s+", " ", str(value or "")).replace("|", "\\|")[:cap]
+        lines += ["## Harness findings ledger", "",
+                  "| id | severity | status | confidence | finding | target | evidence source |",
+                  "|---|---|---|---:|---|---|---|"]
+        for item in ledger:
+            artifact = item.get("artifact") if isinstance(item.get("artifact"), dict) else {}
+            source = ""
+            if artifact:
+                source = f"artifact `{_md(artifact.get('path'), 180)}` sha256 `{_md(artifact.get('sha256'), 80)}`"
+            elif item.get("source_observed"):
+                source = f"observed tool `{_md(item.get('source_tool'), 80)}`"
+            else:
+                source = "model assertion only"
+            lines.append(
+                f"| `{_md(item.get('id'), 70)}` | {_md(item.get('severity'), 20)} | "
+                f"{_md(item.get('status'), 30)} | {int(item.get('confidence') or 0)}% | "
+                f"{_md(item.get('title'))} | {_md(item.get('target'), 180)} | {source} |"
+            )
+        lines.append("")
+        for item in ledger:
+            lines += [f"### {_md(item.get('id'), 70)} — {_md(item.get('title'))}", "",
+                      f"- Status: **{_md(item.get('status'), 30)}**",
+                      f"- Severity: **{_md(item.get('severity'), 20)}**",
+                      f"- Harness-observed source: **{'yes' if item.get('source_observed') else 'no'}**"]
+            if item.get("description"):
+                lines += ["", _md(item.get("description"), 2000)]
+            if item.get("evidence"):
+                lines += ["", "Model-authored evidence note:", "", _md(item.get("evidence"), 3000)]
+            lines.append("")
+    if body:
+        lines += ["## Analyst narrative", "", body, ""]
     if evidence:
-        lines += ["## Evidence artifacts", "", "| file | size |", "|---|---|"] + evidence + ["",
+        lines += ["## Evidence artifacts", "", "| file | size | sha256 |", "|---|---:|---|"] + evidence + ["",
                  "_evidence files live in `data/recon_evidence/`._"]
     rep_dir = DATA / "reports"
     rep_dir.mkdir(parents=True, exist_ok=True)
     path = rep_dir / f"report-{int(time.time())}.md"
     path.write_text("\n".join(lines), encoding="utf-8")
-    return {"ok": True, "report": str(path), "evidence_count": len(evidence)}
+    # Generating the final report closes the server-side mission. Later model
+    # drift cannot silently resume recon/exploitation; a fresh gate launch is
+    # required to create a new active authorization record.
+    if isinstance(chat, dict) and isinstance(chat.get("mission"), dict):
+        chat["mission"]["status"] = "closed"
+        chat["mission"]["closed_at"] = int(time.time())
+        if isinstance(chats_data, dict):
+            save_json(CHATS_FILE, chats_data)
+    return {"ok": True, "report": str(path), "evidence_count": len(evidence),
+            "finding_count": len(ledger),
+            "validated_findings": sum(1 for x in ledger if x.get("status") in ("validated", "reproduced")),
+            "mission_status": "closed"}
 
 
 TOOLS["sandbox_nmap"] = {
@@ -18876,8 +21096,8 @@ TOOLS["sandbox_sqlmap"] = {
 TOOLS["rt_generate_report"] = {
     "description": (
         "Assemble the engagement report at the end of a red-team run: markdown "
-        "file with the mission header (objective/target/scope), your findings "
-        "(pass full findings markdown: severity, evidence, impact, fix), and "
+        "file with the mission header (objective/target/scope), the harness-owned "
+        "structured finding ledger, optional analyst narrative, and "
         "the evidence manifest from data/recon_evidence. Saved under "
         "data/reports/; the path is returned."
     ),
@@ -18885,9 +21105,9 @@ TOOLS["rt_generate_report"] = {
         "type": "object",
         "properties": {
             "title": {"type": "string", "description": "report title"},
-            "findings": {"type": "string", "description": "full findings markdown"},
+            "findings": {"type": "string", "description": "optional analyst narrative markdown; structured session findings are included automatically"},
         },
-        "required": ["findings"],
+        "required": [],
     },
     "fn": tool_rt_generate_report,
 }
@@ -19158,12 +21378,14 @@ class Handler(BaseHTTPRequestHandler):
             loaded = _llama.loaded_model() or s.get("model_path") or ""
             for f in files:
                 f["loaded"] = (f["path"] == loaded)
+            reasoning_capability = _reasoning_capability(loaded, s) if loaded else _reasoning_capability("", s)
             return self._send_json(200, {
                 "models_dir": mdir,
                 "loaded_model": loaded,
                 "llama_running": _llama.is_running() or llama_ping(timeout=0.5),
                 "vision_capable": _llama.is_vision_capable(),
                 "loaded_mmproj": _llama.loaded_mmproj(),
+                "reasoning_capability": reasoning_capability,
                 "models": files,
             })
         if p.startswith("/api/model-info/"):
@@ -19171,6 +21393,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, recommended_settings(name))
         if p == "/api/settings":
             return self._send_json(200, get_settings())
+        if p == "/api/model-health":
+            return self._send_json(200, _public_model_health())
         if p == "/api/savings":
             # Lifetime token totals for the "saved vs cloud" card. Server-side so
             # it survives restarts and follows the machine, not the browser.
@@ -20130,8 +22354,19 @@ class Handler(BaseHTTPRequestHandler):
         mode = body.get("mode") or "auto"  # auto | ide | agent
         images = body.get("images") or []  # list of base64 data URLs
         regenerate = bool(body.get("regenerate"))
+        reasoning_effort = _normalize_reasoning_effort(body.get("reasoning_effort"))
         if not user_text and not images and not regenerate:
             return self._send_json(400, {"error": "empty message"})
+        mission_panel = body.get("mission")
+        if mission_panel is not None:
+            if not get_settings().get("red_team_enabled"):
+                return self._send_json(403, {"error": "red-team tools are disabled in Settings"})
+            if (not isinstance(mission_panel, dict)
+                    or mission_panel.get("authorized") is not True
+                    or not str(mission_panel.get("target") or "").strip()):
+                return self._send_json(400, {
+                    "error": "red-team mission requires an explicit authorization confirmation and target"
+                })
 
         # Two paths for incoming images:
         #   (a) The loaded model has its own vision tower (we booted with
@@ -20211,6 +22446,7 @@ class Handler(BaseHTTPRequestHandler):
                 # already; we re-attach as user-attached metadata.
                 user_msg["images"] = list(images)
             chat["messages"].append(user_msg)
+            _update_task_anchor(chat, user_text)
         chat["updated"] = int(time.time())
         save_json(CHATS_FILE, chats)
 
@@ -20278,9 +22514,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 # Scope/auth panel data (Step 3) applied first so its explicit
                 # objective wins over the auto-seed from the run instruction.
-                _panel = body.get("mission")
-                _dirty = _rt_mission_apply_panel(chat, _panel) if isinstance(_panel, dict) else False
-                if _rt_mission_seed(chat, user_text):
+                _dirty = (_rt_mission_apply_panel(chat, mission_panel)
+                          if isinstance(mission_panel, dict) else False)
+                if _rt_authorized_mission(chat) and _rt_mission_seed(chat, user_text):
                     _dirty = True
                 if _dirty:
                     save_json(CHATS_FILE, chats)
@@ -20377,7 +22613,8 @@ class Handler(BaseHTTPRequestHandler):
         tok = _current_chat_id.set(chat_id)
         try:
             final = run_chat_turn(chat_id, msgs, use_tools=use_tools, emit=emit,
-                                  native_tools=native_tools)
+                                  native_tools=native_tools,
+                                  reasoning_effort=reasoning_effort)
         except Exception as e:
             traceback.print_exc()
             try:
@@ -20392,6 +22629,7 @@ class Handler(BaseHTTPRequestHandler):
             chats = get_chats()
             if chat_id in chats["chats"]:
                 chat = chats["chats"][chat_id]
+                _completed_turn_id = str(final.pop("_turn_id", "") or "")
                 # Persist the agentic loop's working memory (tool calls + tool
                 # results + intermediate assistant messages) BEFORE the final
                 # bubble. Marked _internal=true on assistants so the renderer
@@ -20404,6 +22642,17 @@ class Handler(BaseHTTPRequestHandler):
                 _mu = final.pop("_mission_updates", None)
                 if isinstance(_mu, dict):
                     chat["mission"] = _mu
+                _au = final.pop("_activity_updates", None)
+                if isinstance(_au, list):
+                    chat["activity"] = [a for a in _au if isinstance(a, dict)][-_ACTIVITY_MAX:]
+                _vu = final.pop("_verification_updates", None)
+                if isinstance(_vu, list):
+                    chat["verification_debt"] = [x for x in _vu if isinstance(x, dict)][-20:]
+                _cu = final.pop("_continuity_updates", None)
+                if isinstance(_cu, dict):
+                    chat["continuity"] = _cu
+                else:
+                    _refresh_continuity_state(chat)
                 now_t = int(time.time())
                 for im in appended:
                     role = im.get("role")
@@ -20415,6 +22664,8 @@ class Handler(BaseHTTPRequestHandler):
                         "content": im.get("content", "") or "",
                         "t": now_t,
                     }
+                    if _completed_turn_id:
+                        persisted["_turn_id"] = _completed_turn_id
                     if role == "assistant":
                         persisted["_internal"] = True
                         if im.get("tool_calls"):
@@ -20431,6 +22682,8 @@ class Handler(BaseHTTPRequestHandler):
                     "content": final.get("content", ""),
                     "t": now_t,
                 }
+                if _completed_turn_id:
+                    msg["_turn_id"] = _completed_turn_id
                 if final.get("_build"):
                     msg["_build"] = final["_build"]
                 if final.get("_carry_diag"):
@@ -20456,6 +22709,11 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                 save_json(CHATS_FILE, chats)
+                _turn_journal_clear(chat_id, _completed_turn_id)
+        else:
+            # A transport failure after one or more completed tool calls should
+            # not wait for a full application restart to recover its work.
+            _recover_turn_journals()
 
         _changes = _undo_commit_turn()
         if _changes:
@@ -20670,8 +22928,13 @@ def read_gguf_metadata(path: str, max_bytes: int = 4 * 1024 * 1024) -> dict:
                     vtype = struct.unpack_from("<I", data, pos)[0]; pos += 4
                     val, pos = read_value(pos, vtype)
                     if isinstance(val, str) and len(val) > 2048:
-                        # Huge string (chat template etc.) — keep length only.
-                        val = {"__array_len__": len(val)}
+                        # Template kwargs are the strongest model-agnostic
+                        # signal for adjustable reasoning. Keep a bounded copy
+                        # of chat templates; collapse unrelated giant strings.
+                        if "chat_template" in key.lower():
+                            val = val[:262144]
+                        else:
+                            val = {"__array_len__": len(val)}
                     meta[key] = val
                 except _Degraded:
                     status = "degraded"
@@ -20860,6 +23123,240 @@ def inspect_model(model_path: str) -> dict:
             largest = v
     out["total_params_b"] = int(round(largest)) if largest else 0
     return out
+
+
+_REASONING_LEVELS = ("auto", "low", "medium", "high")
+
+
+def _normalize_reasoning_effort(value) -> str:
+    value = str(value or "auto").strip().lower()
+    aliases = {"med": "medium", "default": "auto", "normal": "medium"}
+    value = aliases.get(value, value)
+    return value if value in _REASONING_LEVELS else "auto"
+
+
+def _model_reasoning_was_observed(model: str) -> bool:
+    """True when a prior real response exposed a reasoning stream.
+
+    This stores no generated text. It is just a durable capability bit, useful
+    for brand-new model families whose template names Accuretta has never seen.
+    """
+    if not model:
+        return False
+    try:
+        rows = (load_json(MODEL_RUNTIME_FILE, {"models": {}}).get("models") or {})
+        p = Path(str(model))
+        keys = {_model_profile_key(model), p.stem[:180], p.name[:180]}
+        return any(bool((rows.get(k) or {}).get("reasoning_observed")) for k in keys)
+    except Exception:
+        return False
+
+
+def _mark_model_reasoning_observed(model: str) -> None:
+    """Persist a path-free, content-free fact learned from a real response."""
+    if not model:
+        return
+    key = _model_profile_key(model)
+    with _MODEL_RUNTIME_LOCK:
+        try:
+            data = load_json(MODEL_RUNTIME_FILE, {"version": 1, "models": {}})
+            if not isinstance(data, dict):
+                data = {"version": 1, "models": {}}
+            row = data.setdefault("models", {}).setdefault(key, {})
+            if row.get("reasoning_observed"):
+                return
+            row["reasoning_observed"] = True
+            row["reasoning_observed_at"] = int(time.time())
+            save_json(MODEL_RUNTIME_FILE, data)
+            _REASONING_CAP_CACHE.clear()
+        except Exception:
+            pass
+
+
+def _reasoning_capability(model_path: str = "", settings: dict | None = None,
+                          props: dict | None = None) -> dict:
+    """Describe adjustable reasoning support without trusting a single name.
+
+    Detection prefers actual template kwargs from live llama-server /props and
+    the GGUF chat template. Known-family names are only a fallback. A Settings
+    override exists because new local models routinely arrive before harnesses
+    know their template vocabulary.
+    """
+    settings = settings or get_settings()
+    model_path = str(model_path or settings.get("model_path") or "").strip()
+    override = str(settings.get("reasoning_capability_override") or "auto").strip().lower()
+    if override not in ("auto", "off", "budget", "native_effort"):
+        override = "auto"
+    if not model_path:
+        return {
+            "supported": False, "mode": "none", "source": "no_model",
+            "levels": list(_REASONING_LEVELS),
+            "description": "Load a model to detect adjustable reasoning.",
+        }
+    if override == "off":
+        return {
+            "supported": False, "mode": "none", "source": "manual",
+            "levels": list(_REASONING_LEVELS),
+            "description": "Reasoning control is disabled in Settings.",
+        }
+
+    observed = _model_reasoning_was_observed(model_path)
+    try:
+        st = Path(model_path).stat()
+        file_sig = (int(st.st_mtime_ns), int(st.st_size))
+    except Exception:
+        file_sig = (0, 0)
+    props = props if isinstance(props, dict) else _llama_props_data()
+    cache_key = (model_path, file_sig, override, observed, id(props))
+    cached = _REASONING_CAP_CACHE.get(cache_key)
+    if cached:
+        return dict(cached)
+
+    if override in ("budget", "native_effort"):
+        cap = {
+            "supported": True, "mode": override, "source": "manual",
+            "levels": list(_REASONING_LEVELS),
+            "description": ("Uses the model's native effort levels."
+                            if override == "native_effort"
+                            else "Uses a token budget with Accuretta's runaway guard."),
+        }
+        if override == "native_effort":
+            cap["native_parameter"] = "reasoning_effort"
+        _REASONING_CAP_CACHE[cache_key] = cap
+        return dict(cap)
+
+    # Only inspect chat-template values from GGUF metadata. Other huge metadata
+    # strings cannot establish reasoning support and would just waste memory.
+    gguf_template = ""
+    try:
+        keys = (read_gguf_metadata(model_path).get("keys") or {})
+        gguf_template = "\n".join(
+            str(v) for k, v in keys.items()
+            if "chat_template" in str(k).lower() and isinstance(v, str)
+        )
+    except Exception:
+        pass
+    # /props also exposes generic server request defaults. Looking for an
+    # arbitrary `reasoning_effort` key across that whole object would make the
+    # slider appear for every model even when its template drops the value.
+    # Inspect only fields explicitly belonging to a chat template/capability.
+    prop_templates: list[str] = []
+    def _collect_prop_templates(value, key_hint=""):
+        if len(prop_templates) >= 24:
+            return
+        if "chat_template" in key_hint.lower():
+            try:
+                prop_templates.append(json.dumps(value, ensure_ascii=False)[:262144])
+            except Exception:
+                pass
+            return
+        if isinstance(value, dict):
+            for k, v in value.items():
+                _collect_prop_templates(v, str(k))
+        elif isinstance(value, list):
+            for v in value[:32]:
+                _collect_prop_templates(v, key_hint)
+    _collect_prop_templates(props)
+    props_text = "\n".join(prop_templates)
+    signal = (gguf_template + "\n" + props_text).lower()
+    name = Path(model_path).name.lower()
+
+    native_parameter = ""
+    for candidate in ("reasoning_effort", "reasoning_strength",
+                      "thinking_level", "reasoning_level"):
+        if candidate in signal:
+            native_parameter = candidate
+            break
+    has_native = bool(native_parameter)
+    has_budget = ("thinking_budget_tokens" in signal or "thinking_budget" in signal)
+    has_toggle = "enable_thinking" in signal
+    native_family = any(x in name for x in ("gpt-oss", "stepfun", "step-3", "step3"))
+    budget_family = any(x in name for x in (
+        "qwq", "deepseek-r1", "deepseek_r1", "r1-distill",
+        "reasoner", "reasoning", "thinker",
+    ))
+
+    if has_native or native_family:
+        mode = "native_effort"
+        source = "chat_template" if has_native else "model_family"
+        description = "The model exposes native low, medium, and high effort levels."
+    elif has_budget or has_toggle or observed or budget_family:
+        mode = "budget"
+        if has_budget or has_toggle:
+            source = "chat_template"
+        elif observed:
+            source = "observed_output"
+        else:
+            source = "model_family"
+        description = "Accuretta adjusts the thinking budget and keeps its runaway guard active."
+    else:
+        mode = "none"
+        source = "not_detected"
+        description = "This model did not advertise adjustable reasoning."
+
+    cap = {
+        "supported": mode != "none", "mode": mode, "source": source,
+        "levels": list(_REASONING_LEVELS), "description": description,
+    }
+    if mode == "native_effort":
+        cap["native_parameter"] = native_parameter or "reasoning_effort"
+    _REASONING_CAP_CACHE[cache_key] = cap
+    return dict(cap)
+
+
+def _reasoning_budget_for_effort(level: str, ctx_limit: int) -> int:
+    """Translate friendly effort levels into a context-aware reasoning cap."""
+    reserve = max(min(int(max(1024, ctx_limit) * 0.25), 16000), 1024)
+    available = max(256, reserve - 1024)
+    if level == "low":
+        return max(256, min(1024, int(available * 0.16)))
+    if level == "high":
+        return max(1024, min(8192, int(available * 0.72)))
+    return max(512, min(4096, int(available * 0.40)))
+
+
+def _resolve_reasoning_request(effort, capability: dict, settings: dict,
+                               ctx_limit: int) -> dict:
+    """Resolve one composer choice into template kwargs + harness limits."""
+    level = _normalize_reasoning_effort(effort)
+    if level != "auto" and not capability.get("supported"):
+        level = "auto"
+    enabled = settings.get("enable_thinking") is not False
+    try:
+        legacy_budget = int(settings.get("thinking_budget") if settings.get("thinking_budget") is not None else 2048)
+    except (TypeError, ValueError):
+        legacy_budget = 2048
+    native_effort = None
+    if level != "auto":
+        enabled = True
+        budget = _reasoning_budget_for_effort(level, ctx_limit)
+        if capability.get("mode") == "native_effort":
+            native_effort = level
+    else:
+        budget = legacy_budget
+    if not enabled:
+        budget = 0
+    return {
+        "effort": level, "enabled": bool(enabled), "budget": int(budget),
+        "native_effort": native_effort,
+    }
+
+
+def _reasoning_payload_overrides(config: dict, capability: dict) -> dict:
+    """Return only explicit, per-message top-level llama.cpp controls."""
+    if config.get("effort") == "auto":
+        return {}  # Preserve the painstakingly tuned legacy behavior exactly.
+    if capability.get("mode") == "budget":
+        # Modern llama.cpp's real per-request budget. The caller also sends a
+        # template kwarg for older builds, and the stream guard remains the
+        # final backstop if either is ignored.
+        return {"thinking_budget_tokens": max(0, int(config.get("budget") or 0))}
+    if (config.get("native_effort")
+            and (capability.get("native_parameter") or "reasoning_effort") == "reasoning_effort"):
+        # OpenAI-compatible clients expect this at top level, while the caller
+        # mirrors it into chat_template_kwargs for model-native templates.
+        return {"reasoning_effort": config["native_effort"]}
+    return {}
 
 
 # KV cache dtype byte costs per element (post block-quant overhead).
@@ -23467,8 +25964,8 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
         })
         chat.setdefault("messages", [])
         chat["messages"].append({"role": "user", "content": user_text})
-        if len(chat["messages"]) > CHAT_HISTORY_MAX:
-            chat["messages"] = chat["messages"][-CHAT_HISTORY_MAX:]
+        _update_task_anchor(chat, user_text)
+        _enforce_chat_retention(chat)
         chat["updated"] = int(time.time())
         save_json(CHATS_FILE, chats)
 
@@ -23505,7 +26002,7 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
                     traceback.print_exc()
             if get_settings().get("red_team_enabled") and get_settings().get("rt_mission_state", True):
                 try:
-                    if _rt_mission_seed(chat, user_text):
+                    if _rt_authorized_mission(chat) and _rt_mission_seed(chat, user_text):
                         save_json(CHATS_FILE, chats)
                 except Exception:
                     traceback.print_exc()
@@ -23551,17 +26048,34 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
         chats = get_chats()
         chat = chats["chats"].get(chat_id)
         if chat is not None:
+            _completed_turn_id = str(final.pop("_turn_id", "") or "")
             _mu = final.get("_mission_updates")
             if isinstance(_mu, dict):
                 chat["mission"] = _mu
+            _au = final.get("_activity_updates")
+            if isinstance(_au, list):
+                chat["activity"] = [a for a in _au if isinstance(a, dict)][-_ACTIVITY_MAX:]
+            _vu = final.get("_verification_updates")
+            if isinstance(_vu, list):
+                chat["verification_debt"] = [x for x in _vu if isinstance(x, dict)][-20:]
+            _cu = final.get("_continuity_updates")
+            if isinstance(_cu, dict):
+                chat["continuity"] = _cu
+            else:
+                _refresh_continuity_state(chat)
             for im in (final.get("_appended_intermediate") or []):
+                if _completed_turn_id and isinstance(im, dict):
+                    im = {**im, "_turn_id": _completed_turn_id}
                 chat["messages"].append(im)
             amsg = {"role": "assistant", "content": final.get("content", "")}
+            if _completed_turn_id:
+                amsg["_turn_id"] = _completed_turn_id
             if final.get("tool_calls"):
                 amsg["tool_calls"] = final["tool_calls"]
             chat["messages"].append(amsg)
             chat["updated"] = int(time.time())
             save_json(CHATS_FILE, chats)
+            _turn_journal_clear(chat_id, _completed_turn_id)
         return _discord_strip_think(final.get("content", "")) or "(done)"
     except Exception as e:
         traceback.print_exc()
@@ -23720,6 +26234,38 @@ def _discord_start() -> None:
         _discord_state["running"] = False
 
 
+def _prune_red_team_evidence(settings: dict, now: float | None = None) -> dict:
+    """Apply the configured evidence retention policy at startup."""
+    ev_dir = DATA / "recon_evidence"
+    if not ev_dir.exists():
+        return {"removed": 0, "kept": 0, "days": None}
+    try:
+        days = max(0, min(3650, int(settings.get("rt_evidence_retention_days", 30))))
+    except (TypeError, ValueError):
+        days = 30
+    now = time.time() if now is None else float(now)
+    cutoff = now - days * 86400
+    removed = 0
+    kept = 0
+    try:
+        for item in ev_dir.iterdir():
+            try:
+                expired = days == 0 or item.stat().st_mtime < cutoff
+                if not expired:
+                    kept += 1
+                    continue
+                if item.is_file():
+                    item.unlink()
+                elif item.is_dir():
+                    shutil.rmtree(item)
+                removed += 1
+            except Exception:
+                kept += 1
+    except Exception:
+        pass
+    return {"removed": removed, "kept": kept, "days": days}
+
+
 def main():
     _load_mcp_servers()
     print(f"accuretta bridge")
@@ -23730,26 +26276,18 @@ def main():
     print(f"  port:    {PORT}")
     print(f"  bind:    0.0.0.0  (reachable over LAN / Tailscale)")
 
-    # Wipe red-team evidence on every boot: recon_evidence holds hashed proof
-    # artifacts (target, request, response) — a machine-local fingerprint for
-    # an operator that would rather leave no trace. Nothing else touches it, so
-    # this runs once at startup before the HTTP server accepts any request.
-    _ev_dir = DATA / "recon_evidence"
-    if _ev_dir.exists():
-        n = 0
-        try:
-            for _f in _ev_dir.iterdir():
-                try:
-                    if _f.is_file():
-                        _f.unlink()
-                        n += 1
-                    elif _f.is_dir():
-                        shutil.rmtree(_f)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        print(f"  wiped:   {n} recon evidence artifact(s) from boot")
+    _jr = _recover_turn_journals()
+    if _jr.get("recovered") or _jr.get("stale") or _jr.get("invalid"):
+        print(f"  recovery: {_jr['recovered']} interrupted turn(s), "
+              f"{_jr['entries']} tool entries; {_jr['stale']} stale, {_jr['invalid']} invalid")
+
+    # Evidence must survive a restart long enough to verify the report that
+    # cites it. The retention setting keeps privacy explicit: 30 days by
+    # default, while 0 restores the old wipe-on-boot behavior.
+    _ev_ret = _prune_red_team_evidence(get_settings())
+    if _ev_ret.get("days") is not None:
+        print(f"  evidence: kept {_ev_ret['kept']}, removed {_ev_ret['removed']} "
+              f"(retention {_ev_ret['days']} day(s))")
 
     # first-run system context scan (creates data/ACCURETTA.md if missing)
     if not SYSTEM_CONTEXT_FILE.exists():
