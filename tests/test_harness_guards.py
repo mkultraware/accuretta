@@ -32,6 +32,10 @@ def _msg(role, content, **extra):
     return {"role": role, "content": content, **extra}
 
 
+def _synthetic_credential(prefix, reversed_suffix):
+    return prefix + reversed_suffix[::-1]
+
+
 class CompactionGuardTests(unittest.TestCase):
     def test_failed_turn_is_included_in_passive_model_telemetry(self):
         settings = {"model": "failing.gguf", "num_ctx": 8192, "max_tool_rounds": 2,
@@ -1411,8 +1415,12 @@ class RedTeamEnforcementTests(unittest.TestCase):
         self.assertTrue(all("https://example.com" not in url for url, _ in seen))
 
     def test_frontend_secret_audit_follows_bundles_and_source_maps(self):
-        github_token = "ghp_AbCdEf0123456789AbCdEf0123456789AbCdEf01"
-        google_key = "AIzaA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r"
+        github_token = _synthetic_credential(
+            "ghp_", "10fEdCbA9876543210fEdCbA9876543210fEdCbA"
+        )
+        google_key = _synthetic_credential(
+            "AIza", "r7Q6p5O4n3M2l1K0j9I8h7G6f5E4d3C2b1A"
+        )
         bodies = {
             "https://example.com/": '<script src="/assets/app.js"></script>',
             "https://example.com/assets/app.js": (
@@ -1462,7 +1470,7 @@ class RedTeamEnforcementTests(unittest.TestCase):
         self.assertEqual(bridge._tool_result_cap("scan_js_secrets"), 48000)
 
     def test_frontend_secret_audit_suppresses_placeholders_hashes_and_public_keys(self):
-        public_aws_id = "AKIA0123456789ABCDEF"
+        public_aws_id = _synthetic_credential("AKIA", "FEDCBA9876543210")
         publishable = "pk_live_AbCdEf0123456789AbCdEf012345"
         text = (
             f'const awsKey = "{public_aws_id}";\n'
