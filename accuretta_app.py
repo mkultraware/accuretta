@@ -104,7 +104,7 @@ def _acquire_single_instance(lock_port: int = 8799) -> bool:
 
 # Themes whose splash background needs the dark-colored logo mark. Keep this in
 # sync with the actual palette luminance, including the softer and pastel sets.
-_LIGHT_THEMES = {"", "light", "soft", "pastel", "retro", "neumorphic", "neobrutalism"}
+_LIGHT_THEMES = {"", "light", "soft", "pastel", "retro", "neumorphic", "neobrutalism", "aperture"}
 
 
 def _read_saved_theme() -> str:

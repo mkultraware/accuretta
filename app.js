@@ -12,6 +12,8 @@
     chats: { chats: {}, order: [] },
     chatId: null,
     messages: [],
+    messageWindowStart: 0,
+    messageWindowSize: 40,
     settings: {},
     workspace: { folders: [] },
     models: [],
@@ -24,8 +26,14 @@
     streaming: false,
     abortCtl: null,
     approvals: new Map(),
+    compactingChats: new Set(),
+    compactionRows: new Map(),
     mobileTab: "chat",
     pendingImages: [],  // [{ dataUrl, name }]
+    pendingFiles: [],   // browser File objects uploaded on send
+    clientContext: null,
+    remoteAccess: null,
+    executionTarget: localStorage.getItem("accuretta:execution-target") || "host",
     viewport: "full",        // full | desktop | tablet | mobile
     consoleOpen: false,
     consoleLogs: [],         // [{level, text, t}]
@@ -128,8 +136,7 @@
       info: '<i class="ph ph-info toast-ico" style="color:var(--accent)"></i>',
       ok: '<i class="ph ph-check-circle toast-ico" style="color:var(--success)"></i>',
       warn: '<i class="ph ph-warning toast-ico" style="color:var(--warning)"></i>',
-      err: '<i class="ph ph-x-circle" style="color:var(--danger)"></i>',
-      compact: '' // custom icon is embedded in the message HTML by the caller
+      err: '<i class="ph ph-x-circle" style="color:var(--danger)"></i>'
     };
     const iconHtml = iconMap[kind] != null ? iconMap[kind] : iconMap.info;
     const cleanMsg = html ? msg : esc(msg);
@@ -160,10 +167,71 @@
     }
   }
 
-  // Squeeze-SVG shared by compaction notifications (in-progress toast and
-  // the "compacted" confirmation toast). The .compact-anim class drives the
-  // squeeze keyframes; #compact-indicator CSS rules are now inert.
-  const _COMPACT_SVG = `<svg class="compact-anim" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex:0 0 auto;color:var(--accent);vertical-align:-2px;margin-right:6px" aria-hidden="true"><path d="M4 4v16M20 4v16"/><g class="ca-left"><path d="M4 12h4m0 0l-2.5-2.5M8 12l-2.5 2.5"/></g><g class="ca-right"><path d="M20 12h-4m0 0l2.5-2.5M16 12l2.5 2.5"/></g></svg>`;
+  function compactionRowFor(chatId) {
+    const row = state.compactionRows.get(chatId);
+    if (row?.isConnected) return row;
+    state.compactionRows.delete(chatId);
+    return null;
+  }
+
+  function removeCompactionRow(chatId, row) {
+    if (!row) return;
+    clearTimeout(row._safetyTimer);
+    clearTimeout(row._removeTimer);
+    row.classList.add("is-leaving");
+    row._removeTimer = setTimeout(() => {
+      if (state.compactionRows.get(chatId) === row) {
+        state.compactionRows.delete(chatId);
+      }
+      try { row.remove(); } catch {}
+    }, 260);
+  }
+
+  function ensureCompactionRow(chatId) {
+    if (!chatId || chatId !== state.chatId) return null;
+    const inner = $("#chat-inner");
+    if (!inner) return null;
+    let row = compactionRowFor(chatId);
+    if (!row) {
+      const follow = isNearBottom();
+      row = document.createElement("div");
+      row.className = "compaction-inline-row is-working";
+      row.dataset.chatId = chatId;
+      row.setAttribute("role", "status");
+      row.setAttribute("aria-live", "polite");
+      const dots = Array.from({ length: 9 }, () => "<span></span>").join("");
+      row.innerHTML = `<span class="compaction-dot-matrix" aria-hidden="true">${dots}</span><span class="compaction-inline-label">Compacting..</span>`;
+
+      const liveRow = state.liveTurn?.chatId === chatId
+        && state.liveTurn.row?.parentNode === inner
+        ? state.liveTurn.row
+        : Array.from(inner.querySelectorAll(".bubble-row"))
+            .find(candidate => candidate.querySelector(".bubble-meta.streaming"));
+      if (liveRow) inner.insertBefore(row, liveRow);
+      else inner.appendChild(row);
+      state.compactionRows.set(chatId, row);
+      if (follow) requestAnimationFrame(() => scrollToBottom(true));
+    }
+    clearTimeout(row._safetyTimer);
+    row._safetyTimer = setTimeout(() => {
+      state.compactingChats.delete(chatId);
+      removeCompactionRow(chatId, row);
+    }, 310000);
+    return row;
+  }
+
+  function finishCompactionRow(chatId, outcome = "done") {
+    state.compactingChats.delete(chatId);
+    const row = compactionRowFor(chatId);
+    if (!row) return;
+    clearTimeout(row._safetyTimer);
+    row.classList.remove("is-working");
+    row.classList.add(outcome === "failed" ? "is-failed" : "is-done");
+    const label = row.querySelector(".compaction-inline-label");
+    if (label) label.textContent = outcome === "failed" ? "Compaction failed" : "Compacted";
+    row._removeTimer = setTimeout(
+      () => removeCompactionRow(chatId, row), outcome === "failed" ? 3600 : 900);
+  }
 
   function hideToast(key) {
     if (!key || !_toasts.has(key)) return;
@@ -200,6 +268,59 @@
     if (n < 1024) return n + " B";
     if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
     return (n / 1024 / 1024).toFixed(2) + " MB";
+  }
+
+  function detectClientOs() {
+    const ua = navigator.userAgent || "";
+    const platform = navigator.userAgentData?.platform || navigator.platform || "";
+    if (/iPhone|iPad|iPod/i.test(ua) || (platform === "MacIntel" && navigator.maxTouchPoints > 1)) return "iOS";
+    if (/Mac/i.test(platform) || /Macintosh/i.test(ua)) return "macOS";
+    if (/Win/i.test(platform) || /Windows/i.test(ua)) return "Windows";
+    if (/Android/i.test(ua)) return "Android";
+    if (/Linux/i.test(platform) || /Linux/i.test(ua)) return "Linux";
+    return "unknown";
+  }
+
+  function currentClientHint() {
+    return {
+      os: detectClientOs(),
+      mobile: isMobile(),
+      secure_context: !!window.isSecureContext,
+      execution_target: state.executionTarget || "host",
+    };
+  }
+
+  async function copyText(text) {
+    const value = String(text ?? "");
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(value);
+        return "clipboard";
+      } catch (_) {}
+    }
+    const area = document.createElement("textarea");
+    area.value = value;
+    area.readOnly = true;
+    area.setAttribute("aria-hidden", "true");
+    Object.assign(area.style, {
+      position: "fixed", left: "-9999px", top: "0", opacity: "0",
+    });
+    document.body.appendChild(area);
+    area.focus();
+    area.select();
+    area.setSelectionRange(0, value.length);
+    try {
+      if (document.execCommand("copy")) return "legacy";
+    } catch (_) {
+    } finally {
+      area.remove();
+    }
+    try {
+      window.prompt("Browser clipboard access is blocked. Copy the text below:", value);
+      return "manual";
+    } catch (_) {
+      throw new Error("Clipboard unavailable");
+    }
   }
 
   // ---------- notifications & audio ----------
@@ -392,6 +513,9 @@
   const COMMAND_TOOLS = new Set([
     "write_file", "delete_file", "edit_file", "patch_file",
     "run_powershell", "open_program",
+    "remote_shell", "remote_write_file", "remote_save_code_block",
+    "remote_file_begin", "remote_file_append", "remote_file_commit",
+    "remote_copy_to", "remote_copy_from",
     "desktop_launch_app", "desktop_focus_window", "desktop_click",
     "desktop_type_text", "desktop_press_keys", "desktop_close_window",
   ]);
@@ -480,8 +604,17 @@
           row.appendChild(osint);
         }
       }
+      const secretRail = deck.querySelector(".secret-rail");
+      if (secretRail) {
+        secretRail.classList.remove("revealer-card");
+        if (stack && stack.parentNode) {
+          stack.parentNode.insertBefore(secretRail, stack);
+        } else {
+          row.appendChild(secretRail);
+        }
+      }
       
-      deck.querySelectorAll(".revealer-card:not(.permissions):not(.attack-rail):not(.osint-card)").forEach(c => c.remove());
+      deck.querySelectorAll(".revealer-card:not(.permissions):not(.attack-rail):not(.osint-card):not(.secret-rail)").forEach(c => c.remove());
       if (deck.children.length === 0) deck.innerHTML = "";
     }
     
@@ -609,6 +742,14 @@
       case "edit_file":      return `Editing ${shortPath(args.path)}…`;
       case "delete_file":    return `Deleting ${shortPath(args.path)}…`;
       case "run_powershell": return `Running command…`;
+      case "remote_shell":   return `Running on Mac…`;
+      case "remote_write_file": return `Writing ${shortPath(args.path)} on Mac…`;
+      case "remote_save_code_block": return `Saving chat code to ${shortPath(args.path)} on Mac…`;
+      case "remote_file_begin": return `Preparing ${shortPath(args.path)} on Mac…`;
+      case "remote_file_append": return `Sending the next file chunk to Mac…`;
+      case "remote_file_commit": return `Finishing the Mac file…`;
+      case "remote_copy_to": return `Copying ${shortPath(args.destination)} to Mac…`;
+      case "remote_copy_from": return `Copying ${shortPath(args.source)} from Mac…`;
       case "open_program":   return `Opening ${args.name || args.path || "program"}…`;
       case "web_fetch":      return `Fetching ${args.url || "the web"}…`;
       case "network_snapshot": return `Scanning network…`;
@@ -632,6 +773,14 @@
       case "write_file":     return `Wrote ${shortPath(res.path)}`;
       case "edit_file":      return `Edited ${shortPath(res.path)} · ${res.edits_applied || 0} change${(res.edits_applied || 0) === 1 ? "" : "s"}`;
       case "delete_file":    return `Deleted ${shortPath(res.path)}`;
+      case "remote_shell":   return `Mac command completed`;
+      case "remote_write_file":
+      case "remote_save_code_block": return `Wrote ${shortPath(res.path)} on Mac${res.bytes != null ? ` (${res.bytes} bytes)` : ""}`;
+      case "remote_file_begin": return `Mac file ready for chunks`;
+      case "remote_file_append": return `Sent chunk ${res.chunks || ""}${res.bytes != null ? ` · ${res.bytes} bytes total` : ""}`;
+      case "remote_file_commit": return `Finished ${shortPath(res.path)} on Mac${res.bytes != null ? ` (${res.bytes} bytes)` : ""}`;
+      case "remote_copy_to": return `Copied ${shortPath(res.destination)} to Mac`;
+      case "remote_copy_from": return `Copied ${shortPath(res.destination)} from Mac`;
       case "run_powershell": {
         const out = (res.stdout || "").trim();
         const first = out.split(/\r?\n/)[0] || "(no output)";
@@ -1408,6 +1557,27 @@
     return `<div class="diff-card">${head}${rawHolder}<div class="diff-split">${renderDiffSplit(rows)}</div>${unified}</div>`;
   }
 
+  // Working notes are model narration, not a deliverable. Render them as
+  // escaped prose so stray backticks cannot turn whole thoughts into code UI.
+  function renderWorkingNotes(text) {
+    if (!text) return "";
+    const plain = String(text)
+      .replace(/(^|\n)[ \t]*```[^\n]*\n?/g, "$1")
+      .replace(/```/g, "")
+      .replace(/`+/g, "")
+      .replace(/\r\n?/g, "\n")
+      .trim();
+    if (!plain) return "";
+    return plain.split(/\n{2,}/)
+      .map(block => `<p>${esc(block).replace(/\n/g, "<br>")}</p>`)
+      .join("");
+  }
+
+  function renderWorkingNotesBlock(text) {
+    const html = renderWorkingNotes(text);
+    return html ? `<div class="answer-interim">${html}</div>` : "";
+  }
+
   // ---------- markdown-lite for chat bubbles ----------
   // Preserves code fences, ignores tool_call tags (rendered as tool cards separately).
   function renderMarkdown(text) {
@@ -1967,6 +2137,8 @@
     wireEvents();
     subscribeSSE();
     initCostWidget();
+    loadClientContext().catch(() => {});
+    setTimeout(() => checkModelAdvisor({ notify: true }).catch(() => {}), 1200);
 
     // Background self-correct: re-tune for the currently loaded model on every
     // boot so saved settings from old/buggy autotune runs heal themselves.
@@ -2024,8 +2196,23 @@
   // ---------- data loading ----------
   async function loadSettings() {
     state.settings = await api("/api/settings");
-    if (state.settings && state.settings.theme) {
-      localStorage.setItem("accuretta:theme", state.settings.theme);
+    if (state.settings) {
+      const storedTheme = state.settings.theme || "light";
+      const theme = normalizeTheme(storedTheme);
+      state.settings.theme = theme;
+      localStorage.setItem("accuretta:theme", theme);
+      if (theme !== storedTheme) {
+        try {
+          state.settings = await api("/api/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ theme }),
+          });
+        } catch (error) {
+          state.settings.theme = theme;
+          console.warn("theme migration could not be persisted:", error);
+        }
+      }
     }
   }
   async function saveSettings(update) {
@@ -2074,6 +2261,51 @@
       state.modelsError = "bridge unreachable: " + (e.message || e);
       renderReasoningEffort();
     }
+  }
+
+  function renderClientContext() {
+    const data = state.remoteAccess || {};
+    const machines = Array.isArray(data.machines) ? data.machines : [];
+    const select = $("#execution-target-select");
+    if (select) {
+      const wanted = state.executionTarget || "host";
+      select.innerHTML = '<option value="host">Inference PC</option>';
+      machines.filter(m => m.status === "ready" && m.enabled !== false).forEach(machine => {
+        const option = document.createElement("option");
+        option.value = machine.id;
+        option.textContent = machine.label || "Paired Mac";
+        select.appendChild(option);
+      });
+      const valid = Array.from(select.options).some(o => o.value === wanted);
+      state.executionTarget = valid ? wanted : "host";
+      select.value = state.executionTarget;
+    }
+    const badge = $("#client-context-badge");
+    if (badge) {
+      const os = detectClientOs();
+      const remote = !!data.context?.remote;
+      const icon = os === "macOS" ? "ph-laptop" : (isMobile() ? "ph-device-mobile" : "ph-desktop");
+      badge.innerHTML = `<i class="ph ${icon}"></i><span>${esc(remote ? `${os} remote` : os)}</span>`;
+      badge.dataset.remote = remote ? "1" : "0";
+      document.body.classList.toggle("remote-client", remote);
+      document.body.classList.toggle("client-macos", os === "macOS");
+    }
+  }
+
+  async function loadClientContext() {
+    const hint = currentClientHint();
+    const query = new URLSearchParams({
+      os: hint.os,
+      mobile: hint.mobile ? "1" : "0",
+      secure: hint.secure_context ? "1" : "0",
+      target: hint.execution_target,
+    });
+    const data = await api(`/api/client-context?${query}`);
+    state.remoteAccess = data;
+    state.clientContext = data.context || null;
+    renderClientContext();
+    renderRemoteAccess();
+    return data;
   }
 
   // ---------- chat ----------
@@ -2126,6 +2358,8 @@
           m => (m.role === "user" || m.role === "assistant") && !m._internal
         )
       : [];
+    state.messageWindowStart = Math.max(
+      0, state.messages.length - state.messageWindowSize);
     $("#chat-title").textContent = chat ? chat.title : "new session";
     // restore the last-used mode for this chat so the toolbar feels sticky.
     // on mobile we drop IDE — there's no preview pane to render into — and
@@ -2390,7 +2624,7 @@
       { kind: "cmd", icon: "ph-gear-six", label: "Open Settings", action: () => { closePalette(); openSettings(); } },
       { kind: "cmd", icon: "ph-brain", label: "Open Long-term memory", action: () => { closePalette(); openSettings(); setTimeout(() => revealSettingsControl("#btn-mem-refresh"), 80); } },
       { kind: "cmd", icon: "ph-arrow-counter-clockwise", label: "Regenerate last reply", action: () => { closePalette(); regenerateLast(); } },
-      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / neobrutalism / neobrutalism-dark / kinetic / soft / pastel / velvet / cartograph / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
+      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / neobrutalism / aperture / soft / pastel / velvet / cartograph / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
       { kind: "cmd", icon: "ph-browser", label: "Toggle preview pane", action: () => { closePalette(); app.classList.toggle("preview-collapsed"); } },
       { kind: "cmd", icon: "ph-camera", label: "Screenshot preview", action: () => { closePalette(); screenshotPreview(); } },
       { kind: "cmd", icon: "ph-package", label: "Export project", action: () => { closePalette(); exportProjectZip(); } },
@@ -2533,10 +2767,28 @@
       scrollToBottom(true);
       return;
     }
-    for (const m of state.messages) {
+    const start = Math.max(0, Math.min(
+      state.messageWindowStart || 0, state.messages.length));
+    if (start > 0) {
+      const history = document.createElement("div");
+      history.className = "history-window";
+      history.innerHTML = `<button type="button" class="btn sm history-window-more"><i class="ph ph-clock-counter-clockwise"></i>Load ${Math.min(state.messageWindowSize, start)} earlier messages</button><span>${start} older messages are sleeping, not deleted</span>`;
+      history.querySelector("button").addEventListener("click", () => {
+        const scroller = $(".chat-scroll");
+        const beforeHeight = scroller ? scroller.scrollHeight : 0;
+        const beforeTop = scroller ? scroller.scrollTop : 0;
+        state.messageWindowStart = Math.max(
+          0, state.messageWindowStart - state.messageWindowSize);
+        renderMessages();
+        if (scroller) scroller.scrollTop = beforeTop + (scroller.scrollHeight - beforeHeight);
+      });
+      inner.appendChild(history);
+    }
+    for (const m of state.messages.slice(start)) {
       if (m.invisible) continue;
       inner.appendChild(renderBubble(m));
     }
+    if (state.compactingChats.has(state.chatId)) ensureCompactionRow(state.chatId);
     renderRegenerateChip();
     scrollToBottom(true);
   }
@@ -2601,9 +2853,11 @@
 
     let visible = stripMentionRefs(m.content || "");
     let thoughtChip = "";
+    let thinkingText = "";
     let cascadeChips = "";
     if (m.role === "assistant") {
       const { thinking, content } = splitThinking(visible);
+      thinkingText = thinking;
       // Promote a reply whose ENTIRE text was parked inside the thinking tags
       // (the closing tag is the very last content): splitThinking demotes
       // everything to "thinking" and the bubble would render empty while the
@@ -2612,7 +2866,9 @@
       // chip above stays as the collapsible copy of the same content.
       if (!content.trim() && thinking &&
           THINK_CLOSE_RE.test((m.content || "").replace(/\s+$/, "").slice(-200))) {
-        visible = "> The model closed its reply inside its **thinking block** — full text below.\n\n" + thinking;
+        visible = "> The model closed its reply inside its **thinking block**. Full text follows.\n\n" + thinking;
+      } else if (!content.trim() && thinking) {
+        visible = "> The model stopped during reasoning before producing a final answer. Nothing was written. Use Retry to run the turn again.";
       } else {
         visible = content;
       }
@@ -2624,7 +2880,7 @@
               <i class="ph ph-check-circle think-check-icon done"></i>
               <span class="think-title">Thought for a moment</span>
             </div>
-            <div class="think-content hidden">${esc(thinking)}</div>
+            <div class="think-content hidden"></div>
           </div>`;
       }
       const cascadeRes = splitCascade(visible);
@@ -2646,6 +2902,8 @@
         ${cascadeChips}
         <div class="bubble-meta"${tokTip}>${m.role === "user" ? "you" : (state.settings.model || "agent")} · ${relTime(m.t)}</div>
       </div>`;
+    const savedThinkContent = row.querySelector(".think-content");
+    if (savedThinkContent) savedThinkContent._fullText = thinkingText;
     
     // (Cascade click listeners are now handled via event delegation on #chat-inner)
     // Single copy action under every bubble. Same .bubble-actions row used
@@ -2664,7 +2922,7 @@
       const copyBtn = actions.querySelector('[data-act="copy"]');
       copyBtn.addEventListener("click", async () => {
         try {
-          await navigator.clipboard.writeText(m.content || "");
+          await copyText(m.content || "");
           const icon = copyBtn.querySelector("i");
           copyBtn.classList.add("copied");
           icon.classList.remove("ph-copy");
@@ -2745,7 +3003,7 @@
       if (copyAct) {
         copyAct.addEventListener("click", async () => {
           try {
-            await navigator.clipboard.writeText(getText());
+            await copyText(getText());
             const labelEl = copyAct.querySelector("span");
             const iconEl = copyAct.querySelector("i");
             const prevLabel = labelEl ? labelEl.textContent : "";
@@ -2794,7 +3052,7 @@
         btn.title = "Copy";
         btn.addEventListener("click", async () => {
           try {
-            await navigator.clipboard.writeText(getText());
+            await copyText(getText());
             btn.innerHTML = '<i class="ph ph-check"></i>';
             setTimeout(() => (btn.innerHTML = '<i class="ph ph-copy"></i>'), 1200);
           } catch { toast("Clipboard blocked", "warn", 2000); }
@@ -2813,7 +3071,7 @@
       if (!btn || !holder) return;
       btn.addEventListener("click", async () => {
         try {
-          await navigator.clipboard.writeText(holder.value);
+          await copyText(holder.value);
           const icon = btn.querySelector("i");
           if (icon) { icon.classList.remove("ph-copy"); icon.classList.add("ph-check"); }
           setTimeout(() => { if (icon) { icon.classList.add("ph-copy"); icon.classList.remove("ph-check"); } }, 1200);
@@ -2933,7 +3191,7 @@
       const btn = e.currentTarget;
       const text = bubble?.innerText || "";
       try {
-        await navigator.clipboard.writeText(text);
+        await copyText(text);
         const icon = btn.querySelector("i");
         if (icon) {
           icon.classList.remove("ph-copy");
@@ -2957,7 +3215,7 @@
     const tray = $("#image-tray");
     if (!tray) return;
     tray.innerHTML = "";
-    if (!state.pendingImages.length) { tray.classList.add("hidden"); return; }
+    if (!state.pendingImages.length && !state.pendingFiles.length) { tray.classList.add("hidden"); return; }
     tray.classList.remove("hidden");
     state.pendingImages.forEach((img, i) => {
       const div = document.createElement("div");
@@ -2965,6 +3223,16 @@
       div.innerHTML = `<img src="${img.dataUrl}" alt="${esc(img.name || "image")}"><button class="rm" title="Remove"><i class="ph ph-x"></i></button>`;
       div.querySelector(".rm").addEventListener("click", () => {
         state.pendingImages.splice(i, 1);
+        renderImageTray();
+      });
+      tray.appendChild(div);
+    });
+    state.pendingFiles.forEach((file, i) => {
+      const div = document.createElement("div");
+      div.className = "file-chip";
+      div.innerHTML = `<i class="ph ph-file"></i><span title="${esc(file.name)}">${esc(file.name)}</span><small>${humanBytes(file.size)}</small><button class="rm" title="Remove"><i class="ph ph-x"></i></button>`;
+      div.querySelector(".rm").addEventListener("click", () => {
+        state.pendingFiles.splice(i, 1);
         renderImageTray();
       });
       tray.appendChild(div);
@@ -2989,6 +3257,41 @@
     renderImageTray();
   }
 
+  function addClientFiles(files) {
+    const maxBytes = Math.max(1, Number(state.settings.remote_file_max_mb || 100)) * 1024 * 1024;
+    for (const file of files) {
+      if (!file || !file.name) continue;
+      if (file.size > maxBytes) {
+        toast(`${file.name} exceeds the ${Math.round(maxBytes / 1024 / 1024)} MB limit`, "warn", 3500);
+        continue;
+      }
+      if (state.pendingFiles.length >= 20) {
+        toast("Twenty files at once is plenty. The browser is not a moving van.", "warn", 3000);
+        break;
+      }
+      state.pendingFiles.push(file);
+    }
+    renderImageTray();
+  }
+
+  async function uploadClientFiles(files) {
+    const uploaded = [];
+    for (const file of files) {
+      const resp = await fetch("/api/client-files/upload", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "X-File-Name": encodeURIComponent(file.name),
+        },
+        body: file,
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || data.error) throw new Error(data.error || `upload failed (${resp.status})`);
+      uploaded.push(data);
+    }
+    return uploaded;
+  }
+
   // ---------- send / stream ----------
   async function send(opts = {}) {
     if (state.streaming) return;
@@ -3008,7 +3311,8 @@
     }
 
     const images = state.pendingImages.slice();
-    if (!text && !images.length) return;
+    const files = state.pendingFiles.slice();
+    if (!text && !images.length && !files.length) return;
     // A new request starts fresh: drop any prior turn's plan panel. The model
     // re-emits update_plan if this task is multi-step.
     renderPlanPanel([]);
@@ -3017,6 +3321,23 @@
       openSettings();
       return;
     }
+    let uploadedFiles = [];
+    if (files.length) {
+      try {
+        toast(`uploading ${files.length} file${files.length === 1 ? "" : "s"}…`, "info", 60000, "client-upload");
+        uploadedFiles = await uploadClientFiles(files);
+        hideToast("client-upload");
+      } catch (e) {
+        hideToast("client-upload");
+        toast(`File upload failed: ${e.message || e}`, "err", 4500);
+        return;
+      }
+      const fileBlock = [
+        "[Files uploaded from the active browser client into the inference PC workspace]",
+        ...uploadedFiles.map(f => `- ${f.name}: ${f.path}`),
+      ].join("\n");
+      text = text ? `${text}\n\n${fileBlock}` : fileBlock;
+    }
     if (opts.prompt === undefined) {
       ta.value = "";
       autoResize(ta);
@@ -3024,15 +3345,16 @@
     }
     if (state.chatId) localStorage.removeItem("accuretta:draft:" + state.chatId);
     state.pendingImages = [];
+    state.pendingFiles = [];
     renderImageTray();
 
     // show the image count in the user bubble so they know what got sent.
     // Plain text label — no emoji (rendered inline in stored content, where an
     // SVG can't live; "nothing" per the no-emoji rule).
-    const imgNote = `${images.length} image${images.length > 1 ? "s" : ""} attached`;
-    const bubbleText = images.length
-      ? (text ? `${text}\n\n${imgNote}` : imgNote)
-      : text;
+    const notes = [];
+    if (images.length) notes.push(`${images.length} image${images.length > 1 ? "s" : ""} attached`);
+    if (uploadedFiles.length) notes.push(`${uploadedFiles.length} file${uploadedFiles.length > 1 ? "s" : ""} uploaded`);
+    const bubbleText = notes.length ? `${text}\n\n${notes.join(" · ")}` : text;
     const userMsg = { role: "user", content: bubbleText, t: Math.floor(Date.now() / 1000) };
     if (opts.invisible) {
       userMsg.invisible = true;
@@ -3204,6 +3526,7 @@
         invisible: !!(opts && opts.invisible),
         mission: (opts && opts.mission) || undefined,
         reasoning_effort: state.reasoningEffort || "auto",
+        client_context: currentClientHint(),
       }),
       signal,
     });
@@ -3255,7 +3578,10 @@
         collapseWorkBlock(agentRow);
         // Settle the OSINT recon card (stop the live pulse, show the summary).
         osintCardFinalize(agentRow);
+        secretRailFinalize(agentRow);
         attackRailFinalize(agentRow);
+        const revealerDeck = document.querySelector("#revealer-deck");
+        if (revealerDeck) delete revealerDeck.dataset.rtEngagement;
       }
       // safety net: if the model ran tools or thought for a while but ended
       // without a visible answer, surface what we have so the user isn't
@@ -3365,6 +3691,18 @@
       lastMarkerEnd = mm.index + mm[0].length;
     }
 
+    // A reasoning template may stream the boundary as its own line, then send
+    // the answer in the next delta. Recognize that pending state immediately;
+    // otherwise the complete scratchpad flashes as answer markdown until the
+    // first answer character arrives.
+    if (lastMarker < 0) {
+      const pendingMarker = /(?:^|\n)[ \t]*response[ \t]*$/i.exec(buf);
+      if (pendingMarker) {
+        lastMarker = pendingMarker.index;
+        lastMarkerEnd = buf.length;
+      }
+    }
+
     const closeRe = /<\/(?:think|thinking|reasoning)>|<\|\/thinking\|>|\[\/(?:thought|thinking|reasoning|scratchpad)\]/gi;
     let lastClose = -1;
     let m;
@@ -3457,6 +3795,21 @@
     content = content.replace(/\s*<\/\s*$/, "");  // bare "</" with nothing after
     content = content.replace(/\s*\[\/?\s*$/, ""); // bare "[" or "[/" with nothing after
     return { thinking: thinking.trim(), content };
+  }
+
+  // Some reasoning templates stream an untagged scratchpad and reveal its
+  // boundary only later with a standalone `response` marker. Keep obvious
+  // planning prose in the thought surface while it is live. This guard is
+  // deliberately presentation-only: the final event still uses splitThinking
+  // alone, so a direct answer that happens to match is never lost.
+  function isLikelyLiveWorkingNotes(text) {
+    const sample = String(text || "").trimStart().slice(0, 1800);
+    if (sample.length < 24) return false;
+    const startsLikePlanning = /^(?:hmm\b|okay\b|ok\b|we need\b|i need\b|let me\b|let's\b|now (?:i|we|let)\b|need to\b|the user\b|user wants\b|i should\b|i'll\b)/i.test(sample);
+    const planningHits = sample.match(
+      /\b(?:let me|we need|i need|need to|let's|i'll|i should|careful|plan(?:ning)?|first i|then i)\b/gi
+    ) || [];
+    return startsLikePlanning || planningHits.length >= 3;
   }
 
   function splitCascade(buf) {
@@ -3565,7 +3918,7 @@
   function isExploitTool(name) { return RT_EXPLOIT_TOOLS.has(name); }
   function isRedTeamTool(name) {
     return !!name && (name.startsWith("recon_") || name === "encode_decode"
-      || isExploitTool(name) || RT_WORKFLOW_TOOLS.has(name));
+      || name === "scan_js_secrets" || isExploitTool(name) || RT_WORKFLOW_TOOLS.has(name));
   }
   // Short path helper: strip scheme+host, keep path+query, cap length.
   function arPath(u, cap = 40) {
@@ -3586,6 +3939,9 @@
     }
     if (name === "rt_generate_report") {
       return "report → assembling evidence and findings";
+    }
+    if (name === "scan_js_secrets") {
+      return `frontend audit → ${arPath(args.url || args.target, 46) || "page"}`;
     }
     if (name === "http_request") {
       const m = (args.method || "GET").toUpperCase();
@@ -3747,7 +4103,7 @@
   }
   function attackRailToolStart(row, name, args) {
     // Tool starts update activity. They do not authorize or complete a phase.
-    if (!isRedTeamTool(name)) return;
+    if (!isRedTeamTool(name) || isPassiveOsint(row) || isFrontendSecretAudit(row)) return;
     const rail = ensureAttackRail(row);
     if (!rail) return;
     rail.dataset.state = "active";
@@ -3759,7 +4115,7 @@
     renderRail(rail);
   }
   function attackRailToolResult(row, name, result) {
-    if (!isRedTeamTool(name)) return;
+    if (!isRedTeamTool(name) || isFrontendSecretAudit(row)) return;
     const rail = (row && row.querySelector(".attack-rail"))
       || document.querySelector("#revealer-deck .attack-rail");
     if (!rail) return;
@@ -3826,6 +4182,156 @@
     renderRail(rail);
   }
 
+  // ---------- frontend exposure rail ----------
+  // A frontend audit is one bounded read-only pass, not a four-stage attack.
+  // Its compact signal strip moves while scanning, then settles into a durable
+  // result that stays with the completed answer.
+  const SECRET_SIGNAL_HEIGHTS = [
+    5, 10, 7, 14, 8, 17, 6, 12, 9, 18, 7, 15, 5,
+    11, 8, 16, 6, 13, 9, 17, 7, 14, 5, 12, 8, 15,
+  ];
+  function secretRail(row) {
+    return (row && row.querySelector(".secret-rail"))
+      || document.querySelector("#revealer-deck .secret-rail");
+  }
+  function isFrontendSecretAudit(row) {
+    return row?._rtEngagement === "frontend_secrets"
+      || document.querySelector("#revealer-deck")?.dataset.rtEngagement === "frontend_secrets";
+  }
+  function ensureSecretRail(row, mission = {}) {
+    if (!row) return null;
+    let rail = secretRail(row);
+    if (rail) {
+      const target = rail.querySelector(".sr-target");
+      if (target && mission.target) target.textContent = mission.target;
+      return rail;
+    }
+    const deck = document.querySelector("#revealer-deck");
+    const toolStack = row.querySelector(".tool-stack");
+    const samples = SECRET_SIGNAL_HEIGHTS.map((height, index) =>
+      `<span style="--sr-i:${index};--sr-h:${height}px"></span>`).join("");
+    rail = document.createElement("div");
+    rail.className = "secret-rail is-idle";
+    rail.dataset.outcome = "pending";
+    rail.setAttribute("role", "status");
+    rail.setAttribute("aria-live", "polite");
+    rail.innerHTML =
+      `<span class="sr-sigil" aria-hidden="true">` +
+        `<svg viewBox="0 0 32 32" focusable="false">` +
+          `<rect class="sr-icon-frame" x="3.5" y="4.5" width="25" height="23" rx="5"></rect>` +
+          `<path class="sr-icon-header" d="M4 11h24"></path>` +
+          `<circle class="sr-icon-dot" cx="8" cy="7.8" r="1"></circle>` +
+          `<circle class="sr-icon-dot" cx="11.5" cy="7.8" r="1"></circle>` +
+          `<path class="sr-icon-code" d="m12.5 16.5-3 3 3 3m7-6 3 3-3 3m-2-7-2.2 9"></path>` +
+        `</svg>` +
+      `</span>` +
+      `<div class="sr-body">` +
+        `<div class="sr-title"><span class="sr-kicker">Frontend attack surface</span>` +
+          `<strong class="sr-target">${esc(mission.target || "Authorized page")}</strong></div>` +
+        `<div class="sr-spectrum" aria-hidden="true">${samples}<i></i></div>` +
+        `<div class="sr-detail"><span class="sr-live-dot"></span>` +
+          `<span class="sr-activity">Ready to inspect bundles, chunks and source maps</span></div>` +
+      `</div>` +
+      `<div class="sr-readout"><span class="sr-state">Ready</span>` +
+        `<strong class="sr-result">One-pass audit</strong>` +
+        `<small class="sr-meta">JavaScript · lazy chunks · maps</small></div>`;
+    if (deck) {
+      rail.classList.add("revealer-card");
+      deck.appendChild(rail);
+    } else if (toolStack?.parentNode) {
+      toolStack.parentNode.insertBefore(rail, toolStack);
+    } else {
+      row.appendChild(rail);
+    }
+    return rail;
+  }
+  function secretRailToolStart(row, name) {
+    if (name !== "scan_js_secrets" || !isFrontendSecretAudit(row)) return;
+    const rail = ensureSecretRail(row);
+    if (!rail) return;
+    rail.dataset.outcome = "running";
+    rail.classList.remove("is-idle", "is-complete", "is-error", "is-stopped", "has-findings", "has-candidates");
+    rail.classList.add("is-running");
+    const stateEl = rail.querySelector(".sr-state");
+    const resultEl = rail.querySelector(".sr-result");
+    const activity = rail.querySelector(".sr-activity");
+    if (stateEl) stateEl.textContent = "Live analysis";
+    if (resultEl) resultEl.textContent = "Scanning";
+    if (activity) activity.textContent = "Inspecting bundles, lazy chunks and source maps";
+  }
+  function secretRailToolResult(row, name, result) {
+    if (name !== "scan_js_secrets" || !isFrontendSecretAudit(row)) return;
+    const rail = ensureSecretRail(row);
+    if (!rail) return;
+    const failed = !result || !!result.error;
+    const verified = Math.max(0, Number(result?.verified_structure_count || 0));
+    const high = Math.max(0, Number(result?.high_confidence_count || 0));
+    const confirmed = verified + high;
+    const candidates = result?.candidates_included
+      ? Math.max(0, Number(result?.candidate_count || 0)) : 0;
+    const files = Math.max(0, Number(result?.files_scanned || 0));
+    const publicIds = Math.max(0, Number(result?.public_identifier_count || 0));
+    rail.dataset.outcome = failed ? "error" : "complete";
+    rail.classList.remove("is-idle", "is-running", "is-stopped");
+    rail.classList.toggle("is-error", failed);
+    rail.classList.toggle("is-complete", !failed);
+    rail.classList.toggle("has-findings", confirmed > 0);
+    rail.classList.toggle("has-candidates", confirmed === 0 && candidates > 0);
+    const stateEl = rail.querySelector(".sr-state");
+    const resultEl = rail.querySelector(".sr-result");
+    const activity = rail.querySelector(".sr-activity");
+    const meta = rail.querySelector(".sr-meta");
+    if (failed) {
+      if (stateEl) stateEl.textContent = "Incomplete";
+      if (resultEl) resultEl.textContent = "Scan failed";
+      if (activity) activity.textContent = "The audit stopped before a reliable result was produced";
+      if (meta) meta.textContent = "Review the error below";
+      return;
+    }
+    if (stateEl) stateEl.textContent = confirmed || candidates ? "Review ready" : "Complete";
+    if (resultEl) resultEl.textContent = confirmed
+      ? `${confirmed} confirmed`
+      : candidates ? `${candidates} candidate${candidates === 1 ? "" : "s"}` : "Clear";
+    if (activity) activity.textContent = confirmed
+      ? `Exact values ready for reporting · ${files} file${files === 1 ? "" : "s"} inspected`
+      : candidates
+        ? `No confirmed exposures · ${candidates} candidate${candidates === 1 ? "" : "s"} separated`
+        : `No high-confidence exposures · ${files} file${files === 1 ? "" : "s"} inspected`;
+    if (meta) meta.textContent = publicIds
+      ? `${publicIds} public identifier${publicIds === 1 ? "" : "s"} kept as context`
+      : "No provider validation performed";
+  }
+  function secretRailMission(row, mission) {
+    if (!row || mission?.engagement !== "frontend_secrets") return;
+    row._rtEngagement = "frontend_secrets";
+    const deck = document.querySelector("#revealer-deck");
+    if (deck) deck.dataset.rtEngagement = "frontend_secrets";
+    const rail = ensureSecretRail(row, mission);
+    if (!rail || mission.status !== "closed" || rail.dataset.outcome !== "pending") return;
+    rail.dataset.outcome = "stopped";
+    rail.classList.remove("is-idle", "is-running");
+    rail.classList.add("is-stopped");
+    const stateEl = rail.querySelector(".sr-state");
+    const resultEl = rail.querySelector(".sr-result");
+    const activity = rail.querySelector(".sr-activity");
+    if (stateEl) stateEl.textContent = "Stopped";
+    if (resultEl) resultEl.textContent = "No scan result";
+    if (activity) activity.textContent = "The one-pass audit ended before the scanner returned";
+  }
+  function secretRailFinalize(row) {
+    const rail = secretRail(row);
+    if (!rail || !rail.classList.contains("is-running")) return;
+    rail.dataset.outcome = "stopped";
+    rail.classList.remove("is-running");
+    rail.classList.add("is-stopped");
+    const stateEl = rail.querySelector(".sr-state");
+    const resultEl = rail.querySelector(".sr-result");
+    const activity = rail.querySelector(".sr-activity");
+    if (stateEl) stateEl.textContent = "Stopped";
+    if (resultEl) resultEl.textContent = "No result";
+    if (activity) activity.textContent = "The audit ended before the scanner completed";
+  }
+
   // ---------- confirmed recon -> exploit transition ----------
   function rtPhaseMarker(row, via) {
     const rail = ensureAttackRail(row, { phase: "exploit" });
@@ -3851,18 +4357,15 @@
   // theatrics. Only passive recon/OSINT tools summon it; active exploitation
   // (http_request, injection/auth probes) stays with the attack rail.
   const OSINT_CATS = [
-    { key: "surface",  label: "Surface",  icon: "ph-globe-hemisphere-west",
-      tools: ["recon_subdomains", "recon_dns", "recon_content_discovery", "recon_subdomain_takeover"] },
-    { key: "services", label: "Services", icon: "ph-stack",
-      tools: ["recon_port_scan", "recon_tls_audit", "recon_http_fingerprint", "recon_open_services"] },
-    { key: "exposure", label: "Exposure", icon: "ph-warning-diamond",
-      tools: ["recon_check_exposure", "scan_js_secrets", "recon_cve_match"] },
-    { key: "intel",    label: "Intel",    icon: "ph-fingerprint",
-      tools: ["validate_finding", "recon_capture_evidence"] },   // + any mcp_osint_* tool
+    { key: "registry", label: "Registry", tools: ["recon_rdap"] },
+    { key: "dns", label: "DNS", tools: ["recon_dns"] },
+    { key: "certs", label: "Certificates", tools: ["recon_subdomains"] },
+    { key: "records", label: "Public record",
+      tools: ["recon_web_archive", "recon_cve_match", "web_search"] },
   ];
   function osintCatForTool(name) {
     if (!name) return null;
-    if (name.startsWith("mcp_osint")) return "intel";
+    if (name.startsWith("mcp_osint")) return "records";
     for (const c of OSINT_CATS) if (c.tools.includes(name)) return c.key;
     return null;
   }
@@ -3883,29 +4386,39 @@
     for (const v of Object.values(res)) if (Array.isArray(v)) best = Math.max(best, v.length);
     return best > 0 ? best : 1;
   }
-  function ensureOsintCard(row) {
+  function isPassiveOsint(row) {
+    return row?._rtEngagement === "passive_osint"
+      || document.querySelector("#revealer-deck")?.dataset.rtEngagement === "passive_osint";
+  }
+  function ensureOsintCard(row, mission = {}) {
     if (!row) return null;
     let card = row.querySelector(".osint-card") || document.querySelector("#revealer-deck .osint-card");
-    if (card) return card;
+    if (card) {
+      const target = card.querySelector(".oc-target-title");
+      if (target && mission.target) target.textContent = mission.target;
+      return card;
+    }
     const toolStack = row.querySelector(".tool-stack");
     card = document.createElement("div");
     card.className = "osint-card is-running";
     card.dataset.total = "0";
     const tiles = OSINT_CATS.map(c =>
       `<div class="oc-cat is-empty" data-cat="${c.key}">` +
-        `<span class="oc-ico"><i class="ph ${c.icon}"></i></span>` +
+        `<span class="oc-source-dot"></span>` +
         `<span class="oc-cat-body"><span class="oc-cat-label">${c.label}</span>` +
-        `<span class="oc-cat-count">0</span></span>` +
+        `<span class="oc-cat-count">Waiting</span></span>` +
       `</div>`
     ).join("");
     card.innerHTML =
       `<div class="oc-head">` +
-        `<span class="oc-title"><i class="ph ph-magnifying-glass"></i> OSINT recon</span>` +
-        `<span class="oc-live"><span class="oc-live-dot"></span><span class="oc-live-text">scanning</span></span>` +
+        `<div class="oc-heading"><span class="oc-kicker">Passive intelligence</span>` +
+        `<span class="oc-target-title">${esc(mission.target || "Public-source collection")}</span></div>` +
+        `<span class="oc-boundary"><i class="ph ph-eye-slash"></i>No direct target traffic</span>` +
       `</div>` +
       `<div class="oc-grid">${tiles}</div>` +
-      `<div class="oc-foot"><span class="oc-activity">gathering sources…</span>` +
-        `<span class="oc-total"><i class="ph ph-database"></i> <span class="oc-total-n">0</span> findings</span></div>`;
+      `<div class="oc-foot"><span class="oc-live"><span class="oc-live-dot live"></span><span class="oc-live-text">Collecting</span></span>` +
+        `<span class="oc-activity">Preparing public sources</span>` +
+        `<span class="oc-total"><span class="oc-total-n">0</span> records</span></div>`;
     
     const deck = document.getElementById("revealer-deck");
     if (deck) {
@@ -3931,8 +4444,7 @@
     return "";
   }
   function osintCardToolStart(row, name, args) {
-    if ((row && row.querySelector(".attack-rail"))
-        || document.querySelector("#revealer-deck .attack-rail")) return;
+    if (!isPassiveOsint(row)) return;
     const cat = osintCatForTool(name);
     if (!cat) return;
     const card = ensureOsintCard(row);
@@ -3940,14 +4452,14 @@
     card.classList.add("is-running");
     card.querySelector(".oc-live-dot")?.classList.add("live");
     const liveText = card.querySelector(".oc-live-text");
-    if (liveText) liveText.textContent = "scanning";
+    if (liveText) liveText.textContent = "Collecting";
     card.querySelectorAll(".oc-cat").forEach(t => t.classList.toggle("is-active", t.dataset.cat === cat));
     const act = card.querySelector(".oc-activity");
     if (act) {
       const tgt = String((args && (args.url || args.target || args.domain || args.host || args.query)) || "").replace(/^https?:\/\//, "");
       const base = name.startsWith("mcp_osint") ? name.replace(/^mcp_osint_?/, "osint · ") : name;
       const clean = base + reconModeLabel(name, args);
-      act.textContent = tgt ? `${clean} → ${tgt.slice(0, 40)}` : `${clean}…`;
+      act.textContent = tgt ? `${clean} · ${tgt.slice(0, 40)}` : clean;
     }
   }
   function osintCardToolResult(row, name, res) {
@@ -3961,7 +4473,7 @@
     const next = parseInt(tile.dataset.n || "0", 10) + add;
     tile.dataset.n = String(next);
     const countEl = tile.querySelector(".oc-cat-count");
-    if (countEl) countEl.textContent = String(next);
+    if (countEl) countEl.textContent = add > 0 ? `${next} found` : "Checked";
     tile.classList.remove("is-empty", "is-active");
     if (next > 0) tile.classList.add("has-data");
     if (add > 0) { tile.classList.remove("just-hit"); void tile.offsetWidth; tile.classList.add("just-hit"); }
@@ -3977,10 +4489,19 @@
     card.classList.add("is-done");
     card.querySelector(".oc-live-dot")?.classList.remove("live");
     const liveText = card.querySelector(".oc-live-text");
-    if (liveText) liveText.textContent = "done";
+    if (liveText) liveText.textContent = "Complete";
     card.querySelectorAll(".oc-cat.is-active").forEach(t => t.classList.remove("is-active"));
     const act = card.querySelector(".oc-activity");
-    if (act) act.textContent = parseInt(card.dataset.total || "0", 10) > 0 ? "recon complete" : "no sources returned data";
+    if (act) act.textContent = parseInt(card.dataset.total || "0", 10) > 0 ? "Public-source review complete" : "No public records returned";
+  }
+
+  function passiveIntelMission(row, mission) {
+    if (!row || mission?.engagement !== "passive_osint") return;
+    row._rtEngagement = "passive_osint";
+    const deck = document.querySelector("#revealer-deck");
+    if (deck) deck.dataset.rtEngagement = "passive_osint";
+    const card = ensureOsintCard(row, mission);
+    if (card && mission.status === "closed") osintCardFinalize(row);
   }
 
   function handleEvent(evt, ctx) {
@@ -4025,13 +4546,37 @@
           }
         }
       }
+      // Rebuilding markdown and scanning the complete growing buffer for every
+      // token is quadratic work. Paint at a controlled cadence; the buffer and
+      // counters above still consume every delta, and the final event always
+      // performs one authoritative full render. Remote browsers get a calmer
+      // cadence because older laptops benefit far more than they notice 50 ms.
+      const paintNow = performance.now();
+      const paintInterval = state.clientContext?.remote ? 90 : 50;
+      if (ctx.row && ctx.row._lastStreamPaint
+          && paintNow - ctx.row._lastStreamPaint < paintInterval) {
+        return;
+      }
+      if (ctx.row) ctx.row._lastStreamPaint = paintNow;
       let { thinking, content } = splitThinking(newBuf);
+      if (!thinking && content && ctx.row
+          && state.settings.enable_thinking !== false
+          && state.reasoningCapability?.supported
+          && isLikelyLiveWorkingNotes(content)) {
+        thinking = content;
+        content = "";
+      }
       const cascadeRes = splitCascade(content);
       content = cascadeRes.content;
       
       if (thinking && ctx.row) {
         const thinkContent = ctx.row.querySelector(".think-content");
-        if (thinkContent) thinkContent.textContent = thinking;   // full reasoning fills the expandable body
+        if (thinkContent) {
+          thinkContent._fullText = thinking;
+          if (!thinkContent.classList.contains("hidden")) {
+            thinkContent.textContent = thinking;
+          }
+        }
       }
       // Status line = a live, shimmering PHASE indicator, not a parrot of the
       // request. It tracks what's actually happening, in priority order:
@@ -4084,7 +4629,7 @@
         // Interim narration renders dimmed + small; only the live answer gets
         // full markdown treatment below.
         const interimHtml = interim.trim()
-          ? `<div class="answer-interim">${renderMarkdown(interim)}</div>` : "";
+          ? renderWorkingNotesBlock(interim) : "";
         // Detect an in-progress LARGE code fence in the ANSWER. The full markdown
         // render is O(N); for a 700-line dump we swap to a cheap progress
         // placeholder. Everything else streams token-by-token like normal.
@@ -4127,6 +4672,7 @@
       }
       scrollToBottom();
     } else if (evt.type === "tool_start") {
+      secretRailToolStart(row, evt.name, evt.arguments);
       attackRailToolStart(row, evt.name, evt.arguments);
       osintCardToolStart(row, evt.name, evt.arguments);
       // Mark the content boundary: everything streamed before this tool call is
@@ -4222,6 +4768,7 @@
         }
       }
     } else if (evt.type === "tool_result") {
+      secretRailToolResult(row, evt.name, evt.result);
       attackRailToolResult(row, evt.name, evt.result);
       osintCardToolResult(row, evt.name, evt.result);
       if (evt.name === "web_image_search" && evt.result && evt.result.results) {
@@ -4494,7 +5041,7 @@
           let interimHtml = "";
           let answerText = finalContent;
           if (interimText.trim() && finalContent.startsWith(interimText)) {
-            interimHtml = `<div class="answer-interim">${renderMarkdown(interimText)}</div>`;
+            interimHtml = renderWorkingNotesBlock(interimText);
             answerText = finalContent.slice(interimText.length);
           }
           if (finalContent.trim()) {
@@ -4522,6 +5069,7 @@
       }
       renderCtxGauge();
       renderRegenerateChip();
+      setTimeout(() => checkModelAdvisor({ notify: true }).catch(() => {}), 700);
       }
     } else if (evt.type === "notice") {
       toast(evt.note || "", "info", 3000, "ctx-notice");
@@ -4537,7 +5085,14 @@
       // Recon -> exploit gate opened. Subtle marker only (see rtPhaseMarker).
       rtPhaseMarker(row, evt.via);
     } else if (evt.type === "rt_mission") {
-      attackRailMission(row, evt);
+      if (evt.engagement === "passive_osint") passiveIntelMission(row, evt);
+      else if (evt.engagement === "frontend_secrets") secretRailMission(row, evt);
+      else {
+        if (row) row._rtEngagement = evt.engagement || "recon";
+        const deck = document.querySelector("#revealer-deck");
+        if (deck) delete deck.dataset.rtEngagement;
+        attackRailMission(row, evt);
+      }
     } else if (evt.type === "turn_changes") {
       renderTurnChanges(row, evt);
     } else if (evt.type === "plan") {
@@ -5076,6 +5631,14 @@
     const encRel = (rel || "").replace(/\\/g, "/").split("/").map(encodeURIComponent).join("/");
     return `/api/wsfs/${wsRootToken(root)}/${encRel}`;
   }
+  function downloadWorkspaceFile(root, rel) {
+    const link = document.createElement("a");
+    link.href = `${wsFileUrl(root, rel)}?download=1`;
+    link.rel = "noopener";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
 
   // Stream an existing .html from a workspace folder into the preview iframe.
   // Uses iframe `src` (not srcdoc) so relative asset URLs resolve back through
@@ -5570,7 +6133,7 @@
     const b64 = btoa(unescape(encodeURIComponent(html)));
     const url = `data:text/html;charset=utf-8;base64,${b64}`;
     try {
-      await navigator.clipboard.writeText(url);
+      await copyText(url);
       toast(`Copied data URL (${Math.round(url.length / 1024)}KB)`, "ok", 2400, "dataurl");
     } catch {
       // clipboard may be blocked — fall back to a throwaway prompt
@@ -5694,6 +6257,7 @@
   const SVG_PYCHECK  = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>';
   const SVG_BOOK     = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>';
   const SVG_EYE      = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+  const SVG_DOWNLOAD = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>';
 
   // Map file extension → highlightCode() language id. Determines which
   // entries get an "eye" view-source button in the tree and how the
@@ -5752,6 +6316,7 @@
     // file-type-specific inline action buttons (SVG, not emoji)
     let actions = "";
     if (!entry.is_dir) {
+      actions += `<button class="tree-action ws-download" title="Download to this browser">${SVG_DOWNLOAD}</button>`;
       if (isPreviewableHtml(entry.name)) {
         actions += `<button class="tree-action ws-preview-html" title="Preview this HTML in the panel">${SVG_LIGHTNING}</button>`;
       }
@@ -5808,6 +6373,14 @@
     } else {
       // wire file-action buttons; both stop propagation so clicking them
       // doesn't also toggle the row.
+      const downloadBtn = node.querySelector(".ws-download");
+      if (downloadBtn) {
+        downloadBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          downloadWorkspaceFile(rootFolder, relPathFromRoot(rootFolder, entry.path));
+        });
+      }
       const previewBtn = node.querySelector(".ws-preview-html");
       if (previewBtn) {
         previewBtn.addEventListener("click", (e) => {
@@ -6115,7 +6688,7 @@
     html += buildCommandsCardHtml(running.commands, isCollapsed("commands"), true);
     html += buildMcpCardHtml(running.mcp, isCollapsed("mcp"), true);
 
-    deck.querySelectorAll(".revealer-card:not(.permissions):not(.attack-rail):not(.osint-card)").forEach(c => c.remove());
+    deck.querySelectorAll(".revealer-card:not(.permissions):not(.attack-rail):not(.osint-card):not(.secret-rail)").forEach(c => c.remove());
     if (html) {
       deck.insertAdjacentHTML("beforeend", html);
     }
@@ -6411,25 +6984,21 @@
           renderCtxGauge();
         }
       } else if (evt.type === "summary_folding") {
-        if (evt.chat_id && evt.chat_id !== state.chatId) return;
-        // Rendered as a normal notification in the toast stack above the
-        // composer (same host as all other toasts). 120s auto-dismiss is a
-        // safety net if a matching summary_folded / summary_fold_failed event
-        // is lost; hideToast on those events normally ends it earlier.
-        toast(_COMPACT_SVG + "Compacting session history…", "compact", 120000, "compact-progress", true);
+        const chatId = evt.chat_id || state.chatId;
+        if (!chatId) return;
+        state.compactingChats.add(chatId);
+        if (chatId === state.chatId) ensureCompactionRow(chatId);
         appendAgentLog("Context compaction started — condensing older turns into the session summary.");
       } else if (evt.type === "summary_folded") {
         window._lastCompactionAt = Date.now();
-        // Clear the in-progress toast unconditionally — a fold can end while
-        // the user is looking at a different chat; a chat-guarded early return
-        // would leave the indicator stuck.
-        hideToast("compact-progress");
-        if (evt.chat_id && evt.chat_id !== state.chatId) return;
-        toast(`Context compacted — ${evt.folded} older message${evt.folded === 1 ? "" : "s"} folded into the session summary.`, "info", 4000, "summary-fold");
+        finishCompactionRow(evt.chat_id || state.chatId, "done");
       } else if (evt.type === "summary_fold_failed") {
-        hideToast("compact-progress");
-        if (evt.chat_id && evt.chat_id !== state.chatId) return;
-        toast("Context is full but compaction failed (summarizer error) — older messages are being trimmed instead. If the model starts repeating itself, send any message to retry the fold.", "warn", 8000, "summary-fold-fail");
+        const chatId = evt.chat_id || state.chatId;
+        finishCompactionRow(chatId, "failed");
+        if (chatId && chatId !== state.chatId) return;
+        toast("Compaction could not produce a valid summary, so this response was stopped before older context could be discarded. Saved messages and completed actions are intact. Use Compact to try again now, wait three minutes and retry, or continue in a new session.", "warn", 11000, "summary-fold-fail");
+      } else if (evt.type === "summary_fold_finished") {
+        finishCompactionRow(evt.chat_id || state.chatId, "done");
       } else if (evt.type === "desktop:panic") {
         if (evt.on) toast("desktop automation PANICKED — all actions blocked", "warn", 6000, "desktop-panic");
         else toast("desktop automation resumed", "ok", 2000, "desktop-panic");
@@ -6595,7 +7164,7 @@
       title: "Connections",
       subtitle: "Remote access and integrations",
       icon: "ph-plugs-connected",
-      headings: ["Discord remote bridge"],
+      headings: ["Tailscale remote access", "Discord remote bridge"],
     },
   ];
 
@@ -6715,6 +7284,22 @@
     return `${Math.round(Math.max(0, Math.min(1, Number(value) || 0)) * 100)}%`;
   }
 
+  function modelHealthValue(value) {
+    if (typeof value === "boolean") return value ? "On" : "Off";
+    if (typeof value === "number") return value.toLocaleString();
+    if (value == null || value === "") return "Auto";
+    return String(value).replace(/_/g, " ");
+  }
+
+  function modelHealthChanges(changes) {
+    if (!Array.isArray(changes) || !changes.length) return "";
+    return changes.map(change => `
+      <div class="model-health-change">
+        <span>${esc(change.label || change.key || "Setting")}</span>
+        <strong>${esc(modelHealthValue(change.from))}<i class="ph ph-arrow-right"></i>${esc(modelHealthValue(change.to))}</strong>
+      </div>`).join("");
+  }
+
   function renderModelHealth(data) {
     const card = $("#model-health-card");
     if (!card) return;
@@ -6724,8 +7309,15 @@
     const enabled = data?.enabled !== false;
     const advice = Array.isArray(data?.advice) ? data.advice.filter(Boolean) : [];
     const context = Math.max(0, Number(data?.last_context) || 0);
-    const avgContext = Math.max(0, Number(observed.avg_peak_context_tokens) || 0);
-    const contextRatio = context ? avgContext / context : 0;
+    const peakContext = Math.max(0, Number(observed.p90_peak_context_tokens || observed.avg_peak_context_tokens) || 0);
+    const contextRatio = context ? peakContext / context : 0;
+    const learning = data?.learning || {};
+    const recommendation = data?.recommendation || null;
+    const trial = data?.trial || null;
+    const sessions = Math.max(0, Number(learning.sessions) || 0);
+    const turnsRequired = Math.max(1, Number(learning.turns_required) || 25);
+    const sessionsRequired = Math.max(1, Number(learning.sessions_required) || 3);
+    const ready = turns >= turnsRequired && sessions >= sessionsRequired;
 
     const model = data?.model || state.settings?.model || "No model selected";
     $("#model-health-title").textContent = model;
@@ -6742,38 +7334,93 @@
       card.dataset.state = "collecting";
       badge.textContent = "waiting";
       subtitle.textContent = "Choose a model to begin";
-    } else if (turns < 8) {
+    } else if (!ready) {
       card.dataset.state = "collecting";
-      badge.textContent = `${turns}/8 turns`;
+      badge.textContent = `${Math.min(turns, turnsRequired)}/${turnsRequired} turns`;
       subtitle.textContent = turns
-        ? "Learning its normal behavior"
+        ? `Building a baseline across ${sessions}/${sessionsRequired} sessions`
         : "Learning begins with your next chat";
+    } else if (trial?.status === "worse") {
+      card.dataset.state = "attention";
+      badge.textContent = "undo suggested";
+      subtitle.textContent = "The recommended setup performed worse";
+    } else if (trial?.status === "measuring") {
+      card.dataset.state = "testing";
+      badge.textContent = `${trial.progress || 0}/${trial.target || 10} trial turns`;
+      subtitle.textContent = "Checking the recommended setup";
+    } else if (recommendation) {
+      card.dataset.state = "attention";
+      badge.textContent = "high confidence";
+      subtitle.textContent = `Based on ${turns} turns across ${sessions} sessions`;
     } else if (advice.length) {
       card.dataset.state = "attention";
-      badge.textContent = data?.confidence === "high" ? "high confidence" : "watching";
+      badge.textContent = "watching";
       subtitle.textContent = `Based on ${turns} local turns`;
     } else {
       card.dataset.state = "healthy";
-      badge.textContent = data?.confidence === "high" ? "stable" : "looks good";
-      subtitle.textContent = `Based on ${turns} local turns`;
+      badge.textContent = trial?.status === "stable" ? "trial complete" : "well tuned";
+      subtitle.textContent = `Based on ${turns} turns across ${sessions} sessions`;
     }
 
     $("#model-health-metrics").innerHTML = `
       <div class="model-health-metric"><span>Observed turns</span><strong>${turns || "&mdash;"}</strong></div>
       <div class="model-health-metric"><span>Finished</span><strong>${turns ? pct(observed.completion_rate) : "&mdash;"}</strong></div>
       <div class="model-health-metric"><span>Tool success</span><strong>${calls ? pct(1 - (Number(observed.tool_error_rate) || 0)) : "&mdash;"}</strong></div>
-      <div class="model-health-metric"><span>Context use</span><strong>${avgContext && context ? pct(contextRatio) : "&mdash;"}</strong></div>`;
+      <div class="model-health-metric"><span>Busy context</span><strong>${peakContext && context ? pct(contextRatio) : "&mdash;"}</strong></div>`;
 
     const adviceEl = $("#model-health-advice");
     if (!enabled) {
       adviceEl.textContent = "Existing observations are kept locally. Turn learning back on whenever you want it to continue.";
-    } else if (turns < 8) {
-      const remaining = 8 - turns;
-      adviceEl.textContent = `No benchmark needed. Use Accuretta normally; useful advice unlocks after ${remaining} more observed turn${remaining === 1 ? "" : "s"}.`;
+    } else if (!ready) {
+      const turnText = Number(learning.turns_remaining) > 0
+        ? `${learning.turns_remaining} more turn${Number(learning.turns_remaining) === 1 ? "" : "s"}` : "enough turns";
+      const sessionText = Number(learning.sessions_remaining) > 0
+        ? `${learning.sessions_remaining} more session${Number(learning.sessions_remaining) === 1 ? "" : "s"}` : "enough sessions";
+      adviceEl.textContent = `Keep using this exact setup normally. The advisor needs ${turnText} and ${sessionText} before changing anything.`;
     } else if (advice.length) {
       adviceEl.innerHTML = `<ul>${advice.map(item => `<li>${esc(item)}</li>`).join("")}</ul>`;
     } else {
-      adviceEl.textContent = "No recurring operational problems detected. Accuretta will flag a pattern here if that changes.";
+      adviceEl.textContent = recommendation
+        ? "A measured configuration change is ready below."
+        : "No measured reason to change the current settings. Accuretta will keep watching this configuration.";
+    }
+
+    const recommendationEl = $("#model-health-recommendation");
+    if (recommendationEl) {
+      recommendationEl.hidden = !(recommendation || trial);
+      if (recommendation) {
+        recommendationEl.innerHTML = `
+          <div class="model-health-rec-head"><span><i class="ph ph-sliders-horizontal"></i>Recommended setup</span><small>high confidence</small></div>
+          <p>${esc(recommendation.reason || "A better local configuration is ready.")}</p>
+          <div class="model-health-changes">${modelHealthChanges(recommendation.changes)}</div>
+          <small class="model-health-tradeoff">${esc(recommendation.tradeoff || "")}</small>
+          <div class="model-health-actions">
+            <button type="button" class="btn accent" data-model-health-action="apply" data-recommendation-id="${esc(recommendation.id || "")}">Use recommended settings</button>
+            <button type="button" class="btn sm" data-model-health-action="dismiss" data-recommendation-id="${esc(recommendation.id || "")}">Not now</button>
+          </div>`;
+      } else if (trial) {
+        const measuring = trial.status === "measuring";
+        const worse = trial.status === "worse";
+        const title = measuring ? "Testing the recommendation" : (worse ? "The trial needs attention" : "Trial complete");
+        const detail = measuring
+          ? `${trial.progress || 0} of ${trial.target || 10} comparison turns finished.`
+          : (trial.result || "The comparison is complete.");
+        recommendationEl.innerHTML = `
+          <div class="model-health-rec-head"><span><i class="ph ${worse ? "ph-warning" : "ph-gauge"}"></i>${esc(title)}</span><small>${measuring ? "measuring" : esc(trial.status || "complete")}</small></div>
+          <p>${esc(detail)}</p>
+          <div class="model-health-trial-track"><span style="width:${Math.min(100, ((trial.progress || 0) / Math.max(1, trial.target || 10)) * 100)}%"></span></div>
+          <div class="model-health-actions">
+            ${!measuring && !worse ? '<button type="button" class="btn accent" data-model-health-action="keep">Keep settings</button>' : ""}
+            <button type="button" class="btn sm ${worse ? "danger" : ""}" data-model-health-action="undo">Undo recommended settings</button>
+          </div>`;
+      }
+      recommendationEl.querySelectorAll("[data-model-health-action]").forEach(button => {
+        button.addEventListener("click", () => runModelHealthAction(
+          button.dataset.modelHealthAction,
+          button.dataset.recommendationId || "",
+          button,
+        ));
+      });
     }
     const sw = $("#sw-passive-model-telemetry");
     sw?.classList.toggle("on", enabled);
@@ -6794,6 +7441,141 @@
     }
   }
 
+  async function reloadModelHealthSettings(result, action) {
+    if (!result?.settings) return;
+    state.settings = result.settings;
+    populateSettingsForm();
+    renderStatus();
+    renderModelPill();
+    if (!result.reload || !result.model_path) return;
+    const tid = "model-health-reload";
+    state._reloading = true;
+    renderStatus();
+    renderModelPill();
+    toast(action === "undo" ? "restoring the previous model setup…" : "loading the recommended model setup…", "info", 60000, tid);
+    try {
+      await api("/api/models/load", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: result.model_path }),
+      });
+      await refreshModels();
+      toast(action === "undo" ? "previous settings restored" : "recommended settings applied; the ten-turn check starts now", "ok", 5000, tid);
+    } finally {
+      state._reloading = false;
+      renderStatus();
+      renderModelPill();
+    }
+  }
+
+  async function runModelHealthAction(action, recommendationId = "", button = null) {
+    if (button) button.disabled = true;
+    try {
+      const result = await api("/api/model-health/action", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, recommendation_id: recommendationId }),
+      });
+      await reloadModelHealthSettings(result, action);
+      if (action === "dismiss") toast("recommendation dismissed for this setup", "info", 2200);
+      if (action === "keep") toast("recommended settings kept", "ok", 2200);
+      await loadModelHealth();
+    } catch (error) {
+      toast(`setup advisor: ${error.message || error}`, "err", 5000, "model-health-action");
+      if (button) button.disabled = false;
+    }
+  }
+
+  let _modelAdvisorNotificationId = "";
+  function showModelAdvisorNotification(data) {
+    const recommendation = data?.recommendation;
+    if (!recommendation?.id || recommendation.id === _modelAdvisorNotificationId) return;
+    _modelAdvisorNotificationId = recommendation.id;
+    const summary = (recommendation.changes || []).slice(0, 3)
+      .map(change => `${change.label}: ${modelHealthValue(change.from)} to ${modelHealthValue(change.to)}`)
+      .join("; ");
+    const row = toast(
+      `<span class="advisor-toast-copy"><strong>A better setup is ready</strong><small>${esc(summary || recommendation.reason || "Measured from normal local use.")}</small></span>` +
+      `<button type="button" class="advisor-toast-apply">Use recommended settings</button>` +
+      `<button type="button" class="advisor-toast-review">Review</button>`,
+      "info", 45000, "model-advisor", true,
+    );
+    row?.querySelector(".advisor-toast-apply")?.addEventListener("click", event =>
+      runModelHealthAction("apply", recommendation.id, event.currentTarget));
+    row?.querySelector(".advisor-toast-review")?.addEventListener("click", async () => {
+      await openSettings();
+      revealSettingsControl("#model-health-recommendation");
+    });
+    api("/api/model-health/action", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "seen", recommendation_id: recommendation.id }),
+    }).catch(() => {});
+  }
+
+  async function checkModelAdvisor(options = {}) {
+    const data = await api("/api/model-health");
+    renderModelHealth(data);
+    if (options.notify && data?.notification_needed) showModelAdvisorNotification(data);
+    return data;
+  }
+
+  function renderRemoteAccess() {
+    const data = state.remoteAccess || {};
+    const tail = data.tailscale || {};
+    const serve = data.serve || {};
+    const card = $("#remote-status-card");
+    const title = $("#remote-status-title");
+    const detail = $("#remote-status-detail");
+    const health = Array.isArray(tail.health) ? tail.health.filter(Boolean) : [];
+    if (card) card.dataset.state = tail.ok ? "ok" : "warn";
+    if (title) title.textContent = tail.ok
+      ? "Tailscale is ready"
+      : (tail.state ? `Tailscale: ${tail.state}` : "Tailscale unavailable");
+    if (detail) {
+      const parts = [];
+      if (health.length) parts.push(health[0]);
+      parts.push(window.isSecureContext ? "Clipboard has a secure browser context." : "This page is HTTP, so browser clipboard access may be blocked.");
+      detail.textContent = parts.join(" ");
+    }
+    const serveBtn = $("#btn-tailscale-serve");
+    if (serveBtn) {
+      serveBtn.innerHTML = serve.configured
+        ? '<i class="ph ph-check-circle"></i>HTTPS enabled'
+        : '<i class="ph ph-lock-key"></i>Enable HTTPS address';
+      serveBtn.disabled = !!serve.configured;
+    }
+    const serveLink = $("#remote-serve-url");
+    if (serveLink) {
+      serveLink.hidden = !serve.url;
+      serveLink.href = serve.url || "#";
+      serveLink.textContent = serve.url || "";
+    }
+    const peerSelect = $("#remote-peer-select");
+    if (peerSelect) {
+      const prior = peerSelect.value;
+      const peers = Array.isArray(data.mac_peers) ? data.mac_peers : [];
+      peerSelect.innerHTML = peers.length ? "" : '<option value="">No Mac detected</option>';
+      peers.forEach(peer => {
+        const option = document.createElement("option");
+        option.value = peer.node_id || "";
+        option.textContent = `${peer.hostname || peer.dns_name || "Mac"}${peer.online ? " · online" : " · offline"}`;
+        peerSelect.appendChild(option);
+      });
+      if (Array.from(peerSelect.options).some(o => o.value === prior)) peerSelect.value = prior;
+    }
+    const machineList = $("#remote-machine-list");
+    if (machineList) {
+      const machines = Array.isArray(data.machines) ? data.machines : [];
+      machineList.innerHTML = machines.length ? machines.map(machine => `
+        <div class="remote-machine" data-machine="${esc(machine.id)}">
+          <strong>${esc(machine.label || "Paired Mac")}</strong>
+          <small>${esc(machine.username || "user")}@${esc(machine.hostname || machine.ip || "Mac")} · ${esc(machine.status || "prepared")}</small>
+          <span class="remote-machine-actions">
+            ${machine.status !== "ready" ? '<button class="btn sm remote-verify" type="button">Verify</button>' : '<span class="hint">ready</span>'}
+            <button class="iconbtn remote-remove" type="button" title="Remove pairing"><i class="ph ph-trash"></i></button>
+          </span>
+        </div>`).join("") : '<span class="hint">No Mac paired yet.</span>';
+    }
+  }
+
   async function openSettings() {
     initSettingsSections();
     $("#drawer-scrim").classList.add("open");
@@ -6804,6 +7586,7 @@
     loadSystemContext();
     loadDetectedVram();
     refreshSandboxStatus();
+    loadClientContext().catch(() => {});
     await health;
   }
 
@@ -7258,7 +8041,7 @@
         else if (what === "stdout") text = e.stdout || "";
         else if (what === "stderr") text = e.stderr || "";
         if (!text) { toast("nothing to copy", "warn", 1500); return; }
-        navigator.clipboard.writeText(text).then(
+        copyText(text).then(
           () => { toast("copied", "ok", 1500); },
           () => { toast("clipboard failed", "error", 2000); },
         );
@@ -7400,7 +8183,7 @@
     const reasoningCap = $("#set-reasoning-capability");
     if (reasoningCap) reasoningCap.value = s.reasoning_capability_override || "auto";
     const themeSel = $("#set-theme");
-    if (themeSel) themeSel.value = s.theme || "light";
+    if (themeSel) themeSel.value = normalizeTheme(s.theme || "light");
     $("#sw-web").classList.toggle("on", s.allow_web_preview !== false);
 
     // IDE toggles mirror back into the composer chips
@@ -7422,6 +8205,9 @@
     $("#sw-discord-enabled")?.classList.toggle("on", !!s.discord_enabled);
     fill("#set-discord-token", s.discord_bot_token || "");
     fill("#set-discord-owner", s.discord_owner_id || "");
+    $("#sw-remote-enabled")?.classList.toggle("on", s.remote_access_enabled !== false);
+    fill("#set-remote-timeout", s.remote_command_timeout || 120);
+    fill("#set-remote-file-mb", s.remote_file_max_mb || 100);
     const al = $("#set-desktop-allowlist");
     if (al) al.value = (s.desktop_app_allowlist || []).join("\n");
     fill("#set-desktop-rate", s.desktop_max_actions_per_minute || 30);
@@ -7520,6 +8306,9 @@
       discord_enabled: $("#sw-discord-enabled")?.classList.contains("on") || false,
       discord_bot_token: ($("#set-discord-token")?.value || "").trim(),
       discord_owner_id: ($("#set-discord-owner")?.value || "").trim(),
+      remote_access_enabled: $("#sw-remote-enabled")?.classList.contains("on") !== false,
+      remote_command_timeout: Math.max(10, Math.min(3600, n("#set-remote-timeout") || 120)),
+      remote_file_max_mb: Math.max(1, Math.min(1024, n("#set-remote-file-mb") || 100)),
       desktop_app_allowlist: ($("#set-desktop-allowlist")?.value || "")
         .split("\n").map(x => x.trim()).filter(Boolean),
       desktop_max_actions_per_minute: Math.max(1, Math.min(300, n("#set-desktop-rate") || 30)),
@@ -7568,14 +8357,14 @@
     closeSettings();
   }
 
-  // Eight themes: dark (default), dim (warm cappuccino), retro (silver-mauve
-  // midpoint between light and dark), aurora, nebula, operator (phosphor CRT
-  // terminal), soft, light. THEME_CYCLE below is the source of truth for
-  // order; the toggle button walks it start→end so the first click from dark
-  // lands on the next option instead of jumping straight to bright white.
-  // nextTheme() handles the cycle and accepts whatever string is in settings
-  // as the starting point.
-  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "neobrutalism", "neobrutalism-dark", "kinetic", "soft", "pastel", "velvet", "cartograph", "light"];
+  // THEME_CYCLE is the source of truth for the selector and cycle controls.
+  // Retired theme names normalize to Aperture so old settings do not leave the
+  // document in a theme state with no matching CSS.
+  const THEME_MIGRATIONS = Object.freeze({
+    "neobrutalism-dark": "aperture",
+    kinetic: "aperture",
+  });
+  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "neobrutalism", "aperture", "soft", "pastel", "velvet", "cartograph", "light"];
   const THEME_ICONS = {
     dark:              "ph ph-moon",
     dim:               "ph ph-moon-stars",
@@ -7585,15 +8374,18 @@
     operator:          "ph ph-command",
     neumorphic:        "ph ph-drop-half",
     neobrutalism:      "ph ph-lightning",
-    "neobrutalism-dark": "ph ph-lightning-slash",
-    kinetic:           "ph ph-text-t",
+    aperture:          "ph ph-aperture",
     soft:              "ph ph-cloud",
     pastel:            "ph ph-flower-tulip",
     velvet:            "ph ph-crown",
     cartograph:        "ph ph-compass",
     light:             "ph ph-sun",
   };
+  function normalizeTheme(theme) {
+    return THEME_MIGRATIONS[theme] || theme;
+  }
   function nextTheme(cur) {
+    cur = normalizeTheme(cur);
     const idx = THEME_CYCLE.indexOf(cur);
     return THEME_CYCLE[(idx + 1) % THEME_CYCLE.length];
   }
@@ -7603,6 +8395,7 @@
   function applyTheme(theme) {
     if (theme === true) theme = "dark";
     else if (theme === false) theme = "light";
+    theme = normalizeTheme(theme);
     if (!THEME_CYCLE.includes(theme)) theme = "light";
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("accuretta:theme", theme);
@@ -8332,7 +9125,7 @@
 
   const REASONING_EFFORT_KEY = "accuretta:reasoning-effort:v1";
   const REASONING_EFFORT_LEVELS = ["auto", "low", "medium", "high"];
-  const REASONING_EFFORT_LABELS = ["Auto", "Low", "Medium", "High"];
+  const REASONING_EFFORT_LABELS = ["Default", "Low", "Medium", "Deep"];
 
   function reasoningModelKey() {
     return String(state.loadedModel || state.settings.model_path || state.settings.model || "")
@@ -8369,17 +9162,6 @@
     const popValue = $("#reasoning-effort-popover-value");
     if (pillValue) pillValue.textContent = label;
     if (popValue) popValue.textContent = label;
-    const note = $("#reasoning-effort-note");
-    if (note) {
-      const cap = state.reasoningCapability || {};
-      if (level === "auto") {
-        note.textContent = "Uses the model default and your Reasoning settings.";
-      } else if (cap.mode === "native_effort") {
-        note.textContent = `Sends the model's native ${label.toLowerCase()} effort level; Accuretta still guards runaways.`;
-      } else {
-        note.textContent = `${label} changes the thinking-token allowance for this message.`;
-      }
-    }
     const control = $("#reasoning-effort-control");
     if (control) {
       control.classList.remove("is-changing");
@@ -8924,7 +9706,7 @@
   // sidesteps the problem entirely. IDE stays hidden by CSS (no preview
   // pane at this width). The Build / Network items already live in the
   // menu, so the chips just join them.
-  const _MOBILE_TOOLBAR_IDS = ["mode-agent", "mode-auto", "btn-attach-image", "btn-trust-writes"];
+  const _MOBILE_TOOLBAR_IDS = ["mode-agent", "mode-auto", "btn-attach-image", "btn-attach-file", "btn-trust-writes"];
   function applyMobileToolbarLayout() {
     const tools = document.querySelector(".composer-tools");
     const menu = document.getElementById("toolbar-overflow-menu");
@@ -9394,6 +10176,13 @@
     });
     $("#btn-send").addEventListener("click", send);
     $("#btn-stop").addEventListener("click", stopStreaming);
+    $("#execution-target-select")?.addEventListener("change", async (e) => {
+      state.executionTarget = e.currentTarget.value || "host";
+      localStorage.setItem("accuretta:execution-target", state.executionTarget);
+      try { await loadClientContext(); } catch (_) {}
+      const machine = (state.remoteAccess?.machines || []).find(m => m.id === state.executionTarget);
+      toast(machine ? `Commands now target ${machine.label || "the paired Mac"}` : "Commands now target the inference PC", "info", 2200);
+    });
     $("#composer-input").addEventListener("input", e => autoResize(e.target));
     $("#composer-input").addEventListener("keydown", e => {
       if (mentionMenuKeydown(e)) return;   // ↑↓/Enter/Tab/Esc drive the @ picker
@@ -9416,6 +10205,7 @@
 
     // image attach: click button, paste, drop
     $("#btn-attach-image")?.addEventListener("click", () => $("#file-image").click());
+    $("#btn-attach-file")?.addEventListener("click", () => $("#file-client").click());
 
     // trust-writes toggle: auto-approve in-workspace file writes/edits. Styled
     // like the mode chips (.chip.on). Registry/system/PowerShell still prompt.
@@ -9459,6 +10249,10 @@
       await addImageFiles(Array.from(e.target.files || []));
       e.target.value = "";
     });
+    $("#file-client")?.addEventListener("change", (e) => {
+      addClientFiles(Array.from(e.target.files || []));
+      e.target.value = "";
+    });
     $("#composer-input").addEventListener("paste", (e) => {
       const items = Array.from(e.clipboardData?.items || []);
       const files = items.filter(i => i.kind === "file" && i.type.startsWith("image/")).map(i => i.getAsFile()).filter(Boolean);
@@ -9471,10 +10265,119 @@
       composerEl.addEventListener("drop", async (e) => {
         e.preventDefault();
         composerEl.classList.remove("drag-over");
-        const files = Array.from(e.dataTransfer?.files || []).filter(f => f.type.startsWith("image/"));
-        if (files.length) addImageFiles(files);
+        const dropped = Array.from(e.dataTransfer?.files || []);
+        const images = dropped.filter(f => f.type.startsWith("image/"));
+        const files = dropped.filter(f => !f.type.startsWith("image/"));
+        if (images.length) addImageFiles(images);
+        if (files.length) addClientFiles(files);
       });
     }
+
+    $("#btn-remote-refresh")?.addEventListener("click", async () => {
+      try { await loadClientContext(); toast("Remote status refreshed", "ok", 1500); }
+      catch (e) { toast("Remote status failed: " + (e.message || e), "err", 3000); }
+    });
+    $("#sw-remote-enabled")?.addEventListener("click", async (e) => {
+      const on = e.currentTarget.classList.toggle("on");
+      await saveSettings({ remote_access_enabled: on });
+      toast(on ? "Remote tools enabled" : "Remote tools disabled", "ok", 1600);
+    });
+    $("#btn-tailscale-serve")?.addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      try {
+        const result = await api("/api/remote/serve/enable", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        });
+        if (!result.ok && result.consent_url) {
+          const link = $("#remote-serve-url");
+          if (link) {
+            link.href = result.consent_url;
+            link.textContent = "Approve Tailscale Serve";
+            link.hidden = false;
+          }
+          toast("Approve Tailscale Serve using the link, then click Enable HTTPS again.", "warn", 6000);
+          return;
+        }
+        if (!result.ok) throw new Error(result.error || "Tailscale Serve failed");
+        await loadClientContext();
+        toast("Private HTTPS address enabled", "ok", 2500);
+      } catch (err) {
+        toast("HTTPS setup failed: " + (err.message || err), "err", 4500);
+      } finally { btn.disabled = false; }
+    });
+    $("#btn-remote-prepare")?.addEventListener("click", async (e) => {
+      const nodeId = $("#remote-peer-select")?.value || "";
+      const username = ($("#remote-username")?.value || "").trim();
+      if (!nodeId || !username) {
+        toast("Choose the Mac and enter its short account name", "warn", 3000);
+        return;
+      }
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      try {
+        const result = await api("/api/remote/pair/prepare", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            node_id: nodeId, username,
+            label: ($("#remote-label")?.value || "").trim(),
+            allowed_roots: ($("#remote-roots")?.value || "").split("\n").map(x => x.trim()).filter(Boolean),
+          }),
+        });
+        if (!result.ok) throw new Error(result.error || "Pairing preparation failed");
+        $("#remote-pair-command").value = result.pair_command || "";
+        $("#remote-pair-command-row").hidden = false;
+        await loadClientContext();
+        toast("Pairing command ready. Run it once on the Mac.", "ok", 3500);
+      } catch (err) {
+        toast("Pairing failed: " + (err.message || err), "err", 4500);
+      } finally { btn.disabled = false; }
+    });
+    $("#btn-copy-pair-command")?.addEventListener("click", async () => {
+      const command = $("#remote-pair-command")?.value || "";
+      if (!command) return;
+      try { await copyText(command); toast("Pairing command copied", "ok", 1800); }
+      catch (_) { toast("Clipboard unavailable", "warn", 2200); }
+    });
+    $("#remote-machine-list")?.addEventListener("click", async (e) => {
+      const card = e.target.closest(".remote-machine");
+      if (!card) return;
+      const machineId = card.dataset.machine || "";
+      if (e.target.closest(".remote-verify")) {
+        const button = e.target.closest(".remote-verify");
+        button.disabled = true;
+        try {
+          const result = await api("/api/remote/pair/verify", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ machine_id: machineId }),
+          });
+          if (!result.ok) throw new Error(result.error || "Verification failed");
+          await loadClientContext();
+          toast("Mac verified and ready", "ok", 2500);
+        } catch (err) { toast("Mac verification failed: " + (err.message || err), "err", 5000); }
+        finally { button.disabled = false; }
+      }
+      if (e.target.closest(".remote-remove")) {
+        const ok = await confirmModal({
+          title: "Remove Mac pairing?",
+          message: "This deletes Accuretta's dedicated SSH key from the PC. The matching public-key line can also be removed from the Mac later.",
+          confirmText: "Remove pairing", danger: true,
+        });
+        if (!ok) return;
+        const result = await api("/api/remote/pair/remove", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ machine_id: machineId }),
+        });
+        if (result.ok) {
+          if (state.executionTarget === machineId) {
+            state.executionTarget = "host";
+            localStorage.setItem("accuretta:execution-target", "host");
+          }
+          await loadClientContext();
+          toast("Mac pairing removed", "ok", 2200);
+        } else toast(result.error || "Remove failed", "err", 3000);
+      }
+    });
 
     // composer draft auto-save
     $("#composer-input").addEventListener("input", (e) => {
@@ -9552,10 +10455,12 @@
     const reconConstraintVal = () => document.querySelectorAll("#recon-constraint-chips .recon-chip.active").length
       || ($("#recon-constraint-text")?.value || "").trim();
     const reconGate = () => {
-      const authed = !!$("#recon-auth-check")?.checked;
+      const passive = reconObjective === "passive_osint";
+      const secretAudit = reconObjective === "frontend_secrets";
+      const authed = passive || !!$("#recon-auth-check")?.checked;
       const hasTarget = !!($("#recon-target-input")?.value || "").trim();
       const go = $("#recon-go"); if (go) go.disabled = !(authed && hasTarget);
-      const anyBlank = !reconScopeVal() || !($("#recon-objective-text")?.value || "").trim() || !reconConstraintVal();
+      const anyBlank = !passive && !secretAudit && (!reconScopeVal() || !($("#recon-objective-text")?.value || "").trim() || !reconConstraintVal());
       $("#recon-blank-notice")?.classList.toggle("hidden", !anyBlank);
     };
     const reconOpen = (objective) => {
@@ -9564,12 +10469,35 @@
         return;
       }
       reconObjective = objective || "recon";
+      const passive = reconObjective === "passive_osint";
       const access = reconObjective === "gain_access";
-      const h3 = $("#recon-modal h3"); if (h3) h3.textContent = access ? "Authorized pentest" : "Authorized recon";
-      const go = $("#recon-go"); if (go) { go.textContent = access ? "Find a way in" : "Run recon"; go.disabled = true; }
-      ["#recon-target-input", "#recon-scope-in", "#recon-scope-out", "#recon-objective-text", "#recon-constraint-text"]
+      const secretAudit = reconObjective === "frontend_secrets";
+      const modal = $("#recon-modal");
+      modal?.classList.toggle("recon-passive-mode", passive);
+      modal?.classList.toggle("recon-secret-mode", secretAudit);
+      const h3 = $("#recon-modal h3");
+      if (h3) h3.textContent = passive ? "Passive OSINT" : secretAudit ? "Frontend Secret Audit" : access ? "Red Team" : "Target Recon";
+      const modalIcon = $("#recon-modal-icon");
+      if (modalIcon) modalIcon.className = passive ? "ph ph-binoculars" : secretAudit ? "ph ph-file-js" : access ? "ph ph-shield-chevron" : "ph ph-crosshair";
+      const go = $("#recon-go");
+      if (go) { go.textContent = passive ? "Start OSINT" : secretAudit ? "Audit frontend" : access ? "Start assessment" : "Run recon"; go.disabled = true; }
+      const disclaimer = $("#recon-disclaimer-text");
+      if (disclaimer) disclaimer.innerHTML = passive
+        ? "<strong>No direct target contact.</strong> Accuretta queries public search, registry, DNS, certificate and archive providers. It will not connect directly to the target or its hosts."
+        : secretAudit
+          ? "<strong>Read-only frontend audit.</strong> Accuretta fetches the authorized page, linked JavaScript, lazy chunks, and source maps. Exact confirmed values are shown in the report. Discovered credentials are never used or submitted for validation."
+        : "<strong>Authorized testing only.</strong> Test only systems you own or have explicit written permission to test. Unauthorized scanning may be illegal where you are. You alone are responsible for how these tools are used and for the consequences.";
+      const disclaimerIcon = $("#recon-disclaimer-icon");
+      if (disclaimerIcon) disclaimerIcon.className = passive ? "ph ph-eye-slash" : secretAudit ? "ph ph-file-magnifying-glass" : "ph ph-warning";
+      const targetLabel = $("#recon-target-label");
+      if (targetLabel) targetLabel.textContent = passive ? "Domain" : secretAudit ? "Page URL" : "Target domain or host";
+      ["#recon-target-input", "#recon-scope-in", "#recon-scope-out", "#recon-user-agent", "#recon-objective-text", "#recon-constraint-text"]
         .forEach(s => { const el = $(s); if (el) el.value = ""; });
+      const targetInput = $("#recon-target-input");
+      if (targetInput) targetInput.placeholder = secretAudit ? "https://example.com/app" : "example.com";
       const chk = $("#recon-auth-check"); if (chk) chk.checked = false;
+      const thorough = $("#recon-secret-thorough"); if (thorough) thorough.checked = true;
+      const candidates = $("#recon-secret-candidates"); if (candidates) candidates.checked = false;
       document.querySelectorAll("#recon-objective-chips .recon-chip, #recon-constraint-chips .recon-chip")
         .forEach(c => c.classList.remove("active"));
       reconGate();
@@ -9578,56 +10506,117 @@
       setTimeout(() => $("#recon-target-input")?.focus(), 50);
     };
     const reconRun = () => {
-      if (!$("#recon-auth-check")?.checked) { toast("Confirm authorization first.", "warn", 2200); return; }
+      const passive = reconObjective === "passive_osint";
+      const secretAudit = reconObjective === "frontend_secrets";
+      if (!passive && !$("#recon-auth-check")?.checked) { toast("Confirm authorization first.", "warn", 2200); return; }
       const raw = ($("#recon-target-input")?.value || "").trim();
       if (!raw) { toast("Enter a target first.", "warn", 2200); return; }
-      const target = raw.replace(/^https?:\/\//i, "").replace(/\/.*$/, "").replace(/\s+/g, "").trim();
+      let target = raw.replace(/^https?:\/\//i, "").replace(/\/.*$/, "").replace(/\s+/g, "").trim();
+      let scanUrl = "";
+      if (secretAudit) {
+        try {
+          const parsed = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+          if (!/^https?:$/.test(parsed.protocol)) throw new Error("unsupported protocol");
+          scanUrl = parsed.href;
+          target = parsed.host;
+        } catch (_) {
+          toast("Enter a valid http or https page URL.", "warn", 2400);
+          return;
+        }
+      }
       if (!target) { toast("That doesn't look like a domain.", "warn", 2200); return; }
       // Collect the scope/auth panel into a mission the bridge seeds via
       // _rt_mission_seed / _rt_mission_note (flows into the sysprompt).
       const scIn = ($("#recon-scope-in")?.value || "").trim();
       const scOut = ($("#recon-scope-out")?.value || "").trim();
-      const scope = [scIn ? `in: ${scIn}` : "", scOut ? `out: ${scOut}` : ""].filter(Boolean).join(" | ");
-      const objective = ($("#recon-objective-text")?.value || "").trim();
+      const userAgent = ($("#recon-user-agent")?.value || "").trim();
+      if (userAgent && Array.from(userAgent).some(char => {
+        const code = char.codePointAt(0);
+        return code < 32 || code === 127 || code > 255;
+      })) {
+        toast("Use a single-line User-Agent containing standard text characters.", "warn", 2600);
+        return;
+      }
+      const scope = passive
+        ? `in: ${target}`
+        : [scIn ? `in: ${scIn}` : "", scOut ? `out: ${scOut}` : ""].filter(Boolean).join(" | ");
+      const objective = ($("#recon-objective-text")?.value || "").trim()
+        || (passive ? "Build a public-source intelligence profile." : secretAudit ? "Audit frontend resources for exposed credentials." : "");
       const conChips = Array.from(document.querySelectorAll("#recon-constraint-chips .recon-chip.active")).map(c => c.dataset.val);
       const conText = ($("#recon-constraint-text")?.value || "").trim();
-      const constraints = [...conChips, conText].filter(Boolean).join("; ");
+      const constraints = passive
+        ? "zero direct target contact; public third-party sources only"
+        : secretAudit
+          ? "read-only GET requests; show exact confirmed values; never use or submit discovered credentials"
+        : [...conChips, conText].filter(Boolean).join("; ");
       // This explicit bit is consumed by the bridge to create a per-chat
       // authorization record. Merely enabling Red team tools in Settings is
       // no longer enough for a model to invoke them.
       const mission = {
-        target, scope, objective, constraints,
+        target, scope, objective, constraints, user_agent: userAgent,
         authorized: true,
-        engagement: reconObjective === "gain_access" ? "pentest" : "recon",
+        engagement: passive ? "passive_osint" : secretAudit ? "frontend_secrets" : reconObjective === "gain_access" ? "pentest" : "recon",
       };
       reconClose();
+      const userAgentTmpl = userAgent
+        ? `Accuretta will enforce the required User-Agent ${JSON.stringify(userAgent)} on HTTP requests for this engagement. Do not replace it or claim a different value was sent. `
+        : "";
+      const passiveTmpl =
+        `Run a passive OSINT profile on ${target}. Do not connect to ${target} or any host under it. ` +
+        `Use public third-party sources only: recon_rdap, recon_dns without AXFR or loud mode, ` +
+        `recon_subdomains, recon_web_archive, and focused web_search queries. Do not call web_fetch, ` +
+        `TLS, HTTP, port, content-discovery, takeover, validation, shell, sandbox, MCP, or exploit tools. ` +
+        `Correlate the results, distinguish observed facts from inference, name the source behind each ` +
+        `material claim, and finish with a concise intelligence brief covering ownership and lifecycle, ` +
+        `DNS and mail posture, certificate-discovered hosts, public references, and historical URLs. ` +
+        `If a source is unavailable, note the gap instead of replacing it with direct target traffic.`;
       const reconTmpl =
         `Authorized reconnaissance on ${target}. I have confirmed I am authorized to test this target. ` +
+        userAgentTmpl +
         `Run, in order: recon_dns (domain "${target}"), recon_subdomains (domain "${target}"), ` +
         `recon_tls_audit (host "${target}"), recon_http_fingerprint (url "${target}"), and ` +
         `recon_port_scan (host "${target}"). ` +
         `Then present a clean recon report with sections: DNS & infrastructure, Subdomains, ` +
         `TLS / certificate posture, HTTP fingerprint, and Open ports. Use markdown tables where they help. ` +
         `End with a short "Findings worth a look" heading. Be concise and factual.`;
+      const secretTmpl =
+        `Authorized standalone frontend secret audit on ${scanUrl}. I have confirmed I am authorized to test ${target}. ` +
+        `Call scan_js_secrets exactly once with url=${JSON.stringify(scanUrl)}, crawl_depth=${$("#recon-secret-thorough")?.checked ? 3 : 1}, ` +
+        `max_files=${$("#recon-secret-thorough")?.checked ? 120 : 40}, and include_candidates=${$("#recon-secret-candidates")?.checked ? "true" : "false"}. ` +
+        `Then report the resource counts and findings from that tool result. Keep verified-structure and high-confidence findings separate from uncertain candidates. ` +
+        `For every returned finding, copy its exact value into the report without shortening or altering it; use a fenced text block for long or multiline values. ` +
+        `List public_identifiers separately as context, with their exact returned values, without calling them vulnerabilities. Never send or use a discovered value in any HTTP, API, provider, authentication, or validation request. Do not run any other recon or exploit tool. ` +
+        `If there are no returned findings, say that the audit found no high-confidence exposed credentials and mention any skipped out-of-scope resources or fetch errors.`;
       const accessTmpl =
         `Authorized penetration test on ${target}. I have confirmed I am authorized to test this target and I accept responsibility. ` +
+        userAgentTmpl +
         `This is a REAL engagement, NOT a CTF. There is no fixed number of "flags" to find and no CTF scoring. Do NOT invent a flag count, do NOT track progress as "N/3" or "captured X of Y", and do NOT assume a FLAG{...} exists — a FLAG{...} only matters if a tool result literally contains that string. If the target is clean, the correct outcome is "no exploitable findings", not "0 flags". ` +
         `MINDSET — the scope is wide, so go as deep as the target allows. Gaining access is the START of the work, not the end. After EVERY result ask "what does this unlock, and is there a deeper version of it?", and assume there IS more until you have proven there isn't. Test every endpoint and every parameter in scope, not just the first thing that works. Stay strictly NON-DESTRUCTIVE: read, enumerate, and copy proof — never delete, modify, overwrite, deface, DoS, or leave persistence. Be honest both ways: if something is genuinely safe, say so and move on; if it is exploitable, take it as far as it goes. Do not fabricate a finding to look thorough, and do not abandon a real one early.\n` +
         `Work these phases, letting each result drive the next:\n` +
         `1) RECON — recon_dns, recon_subdomains, recon_http_fingerprint, recon_tls_audit, recon_port_scan on ${target}.\n` +
-        `2) MAP THE SURFACE — recon_content_discovery (quiet=true) + recon_check_exposure on the web root(s); recon_open_services on the host; recon_subdomain_takeover on subdomains. Run scan_js_secrets on the front-end pages to pull hardcoded API keys, tokens, JWTs, and cloud credentials out of the linked JavaScript (do not skip this — front-end bundles leak keys constantly). Run validate_finding before trusting any exposure — do NOT report decoys, catch-all, or placeholder pages.\n` +
+        `2) MAP THE SURFACE — recon_content_discovery (quiet=true) + recon_check_exposure on the web root(s); recon_open_services on the host; recon_subdomain_takeover on subdomains. Run scan_js_secrets on the front-end pages with include_candidates=false so it inspects linked bundles, lazy chunks, and source maps. Treat only its returned findings as secrets; public_identifiers and hidden candidates are context, not vulnerabilities. Include each returned finding's exact value in the final report. Never send or use a value returned by scan_js_secrets in any HTTP, API, provider, authentication, or validation request. Run validate_finding before trusting other URL-based exposures — do NOT report decoys, catch-all, placeholder pages, or public client keys.\n` +
         `3) FIND WEAKNESSES — recon_cve_match on any component versions you see; recon_injection_probe on every URL that takes parameters (or batch_probe to fire one payload set at every parameterized endpoint at once); cors_probe any API endpoint for credentialed cross-origin reads; probe EACH parameter, not just the obvious one.\n` +
         `4) EXPLOIT — breach each finding for real with http_request: decode+flip+re-encode an unsigned cookie and replay it, aim an SSRF param at an internal address, POST an SSTI/injection payload, tamper a header. Use encode_decode for base64/url/hex and jwt_tool to decode/forge/crack a JWT — don't compute crypto by hand. Read every response body, set_cookie, and header.\n` +
         `5) GO DEEPER (post-exploitation) — do NOT stop at "confirmed", loot it. On SQL injection, use sql_injection to enumerate the schema and dump the interesting tables (extract="name FROM sqlite_master", then the real data) — 'OR 1=1' only proves the bug, it doesn't extract the secrets. On file read or RCE, pull configs, source, environment variables, and known secret paths; hunt for keys and credentials. On gained access, enumerate what the new role/session unlocks and pivot from it. On an object/id endpoint, use fuzz to enumerate ids and read the outliers (IDOR). Feed each result into the next move.\n` +
         `6) PROVE IT — for every confirmed access or extracted secret, re-send the winning request with save_evidence set (archives request+response with a sha256), or use recon_capture_evidence.\n` +
         `STEALTH — a signature IDS matches the raw request text, so to stay quiet keep recon low-footprint (quiet=true) and obfuscate payloads (url-encode via encode_decode, vary keyword case, use alternate separators); the server still decodes and executes them while the signature misses.\n` +
         `Only stop when you have genuinely exhausted the scope — every endpoint tested, every real finding taken to its depth. Then write a report: Executive summary (did you get in, how deep, what you reached), What's broken (each finding with severity + evidence), Loot (data, secrets, and credentials extracted), Recommendations. Never claim access or a finding you did not verify with a tool result or a captured artifact — but do not leave a real avenue unexplored. Be factual AND thorough. Once you deliver that report the engagement is CLOSED: treat any later message as a debrief — answer it directly and conversationally, and do NOT run recon or exploit tools again unless the user explicitly tells you to resume or keep testing.`;
-      send({ prompt: reconObjective === "gain_access" ? accessTmpl : reconTmpl, invisible: true, mission });
+      send({ prompt: passive ? passiveTmpl : secretAudit ? secretTmpl : reconObjective === "gain_access" ? accessTmpl : reconTmpl, invisible: true, mission });
     };
+    $("#quick-passive-osint")?.addEventListener("click", () => {
+      $("#toolbar-overflow-menu")?.classList.remove("open");
+      $("#btn-toolbar-overflow")?.classList.remove("open");
+      reconOpen("passive_osint");
+    });
     $("#quick-recon-target")?.addEventListener("click", () => {
       $("#toolbar-overflow-menu")?.classList.remove("open");
       $("#btn-toolbar-overflow")?.classList.remove("open");
       reconOpen("recon");
+    });
+    $("#quick-frontend-secrets")?.addEventListener("click", () => {
+      $("#toolbar-overflow-menu")?.classList.remove("open");
+      $("#btn-toolbar-overflow")?.classList.remove("open");
+      reconOpen("frontend_secrets");
     });
     $("#quick-gain-access")?.addEventListener("click", () => {
       $("#toolbar-overflow-menu")?.classList.remove("open");
@@ -9639,7 +10628,7 @@
     $("#recon-scrim")?.addEventListener("click", reconClose);
     $("#recon-auth-check")?.addEventListener("change", reconGate);
     // Re-gate on any input so the button state + wider-targeting notice stay live.
-    ["#recon-target-input", "#recon-scope-in", "#recon-scope-out", "#recon-objective-text", "#recon-constraint-text"]
+    ["#recon-target-input", "#recon-scope-in", "#recon-scope-out", "#recon-user-agent", "#recon-objective-text", "#recon-constraint-text"]
       .forEach(s => $(s)?.addEventListener("input", reconGate));
     // Objective chips are a quick-fill for the free-text objective (single pick).
     document.querySelectorAll("#recon-objective-chips .recon-chip").forEach(chip => {
@@ -9855,7 +10844,7 @@
       // user knows what the tap will do, mirroring the desktop cycle.
       const cur = document.documentElement.getAttribute("data-theme") || "light";
       const next = nextTheme(cur);
-      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", neumorphic: "Neumorphic", neobrutalism: "Neobrutalism", "neobrutalism-dark": "Neobrutalism Dark", kinetic: "Kinetic", soft: "Soft", pastel: "Pastel", velvet: "Velvet", cartograph: "Cartograph", light: "Light" }[next] || next;
+      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", neumorphic: "Neumorphic", neobrutalism: "Neobrutalism", aperture: "Aperture", soft: "Soft", pastel: "Pastel", velvet: "Velvet", cartograph: "Cartograph", light: "Light" }[next] || next;
       const lbl = $("#mm-theme-label");
       if (lbl) lbl.textContent = `Switch to ${niceName.toLowerCase()}`;
       mm.classList.add("open"); mmScrim.classList.add("open");
@@ -10085,8 +11074,11 @@
       if (!container) return;
       const content = container.querySelector(".think-content");
       if (!content) return;
-      
+
+      const willOpen = content.classList.contains("hidden");
+      if (willOpen) content.textContent = content._fullText || "";
       const isHidden = content.classList.toggle("hidden");
+      if (isHidden) content.textContent = "";
       // Finalized "Worked for Xs" block: the same caret also folds the tool group.
       if (container.classList.contains("has-worklog")) {
         const grp = container.closest(".bubble-col")?.querySelector(".tool-group");

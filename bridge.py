@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import json
 import copy
+import getpass
+import math
 import os
+import posixpath
 import random
 import re
 import shlex
@@ -198,6 +201,12 @@ VERSIONS_DIR = DATA / "versions"
 PENDING_DIR = DATA / "pending"
 SNAPSHOTS_DIR = DATA / "snapshots"
 TURN_JOURNAL_DIR = DATA / "turn_journal"
+REMOTE_DIR = DATA / "remote"
+REMOTE_KEYS_DIR = REMOTE_DIR / "keys"
+REMOTE_BACKUPS_DIR = REMOTE_DIR / "backups"
+REMOTE_STAGING_DIR = REMOTE_DIR / "staging"
+REMOTE_MACHINES_FILE = REMOTE_DIR / "machines.json"
+REMOTE_KNOWN_HOSTS_FILE = REMOTE_DIR / "known_hosts"
 CHATS_FILE = DATA / "chats.json"
 SETTINGS_FILE = DATA / "settings.json"
 MODELS_CONFIG_FILE = DATA / "models_config.json"   # per-model tuned flag memory (auto-tune on load)
@@ -386,7 +395,10 @@ _tool_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tool-")
 _tool_jobs: dict[str, dict] = {}
 _tool_jobs_lock = threading.Lock()
 
-for d in (DATA, VERSIONS_DIR, PENDING_DIR, SNAPSHOTS_DIR, TURN_JOURNAL_DIR):
+for d in (
+    DATA, VERSIONS_DIR, PENDING_DIR, SNAPSHOTS_DIR, TURN_JOURNAL_DIR,
+    REMOTE_DIR, REMOTE_KEYS_DIR, REMOTE_BACKUPS_DIR,
+):
     d.mkdir(parents=True, exist_ok=True)
 
 def _resolve_llama_url() -> str:
@@ -655,12 +667,114 @@ def _model_profile_key(model: str) -> str:
     return name[:180]
 
 
+_MODEL_ADVISOR_BASELINE_TURNS = 25
+_MODEL_ADVISOR_BASELINE_SESSIONS = 3
+_MODEL_ADVISOR_TRIAL_TURNS = 10
+_MODEL_ADVISOR_OBSERVATION_CAP = 80
+_MODEL_ADVISOR_CONFIG_KEYS = (
+    "num_ctx", "num_gpu", "num_batch", "n_ubatch", "n_cpu_moe",
+    "num_thread", "n_parallel", "kv_cache_type", "kv_cache_type_v",
+    "flash_attn", "spec_strategy",
+)
+_MODEL_ADVISOR_APPLY_KEYS = set(_MODEL_ADVISOR_CONFIG_KEYS)
+_MODEL_ADVISOR_LABELS = {
+    "num_ctx": "Context window", "num_gpu": "GPU layers",
+    "num_batch": "Batch size", "n_ubatch": "Micro-batch",
+    "n_cpu_moe": "CPU MoE experts", "num_thread": "CPU threads",
+    "n_parallel": "Parallel sequences", "kv_cache_type": "KV cache",
+    "kv_cache_type_v": "V cache", "flash_attn": "Flash attention",
+    "spec_strategy": "Speculative decoding",
+}
+
+
+def _model_runtime_config(settings: dict | None = None) -> dict:
+    """Small content-free snapshot used to keep unlike configurations apart."""
+    s = settings if isinstance(settings, dict) else get_settings()
+    out = {}
+    for key in _MODEL_ADVISOR_CONFIG_KEYS:
+        value = s.get(key)
+        if isinstance(value, bool):
+            out[key] = value
+        elif key in {"kv_cache_type", "kv_cache_type_v", "spec_strategy"}:
+            out[key] = str(value or "")[:40]
+        else:
+            try:
+                out[key] = int(value or 0)
+            except (TypeError, ValueError):
+                out[key] = 0
+    return out
+
+
+def _model_config_signature(snapshot: dict) -> str:
+    raw = json.dumps(snapshot or {}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _model_observed(row: dict, observations: list[dict] | None = None) -> dict:
+    source = observations if observations is not None else None
+    if source is not None:
+        turns = len(source)
+        completed = sum(int(bool(x.get("completed"))) for x in source)
+        prompt_tokens = sum(max(0, int(x.get("prompt_tokens", 0) or 0)) for x in source)
+        output_tokens = sum(max(0, int(x.get("output_tokens", 0) or 0)) for x in source)
+        rounds = sum(max(0, int(x.get("rounds", 0) or 0)) for x in source)
+        calls = sum(max(0, int(x.get("tool_calls", 0) or 0)) for x in source)
+        errors = sum(max(0, int(x.get("tool_errors", 0) or 0)) for x in source)
+        fallbacks = sum(int(bool(x.get("native_fallback"))) for x in source)
+        elapsed_ms = sum(max(0.0, float(x.get("elapsed_ms", 0) or 0)) for x in source)
+        prefill_ms = sum(max(0.0, float(x.get("prefill_ms", 0) or 0)) for x in source)
+        eval_ms = sum(max(0.0, float(x.get("eval_ms", 0) or 0)) for x in source)
+        peaks = sorted(max(0, int(x.get("peak_context_tokens", 0) or 0)) for x in source)
+        compactions = sum(max(0, int(x.get("compactions", 0) or 0)) for x in source)
+        compaction_failures = sum(max(0, int(x.get("compaction_failures", 0) or 0)) for x in source)
+    else:
+        turns = max(0, int(row.get("turns", 0) or 0))
+        completed = max(0, int(row.get("completed_turns", 0) or 0))
+        prompt_tokens = max(0, int(row.get("prompt_tokens", 0) or 0))
+        output_tokens = max(0, int(row.get("output_tokens", 0) or 0))
+        rounds = max(0, int(row.get("rounds", 0) or 0))
+        calls = max(0, int(row.get("tool_calls", 0) or 0))
+        errors = max(0, int(row.get("tool_errors", 0) or 0))
+        fallbacks = max(0, int(row.get("native_fallback_turns", 0) or 0))
+        elapsed_ms = max(0.0, float(row.get("elapsed_s", 0) or 0)) * 1000.0
+        prefill_ms = max(0.0, float(row.get("prefill_ms", 0) or 0))
+        eval_ms = max(0.0, float(row.get("eval_ms", 0) or 0))
+        peaks = sorted(max(0, int(x.get("peak_context_tokens", 0) or 0))
+                       for x in (row.get("observations") or []) if isinstance(x, dict))
+        compactions = max(0, int(row.get("compactions", 0) or 0))
+        compaction_failures = max(0, int(row.get("compaction_failures", 0) or 0))
+    denom_turns = max(1, turns)
+    p90_peak = 0
+    if peaks:
+        p90_peak = peaks[min(len(peaks) - 1, max(0, math.ceil(len(peaks) * 0.90) - 1))]
+    avg_peak = (sum(peaks) / len(peaks)) if peaks else (
+        float(row.get("peak_context_sum", 0) or 0) / denom_turns)
+    decode_seconds = eval_ms / 1000.0
+    prompt_seconds = prefill_ms / 1000.0
+    elapsed_seconds = elapsed_ms / 1000.0
+    return {
+        "completion_rate": round(completed / denom_turns, 3),
+        "tool_error_rate": round(errors / max(1, calls), 3),
+        "avg_rounds": round(rounds / denom_turns, 2),
+        "output_tok_s": round(output_tokens / (decode_seconds or elapsed_seconds or 0.001), 2),
+        "prompt_tok_s": round(prompt_tokens / (prompt_seconds or 0.001), 2) if prefill_ms else 0.0,
+        "avg_peak_context_tokens": round(avg_peak, 1),
+        "p90_peak_context_tokens": int(p90_peak or row.get("peak_context_tokens", 0) or 0),
+        "native_fallback_rate": round(fallbacks / denom_turns, 3),
+        "compactions": compactions,
+        "compaction_failures": compaction_failures,
+    }
+
+
 def _record_model_observation(model: str, *, prompt_tokens: int = 0,
                               output_tokens: int = 0, rounds: int = 0,
                               tool_calls: int = 0, tool_errors: int = 0,
                               peak_prompt_tokens: int = 0,
                               elapsed_s: float = 0.0, native_fallback: bool = False,
-                              completed: bool = True) -> None:
+                              completed: bool = True, chat_id: str = "",
+                              prompt_ms: float = 0.0, eval_ms: float = 0.0,
+                              compactions: int = 0,
+                              compaction_failures: int = 0) -> None:
     """Local-only, content-free observations from normal use.
 
     This replaces a mandatory per-model benchmark. It costs no extra inference,
@@ -668,15 +782,22 @@ def _record_model_observation(model: str, *, prompt_tokens: int = 0,
     real turns have accumulated.
     """
     try:
-        if not get_settings().get("passive_model_telemetry", True):
+        settings = get_settings()
+        if not settings.get("passive_model_telemetry", True):
             return
     except Exception:
         return
     key = _model_profile_key(model)
+    config = _model_runtime_config(settings)
+    config_key = _model_config_signature(config)
+    now = int(time.time())
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    session_key = hashlib.sha256(str(chat_id or day).encode("utf-8")).hexdigest()[:12]
     with _MODEL_RUNTIME_LOCK:
-        data = load_json(MODEL_RUNTIME_FILE, {"version": 1, "models": {}})
+        data = load_json(MODEL_RUNTIME_FILE, {"version": 2, "models": {}})
         if not isinstance(data, dict):
-            data = {"version": 1, "models": {}}
+            data = {"version": 2, "models": {}}
+        data["version"] = max(2, int(data.get("version", 1) or 1))
         models = data.setdefault("models", {})
         row = models.setdefault(key, {
             "turns": 0, "completed_turns": 0, "prompt_tokens": 0,
@@ -695,9 +816,72 @@ def _record_model_observation(model: str, *, prompt_tokens: int = 0,
         row["peak_context_tokens"] = max(int(row.get("peak_context_tokens", 0) or 0), _peak)
         row["peak_context_sum"] = int(row.get("peak_context_sum", 0) or 0) + _peak
         row["elapsed_s"] = round(float(row.get("elapsed_s", 0.0)) + max(0.0, float(elapsed_s or 0)), 3)
+        row["prefill_ms"] = round(float(row.get("prefill_ms", 0.0)) + max(0.0, float(prompt_ms or 0)), 3)
+        row["eval_ms"] = round(float(row.get("eval_ms", 0.0)) + max(0.0, float(eval_ms or 0)), 3)
+        row["compactions"] = int(row.get("compactions", 0) or 0) + max(0, int(compactions or 0))
+        row["compaction_failures"] = int(row.get("compaction_failures", 0) or 0) + max(0, int(compaction_failures or 0))
         row["native_fallback_turns"] = int(row.get("native_fallback_turns", 0)) + int(bool(native_fallback))
-        row["last_seen"] = int(time.time())
-        row["last_context"] = int(_llama_props_ctx() or get_settings().get("num_ctx") or 0)
+        row["last_seen"] = now
+        row["last_context"] = int(_llama_props_ctx() or settings.get("num_ctx") or 0)
+        row["active_config"] = config_key
+
+        configs = row.setdefault("configs", {})
+        cfg = configs.setdefault(config_key, {
+            "settings": config, "first_seen": now, "turns": 0,
+            "completed_turns": 0, "prompt_tokens": 0, "output_tokens": 0,
+            "rounds": 0, "tool_calls": 0, "tool_errors": 0,
+            "elapsed_s": 0.0, "prefill_ms": 0.0, "eval_ms": 0.0,
+            "native_fallback_turns": 0, "peak_context_tokens": 0,
+            "peak_context_sum": 0, "compactions": 0,
+            "compaction_failures": 0, "sessions": [], "days": [],
+            "clients": {}, "observations": [],
+        })
+        cfg["settings"] = config
+        cfg["turns"] = int(cfg.get("turns", 0) or 0) + 1
+        cfg["completed_turns"] = int(cfg.get("completed_turns", 0) or 0) + int(bool(completed))
+        cfg["prompt_tokens"] = int(cfg.get("prompt_tokens", 0) or 0) + max(0, int(prompt_tokens or 0))
+        cfg["output_tokens"] = int(cfg.get("output_tokens", 0) or 0) + max(0, int(output_tokens or 0))
+        cfg["rounds"] = int(cfg.get("rounds", 0) or 0) + max(0, int(rounds or 0))
+        cfg["tool_calls"] = int(cfg.get("tool_calls", 0) or 0) + max(0, int(tool_calls or 0))
+        cfg["tool_errors"] = int(cfg.get("tool_errors", 0) or 0) + max(0, int(tool_errors or 0))
+        cfg["elapsed_s"] = round(float(cfg.get("elapsed_s", 0.0)) + max(0.0, float(elapsed_s or 0)), 3)
+        cfg["prefill_ms"] = round(float(cfg.get("prefill_ms", 0.0)) + max(0.0, float(prompt_ms or 0)), 3)
+        cfg["eval_ms"] = round(float(cfg.get("eval_ms", 0.0)) + max(0.0, float(eval_ms or 0)), 3)
+        cfg["native_fallback_turns"] = int(cfg.get("native_fallback_turns", 0) or 0) + int(bool(native_fallback))
+        cfg["peak_context_tokens"] = max(int(cfg.get("peak_context_tokens", 0) or 0), _peak)
+        cfg["peak_context_sum"] = int(cfg.get("peak_context_sum", 0) or 0) + _peak
+        cfg["compactions"] = int(cfg.get("compactions", 0) or 0) + max(0, int(compactions or 0))
+        cfg["compaction_failures"] = int(cfg.get("compaction_failures", 0) or 0) + max(0, int(compaction_failures or 0))
+        cfg["last_seen"] = now
+        cfg["last_context"] = row["last_context"]
+        sessions = [str(x)[:16] for x in (cfg.get("sessions") or []) if x]
+        if session_key not in sessions:
+            sessions.append(session_key)
+        cfg["sessions"] = sessions[-24:]
+        days = [str(x)[:10] for x in (cfg.get("days") or []) if x]
+        if day not in days:
+            days.append(day)
+        cfg["days"] = days[-30:]
+        client = _client_context_by_chat.get(chat_id, {}) if chat_id else {}
+        client_key = f"{client.get('os') or 'unknown'}:{'remote' if client.get('remote') else 'local'}"
+        clients = cfg.setdefault("clients", {})
+        clients[client_key] = int(clients.get(client_key, 0) or 0) + 1
+        obs = cfg.setdefault("observations", [])
+        obs.append({
+            "ts": now, "completed": bool(completed),
+            "prompt_tokens": max(0, int(prompt_tokens or 0)),
+            "output_tokens": max(0, int(output_tokens or 0)),
+            "peak_context_tokens": _peak, "rounds": max(0, int(rounds or 0)),
+            "tool_calls": max(0, int(tool_calls or 0)),
+            "tool_errors": max(0, int(tool_errors or 0)),
+            "elapsed_ms": round(max(0.0, float(elapsed_s or 0)) * 1000.0, 2),
+            "prefill_ms": round(max(0.0, float(prompt_ms or 0)), 2),
+            "eval_ms": round(max(0.0, float(eval_ms or 0)), 2),
+            "native_fallback": bool(native_fallback),
+            "compactions": max(0, int(compactions or 0)),
+            "compaction_failures": max(0, int(compaction_failures or 0)),
+        })
+        cfg["observations"] = obs[-_MODEL_ADVISOR_OBSERVATION_CAP:]
         save_json(MODEL_RUNTIME_FILE, data)
 
 
@@ -708,16 +892,16 @@ def _model_runtime_profiles() -> dict:
     out = copy.deepcopy(data)
     for row in (out.get("models") or {}).values():
         turns = max(1, int(row.get("turns", 0) or 0))
-        calls = max(1, int(row.get("tool_calls", 0) or 0))
-        elapsed = max(0.001, float(row.get("elapsed_s", 0.0) or 0.0))
-        row["observed"] = {
-            "completion_rate": round(int(row.get("completed_turns", 0)) / turns, 3),
-            "tool_error_rate": round(int(row.get("tool_errors", 0)) / calls, 3),
-            "avg_rounds": round(int(row.get("rounds", 0)) / turns, 2),
-            "output_tok_s": round(int(row.get("output_tokens", 0)) / elapsed, 2),
-            "avg_peak_context_tokens": round(int(row.get("peak_context_sum", 0) or 0) / turns, 1),
-            "native_fallback_rate": round(int(row.get("native_fallback_turns", 0)) / turns, 3),
-        }
+        row["observed"] = _model_observed(row)
+        for cfg in (row.get("configs") or {}).values():
+            if not isinstance(cfg, dict):
+                continue
+            cfg["observed"] = _model_observed(cfg, cfg.get("observations") or None)
+            cfg_turns = int(cfg.get("turns", 0) or 0)
+            cfg_sessions = len(cfg.get("sessions") or [])
+            cfg["confidence"] = ("high" if cfg_turns >= _MODEL_ADVISOR_BASELINE_TURNS
+                                 and cfg_sessions >= _MODEL_ADVISOR_BASELINE_SESSIONS
+                                 else "warming_up")
         row["confidence"] = "high" if turns >= 25 else "medium" if turns >= 8 else "warming_up"
         advice = []
         observed = row["observed"]
@@ -735,6 +919,180 @@ def _model_runtime_profiles() -> dict:
     return out
 
 
+def _advisor_suggest_settings(settings: dict, observed: dict) -> dict:
+    """Return the hardware planner's exact operational settings, if available."""
+    model_path = str(settings.get("model_path") or "").strip()
+    if not model_path or not safe_exists(model_path):
+        return {}
+    try:
+        vram = float(settings.get("vram_tier_gb") or 0)
+        if vram <= 0:
+            vram = _free_vram_gb_for_tune()
+        if vram <= 0:
+            return {}
+        current_ctx = max(8192, int(settings.get("num_ctx") or 8192))
+        suggested = auto_tune(
+            model_path, vram, profile=inspect_model(model_path), min_ctx=current_ctx)
+        return {k: suggested[k] for k in _MODEL_ADVISOR_APPLY_KEYS if k in suggested}
+    except Exception:
+        return {}
+
+
+def _advisor_recommendation(model: str, config_key: str, cfg: dict,
+                            settings: dict) -> dict | None:
+    turns = int(cfg.get("turns", 0) or 0)
+    sessions = len(cfg.get("sessions") or [])
+    if turns < _MODEL_ADVISOR_BASELINE_TURNS or sessions < _MODEL_ADVISOR_BASELINE_SESSIONS:
+        return None
+    observed = _model_observed(cfg, cfg.get("observations") or None)
+    current = _model_runtime_config(settings)
+    suggested = _advisor_suggest_settings(settings, observed)
+    updates = {k: v for k, v in suggested.items()
+               if k in _MODEL_ADVISOR_APPLY_KEYS and current.get(k) != v}
+    if not updates:
+        return None
+    changes = []
+    for key in _MODEL_ADVISOR_CONFIG_KEYS:
+        if key not in updates:
+            continue
+        changes.append({
+            "key": key, "label": _MODEL_ADVISOR_LABELS.get(key, key),
+            "from": current.get(key), "to": updates[key],
+        })
+    ctx = max(1, int(current.get("num_ctx", 0) or cfg.get("last_context", 0) or 1))
+    peak = int(observed.get("p90_peak_context_tokens", 0) or 0)
+    pressure = peak / ctx if ctx else 0
+    if "num_ctx" in updates and int(updates["num_ctx"] or 0) > ctx:
+        reason = (
+            f"Across {turns} turns, busy prompts reached {round(pressure * 100)}% of the current context window. "
+            "The model and available memory can support more working room with the settings below."
+        )
+        tradeoff = "More context uses additional memory and very long prompts take longer to process."
+    else:
+        reason = (
+            f"After {turns} turns across {sessions} sessions, this model has a stable local baseline. "
+            "The hardware planner found a better fit than the settings currently loaded."
+        )
+        tradeoff = "The ten-turn trial checks speed and reliability before Accuretta calls the change an improvement."
+    rec_id = hashlib.sha256(json.dumps({
+        "model": model, "config": config_key, "updates": updates,
+    }, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:18]
+    return {
+        "id": rec_id, "created_at": int(time.time()), "confidence": "high",
+        "reason": reason, "tradeoff": tradeoff, "updates": updates,
+        "changes": changes, "turns": turns, "sessions": sessions,
+        "notified_at": 0,
+    }
+
+
+def _advisor_trial_public(row: dict, active_config: str) -> dict | None:
+    trial = row.get("trial") if isinstance(row.get("trial"), dict) else None
+    if not trial or trial.get("status") in {"kept", "rolled_back"}:
+        return None
+    cfg = (row.get("configs") or {}).get(active_config) or {}
+    progress = max(0, int(cfg.get("turns", 0) or 0) - int(trial.get("start_turns", 0) or 0))
+    status = str(trial.get("status") or "measuring")
+    if (status == "measuring" and active_config == trial.get("candidate_config")
+            and progress >= _MODEL_ADVISOR_TRIAL_TURNS):
+        recent = [x for x in (cfg.get("observations") or [])
+                  if int(x.get("ts", 0) or 0) >= int(trial.get("applied_at", 0) or 0)]
+        candidate = _model_observed(cfg, recent[-_MODEL_ADVISOR_TRIAL_TURNS:])
+        baseline = trial.get("baseline") or {}
+        worse_reasons = []
+        if candidate["completion_rate"] + 0.08 < float(baseline.get("completion_rate", 0) or 0):
+            worse_reasons.append("more turns failed to finish")
+        if candidate["tool_error_rate"] > float(baseline.get("tool_error_rate", 0) or 0) + 0.12:
+            worse_reasons.append("tool errors increased")
+        old_speed = float(baseline.get("output_tok_s", 0) or 0)
+        new_speed = float(candidate.get("output_tok_s", 0) or 0)
+        if old_speed > 0 and new_speed > 0 and new_speed < old_speed * 0.82:
+            worse_reasons.append("response speed fell by more than 18%")
+        status = "worse" if worse_reasons else "stable"
+        trial["status"] = status
+        trial["candidate"] = candidate
+        trial["result"] = ("; ".join(worse_reasons) if worse_reasons
+                           else "The ten-turn check found no meaningful loss in speed or reliability.")
+    return {
+        "id": str(trial.get("id") or ""), "status": status,
+        "progress": min(progress, _MODEL_ADVISOR_TRIAL_TURNS),
+        "target": _MODEL_ADVISOR_TRIAL_TURNS,
+        "result": str(trial.get("result") or ""),
+        "changes": list(trial.get("changes") or []),
+    }
+
+
+def _model_health_action(action: str, recommendation_id: str = "") -> dict:
+    action = str(action or "").strip().lower()
+    settings = get_settings()
+    model = _model_profile_key(settings.get("model_path") or settings.get("model") or "")
+    runtime_key = _model_profile_key(settings.get("model") or model)
+    active_config = _model_config_signature(_model_runtime_config(settings))
+    with _MODEL_RUNTIME_LOCK:
+        data = load_json(MODEL_RUNTIME_FILE, {"version": 2, "models": {}})
+        models = data.get("models") if isinstance(data, dict) else {}
+        row = ((models or {}).get(runtime_key) or (models or {}).get(model) or {})
+        cfg = (row.get("configs") or {}).get(active_config) or {}
+        rec = cfg.get("recommendation") if isinstance(cfg.get("recommendation"), dict) else None
+        if action in {"seen", "dismiss", "apply"}:
+            if not rec or (recommendation_id and rec.get("id") != recommendation_id):
+                return {"ok": False, "error": "recommendation is no longer current"}
+            if action == "seen":
+                rec["notified_at"] = int(time.time())
+                save_json(MODEL_RUNTIME_FILE, data)
+                return {"ok": True}
+            if action == "dismiss":
+                rec["dismissed_at"] = int(time.time())
+                save_json(MODEL_RUNTIME_FILE, data)
+                return {"ok": True}
+            updates = {k: v for k, v in (rec.get("updates") or {}).items()
+                       if k in _MODEL_ADVISOR_APPLY_KEYS}
+            if not updates:
+                return {"ok": False, "error": "recommendation has no applicable settings"}
+            previous = {k: settings.get(k) for k in updates}
+            settings.update(updates)
+            if "spec_strategy" in updates:
+                settings["enable_speculative"] = updates["spec_strategy"] != "off"
+            candidate_config = _model_config_signature(_model_runtime_config(settings))
+            start_turns = int(((row.get("configs") or {}).get(candidate_config) or {}).get("turns", 0) or 0)
+            row["trial"] = {
+                "id": uuid.uuid4().hex[:16], "recommendation_id": rec.get("id"),
+                "status": "measuring", "applied_at": int(time.time()),
+                "from_config": active_config, "candidate_config": candidate_config,
+                "start_turns": start_turns, "updates": updates, "previous": previous,
+                "changes": list(rec.get("changes") or []),
+                "baseline": _model_observed(cfg, cfg.get("observations") or None),
+            }
+            save_json(SETTINGS_FILE, settings)
+            if settings.get("model_path"):
+                _save_model_config(str(settings["model_path"]), updates)
+            save_json(MODEL_RUNTIME_FILE, data)
+            broadcast_event({"type": "settings:update"})
+            return {"ok": True, "settings": settings, "reload": True,
+                    "model_path": settings.get("model_path") or "", "trial": row["trial"]}
+        trial = row.get("trial") if isinstance(row.get("trial"), dict) else None
+        if action in {"undo", "keep"} and trial:
+            if action == "keep":
+                trial["status"] = "kept"
+                trial["closed_at"] = int(time.time())
+                save_json(MODEL_RUNTIME_FILE, data)
+                return {"ok": True, "settings": settings, "reload": False}
+            previous = {k: v for k, v in (trial.get("previous") or {}).items()
+                        if k in _MODEL_ADVISOR_APPLY_KEYS}
+            settings.update(previous)
+            if "spec_strategy" in previous:
+                settings["enable_speculative"] = previous["spec_strategy"] != "off"
+            trial["status"] = "rolled_back"
+            trial["closed_at"] = int(time.time())
+            save_json(SETTINGS_FILE, settings)
+            if settings.get("model_path"):
+                _save_model_config(str(settings["model_path"]), previous)
+            save_json(MODEL_RUNTIME_FILE, data)
+            broadcast_event({"type": "settings:update"})
+            return {"ok": True, "settings": settings, "reload": True,
+                    "model_path": settings.get("model_path") or ""}
+    return {"ok": False, "error": "unsupported model health action"}
+
+
 def _public_model_health() -> dict:
     """Small, path-free snapshot safe for the Settings UI.
 
@@ -746,36 +1104,69 @@ def _public_model_health() -> dict:
     enabled = bool(settings.get("passive_model_telemetry", True))
     model = _model_profile_key(settings.get("model_path") or settings.get("model") or "")
     runtime_key = _model_profile_key(settings.get("model") or model)
+    active_config = _model_config_signature(_model_runtime_config(settings))
     try:
-        profiles = _model_runtime_profiles().get("models") or {}
-        # Turns are recorded under settings.model, while the UI should display
-        # the friendlier basename from model_path. Older settings may use either
-        # spelling, so accept both instead of silently showing zero observations.
-        row = (profiles.get(runtime_key) or profiles.get(model) or {}) if model else {}
+        with _MODEL_RUNTIME_LOCK:
+            data = load_json(MODEL_RUNTIME_FILE, {"version": 2, "models": {}})
+            profiles = data.get("models") if isinstance(data, dict) else {}
+            row = ((profiles or {}).get(runtime_key) or (profiles or {}).get(model) or {}) if model else {}
+            cfg = (row.get("configs") or {}).get(active_config) or {}
+            changed = False
+            if cfg:
+                observed = _model_observed(cfg, cfg.get("observations") or None)
+                rec = cfg.get("recommendation") if isinstance(cfg.get("recommendation"), dict) else None
+                if not rec:
+                    rec = _advisor_recommendation(model, active_config, cfg, settings)
+                    if rec:
+                        cfg["recommendation"] = rec
+                        changed = True
+                if rec and rec.get("dismissed_at"):
+                    rec = None
+            else:
+                observed = _model_observed(row)
+                rec = None
+            trial_before = copy.deepcopy(row.get("trial"))
+            trial = _advisor_trial_public(row, active_config)
+            if row.get("trial") != trial_before:
+                changed = True
+            if changed:
+                save_json(MODEL_RUNTIME_FILE, data)
     except Exception:
-        row = {}
-    observed = row.get("observed") if isinstance(row.get("observed"), dict) else {}
+        row, cfg, observed, rec, trial = {}, {}, {}, None, None
+    current = cfg if cfg else row
+    turns = max(0, int(current.get("turns", 0) or 0))
+    sessions = len(current.get("sessions") or []) if cfg else 0
+    advice = []
+    context = max(0, int(current.get("last_context", 0) or settings.get("num_ctx") or 0))
+    if turns >= 8 and context and float(observed.get("avg_peak_context_tokens", 0) or 0) >= context * 0.82:
+        advice.append("Normal work approaches the context ceiling. The setup advisor will check whether this model can safely use more room.")
+    if turns >= 8 and float(observed.get("completion_rate", 0) or 0) < 0.8:
+        advice.append("Incomplete turns are elevated. Accuretta will keep conservative settings until reliability improves.")
     return {
         "enabled": enabled,
         "model": model,
-        "turns": max(0, int(row.get("turns", 0) or 0)),
-        "completed_turns": max(0, int(row.get("completed_turns", 0) or 0)),
-        "tool_calls": max(0, int(row.get("tool_calls", 0) or 0)),
-        "tool_errors": max(0, int(row.get("tool_errors", 0) or 0)),
-        "last_context": max(0, int(row.get("last_context", 0) or 0)),
-        "peak_context_tokens": max(0, int(row.get("peak_context_tokens", 0) or 0)),
-        "confidence": str(row.get("confidence") or "collecting"),
-        "observed": {
-            "completion_rate": float(observed.get("completion_rate", 0) or 0),
-            "tool_error_rate": float(observed.get("tool_error_rate", 0) or 0),
-            "avg_rounds": float(observed.get("avg_rounds", 0) or 0),
-            "avg_peak_context_tokens": float(observed.get("avg_peak_context_tokens", 0) or 0),
-            "native_fallback_rate": float(observed.get("native_fallback_rate", 0) or 0),
+        "turns": turns,
+        "completed_turns": max(0, int(current.get("completed_turns", 0) or 0)),
+        "tool_calls": max(0, int(current.get("tool_calls", 0) or 0)),
+        "tool_errors": max(0, int(current.get("tool_errors", 0) or 0)),
+        "last_context": context,
+        "peak_context_tokens": max(0, int(current.get("peak_context_tokens", 0) or 0)),
+        "confidence": ("high" if turns >= _MODEL_ADVISOR_BASELINE_TURNS
+                       and sessions >= _MODEL_ADVISOR_BASELINE_SESSIONS else "warming_up"),
+        "observed": observed,
+        "advice": advice,
+        "learning": {
+            "turns_required": _MODEL_ADVISOR_BASELINE_TURNS,
+            "sessions_required": _MODEL_ADVISOR_BASELINE_SESSIONS,
+            "turns_remaining": max(0, _MODEL_ADVISOR_BASELINE_TURNS - turns),
+            "sessions": sessions,
+            "sessions_remaining": max(0, _MODEL_ADVISOR_BASELINE_SESSIONS - sessions),
         },
-        "advice": [str(x)[:320] for x in (row.get("advice") or [])[:6]],
-        "next_confidence_at": 8 if int(row.get("turns", 0) or 0) < 8 else (
-            25 if int(row.get("turns", 0) or 0) < 25 else 0),
-        "privacy": "Local aggregate counters only. No prompts, replies, files, commands, screenshots, or tool output.",
+        "recommendation": copy.deepcopy(rec) if rec else None,
+        "notification_needed": bool(rec and not rec.get("notified_at")),
+        "trial": trial,
+        "privacy": ("Local performance numbers only. Prompts, replies, commands, files, screenshots, "
+                    "tool output, peer addresses, and account names are never stored."),
     }
 
 
@@ -807,6 +1198,11 @@ DEFAULT_SETTINGS = {
     "discord_enabled": False,
     "discord_bot_token": "",
     "discord_owner_id": "",
+    # private remote access. Tailscale remains the network identity layer;
+    # SSH keys below are scoped per paired machine and never leave ./data.
+    "remote_access_enabled": True,
+    "remote_command_timeout": 120,
+    "remote_file_max_mb": 100,
     "desktop_app_allowlist": [],            # e.g. ["notepad", "chrome", "code"]; matched case-insensitive against exe/launch target
     "desktop_max_actions_per_minute": 30,   # hard rate limit for agent-driven actions
     "desktop_auto_approve_read": True,      # screenshot/describe/list_windows never require approval
@@ -930,6 +1326,623 @@ def get_settings() -> dict:
     s = load_json(SETTINGS_FILE, {})
     out = {**DEFAULT_SETTINGS, **(s if isinstance(s, dict) else {})}
     return out
+
+
+_REMOTE_USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+_REMOTE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+_CLIENT_OS_VALUES = {"macOS", "Windows", "Linux", "iOS", "Android", "unknown"}
+_remote_file_reads: dict[tuple[str, str, str], str] = {}
+_remote_file_reads_lock = threading.Lock()
+_remote_staged_writes: dict[str, dict] = {}
+_remote_staged_writes_lock = threading.Lock()
+_client_context_by_chat: dict[str, dict] = {}
+
+
+def _load_remote_machines() -> dict:
+    data = load_json(REMOTE_MACHINES_FILE, {"machines": []})
+    if not isinstance(data, dict) or not isinstance(data.get("machines"), list):
+        return {"machines": []}
+    clean = []
+    for row in data["machines"]:
+        if isinstance(row, dict) and _REMOTE_ID_RE.fullmatch(str(row.get("id") or "")):
+            clean.append(dict(row))
+    return {"machines": clean}
+
+
+def _save_remote_machines(data: dict) -> None:
+    REMOTE_DIR.mkdir(parents=True, exist_ok=True)
+    save_json(REMOTE_MACHINES_FILE, data)
+
+
+def _remote_machine(machine_id: str) -> dict | None:
+    mid = str(machine_id or "").strip()
+    if not _REMOTE_ID_RE.fullmatch(mid):
+        return None
+    for row in _load_remote_machines().get("machines", []):
+        if row.get("id") == mid and row.get("enabled", True):
+            return row
+    return None
+
+
+def _public_remote_machine(row: dict) -> dict:
+    return {
+        "id": row.get("id", ""),
+        "label": row.get("label", "Mac"),
+        "hostname": row.get("hostname", ""),
+        "dns_name": row.get("dns_name", ""),
+        "ip": row.get("ip", ""),
+        "os": row.get("os", "macOS"),
+        "username": row.get("username", ""),
+        "allowed_roots": list(row.get("allowed_roots") or []),
+        "home": row.get("home", ""),
+        "status": row.get("status", "prepared"),
+        "last_verified": int(row.get("last_verified") or 0),
+        "enabled": bool(row.get("enabled", True)),
+    }
+
+
+def _find_executable(names: tuple[str, ...]) -> str:
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+    return ""
+
+
+def _tailscale_exe() -> str:
+    candidates = (
+        "tailscale.exe" if os.name == "nt" else "tailscale",
+        r"C:\Program Files\Tailscale\tailscale.exe",
+    )
+    for item in candidates:
+        found = shutil.which(item) if not os.path.isabs(item) else (item if os.path.isfile(item) else "")
+        if found:
+            return found
+    return ""
+
+
+def _ssh_exe() -> str:
+    candidates = ("ssh.exe", "ssh") if os.name == "nt" else ("ssh",)
+    return _find_executable(candidates)
+
+
+def _ssh_keygen_exe() -> str:
+    candidates = ("ssh-keygen.exe", "ssh-keygen") if os.name == "nt" else ("ssh-keygen",)
+    return _find_executable(candidates)
+
+
+def _run_small(argv: list[str], timeout: int = 8) -> dict:
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout,
+            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "exit": proc.returncode,
+            "stdout": (proc.stdout or "")[:200_000],
+            "stderr": (proc.stderr or "")[:40_000],
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "exit": -1, "stdout": "", "stderr": "timed out"}
+    except Exception as exc:
+        return {"ok": False, "exit": -1, "stdout": "", "stderr": str(exc)}
+
+
+def _tailscale_snapshot() -> dict:
+    exe = _tailscale_exe()
+    if not exe:
+        return {"ok": False, "error": "Tailscale CLI not found", "peers": []}
+    result = _run_small([exe, "status", "--json"], timeout=8)
+    if not result.get("ok") and not result.get("stdout"):
+        return {"ok": False, "error": result.get("stderr") or "Tailscale status failed", "peers": []}
+    try:
+        raw = json.loads(result.get("stdout") or "{}")
+    except Exception:
+        return {"ok": False, "error": "Tailscale returned invalid status data", "peers": []}
+    peers = []
+    for peer in (raw.get("Peer") or {}).values():
+        if not isinstance(peer, dict):
+            continue
+        ips = [str(x) for x in (peer.get("TailscaleIPs") or [])]
+        peers.append({
+            "node_id": str(peer.get("ID") or peer.get("NodeID") or ""),
+            "hostname": str(peer.get("HostName") or ""),
+            "dns_name": str(peer.get("DNSName") or "").rstrip("."),
+            "os": str(peer.get("OS") or "unknown"),
+            "ip": next((x for x in ips if ":" not in x), ips[0] if ips else ""),
+            "ips": ips,
+            "online": bool(peer.get("Online")),
+            "last_seen": str(peer.get("LastSeen") or ""),
+        })
+    self_row = raw.get("Self") if isinstance(raw.get("Self"), dict) else {}
+    self_ips = [str(x) for x in (self_row.get("TailscaleIPs") or raw.get("TailscaleIPs") or [])]
+    return {
+        "ok": not bool(raw.get("Health")),
+        "state": str(raw.get("BackendState") or "unknown"),
+        "health": [str(x) for x in (raw.get("Health") or [])],
+        "dns_suffix": str(raw.get("MagicDNSSuffix") or ""),
+        "self_dns": str(self_row.get("DNSName") or "").rstrip("."),
+        "self_ips": self_ips,
+        "peers": peers,
+    }
+
+
+def _tailscale_serve_status(snapshot: dict | None = None) -> dict:
+    exe = _tailscale_exe()
+    snap = snapshot or _tailscale_snapshot()
+    if not exe:
+        return {"configured": False, "url": "", "error": "Tailscale CLI not found"}
+    result = _run_small([exe, "serve", "status"], timeout=6)
+    output = ((result.get("stdout") or "") + "\n" + (result.get("stderr") or "")).strip()
+    configured = result.get("ok") and "No serve config" not in output and bool(output)
+    dns_name = str(snap.get("self_dns") or "")
+    return {
+        "configured": bool(configured),
+        "url": f"https://{dns_name}" if configured and dns_name else "",
+        "detail": output[:2000],
+        "error": "" if result.get("ok") else (result.get("stderr") or "Serve status failed"),
+    }
+
+
+def enable_tailscale_serve() -> dict:
+    exe = _tailscale_exe()
+    if not exe:
+        return {"ok": False, "error": "Tailscale CLI not found"}
+    result = _run_small([exe, "serve", "--bg", str(PORT)], timeout=30)
+    status = _tailscale_serve_status()
+    if not result.get("ok"):
+        detail = result.get("stderr") or result.get("stdout") or "Serve setup failed"
+        consent_match = re.search(r"https://login\.tailscale\.com/[^\s]+", detail)
+        if consent_match:
+            consent_url = consent_match.group(0).rstrip(".,);]")
+            return {
+                **status,
+                "ok": False,
+                "error": "Approve Tailscale Serve once, then click Enable HTTPS address again.",
+                "consent_url": consent_url,
+            }
+        if os.name == "nt" and "access is denied" in detail.lower():
+            detail = (
+                "Windows denied access to Tailscale control. Open Administrator PowerShell once and run: "
+                f"& '{exe}' serve --bg {PORT}"
+            )
+        return {**status, "ok": False, "error": detail}
+    return {"ok": True, **status}
+
+
+def _sanitize_client_hint(raw: Any) -> dict:
+    src = raw if isinstance(raw, dict) else {}
+    client_os = str(src.get("os") or "unknown")
+    if client_os not in _CLIENT_OS_VALUES:
+        client_os = "unknown"
+    target = str(src.get("execution_target") or "host").strip()
+    if target != "host" and _remote_machine(target) is None:
+        target = "host"
+    return {
+        "os": client_os,
+        "mobile": bool(src.get("mobile")),
+        "secure_context": bool(src.get("secure_context")),
+        "execution_target": target,
+    }
+
+
+def _handler_client_context(handler, raw_hint: Any = None) -> dict:
+    hint = _sanitize_client_hint(raw_hint)
+    peer_text = str((getattr(handler, "client_address", None) or ("",))[0] or "")
+    try:
+        peer = ipaddress.ip_address(peer_text)
+    except ValueError:
+        peer = None
+    tailnet_peer = bool(peer and any(
+        peer in ipaddress.ip_network(cidr)
+        for cidr in ("100.64.0.0/10", "fd7a:115c:a1e0::/48")
+    ))
+    # Serve proxies from localhost and adds identity headers. They are used only
+    # for presentation here, never authorization, so a direct caller spoofing
+    # one gains nothing.
+    served = bool((handler.headers.get("Tailscale-User-Login") or "").strip())
+    remote = bool(tailnet_peer or served)
+    transport = "tailscale_serve" if served else ("tailscale_direct" if tailnet_peer else "local")
+    target = hint["execution_target"]
+    machine = _remote_machine(target) if target != "host" else None
+    return {
+        **hint,
+        "remote": remote,
+        "transport": transport,
+        "peer_ip": peer_text if tailnet_peer else "",
+        "target_label": machine.get("label", "Mac") if machine else "Inference PC",
+        "inference_os": "Windows" if os.name == "nt" else ("macOS" if sys.platform == "darwin" else "Linux"),
+    }
+
+
+def _client_context_prompt(ctx: dict) -> str:
+    client_os = ctx.get("os") or "unknown"
+    remote = bool(ctx.get("remote"))
+    target = ctx.get("execution_target") or "host"
+    machine = _remote_machine(target) if target != "host" else None
+    lines = [
+        "=== CURRENT CLIENT AND EXECUTION CONTEXT (volatile; applies only to this turn) ===",
+        f"Inference host: {ctx.get('inference_os') or 'local computer'}.",
+        f"Active browser client: {client_os}{' over a private remote connection' if remote else ' on the inference host'}.",
+    ]
+    if machine:
+        label = re.sub(r"[\r\n]+", " ", str(machine.get("label") or "paired Mac"))[:80]
+        lines.append(f"Selected command and file target: paired macOS machine '{label}'.")
+        lines.append(
+            "Use the remote_* tools for terminal and file actions. For a newly generated Mac file, "
+            "write directly with remote_write_file; do not stage it with the PC write_file tool. "
+            "If the complete code already exists in a prior visible code block, use remote_save_code_block. "
+            "For a large new file, use remote_file_begin, append chunks of at most 6000 characters with "
+            "remote_file_append, then remote_file_commit. That flow asks once and writes atomically."
+        )
+    else:
+        lines.append("Selected command and file target: inference PC.")
+    if remote and client_os != ctx.get("inference_os"):
+        lines.append(
+            "Do not call the inference PC 'your computer' or promise to place files on an unqualified Desktop. "
+            "Name the PC or active client explicitly, and ask which device only when the selected target does not settle it."
+        )
+    lines.append("Never silently fall back to another machine when the selected target is unavailable.")
+    return "\n".join(lines)
+
+
+def _protect_remote_private_key(path: Path) -> None:
+    """Best-effort owner-only permissions for a generated SSH private key."""
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+    if os.name != "nt":
+        return
+    account = getpass.getuser().strip()
+    if not account:
+        return
+    icacls = shutil.which("icacls.exe") or shutil.which("icacls")
+    if not icacls:
+        return
+    _run_small([icacls, str(path), "/inheritance:r", "/grant:r", f"{account}:(F)"], timeout=10)
+
+
+def _normalize_pairing_roots(value: Any) -> list[str]:
+    raw = value if isinstance(value, list) else str(value or "").splitlines()
+    roots: list[str] = []
+    for item in raw:
+        root = str(item or "").strip().replace("\\", "/")
+        if not root or "\x00" in root or "\n" in root or "\r" in root:
+            continue
+        if not (root == "~" or root.startswith("~/") or root.startswith("/")):
+            continue
+        root = posixpath.normpath(root)
+        if root not in roots:
+            roots.append(root)
+        if len(roots) >= 12:
+            break
+    return roots or ["~/Desktop", "~/Documents", "~/Downloads"]
+
+
+def prepare_remote_pairing(node_id: str, username: str, label: str = "",
+                           allowed_roots: Any = None) -> dict:
+    """Create a dedicated key and a single command the user runs on the Mac."""
+    if not get_settings().get("remote_access_enabled", True):
+        return {"ok": False, "error": "Remote access is disabled in Settings."}
+    username = str(username or "").strip()
+    if not _REMOTE_USER_RE.fullmatch(username):
+        return {"ok": False, "error": "Enter the short macOS account name, for example jane."}
+    snap = _tailscale_snapshot()
+    peer = next((p for p in snap.get("peers", []) if p.get("node_id") == str(node_id or "")), None)
+    if not peer:
+        return {"ok": False, "error": "That Mac is not present in the current Tailscale device list."}
+    if str(peer.get("os") or "").lower() not in {"macos", "darwin"}:
+        return {"ok": False, "error": "The selected Tailscale device is not a Mac."}
+    if not peer.get("ip"):
+        return {"ok": False, "error": "The selected Mac has no Tailscale IPv4 address."}
+    source_ip = next((ip for ip in snap.get("self_ips", []) if ":" not in ip), "")
+    if not source_ip:
+        return {"ok": False, "error": "This PC has no Tailscale IPv4 address yet."}
+    keygen = _ssh_keygen_exe()
+    if not keygen:
+        return {"ok": False, "error": "Windows OpenSSH key generator is not installed."}
+
+    machine_id = "mac-" + hashlib.sha256(
+        f"{peer.get('node_id')}\0{username}".encode("utf-8")
+    ).hexdigest()[:12]
+    REMOTE_KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    key_path = REMOTE_KEYS_DIR / machine_id
+    pub_path = Path(str(key_path) + ".pub")
+    if not key_path.exists() or not pub_path.exists():
+        result = _run_small([
+            keygen, "-q", "-t", "ed25519", "-N", "", "-C",
+            f"accuretta-{machine_id}", "-f", str(key_path),
+        ], timeout=20)
+        if not result.get("ok"):
+            return {"ok": False, "error": result.get("stderr") or "Could not create the SSH key."}
+    _protect_remote_private_key(key_path)
+    try:
+        public_key = pub_path.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not read the generated public key: {exc}"}
+    if not public_key.startswith("ssh-ed25519 "):
+        return {"ok": False, "error": "The generated public key is invalid."}
+
+    authorized_line = f'restrict,from="{source_ip}" {public_key}'
+    quoted = shlex.quote(authorized_line)
+    pair_command = (
+        "umask 077; mkdir -p \"$HOME/.ssh\"; touch \"$HOME/.ssh/authorized_keys\"; "
+        "chmod 700 \"$HOME/.ssh\"; chmod 600 \"$HOME/.ssh/authorized_keys\"; "
+        f"grep -qxF -- {quoted} \"$HOME/.ssh/authorized_keys\" || "
+        f"printf '%s\\n' {quoted} >> \"$HOME/.ssh/authorized_keys\""
+    )
+    safe_label = re.sub(r"[\r\n\t]+", " ", str(label or "").strip())[:80]
+    if not safe_label:
+        safe_label = str(peer.get("hostname") or "Mac")[:80]
+    row = {
+        "id": machine_id,
+        "node_id": str(peer.get("node_id") or ""),
+        "label": safe_label,
+        "hostname": str(peer.get("hostname") or ""),
+        "dns_name": str(peer.get("dns_name") or ""),
+        "ip": str(peer.get("ip") or ""),
+        "os": "macOS",
+        "username": username,
+        "allowed_roots": _normalize_pairing_roots(allowed_roots),
+        "home": "",
+        "key_path": str(key_path),
+        "status": "prepared",
+        "enabled": True,
+        "source_ip": source_ip,
+        "created": int(time.time()),
+        "last_verified": 0,
+    }
+    data = _load_remote_machines()
+    data["machines"] = [m for m in data["machines"] if m.get("id") != machine_id]
+    data["machines"].append(row)
+    _save_remote_machines(data)
+    return {
+        "ok": True,
+        "machine": _public_remote_machine(row),
+        "pair_command": pair_command,
+        "note": "Run this once in Terminal on the Mac, then click Verify.",
+    }
+
+
+def _refresh_remote_machine(row: dict) -> dict:
+    peer = next((p for p in _tailscale_snapshot().get("peers", [])
+                 if p.get("node_id") == row.get("node_id")), None)
+    if peer:
+        row = dict(row)
+        row["ip"] = str(peer.get("ip") or row.get("ip") or "")
+        row["dns_name"] = str(peer.get("dns_name") or row.get("dns_name") or "")
+        row["hostname"] = str(peer.get("hostname") or row.get("hostname") or "")
+        row["online"] = bool(peer.get("online"))
+    return row
+
+
+def _remote_ssh_argv(row: dict, *, accept_new: bool = False) -> list[str]:
+    ssh = _ssh_exe()
+    if not ssh:
+        return []
+    host = str(row.get("ip") or row.get("dns_name") or "").strip()
+    username = str(row.get("username") or "").strip()
+    key_path = str(row.get("key_path") or "").strip()
+    if not host or not _REMOTE_USER_RE.fullmatch(username) or not os.path.isfile(key_path):
+        return []
+    REMOTE_KNOWN_HOSTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    return [
+        ssh,
+        "-T",
+        "-o", "BatchMode=yes",
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "ConnectTimeout=12",
+        "-o", f"UserKnownHostsFile={REMOTE_KNOWN_HOSTS_FILE}",
+        "-o", f"StrictHostKeyChecking={'accept-new' if accept_new else 'yes'}",
+        "-i", key_path,
+        f"{username}@{host}",
+    ]
+
+
+def _run_remote_process(row: dict, command: str, *, timeout: int | None = None,
+                        stdin: bytes | None = None, max_stdout: int = 200_000,
+                        accept_new: bool = False, stream_name: str = "remote_shell") -> dict:
+    row = _refresh_remote_machine(row)
+    argv = _remote_ssh_argv(row, accept_new=accept_new)
+    if not argv:
+        return {"ok": False, "error": "SSH is unavailable or this pairing is incomplete."}
+    timeout = max(1, min(int(timeout or get_settings().get("remote_command_timeout") or 120), 3600))
+    started = time.time()
+    try:
+        proc = subprocess.Popen(
+            [*argv, command], stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    cid = _get_current_chat() or ""
+    if cid:
+        with _running_cmds_lock:
+            _running_cmds[cid] = proc
+    try:
+        try:
+            stdout, stderr = proc.communicate(input=stdin, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            return {"ok": False, "error": f"Remote command timed out after {timeout}s.", "timed_out": True}
+        with _running_cmds_lock:
+            killed = proc in _killed_procs or (proc.returncode is not None and proc.returncode < 0)
+        stdout = stdout or b""
+        stderr = stderr or b""
+        result = {
+            "ok": proc.returncode == 0 and not killed,
+            "exit": proc.returncode,
+            "stdout_bytes": stdout[-max_stdout:],
+            "stderr": stderr[-20_000:].decode("utf-8", "replace"),
+            "duration_ms": int((time.time() - started) * 1000),
+            "machine": _public_remote_machine(row),
+        }
+        if killed:
+            result.update({"ok": False, "killed": True, "error": "Remote command was stopped."})
+        if stream_name and stdout:
+            text_out = stdout[-min(len(stdout), 16_000):].decode("utf-8", "replace")
+            for line in text_out.splitlines()[-120:]:
+                _emit_tool_stream(stream_name, line)
+        _append_cmd_history({
+            "ts": int(started * 1000), "chat_id": cid, "target": row.get("label"),
+            "command": command, "exit": proc.returncode, "ok": result["ok"],
+            "duration_ms": result["duration_ms"],
+            "stdout": stdout[-16_000:].decode("utf-8", "replace"),
+            "stderr": result["stderr"], "remote": True, "killed": killed,
+        })
+        return result
+    finally:
+        with _running_cmds_lock:
+            if cid and _running_cmds.get(cid) is proc:
+                _running_cmds.pop(cid, None)
+            _killed_procs.discard(proc)
+
+
+def verify_remote_pairing(machine_id: str) -> dict:
+    row = _remote_machine(machine_id)
+    if not row:
+        return {"ok": False, "error": "Pairing not found."}
+    row = _refresh_remote_machine(row)
+    marker = "__ACCURETTA_OK__"
+    command = (
+        f"printf '{marker}\\n'; sw_vers -productVersion 2>/dev/null; "
+        "printf '__HOME__%s\\n' \"$HOME\""
+    )
+    result = _run_remote_process(row, command, timeout=25, accept_new=True, max_stdout=40_000, stream_name="")
+    text_out = (result.get("stdout_bytes") or b"").decode("utf-8", "replace")
+    if not result.get("ok") or marker not in text_out:
+        error = result.get("stderr") or result.get("error") or "The Mac did not accept the dedicated key."
+        return {"ok": False, "error": error.strip()[:2000], "machine": _public_remote_machine(row)}
+    home_match = re.search(r"^__HOME__(/[^\r\n]+)$", text_out, re.MULTILINE)
+    if not home_match:
+        return {"ok": False, "error": "SSH worked, but the Mac home folder could not be verified."}
+    row["home"] = posixpath.normpath(home_match.group(1).strip())
+    requested_roots = _resolved_remote_roots(row)
+    resolved_roots = []
+    missing_roots = []
+    for root in requested_roots:
+        root_result = _run_remote_process(
+            row, f"test -d {shlex.quote(root)} && cd -P -- {shlex.quote(root)} && pwd -P",
+            timeout=20, max_stdout=4096, stream_name="",
+        )
+        resolved = (root_result.get("stdout_bytes") or b"").decode("utf-8", "replace").strip().splitlines()
+        if root_result.get("ok") and resolved and resolved[-1].startswith("/"):
+            real_root = posixpath.normpath(resolved[-1])
+            if real_root not in resolved_roots:
+                resolved_roots.append(real_root)
+        else:
+            missing_roots.append(root)
+    if missing_roots:
+        return {
+            "ok": False,
+            "error": "These allowed Mac folders do not exist: " + ", ".join(missing_roots),
+            "machine": _public_remote_machine(row),
+        }
+    row["resolved_roots"] = resolved_roots
+    row["status"] = "ready"
+    row["last_verified"] = int(time.time())
+    data = _load_remote_machines()
+    data["machines"] = [row if m.get("id") == machine_id else m for m in data["machines"]]
+    _save_remote_machines(data)
+    return {"ok": True, "machine": _public_remote_machine(row), "detail": "Dedicated-key SSH verified."}
+
+
+def remove_remote_pairing(machine_id: str) -> dict:
+    row = _remote_machine(machine_id)
+    if not row:
+        return {"ok": False, "error": "Pairing not found."}
+    data = _load_remote_machines()
+    data["machines"] = [m for m in data["machines"] if m.get("id") != machine_id]
+    _save_remote_machines(data)
+    for raw in (row.get("key_path"), str(row.get("key_path") or "") + ".pub"):
+        try:
+            path = Path(str(raw or ""))
+            if path.parent.resolve() == REMOTE_KEYS_DIR.resolve() and path.is_file():
+                path.unlink()
+        except Exception:
+            pass
+    return {
+        "ok": True,
+        "note": "Pairing removed from this PC. Remove the matching accuretta key line from ~/.ssh/authorized_keys on the Mac if you want to revoke it there too.",
+    }
+
+
+def _resolved_remote_roots(row: dict) -> list[str]:
+    verified = [posixpath.normpath(str(x)) for x in (row.get("resolved_roots") or [])
+                if str(x).startswith("/")]
+    if verified:
+        return list(dict.fromkeys(verified))
+    home = posixpath.normpath(str(row.get("home") or ""))
+    roots = []
+    for raw in row.get("allowed_roots") or []:
+        value = str(raw or "")
+        if value == "~":
+            value = home
+        elif value.startswith("~/"):
+            value = posixpath.join(home, value[2:])
+        value = posixpath.normpath(value)
+        if value.startswith("/") and value not in roots:
+            roots.append(value)
+    return roots
+
+
+def _normalize_remote_path(row: dict, raw: str) -> str:
+    value = str(raw or "").strip().replace("\\", "/")
+    home = posixpath.normpath(str(row.get("home") or ""))
+    if value == "~":
+        value = home
+    elif value.startswith("~/"):
+        value = posixpath.join(home, value[2:])
+    value = posixpath.normpath(value)
+    if not value.startswith("/") or not home:
+        raise ValueError("Use an absolute Mac path or a path beginning with ~/.")
+    roots = _resolved_remote_roots(row)
+    if not any(value == root or value.startswith(root.rstrip("/") + "/") for root in roots):
+        raise ValueError("That path is outside this Mac pairing's allowed folders.")
+    return value
+
+
+def _confirm_remote_path(row: dict, path: str, *, directory: bool = False) -> tuple[str, str]:
+    """Resolve parent symlinks on the Mac and re-check the verified root fence."""
+    quoted = shlex.quote(path)
+    if directory:
+        command = f"test -d {quoted} && cd -P -- {quoted} && pwd -P"
+    else:
+        command = (
+            f"test ! -L {quoted} || exit 74; parent=$(dirname -- {quoted}); "
+            f"base=$(basename -- {quoted}); real_parent=$(cd -P -- \"$parent\" 2>/dev/null && pwd -P) || exit 75; "
+            "printf '%s/%s\\n' \"$real_parent\" \"$base\""
+        )
+    result = _run_remote_process(row, command, timeout=25, max_stdout=4096, stream_name="")
+    if not result.get("ok"):
+        if result.get("exit") == 74:
+            return "", "Refused a symbolic-link file. Choose the real file inside an allowed folder."
+        return "", result.get("stderr") or result.get("error") or "Could not verify the remote path."
+    lines = (result.get("stdout_bytes") or b"").decode("utf-8", "replace").strip().splitlines()
+    if not lines or not lines[-1].startswith("/"):
+        return "", "The Mac returned an invalid resolved path."
+    resolved = posixpath.normpath(lines[-1])
+    roots = _resolved_remote_roots(row)
+    if not any(resolved == root or resolved.startswith(root.rstrip("/") + "/") for root in roots):
+        return "", "The resolved Mac path escapes this pairing's allowed folders."
+    return resolved, ""
+
+
+def _selected_remote_machine(args: dict) -> dict | None:
+    machine_id = str(args.get("machine") or "").strip()
+    if not machine_id:
+        ctx = _client_context_by_chat.get(_get_current_chat() or "", {})
+        machine_id = str(ctx.get("execution_target") or "")
+    row = _remote_machine(machine_id)
+    if not row or row.get("status") != "ready":
+        return None
+    return row
 
 
 def get_workspace() -> dict:
@@ -1273,6 +2286,7 @@ def _build_continuity_state(chat: dict, activity: list[dict] | None = None,
     if mission:
         for label, value in (("authorized target", mission.get("target")),
                              ("authorized scope", mission.get("scope")),
+                             ("required user agent", mission.get("user_agent")),
                              ("mission phase", mission.get("phase"))):
             if value:
                 constraints.append(f"{label}: {value}"[:300])
@@ -1557,6 +2571,12 @@ _SUMMARY_TRIGGER_FRAC = 0.85
 _SUMMARY_KEEP_FRAC = 0.10     # aggressively fold most of the history, keeping only the recent tail raw
 _SUMMARY_MIN_OUTPUT_CHARS = 40  # summarizer output below this is degenerate (e.g. 11-char) — treat as failure
 _SUMMARY_REQUEST_CHARS = 200000  # cap the summarizer payload at the newest ~200K chars (~50K tokens) so it always fits ctx
+_SUMMARY_MAX_OUTPUT_TOKENS = 4096
+_COMPACTION_STOP_MESSAGE = (
+    "Accuretta stopped this response because it could not produce a safe session summary. "
+    "Your saved chat and completed actions are intact. Use Compact to try again now, "
+    "wait three minutes and retry, or continue in a new session."
+)
 
 
 def _summary_trigger_limit(ctx_limit: int) -> int:
@@ -1612,6 +2632,13 @@ def _validate_summary_output(text: str) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _summary_output_budget(ctx_limit: int | None) -> int:
+    """Leave small contexts usable while giving long-session summaries room."""
+    if not ctx_limit:
+        return _SUMMARY_MAX_OUTPUT_TOKENS
+    return max(1536, min(_SUMMARY_MAX_OUTPUT_TOKENS, int(ctx_limit) // 8))
+
+
 def _render_msgs_for_summary(slice_msgs: list[dict]) -> str:
     def _excerpt(text: str, limit: int) -> str:
         if len(text) <= limit:
@@ -1652,13 +2679,17 @@ def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: s
     # messages; slicing the combined string could erase established state on a
     # sufficiently deep later fold.
     prefix = f"PRIOR SUMMARY:\n{old_summary}\n\n" if old_summary else ""
+    output_tokens = _summary_output_budget(ctx_limit)
     request_chars = _SUMMARY_REQUEST_CHARS
     if ctx_limit:
         # The summarizer uses the same model slot. Scale its input to the live
         # context instead of assuming the fixed 200K-char ceiling fits every
-        # model. Two chars/token is conservative for JSON/code-heavy history;
-        # leave roughly 4K tokens for instructions, template, and output.
-        request_chars = min(request_chars, max(12000, (ctx_limit - 4096) * 2))
+        # model. Two chars/token is conservative for JSON/code-heavy history.
+        # Reserve the complete output allowance plus template/instruction room;
+        # the old fixed 2K output cap truncated Qwen summaries before their
+        # required final sections.
+        input_headroom = output_tokens + 2048
+        request_chars = min(request_chars, max(8000, (ctx_limit - input_headroom) * 2))
     new_budget = max(2000, request_chars - len(prefix) - 32)
     if len(rendered) > new_budget:
         rendered = ("…(older new messages elided to fit the compaction request)…\n"
@@ -1670,31 +2701,80 @@ def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: s
             {"role": "system", "content": _SUMMARY_INSTR},
             {"role": "user", "content": user},
         ],
-        "stream": False, "temperature": 0.2, "max_tokens": 2048,
+        "stream": False,
+        "temperature": 0.1,
+        "max_tokens": output_tokens,
+        # Summary tokens must be spent on the state block, not an invisible
+        # reasoning preamble. llama.cpp ignores unknown template kwargs, so
+        # this remains safe for non-reasoning models.
+        "chat_template_kwargs": {"enable_thinking": False, "thinking_budget": 0},
     }
     try:
         # This call runs synchronously and can take 2-60s on a local model —
-        # tell the UI so it can show a live "compacting…" indicator while the
-        # fold is in flight (see #compact-indicator in app.js / app.css).
+        # tell the UI so it can show a live inline compaction row while the
+        # fold is in flight.
         if notify:
             broadcast_event({"type": "summary_folding", "chat_id": chat_id})
     except Exception:
         pass
     try:
-        resp = llama_post("/v1/chat/completions", payload, timeout=_SUMMARY_CALL_TIMEOUT_S)
-        txt = ((resp.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
-        valid, why = _validate_summary_output(txt)
-        if not valid:
-            # Degenerate summarizer output (the 11-char failure) would be
-            # recorded as state and poison the summary — treat it as a failure
-            # so the caller backs off and retries instead of folding with junk.
-            raise ValueError(f"summarizer output rejected: {why}")
-        return txt
+        def _call_summary(attempt_payload: dict, attempt: int) -> tuple[str, bool, str, str]:
+            resp = llama_post(
+                "/v1/chat/completions", attempt_payload,
+                timeout=_SUMMARY_CALL_TIMEOUT_S,
+            )
+            choice = (resp.get("choices") or [{}])[0]
+            txt = ((choice.get("message") or {}).get("content", "") or "").strip()
+            valid, why = _validate_summary_output(txt)
+            finish = str(choice.get("finish_reason") or "unknown")
+            if not valid:
+                _log_compact(
+                    chat_id,
+                    f"summarize attempt {attempt} rejected: {why}; "
+                    f"finish={finish} chars={len(txt)}",
+                )
+            return txt, valid, why, finish
+
+        txt, valid, why, _finish = _call_summary(payload, 1)
+        if valid:
+            return txt
+
+        # One bounded repair attempt for a response that arrived but failed the
+        # schema. Reuse the original source messages, not the rejected draft,
+        # and force short sections so a verbose model cannot consume the entire
+        # allowance before FILES/VERIFICATION/NEXT ACTION.
+        repair_instr = (
+            _SUMMARY_INSTR
+            + "\n\nREPAIR ATTEMPT: The previous state block was rejected because "
+            + why
+            + ". Produce the complete block again. Include every heading exactly once, "
+              "use no more than six short bullets per section, write '- None recorded.' "
+              "for an empty section, and keep the entire answer under 1,800 words."
+        )
+        repair_payload = {
+            **payload,
+            "temperature": 0.0,
+            "messages": [
+                {"role": "system", "content": repair_instr},
+                {"role": "user", "content": user},
+            ],
+        }
+        repaired, repaired_valid, repaired_why, repaired_finish = _call_summary(
+            repair_payload, 2)
+        if repaired_valid:
+            _log_compact(
+                chat_id,
+                f"summarize repaired on attempt 2; finish={repaired_finish} "
+                f"chars={len(repaired)}",
+            )
+            return repaired
+        raise ValueError(
+            "summarizer output rejected after repair: "
+            f"{repaired_why} (first attempt: {why})"
+        )
     except Exception as _e:
-        # Surface it — a silent failure here is invisible state loss: the
-        # trimmer keeps deleting the middle and the model loops with no hint
-        # why. Throttled by the caller's backoff so a wedged server doesn't
-        # toast-spam every round.
+        # Surface the final failure. Mid-turn callers stop the active response
+        # rather than trimming the prompt and letting an amnesiac model loop.
         try:
             _log_compact(chat_id, f"summarize failed: {type(_e).__name__}: {_e}")
         except Exception:
@@ -1711,6 +2791,7 @@ def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: s
 # llama-server makes every subsequent round eat a 90s timeout mid-turn.
 _SUMMARY_FAIL_BACKOFF_S = 180
 _summary_last_fail_by_chat: dict[str, float] = {}
+_summary_failure_seq_by_chat: dict[str, int] = {}
 # Automatic folds can legitimately happen more than once during a very long
 # unattended turn, but each fold does not need its own pair of UI messages.
 # Keep full telemetry while rate-limiting only user-facing automatic notices.
@@ -1725,6 +2806,12 @@ _summary_folds_inflight: set[str] = set()
 # fold feel instant. Five minutes gives a slow model room to finish while still
 # bounding a genuinely wedged server; failure backoff prevents retry storms.
 _SUMMARY_CALL_TIMEOUT_S = 300
+
+
+def _summary_failure_backoff_active(chat_id: str) -> bool:
+    """True while automatic compaction is cooling down after a final failure."""
+    last_failure = _summary_last_fail_by_chat.get(chat_id, 0)
+    return bool(last_failure and time.time() - last_failure < _SUMMARY_FAIL_BACKOFF_S)
 
 
 # ---- compaction debug log ---------------------------------------------------
@@ -1832,7 +2919,10 @@ def _maybe_roll_summary_unlocked(chat: dict, ctx_limit: int, force: bool = False
                            through, None)
         return False
     chat_id = chat.get("id") or ""
-    if time.time() - _summary_last_fail_by_chat.get(chat_id, 0) < _SUMMARY_FAIL_BACKOFF_S:
+    # Manual compaction is an explicit retry, so let it bypass the automatic
+    # cooldown. Automatic and mid-turn attempts stay blocked to prevent a
+    # broken summarizer from stalling every model round.
+    if reason_hint != "manual" and _summary_failure_backoff_active(chat_id):
         _record_fold_event(chat, reason_hint, force, False, "fail_backoff",
                            ctx_limit, _last_prompt_tokens_by_chat.get(chat_id, 0),
                            through, None)
@@ -1902,22 +2992,27 @@ def _maybe_roll_summary_unlocked(chat: dict, ctx_limit: int, force: bool = False
         _record_fold_event(chat, reason_hint, force, False, "cannot_align_boundary",
                            ctx_limit, real_fill, through, None)
         return False
-    # Automatic compaction is infrastructure, not chat content. Keep it silent
-    # and observable in fold_events/compaction_debug; only an explicit manual
-    # compact action gets user-facing start/completion/failure notifications.
+    # Compaction stays out of persisted chat content, but every real summarizer
+    # run emits a matched lifecycle event so the active client can show one
+    # temporary inline status row. This matters most for automatic mid-turn
+    # folds, where the model otherwise appears to have frozen.
     _now = time.time()
-    _notify = reason_hint == "manual"
-    if _notify:
+    _notify = True
+    if reason_hint == "manual":
         _summary_last_notice_by_chat[chat_id] = _now
     new_summary = _update_rolling_summary(chat.get("rolling_summary", ""), msgs[through:cut],
                                           chat_id=chat_id, notify=_notify,
                                           ctx_limit=ctx_limit)
     if new_summary is None:
         _summary_last_fail_by_chat[chat_id] = time.time()
+        _summary_failure_seq_by_chat[chat_id] = (
+            _summary_failure_seq_by_chat.get(chat_id, 0) + 1
+        )
         _record_fold_event(chat, reason_hint, force, False, "summarize_failed",
                            ctx_limit, real_fill, through, cut)
         return False
     if new_summary and new_summary != chat.get("rolling_summary", ""):
+        _summary_last_fail_by_chat.pop(chat_id, None)
         chat["rolling_summary"] = new_summary
         chat["summary_through"] = cut
         _refresh_continuity_state(chat)
@@ -1946,6 +3041,12 @@ def _maybe_roll_summary_unlocked(chat: dict, ctx_limit: int, force: bool = False
         return True
     _record_fold_event(chat, reason_hint, force, False, "no_change",
                        ctx_limit, real_fill, through, cut)
+    try:
+        if _notify:
+            broadcast_event({"type": "summary_fold_finished", "chat_id": chat_id,
+                             "outcome": "no_change"})
+    except Exception:
+        pass
     return False
 
 
@@ -2049,10 +3150,11 @@ def _mid_turn_fold(chat_id: str, conversation: list[dict], start_len: int,
     forever. This folds instead: persist this turn's working memory, advance
     the summary, rebuild the conversation from the new fold boundary.
 
-    Returns {"conversation", "start_len", "folded"} on success, or
-    {"conversation": None, "start_len", "folded": 0} when the fold didn't
-    advance but intermediates were persisted (caller must still move its
-    persist boundary so nothing is stored twice). None when there's no chat."""
+    Returns {"conversation", "start_len", "folded"} on success, or a result
+    with conversation=None when the fold did not advance. In that result,
+    failed=True means the summarizer finally failed or remains in cooldown, so
+    the caller must stop instead of trimming older context. None means there is
+    no stored chat."""
     if not chat_id:
         return None
     chats = get_chats()
@@ -2081,12 +3183,20 @@ def _mid_turn_fold(chat_id: str, conversation: list[dict], start_len: int,
                 persisted["name"] = im["name"]
         chat["messages"].append(persisted)
     persisted_upto = len(conversation)
+    failure_seq_before = _summary_failure_seq_by_chat.get(chat_id, 0)
+    failure_backoff_before = _summary_failure_backoff_active(chat_id)
     # force=True: the caller only reaches this path when the trimmer already
     # dropped messages — that drop IS the overflow signal, so skip the 0.85
     # fill gate (it is unreachable anyway: the trimmer caps fill below it).
     if not _maybe_roll_summary(chat, ctx_limit, force=True, reason_hint="mid_turn"):
         save_json(CHATS_FILE, chats)
-        return {"conversation": None, "start_len": persisted_upto, "folded": 0}
+        return {
+            "conversation": None,
+            "start_len": persisted_upto,
+            "folded": 0,
+            "failed": (failure_backoff_before or
+                       _summary_failure_seq_by_chat.get(chat_id, 0) > failure_seq_before),
+        }
     save_json(CHATS_FILE, chats)
     new_through = int(chat.get("summary_through", 0) or 0)
     sys_content = ""
@@ -2554,6 +3664,29 @@ def _rt_authorized_mission(chat: dict | None) -> dict | None:
     return m
 
 
+def _rt_passive_mission(chat: dict | None) -> bool:
+    mission = _rt_authorized_mission(chat)
+    return bool(mission and mission.get("engagement") == "passive_osint")
+
+
+def _rt_frontend_secret_mission(chat: dict | None) -> dict | None:
+    mission = _rt_mission_get(chat) if isinstance(chat, dict) else None
+    return mission if mission and mission.get("engagement") == "frontend_secrets" else None
+
+
+def _rt_close_frontend_secret_mission(chat: dict | None, tool_name: str = "") -> bool:
+    """Close the bounded one-tool frontend audit after its scanner returns."""
+    mission = _rt_frontend_secret_mission(chat)
+    if not mission or str(mission.get("status") or "active").lower() == "closed":
+        return False
+    if tool_name and _resolve_tool_name(tool_name) != "scan_js_secrets":
+        return False
+    mission["status"] = "closed"
+    mission["closed_at"] = int(time.time())
+    chat["mission"] = mission
+    return True
+
+
 def _rt_context_chat() -> dict | None:
     """Return the live turn state when present, otherwise the persisted chat."""
     live = _current_rt_chat.get()
@@ -2565,6 +3698,116 @@ def _rt_context_chat() -> dict | None:
                 if chat_id else None)
     except Exception:
         return None
+
+
+def _rt_clean_user_agent(value: Any) -> str:
+    """Return a header-safe custom User-Agent, or blank when invalid."""
+    user_agent = str(value or "").strip()
+    if not user_agent or len(user_agent) > 512:
+        return ""
+    if any(ord(char) < 32 or ord(char) == 127 for char in user_agent):
+        return ""
+    try:
+        user_agent.encode("latin-1")
+    except UnicodeEncodeError:
+        return ""
+    return user_agent
+
+
+def _rt_required_user_agent() -> str:
+    """Custom User-Agent attached to the active, authorized engagement."""
+    mission = _rt_authorized_mission(_rt_context_chat())
+    return _rt_clean_user_agent((mission or {}).get("user_agent"))
+
+
+def _rt_apply_mission_user_agent(headers: dict | None = None) -> dict:
+    """Force the engagement User-Agent after model- or profile-supplied headers."""
+    result = dict(headers or {})
+    user_agent = _rt_required_user_agent()
+    if not user_agent:
+        return result
+    for key in list(result):
+        low = str(key).lower()
+        if low == "user-agent" or low.startswith("sec-ch-ua"):
+            result.pop(key, None)
+    result["User-Agent"] = user_agent
+    return result
+
+
+_RT_DISCOVERED_SECRET_LOCK = threading.Lock()
+_RT_DISCOVERED_SECRET_VALUES: dict[str, tuple[str, ...]] = {}
+
+
+def _rt_secret_guard_id(chat: dict | None) -> str:
+    mission = _rt_mission_get(chat) if isinstance(chat, dict) else None
+    if not mission:
+        return ""
+    return str(mission.get("authorization_id") or chat.get("id") or "").strip()
+
+
+def _rt_remember_frontend_secret_values(chat: dict | None, records: list[dict]) -> int:
+    """Keep discovered values in process memory so request tools cannot reuse them."""
+    guard_id = _rt_secret_guard_id(chat)
+    if not guard_id:
+        return 0
+    values = {
+        str(record.get("_value") or "")
+        for record in records
+        if isinstance(record, dict) and isinstance(record.get("_value"), str)
+        and record.get("_value")
+    }
+    if not values:
+        return 0
+    with _RT_DISCOVERED_SECRET_LOCK:
+        existing = set(_RT_DISCOVERED_SECRET_VALUES.get(guard_id, ()))
+        existing.update(values)
+        _RT_DISCOVERED_SECRET_VALUES[guard_id] = tuple(sorted(existing, key=len, reverse=True)[:250])
+        while len(_RT_DISCOVERED_SECRET_VALUES) > 128:
+            _RT_DISCOVERED_SECRET_VALUES.pop(next(iter(_RT_DISCOVERED_SECRET_VALUES)))
+        return len(_RT_DISCOVERED_SECRET_VALUES[guard_id])
+
+
+def _rt_args_contain_discovered_secret(args: Any, chat: dict | None) -> bool:
+    guard_id = _rt_secret_guard_id(chat)
+    if not guard_id:
+        return False
+    with _RT_DISCOVERED_SECRET_LOCK:
+        protected = _RT_DISCOVERED_SECRET_VALUES.get(guard_id, ())
+    if not protected:
+        return False
+
+    def contains(value: Any) -> bool:
+        if isinstance(value, str):
+            return any(secret in value for secret in protected)
+        if isinstance(value, dict):
+            return any(contains(item) for item in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return any(contains(item) for item in value)
+        return False
+
+    return contains(args)
+
+
+def _rt_discovered_secret_submission_block(name: str, args: dict,
+                                             chat: dict | None) -> str | None:
+    """Block discovered frontend values from request-capable tools."""
+    reporting_tools = {
+        "scan_js_secrets", "rt_generate_report", "record_finding", "list_findings",
+        "encode_decode", "write_file", "edit_file",
+    }
+    request_capable = (
+        (name in _RED_TEAM_TOOL_NAMES and name not in reporting_tools)
+        or name in _RT_SCOPE_AWARE_GENERIC_TOOLS
+        or name in _RT_SCOPE_AWARE_COMMAND_TOOLS
+        or name.startswith("mcp_")
+    )
+    if request_capable and _rt_args_contain_discovered_secret(args, chat):
+        return (
+            "refused: this request contains a credential found by scan_js_secrets. "
+            "Discovered values may be displayed and written into reports, but the harness will "
+            "not submit or use them in network, provider, authentication, or validation requests."
+        )
+    return None
 
 
 _RT_NETWORK_CMD_RE = re.compile(
@@ -2580,6 +3823,9 @@ def _rt_command_scope_block(command: str, chat: dict | None) -> str | None:
     if not _rt_authorized_mission(chat):
         return None
     scrub = re.sub(r"/mnt/[a-z]/\S+", " ", str(command or "").lower())
+    if _rt_passive_mission(chat) and _RT_NETWORK_CMD_RE.search(scrub):
+        return ("refused: passive OSINT forbids shell-driven network access. "
+                "Use the public-source OSINT tools supplied for this mission.")
     hosts = set(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", scrub))
     hosts |= {h for h in re.findall(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", scrub)
               if not h.endswith((".py", ".js", ".txt", ".gz", ".xz", ".img", ".bin",
@@ -2614,6 +3860,16 @@ def _rt_scope_block(name: str, args: dict) -> str | None:
     if not mission:
         return ("refused: this chat has no active user-authorized red-team mission. "
                 "Open the Red team gate, confirm authorization, and submit a target first.")
+    if _rt_passive_mission(chat):
+        if name not in _RT_PASSIVE_TOOL_NAMES:
+            return ("refused: passive OSINT allows public-source queries only and will not "
+                    "connect to the target. Start a Target Recon or Red Team mission to use "
+                    f"{name}.")
+        if name == "recon_dns" and (
+                str((args or {}).get("mode") or "").lower() == "axfr"
+                or bool((args or {}).get("loud"))):
+            return ("refused: AXFR directly contacts the target's nameserver and is not "
+                    "allowed in passive OSINT.")
     if name in _RT_EXPLOIT_TOOL_NAMES and not _rt_incl_exploit_for(chat, settings):
         return ("refused: exploit tools are locked during recon. Confirm a real finding with "
                 "validate_finding first, or explicitly enable the force-exploit override.")
@@ -2747,13 +4003,19 @@ def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
     scope = str(panel.get("scope") or "").strip() or f"in: {target}"
     objective = str(panel.get("objective") or "").strip()
     constraints = str(panel.get("constraints") or "").strip()
+    user_agent = _rt_clean_user_agent(panel.get("user_agent"))
+    engagement = str(panel.get("engagement") or "recon").strip().lower()
+    if engagement not in ("passive_osint", "frontend_secrets", "recon", "pentest"):
+        engagement = "recon"
     facts = ["constraints: " + constraints[:180]] if constraints else []
     mission = {
         "target": target[:120],
         "scope": scope[:300],
         "objective": objective[:300],
+        "user_agent": user_agent,
         "facts": facts,
         "phase": "recon",
+        "engagement": engagement,
         "status": "active",
         "authorized": True,
         "authorization_source": "ui_gate",
@@ -2795,6 +4057,10 @@ def _rt_mission_render(chat: dict, budget_chars: int | None = None) -> str:
         head.append(f"scope: {m['scope']}")
     if m.get("objective"):
         head.append(f"objective: {m['objective']}")
+    if m.get("engagement"):
+        head.append(f"mode: {m['engagement']}")
+    if m.get("user_agent"):
+        head.append(f"required user agent: {m['user_agent']}")
     facts = list(m.get("facts") or [])
     if budget_chars is not None:
         used = sum(len(h) + 1 for h in head) + 40
@@ -3534,7 +4800,8 @@ def request_approval(title: str, command: str, details: dict | None = None, time
     details.setdefault("allow_always",
                        bool(kind) and (kind in _SAFE_WRITE_KINDS or kind.startswith("mcp_")))
     try:
-        if not details.get("critical"):   # protected ops NEVER auto-approve
+        if not details.get("critical") and not details.get("force_prompt"):
+            # protected ops and explicitly remote mutations NEVER auto-approve
             mode = _approval_mode()
             if kind and kind in _approval_session_allow:
                 return {"status": "session-approved", "decision": "approve", "auto": True, "details": details}
@@ -4173,9 +5440,7 @@ def tool_write_file(args: dict) -> dict:
     if not path:
         return {"error": "missing path"}
     if not isinstance(content, str) or not content.strip():
-        return {"error": "refused: content is empty/missing — your write_file call had no file body "
-                         "(the server's tool parser likely dropped it). Re-emit the call with the "
-                         "path AND the full content together."}
+        return {"error": "refused: content is empty or missing. No file was written."}
     if is_bridge_self_path(path):
         return {"error": "refused: bridge.py is the running server — edit it from your real IDE, not from a chat tool call. Restart the bridge afterward."}
     _cerr = _critical_path_gate(path, "write_file", "PROTECTED PATH - write under Windows/System32")
@@ -5046,6 +6311,548 @@ def tool_run_powershell(args: dict) -> dict:
         if approval.get("decision") != "approve":
             return {"error": f"user denied command ({approval.get('status')})"}
     return _run_powershell(cmd, timeout=int(args.get("timeout", 120)))
+
+
+_REMOTE_READ_ONLY_COMMANDS = {
+    "pwd", "whoami", "id", "uname", "sw_vers", "date", "uptime", "hostname",
+    "which", "df", "ps", "pgrep", "groups",
+}
+
+
+def _remote_command_refusal(command: str) -> str:
+    cmd = str(command or "").strip()
+    catastrophic = _catastrophic_cmd(cmd)
+    if catastrophic:
+        return f"this command {catastrophic}"
+    lowered = " ".join(cmd.lower().split())
+    rules = (
+        (r"(^|[;&|]\s*)(sudo|doas|su)(\s|$)", "requests elevated or another user's privileges"),
+        (r"\bdiskutil\s+(erase|partition|apfs\s+delete|secureerase)", "can erase or repartition a disk"),
+        (r"\bcsrutil\b", "changes macOS System Integrity Protection"),
+        (r"\bsecurity\s+authorizationdb\b", "changes macOS authorization policy"),
+        (r"\blaunchctl\s+(bootstrap|bootout)\s+system\b", "changes system launch services"),
+    )
+    for pattern, reason in rules:
+        if re.search(pattern, lowered):
+            return reason
+    return ""
+
+
+def _remote_command_is_read_only(command: str) -> bool:
+    cmd = str(command or "").strip()
+    if not cmd or any(token in cmd for token in ("\n", "\r", ";", "&&", "||", "|", ">", "<", "`", "$(")):
+        return False
+    try:
+        parts = shlex.split(cmd, posix=True)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    first = parts[0]
+    if first in _REMOTE_READ_ONLY_COMMANDS:
+        return not any(arg in {"-delete", "--delete"} for arg in parts[1:])
+    if first == "brew" and len(parts) > 1:
+        return parts[1] in {"list", "config", "doctor"}
+    if first in {"python", "python3", "node", "npm", "ruby", "clang", "swift", "xcodebuild"}:
+        return len(parts) == 2 and parts[1] in {"--version", "-V", "-v"}
+    return False
+
+
+def _remote_text_result(result: dict) -> dict:
+    raw = result.pop("stdout_bytes", b"") or b""
+    result["stdout"] = raw.decode("utf-8", "replace")
+    return result
+
+
+def tool_remote_shell(args: dict) -> dict:
+    row = _selected_remote_machine(args)
+    if not row:
+        return {"error": "No verified Mac is selected. Pair it in Settings, then choose it in the top bar."}
+    command = str(args.get("command") or "").strip()
+    if not command:
+        return {"error": "command is required"}
+    refused = _remote_command_refusal(command)
+    if refused:
+        return {
+            "error": f"refused: {refused}. Run it yourself on the Mac if that is genuinely intended.",
+            "refused_command": command,
+        }
+    if not _remote_command_is_read_only(command):
+        approval = request_approval(
+            title=f"Run on {row.get('label') or 'paired Mac'}",
+            command=command,
+            details={
+                "kind": "remote_shell", "force_prompt": True,
+                "machine": row.get("id"), "target": row.get("label"),
+            },
+        )
+        if approval.get("decision") != "approve":
+            return {"error": f"user denied remote command ({approval.get('status')})"}
+    result = _run_remote_process(
+        row, command, timeout=args.get("timeout"), max_stdout=240_000,
+        stream_name="remote_shell",
+    )
+    return _remote_text_result(result)
+
+
+def tool_remote_list_directory(args: dict) -> dict:
+    row = _selected_remote_machine(args)
+    if not row:
+        return {"error": "No verified Mac is selected."}
+    try:
+        path = _normalize_remote_path(row, args.get("path") or "~/Desktop")
+    except ValueError as exc:
+        return {"error": str(exc)}
+    path, path_error = _confirm_remote_path(row, path, directory=True)
+    if path_error:
+        return {"error": path_error}
+    command = f"LC_ALL=C ls -laO -- {shlex.quote(path)}"
+    result = _remote_text_result(_run_remote_process(row, command, max_stdout=240_000, stream_name=""))
+    result["path"] = path
+    return result
+
+
+def _remote_file_metadata(row: dict, path: str) -> dict:
+    path, path_error = _confirm_remote_path(row, path)
+    if path_error:
+        return {"ok": False, "error": path_error}
+    quoted = shlex.quote(path)
+    command = (
+        f"test -f {quoted} || exit 44; "
+        f"size=$(stat -f '%z' -- {quoted}) || exit 45; "
+        f"hash=$(shasum -a 256 -- {quoted} | awk '{{print $1}}') || exit 46; "
+        "printf '%s %s\\n' \"$size\" \"$hash\""
+    )
+    result = _remote_text_result(_run_remote_process(row, command, timeout=30, max_stdout=4096, stream_name=""))
+    if not result.get("ok"):
+        return result
+    match = re.search(r"^(\d+)\s+([0-9a-fA-F]{64})\s*$", result.get("stdout") or "", re.MULTILINE)
+    if not match:
+        return {"ok": False, "error": "The Mac returned invalid file metadata."}
+    return {"ok": True, "path": path, "size": int(match.group(1)), "sha256": match.group(2).lower()}
+
+
+def tool_remote_read_file(args: dict) -> dict:
+    row = _selected_remote_machine(args)
+    if not row:
+        return {"error": "No verified Mac is selected."}
+    try:
+        path = _normalize_remote_path(row, args.get("path") or "")
+        offset = max(0, int(args.get("offset") or 0))
+        length = max(1, min(int(args.get("length") or 65536), 262144))
+    except (ValueError, TypeError) as exc:
+        return {"error": str(exc)}
+    meta = _remote_file_metadata(row, path)
+    if not meta.get("ok"):
+        return {"error": meta.get("stderr") or meta.get("error") or "Remote file not found."}
+    path = meta["path"]
+    command = f"dd if={shlex.quote(path)} bs=1 skip={offset} count={length} 2>/dev/null"
+    result = _run_remote_process(row, command, timeout=60, max_stdout=length, stream_name="")
+    if not result.get("ok"):
+        return {"error": result.get("stderr") or result.get("error") or "Remote read failed."}
+    raw = result.get("stdout_bytes") or b""
+    with _remote_file_reads_lock:
+        _remote_file_reads[(_get_current_chat() or "", str(row.get("id")), path)] = meta["sha256"]
+    try:
+        content = raw.decode("utf-8")
+        binary = False
+    except UnicodeDecodeError:
+        content = base64.b64encode(raw).decode("ascii")
+        binary = True
+    return {
+        "ok": True, "path": path, "offset": offset, "bytes": len(raw),
+        "size": meta["size"], "sha256": meta["sha256"],
+        "content": content, "binary_base64": binary,
+        "truncated": offset + len(raw) < meta["size"],
+    }
+
+
+def _remote_write_bytes(row: dict, path: str, payload: bytes,
+                        expected_sha256: str = "") -> dict:
+    quoted = shlex.quote(path)
+    expected = str(expected_sha256 or "").lower()
+    guard = ""
+    if expected:
+        guard = (
+            f"current=$(shasum -a 256 -- {quoted} 2>/dev/null | awk '{{print $1}}'); "
+            f"test \"$current\" = {shlex.quote(expected)} || "
+            "{ printf 'STALE_REMOTE_FILE\\n' >&2; exit 73; }; "
+        )
+    command = (
+        "set -eu; "
+        f"dest={quoted}; parent=$(dirname -- \"$dest\"); test -d \"$parent\"; "
+        f"{guard}"
+        "tmp=\"${dest}.accuretta.$$\"; trap 'rm -f -- \"$tmp\"' EXIT HUP INT TERM; "
+        "cat > \"$tmp\"; "
+        "if test -e \"$dest\"; then mode=$(stat -f '%Lp' -- \"$dest\"); chmod \"$mode\" \"$tmp\"; fi; "
+        "mv -f -- \"$tmp\" \"$dest\"; trap - EXIT HUP INT TERM"
+    )
+    result = _run_remote_process(
+        row, command, timeout=max(60, int(len(payload) / 250_000) + 30),
+        stdin=payload, max_stdout=4096, stream_name="",
+    )
+    if result.get("exit") == 73 or "STALE_REMOTE_FILE" in str(result.get("stderr") or ""):
+        return {"ok": False, "error": "The Mac file changed since it was read. Read it again before overwriting it.", "stale": True}
+    return _remote_text_result(result)
+
+
+def _remote_payload_limit() -> int:
+    try:
+        mb = max(1, min(int(get_settings().get("remote_file_max_mb") or 100), 1024))
+    except Exception:
+        mb = 100
+    return mb * 1024 * 1024
+
+
+def _remote_expected_hash(row: dict, path: str, explicit: str = "") -> str:
+    expected = str(explicit or "").strip().lower()
+    if expected:
+        return expected
+    with _remote_file_reads_lock:
+        return _remote_file_reads.get(
+            (_get_current_chat() or "", str(row.get("id")), path), "")
+
+
+def _remote_write_approved_payload(row: dict, path: str, payload: bytes,
+                                   expected_sha256: str = "",
+                                   title: str = "Write file on paired Mac") -> dict:
+    if len(payload) > _remote_payload_limit():
+        return {"error": "File exceeds the configured remote transfer limit."}
+    approval = request_approval(
+        title=title,
+        command=f"Write {len(payload)} bytes to {path}",
+        details={
+            "kind": "remote_file_write", "force_prompt": True,
+            "machine": row.get("id"), "path": path,
+            "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied remote file write ({approval.get('status')})"}
+    result = _remote_write_bytes(row, path, payload, expected_sha256)
+    if result.get("ok"):
+        result.update({
+            "path": path, "bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        })
+    return result
+
+
+_CHAT_CODE_FENCE_RE = re.compile(r"```([^\r\n`]*)\r?\n([\s\S]*?)```", re.MULTILINE)
+_RESPONSE_BOUNDARY_RE = re.compile(
+    r"(?:^|\n)[ \t]*response(?=[A-Za-z0-9<`])", re.IGNORECASE)
+
+
+def _visible_assistant_text(text: str) -> str:
+    """Best-effort mirror of the UI's reasoning boundary for artifact export."""
+    raw = str(text or "")
+    boundaries = list(_RESPONSE_BOUNDARY_RE.finditer(raw))
+    if boundaries:
+        return raw[boundaries[-1].end():]
+    return re.sub(
+        r"<(?:think|thinking|reasoning)>[\s\S]*?</(?:think|thinking|reasoning)>",
+        "", raw, flags=re.IGNORECASE,
+    )
+
+
+def _recent_visible_code_blocks(chat_id: str, language: str = "") -> list[dict]:
+    wanted = str(language or "").strip().lower()
+    chat = (get_chats().get("chats", {}) or {}).get(chat_id) or {}
+    blocks: list[dict] = []
+    for message_index, message in enumerate(chat.get("messages") or []):
+        if (message.get("role") != "assistant" or message.get("_internal")
+                or not isinstance(message.get("content"), str)):
+            continue
+        visible = _visible_assistant_text(message.get("content") or "")
+        for match in _CHAT_CODE_FENCE_RE.finditer(visible):
+            info = (match.group(1) or "").strip()
+            lang = (info.split(None, 1)[0] if info else "text").lower()
+            if wanted and lang != wanted:
+                continue
+            blocks.append({
+                "content": match.group(2), "language": lang,
+                "info": info, "message_index": message_index,
+            })
+    return blocks
+
+
+def tool_remote_save_code_block(args: dict) -> dict:
+    """Write a prior visible code fence without asking the model to repeat it."""
+    row = _selected_remote_machine(args)
+    if not row:
+        return {"error": "No verified Mac is selected."}
+    try:
+        path = _normalize_remote_path(row, args.get("path") or "")
+        index = max(0, min(int(args.get("index") or 0), 50))
+    except (ValueError, TypeError) as exc:
+        return {"error": str(exc)}
+    path, path_error = _confirm_remote_path(row, path)
+    if path_error:
+        return {"error": path_error}
+    blocks = _recent_visible_code_blocks(
+        _get_current_chat() or "", str(args.get("language") or ""))
+    if index >= len(blocks):
+        return {
+            "error": "No matching visible code block exists in this chat. Generate the complete file first, then retry.",
+            "matching_blocks": len(blocks),
+        }
+    block = blocks[-1 - index]
+    payload = block["content"].encode("utf-8")
+    expected = _remote_expected_hash(row, path, args.get("expected_sha256") or "")
+    result = _remote_write_approved_payload(
+        row, path, payload, expected,
+        title=f"Save chat code on {row.get('label') or 'paired Mac'}",
+    )
+    if result.get("ok"):
+        result.update({
+            "source": "visible_chat_code_block",
+            "language": block["language"],
+            "message_index": block["message_index"],
+        })
+    return result
+
+
+def _cleanup_remote_staging(max_age_s: int = 86400) -> None:
+    cutoff = time.time() - max_age_s
+    try:
+        for path in REMOTE_STAGING_DIR.glob("*.part"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def tool_remote_file_begin(args: dict) -> dict:
+    """Open one path-bound staged write. Approval is intentionally paid here once."""
+    row = _selected_remote_machine(args)
+    if not row:
+        return {"error": "No verified Mac is selected."}
+    try:
+        path = _normalize_remote_path(row, args.get("path") or "")
+    except ValueError as exc:
+        return {"error": str(exc)}
+    path, path_error = _confirm_remote_path(row, path)
+    if path_error:
+        return {"error": path_error}
+    approval = request_approval(
+        title=f"Prepare a large file on {row.get('label') or 'paired Mac'}",
+        command=f"Assemble one file in chunks, then write atomically to {path}",
+        details={
+            "kind": "remote_file_write", "force_prompt": True,
+            "machine": row.get("id"), "path": path,
+            "max_bytes": _remote_payload_limit(),
+        },
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied remote file write ({approval.get('status')})"}
+    REMOTE_STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup_remote_staging()
+    upload_id = uuid.uuid4().hex
+    staging_path = REMOTE_STAGING_DIR / f"{upload_id}.part"
+    staging_path.touch(exist_ok=False)
+    _protect_remote_private_key(staging_path)
+    record = {
+        "id": upload_id, "chat_id": _get_current_chat() or "",
+        "machine_id": str(row.get("id") or ""), "path": path,
+        "staging_path": staging_path, "bytes": 0, "chunks": 0,
+        "created": time.time(),
+        "expected_sha256": _remote_expected_hash(row, path),
+    }
+    with _remote_staged_writes_lock:
+        _remote_staged_writes[upload_id] = record
+    return {
+        "ok": True, "upload_id": upload_id, "path": path,
+        "chunk_chars_max": 6000, "bytes": 0, "chunks": 0,
+        "note": "Append the file in order, then commit it. Do not repeat earlier chunks.",
+    }
+
+
+def _owned_remote_stage(upload_id: str) -> tuple[dict | None, str]:
+    token = str(upload_id or "").strip()
+    with _remote_staged_writes_lock:
+        record = _remote_staged_writes.get(token)
+    if not record:
+        return None, "Unknown or expired staged-write id. Start again with remote_file_begin."
+    if record.get("chat_id") != (_get_current_chat() or ""):
+        return None, "This staged write belongs to another chat."
+    if time.time() - float(record.get("created") or 0) > 86400:
+        with _remote_staged_writes_lock:
+            _remote_staged_writes.pop(token, None)
+        try:
+            Path(record["staging_path"]).unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None, "This staged write expired. Start it again."
+    return record, ""
+
+
+def tool_remote_file_append(args: dict) -> dict:
+    record, error = _owned_remote_stage(args.get("upload_id") or "")
+    if error:
+        return {"error": error}
+    content = args.get("content")
+    if not isinstance(content, str) or not content:
+        return {"error": "Chunk content is empty. Re-emit only this missing chunk."}
+    if len(content) > 8000:
+        return {"error": "Chunk is too large. Split it into chunks of at most 6000 characters."}
+    payload = content.encode("utf-8")
+    if int(record.get("bytes") or 0) + len(payload) > _remote_payload_limit():
+        return {"error": "Staged file exceeds the configured remote transfer limit."}
+    staging_path = Path(record["staging_path"])
+    with _remote_staged_writes_lock:
+        with staging_path.open("ab") as handle:
+            handle.write(payload)
+        record["bytes"] = int(record.get("bytes") or 0) + len(payload)
+        record["chunks"] = int(record.get("chunks") or 0) + 1
+        total = int(record["bytes"])
+        chunks = int(record["chunks"])
+    return {
+        "ok": True, "upload_id": record["id"], "path": record["path"],
+        "bytes": total, "chunks": chunks, "chunk_bytes": len(payload),
+    }
+
+
+def tool_remote_file_commit(args: dict) -> dict:
+    record, error = _owned_remote_stage(args.get("upload_id") or "")
+    if error:
+        return {"error": error}
+    row = _remote_machine(str(record.get("machine_id") or ""))
+    if not row or row.get("status") != "ready":
+        return {"error": "The paired Mac is unavailable. The staged file is retained for a later retry."}
+    path, path_error = _confirm_remote_path(row, str(record.get("path") or ""))
+    if path_error:
+        return {"error": path_error}
+    if path != record.get("path"):
+        return {"error": "The resolved destination changed after approval. Start the staged write again."}
+    staging_path = Path(record["staging_path"])
+    payload = staging_path.read_bytes()
+    if not payload:
+        return {"error": "Staged file is empty. Append content before committing."}
+    actual_sha = hashlib.sha256(payload).hexdigest()
+    wanted_sha = str(args.get("sha256") or "").strip().lower()
+    if wanted_sha and wanted_sha != actual_sha:
+        return {
+            "error": "Staged content SHA-256 does not match the expected value.",
+            "actual_sha256": actual_sha,
+        }
+    result = _remote_write_bytes(
+        row, path, payload, str(record.get("expected_sha256") or ""))
+    if not result.get("ok"):
+        result["upload_id"] = record["id"]
+        result["retained"] = True
+        return result
+    with _remote_staged_writes_lock:
+        _remote_staged_writes.pop(record["id"], None)
+    staging_path.unlink(missing_ok=True)
+    result = _remote_text_result(result) if "stdout_bytes" in result else result
+    result.update({
+        "ok": True, "path": path, "bytes": len(payload),
+        "chunks": int(record.get("chunks") or 0), "sha256": actual_sha,
+    })
+    return result
+
+
+def tool_remote_file_abort(args: dict) -> dict:
+    record, error = _owned_remote_stage(args.get("upload_id") or "")
+    if error:
+        return {"error": error}
+    with _remote_staged_writes_lock:
+        _remote_staged_writes.pop(record["id"], None)
+    Path(record["staging_path"]).unlink(missing_ok=True)
+    return {"ok": True, "upload_id": record["id"], "aborted": True}
+
+
+def tool_remote_write_file(args: dict) -> dict:
+    row = _selected_remote_machine(args)
+    if not row:
+        return {"error": "No verified Mac is selected."}
+    try:
+        path = _normalize_remote_path(row, args.get("path") or "")
+    except ValueError as exc:
+        return {"error": str(exc)}
+    path, path_error = _confirm_remote_path(row, path)
+    if path_error:
+        return {"error": path_error}
+    content = str(args.get("content") or "")
+    payload = content.encode("utf-8")
+    expected = _remote_expected_hash(row, path, args.get("expected_sha256") or "")
+    return _remote_write_approved_payload(
+        row, path, payload, expected,
+        title=f"Write file on {row.get('label') or 'paired Mac'}",
+    )
+
+
+def tool_remote_copy_to(args: dict) -> dict:
+    row = _selected_remote_machine(args)
+    if not row:
+        return {"error": "No verified Mac is selected."}
+    source = normalize_path(args.get("source") or "")
+    if not is_in_workspace(source) or not os.path.isfile(source):
+        return {"error": "Source must be an existing file inside the PC workspace."}
+    try:
+        destination = _normalize_remote_path(row, args.get("destination") or "")
+    except ValueError as exc:
+        return {"error": str(exc)}
+    destination, path_error = _confirm_remote_path(row, destination)
+    if path_error:
+        return {"error": path_error}
+    size = os.path.getsize(source)
+    if size > _remote_payload_limit():
+        return {"error": "File exceeds the configured remote transfer limit."}
+    approval = request_approval(
+        title=f"Copy file to {row.get('label') or 'paired Mac'}",
+        command=f"{source} -> {destination} ({size} bytes)",
+        details={"kind": "remote_file_copy", "force_prompt": True, "machine": row.get("id"), "path": destination},
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied file transfer ({approval.get('status')})"}
+    payload = Path(source).read_bytes()
+    result = _remote_write_bytes(row, destination, payload)
+    if result.get("ok"):
+        result.update({"source": source, "destination": destination, "bytes": size})
+    return result
+
+
+def tool_remote_copy_from(args: dict) -> dict:
+    row = _selected_remote_machine(args)
+    if not row:
+        return {"error": "No verified Mac is selected."}
+    try:
+        source = _normalize_remote_path(row, args.get("source") or "")
+    except ValueError as exc:
+        return {"error": str(exc)}
+    destination = normalize_path(args.get("destination") or "")
+    if not is_in_workspace(destination):
+        return {"error": "Destination must be inside the PC workspace."}
+    meta = _remote_file_metadata(row, source)
+    if not meta.get("ok"):
+        return {"error": meta.get("stderr") or meta.get("error") or "Remote file not found."}
+    if meta["size"] > _remote_payload_limit():
+        return {"error": "File exceeds the configured remote transfer limit."}
+    source = meta["path"]
+    approval = request_approval(
+        title=f"Copy file from {row.get('label') or 'paired Mac'}",
+        command=f"{source} -> {destination} ({meta['size']} bytes)",
+        details={"kind": "remote_file_copy", "force_prompt": True, "machine": row.get("id"), "path": source},
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied file transfer ({approval.get('status')})"}
+    result = _run_remote_process(row, f"cat -- {shlex.quote(source)}", timeout=max(60, int(meta["size"] / 250_000) + 30),
+                                 max_stdout=meta["size"] + 1, stream_name="")
+    if not result.get("ok"):
+        return {"error": result.get("stderr") or result.get("error") or "Remote transfer failed."}
+    payload = result.get("stdout_bytes") or b""
+    if len(payload) != meta["size"] or hashlib.sha256(payload).hexdigest() != meta["sha256"]:
+        return {"error": "Transferred bytes failed the size or SHA-256 integrity check."}
+    dest_path = Path(destination)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest_path.with_name(dest_path.name + ".accuretta.part")
+    tmp.write_bytes(payload)
+    tmp.replace(dest_path)
+    return {"ok": True, "source": source, "destination": destination, "bytes": len(payload), "sha256": meta["sha256"]}
 
 
 # ---- interactive sessions --------------------------------------------------
@@ -6886,12 +8693,7 @@ def _remember_profile(host: str, profile: dict) -> None:
 class _ScopeCheckedRedirect(urllib.request.HTTPRedirectHandler):
     """Follow redirects normally, except across an active RT scope boundary."""
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        try:
-            chat_id = _current_chat_id.get() or _get_current_chat() or ""
-            chat = ((get_chats().get("chats", {}) or {}).get(chat_id)
-                    if chat_id else None)
-        except Exception:
-            chat = None
+        chat = _rt_context_chat()
         if _rt_authorized_mission(chat):
             block = _rt_scope_block("redirect", {"url": newurl})
             if block:
@@ -6933,7 +8735,7 @@ def _browser_headers(profile: dict, *, referer: str | None = None,
         h["Sec-Ch-Ua"] = profile["sec_ch_ua"]
         h["Sec-Ch-Ua-Mobile"] = "?0"
         h["Sec-Ch-Ua-Platform"] = profile["sec_ch_ua_platform"]
-    return h
+    return _rt_apply_mission_user_agent(h)
 
 
 def _open_with_rotation(url: str, *, timeout: float = 15.0,
@@ -6967,6 +8769,7 @@ def _open_with_rotation(url: str, *, timeout: float = 15.0,
         headers = _browser_headers(profile, referer=referer, accept_html=accept_html)
         if extra_headers:
             headers.update(extra_headers)
+        headers = _rt_apply_mission_user_agent(headers)
         try:
             req = urllib.request.Request(url, data=data, method=method, headers=headers)
             opener = urllib.request.build_opener(_ScopeCheckedRedirect())
@@ -10473,10 +12276,9 @@ def tool_audit_http_headers(args: dict) -> dict:
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-    )
+    req = urllib.request.Request(url, headers=_rt_apply_mission_user_agent({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }))
     
     try:
         class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -11060,6 +12862,118 @@ def tool_recon_subdomains(args: dict) -> dict:
     }
 
 
+def tool_recon_rdap(args: dict) -> dict:
+    """Read public registration data through the RDAP bootstrap service.
+
+    The request goes to RDAP infrastructure, never to the subject domain.
+    """
+    domain = _recon_clean_host(args.get("domain") or args.get("target") or "")
+    if not domain:
+        return {"error": "domain required"}
+    url = "https://rdap.org/domain/" + urllib.parse.quote(domain, safe="")
+    try:
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/rdap+json, application/json",
+            "User-Agent": _RECON_UA,
+        })
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read(2_000_000).decode("utf-8", "replace"))
+    except Exception as e:
+        return {"error": f"RDAP query failed: {e}", "domain": domain}
+
+    events = {}
+    for event in data.get("events") or []:
+        action = str(event.get("eventAction") or "").strip()
+        date = str(event.get("eventDate") or "").strip()
+        if action and date:
+            events[action] = date
+    entities = []
+    for entity in (data.get("entities") or [])[:30]:
+        names = []
+        card = entity.get("vcardArray") or []
+        rows = card[1] if isinstance(card, list) and len(card) > 1 else []
+        for item in rows if isinstance(rows, list) else []:
+            if isinstance(item, list) and len(item) >= 4 and item[0] in ("fn", "org"):
+                value = item[3]
+                if isinstance(value, list):
+                    value = " ".join(str(v) for v in value if v)
+                value = str(value or "").strip()
+                if value and value not in names:
+                    names.append(value[:160])
+        entities.append({
+            "handle": str(entity.get("handle") or "")[:120],
+            "roles": [str(x) for x in (entity.get("roles") or [])[:8]],
+            "name": names[0] if names else "",
+        })
+    nameservers = sorted({
+        str(row.get("ldhName") or "").lower()
+        for row in (data.get("nameservers") or [])
+        if row.get("ldhName")
+    })
+    return {
+        "domain": domain,
+        "handle": data.get("handle") or "",
+        "status": data.get("status") or [],
+        "events": events,
+        "nameservers": nameservers[:30],
+        "entities": entities,
+        "dnssec_signed": bool((data.get("secureDNS") or {}).get("delegationSigned")),
+        "source": "RDAP bootstrap and registry data (passive)",
+        "contacted": "rdap.org / authoritative RDAP registry, not the target",
+    }
+
+
+def tool_recon_web_archive(args: dict) -> dict:
+    """Query the Internet Archive CDX index without visiting the target."""
+    domain = _recon_clean_host(args.get("domain") or args.get("target") or "")
+    if not domain:
+        return {"error": "domain required"}
+    limit = max(10, min(int(args.get("limit") or 200), 500))
+    query = urllib.parse.urlencode({
+        "url": f"{domain}/*",
+        "output": "json",
+        "fl": "timestamp,original,statuscode,mimetype,digest",
+        "filter": "statuscode:200",
+        "collapse": "urlkey",
+        "limit": str(limit),
+    })
+    url = "https://web.archive.org/cdx/search/cdx?" + query
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _RECON_UA})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            rows = json.loads(r.read(4_000_000).decode("utf-8", "replace"))
+    except Exception as e:
+        return {"error": f"Internet Archive query failed: {e}", "domain": domain}
+    if not isinstance(rows, list) or len(rows) < 2:
+        return {
+            "domain": domain, "count": 0, "captures": [],
+            "source": "Internet Archive CDX (passive)",
+        }
+    headers = [str(x) for x in rows[0]]
+    captures = []
+    years = set()
+    for raw in rows[1:]:
+        if not isinstance(raw, list):
+            continue
+        item = dict(zip(headers, raw))
+        ts = str(item.get("timestamp") or "")
+        if len(ts) >= 4:
+            years.add(ts[:4])
+        captures.append({
+            "timestamp": ts,
+            "url": str(item.get("original") or "")[:500],
+            "type": str(item.get("mimetype") or "")[:80],
+        })
+    return {
+        "domain": domain,
+        "count": len(captures),
+        "years": sorted(years),
+        "captures": captures[:limit],
+        "source": "Internet Archive CDX (passive)",
+        "contacted": "web.archive.org, not the target",
+    }
+
+
 def _recon_dns_email_auth(domain: str) -> dict:
     """Parse SPF + DMARC (+ a couple of common DKIM selectors) into a spoofing
     posture verdict. All read-only DoH lookups. {severity, evidence, ...}."""
@@ -11237,13 +13151,15 @@ _RT_UA_POOL = [
 
 
 def _rt_ua() -> str:
-    return random.choice(_RT_UA_POOL)
+    return _rt_required_user_agent() or random.choice(_RT_UA_POOL)
 
 
 def _rt_stealth_headers(base: dict | None = None) -> dict:
-    """Browser-like header profile with a per-request rotated UA (repeated
-    probes don't share one identity). Honors rt_spoof_xff: random source-IP
-    headers so target logs that trust XFF record noise, not you."""
+    """Browser-like headers with the mission UA, or a rotated UA when unset.
+
+    Honors rt_spoof_xff: random source-IP headers so target logs that trust XFF
+    record noise, not you.
+    """
     s = get_settings()
     hdrs = dict(base or {})
     hdrs.setdefault("User-Agent", _rt_ua())
@@ -11254,7 +13170,7 @@ def _rt_stealth_headers(base: dict | None = None) -> dict:
         fake = ".".join(str(random.randint(1, 254)) for _ in range(4))
         hdrs.setdefault("X-Forwarded-For", fake)
         hdrs.setdefault("X-Real-IP", fake)
-    return hdrs
+    return _rt_apply_mission_user_agent(hdrs)
 
 
 def _rt_proxy_handler():
@@ -11296,6 +13212,7 @@ def _recon_fetch(url: str, timeout: float = 8.0, max_bytes: int = 8000,
     hdrs = _rt_stealth_headers()
     if extra_headers:
         hdrs.update(extra_headers)
+    hdrs = _rt_apply_mission_user_agent(hdrs)
     req = urllib.request.Request(url, headers=hdrs)
     _handlers = [urllib.request.HTTPSHandler(context=ctx)]
     if not follow:
@@ -12101,7 +14018,7 @@ def tool_recon_capture_evidence(args: dict) -> dict:
     if _ph:
         _capture_handlers.append(_ph)
     opener = urllib.request.build_opener(*_capture_handlers)
-    req = urllib.request.Request(url, headers={"User-Agent": _RECON_UA})
+    req = urllib.request.Request(url, headers={"User-Agent": _rt_ua()})
     ctype = ""
     try:
         resp = opener.open(req, timeout=timeout)
@@ -12199,8 +14116,9 @@ def tool_http_request(args: dict) -> dict:
     cannot: decode+flip+re-encode a session cookie, aim an SSRF url parameter,
     POST an SSTI payload, replay a request with a tampered header.
 
-    It wears a real, rotating browser fingerprint (from the same profile pool as
-    the rest of the suite) so it blends in and gets past bot filters. Crucially
+    It uses the engagement's required User-Agent when configured, otherwise a
+    rotating browser fingerprint from the same profile pool as the rest of the
+    suite. Crucially
     it returns the FULL response — status, ALL response headers (every Set-Cookie
     preserved), and body — because reading a Set-Cookie, a redirect Location, or
     a 500 stack trace is usually the whole point of a finding. Non-2xx responses
@@ -12283,6 +14201,7 @@ def tool_http_request(args: dict) -> dict:
         tried.append(profile)
         req_headers = _browser_headers(profile, accept_html=True)
         req_headers.update(headers)  # caller-supplied headers/cookies win
+        req_headers = _rt_apply_mission_user_agent(req_headers)
         try:
             req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
             _request_handlers = [_ScopeCheckedRedirect()]
@@ -12304,7 +14223,7 @@ def tool_http_request(args: dict) -> dict:
                 "headers": resp_headers,
                 "set_cookie": set_cookie,  # every Set-Cookie the server sent
                 "body": resp_body_text,
-                "user_agent": profile.get("ua", ""),  # identity we blended in as
+                "user_agent": req_headers.get("User-Agent", ""),
             }
             if session:
                 result["session_cookies"] = dict(_HTTP_SESSIONS.get(str(session), {}))
@@ -12334,7 +14253,7 @@ def tool_http_request(args: dict) -> dict:
                 "headers": resp_headers,
                 "set_cookie": set_cookie,
                 "body": body_txt,
-                "user_agent": profile.get("ua", ""),
+                "user_agent": req_headers.get("User-Agent", ""),
                 "note": f"HTTP {e.code}",
             }
             if session:
@@ -12861,105 +14780,369 @@ def tool_batch_probe(args: dict) -> dict:
                     "no signatures fired for this payload set across the given endpoints."}
 
 
-# High-signal secret patterns for scan_js_secrets. Curated to keep false
-# positives low; the generic assignment catcher below is looser and flagged as
-# needs-verification.
-_SECRET_PATTERNS = [
-    ("AWS access key id", re.compile(r"AKIA[0-9A-Z]{16}")),
-    ("Google API key", re.compile(r"AIza[0-9A-Za-z\-_]{35}")),
-    ("Google OAuth token", re.compile(r"ya29\.[0-9A-Za-z\-_]{20,}")),
-    ("Slack token", re.compile(r"xox[baprs]-[0-9A-Za-z-]{10,}")),
-    ("Slack webhook", re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]+")),
-    ("GitHub token", re.compile(r"gh[pousr]_[0-9A-Za-z]{36,}")),
-    ("Stripe live secret key", re.compile(r"sk_live_[0-9a-zA-Z]{24,}")),
-    ("Stripe live publishable key", re.compile(r"pk_live_[0-9a-zA-Z]{24,}")),
-    ("SendGrid API key", re.compile(r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}")),
-    ("Twilio API key sid", re.compile(r"SK[0-9a-fA-F]{32}")),
-    ("Mailgun key", re.compile(r"key-[0-9a-zA-Z]{32}")),
+# Provider-shaped credentials. Public client identifiers have their own list
+# and never become findings merely because they occur in a frontend bundle.
+_FRONTEND_SECRET_SPECS = (
+    {"type": "AWS secret access key", "provider": "aws", "severity": "critical", "group": 1,
+     "regex": re.compile(r"(?i)(?:aws_secret_access_key|secretAccessKey)\s*[:=]\s*['\"]([A-Za-z0-9/+=]{40})['\"]")},
+    {"type": "Google OAuth access token", "provider": "google", "severity": "high", "group": 0,
+     "regex": re.compile(r"ya29\.[0-9A-Za-z_-]{20,}")},
+    {"type": "Slack access token", "provider": "slack", "severity": "high", "group": 0,
+     "regex": re.compile(r"xox[baprs]-[0-9A-Za-z-]{10,}")},
+    {"type": "Slack webhook", "provider": "slack_webhook", "severity": "high", "group": 0,
+     "regex": re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]{20,}")},
+    {"type": "GitHub access token", "provider": "github", "severity": "high", "group": 0,
+     "regex": re.compile(r"gh[pousr]_[0-9A-Za-z]{36,255}")},
+    {"type": "Stripe live secret key", "provider": "stripe", "severity": "critical", "group": 0,
+     "regex": re.compile(r"sk_live_[0-9A-Za-z]{24,}")},
+    {"type": "SendGrid API key", "provider": "sendgrid", "severity": "high", "group": 0,
+     "regex": re.compile(r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}")},
+    {"type": "Mailgun API key", "provider": "mailgun", "severity": "high", "group": 0,
+     "regex": re.compile(r"key-[0-9A-Za-z]{32}")},
+    {"type": "Private key", "provider": "private_key", "severity": "critical", "group": 0,
+     "regex": re.compile(r"-----BEGIN (?:(?:RSA|EC|OPENSSH|DSA|PGP) )?PRIVATE KEY-----[\s\S]{40,12000}?-----END (?:(?:RSA|EC|OPENSSH|DSA|PGP) )?PRIVATE KEY-----")},
+    {"type": "Embedded basic-auth credential", "provider": "basic_auth", "severity": "high", "group": 0,
+     "regex": re.compile(r"https?://[A-Za-z0-9._%+-]+:[^@\s/'\"]{3,}@[A-Za-z0-9.-]+")},
+)
+
+_FRONTEND_PUBLIC_SPECS = (
+    ("AWS access key id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("Google API key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
+    ("Stripe publishable key", re.compile(r"pk_live_[0-9A-Za-z]{24,}")),
+    ("Twilio API key sid", re.compile(r"\bSK[0-9a-fA-F]{32}\b")),
     ("Firebase database URL", re.compile(r"https://[a-z0-9-]+\.firebaseio\.com")),
-    ("Supabase URL", re.compile(r"https://[a-z0-9]+\.supabase\.co")),
-    ("JWT", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}")),
-    ("private key block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
-    ("basic-auth in URL", re.compile(r"https?://[A-Za-z0-9._%+-]+:[^@\s/'\"]{3,}@[A-Za-z0-9.-]+")),
-]
+    ("Supabase project URL", re.compile(r"https://[a-z0-9]+\.supabase\.co")),
+)
 
-# Loose catcher for `apiKey/secret/token/password = "value"` style assignments.
+_FRONTEND_JWT_RE = re.compile(
+    r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}")
 _GENERIC_SECRET_RE = re.compile(
-    r"""['"]?(?P<k>[A-Za-z0-9_]*(?:api[_-]?key|secret|token|passwd|password|pwd|access[_-]?key|client[_-]?secret|auth[_-]?token)[A-Za-z0-9_]*)['"]?\s*[:=]\s*['"](?P<v>[A-Za-z0-9\-_./+=]{12,})['"]""",
-    re.IGNORECASE)
+    r"""['"]?(?P<k>[A-Za-z0-9_]*(?:api[_-]?key|secret|token|passwd|password|pwd|access[_-]?key|client[_-]?secret|auth[_-]?token)[A-Za-z0-9_]*)['"]?\s*[:=]\s*['"](?P<v>[^'"\r\n]{12,512})['"]""",
+    re.IGNORECASE,
+)
+_SECRET_PLACEHOLDER_RE = re.compile(
+    r"(?i)(?:example|sample|placeholder|replace[_ -]?me|insert[_ -]?here|your[_ -]?"
+    r"(?:api[_ -]?key|secret|token|password)|dummy|fake|mock|changeme|todo|xxx+|"
+    r"test[_ -]?(?:key|token|secret)|\$\{|\{\{|<[^>]+>)"
+)
+_SECRET_CONTEXT_NEGATIVE_RE = re.compile(
+    r"(?i)\b(?:example|sample|fixture|mock|storybook|documentation|placeholder|unit.?test)\b"
+)
+_SECRET_CONTEXT_POSITIVE_RE = re.compile(
+    r"(?i)\b(?:authorization|bearer|credential|client_secret|access_token|api_key|"
+    r"apikey|password|secret|fetch|axios|headers|initialize|config)\b"
+)
 
-# Keys commonly PUBLIC by design (client-side) — report but flag as maybe-intended.
-_OFTEN_PUBLIC = {"Google API key", "Firebase database URL", "Supabase URL"}
+
+def _secret_entropy(value: str) -> float:
+    if not value:
+        return 0.0
+    counts = {char: value.count(char) for char in set(value)}
+    total = float(len(value))
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+def _secret_is_placeholder(value: str, *, generic: bool = False) -> bool:
+    cleaned = value.strip()
+    low = cleaned.lower()
+    if not cleaned or _SECRET_PLACEHOLDER_RE.search(cleaned):
+        return True
+    if len(set(low)) <= 4 and len(cleaned) >= 12:
+        return True
+    if re.fullmatch(r"[0-9a-f]{32,128}", low) and generic:
+        return True
+    if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f-]{27,}", low):
+        return True
+    return low in {"undefined", "null", "true", "false", "not-set", "none"}
+
+
+def _secret_redact(value: str) -> str:
+    compact = re.sub(r"\s+", "", value)
+    if len(compact) <= 10:
+        return compact[:2] + "…" + compact[-2:]
+    return compact[:6] + "…" + compact[-4:]
+
+
+def _decode_jwt_claims(token: str) -> tuple[dict | None, str]:
+    try:
+        head_raw, payload_raw, _sig = token.split(".", 2)
+
+        def decode(part: str) -> Any:
+            raw = _b64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+            return json.loads(raw.decode("utf-8"))
+
+        header, payload = decode(head_raw), decode(payload_raw)
+        if not isinstance(header, dict) or not isinstance(payload, dict):
+            return None, "JWT header or payload is not an object"
+        exp = payload.get("exp")
+        if isinstance(exp, (int, float)) and exp < time.time():
+            return payload, "expired JWT"
+        return payload, "valid JWT structure"
+    except Exception:
+        return None, "invalid JWT structure"
+
+
+def _private_key_complete(value: str) -> bool:
+    try:
+        body = re.sub(r"-----[^-]+-----", "", value)
+        body = re.sub(r"\s+", "", body)
+        return len(_b64.b64decode(body, validate=True)) >= 64
+    except Exception:
+        return False
+
+
+def _frontend_resource_urls(base_url: str, text: str, depth: int) -> list[tuple[str, str, int]]:
+    found: list[tuple[str, str, int]] = []
+    patterns = (
+        ("javascript", re.compile(r"<script[^>]+src=['\"]([^'\"]+)['\"]", re.IGNORECASE)),
+        ("javascript", re.compile(r"<link[^>]+href=['\"]([^'\"]+\.(?:m?js)(?:\?[^'\"]*)?)['\"]", re.IGNORECASE)),
+        ("source_map", re.compile(r"(?://[#@]\s*sourceMappingURL=|/\*[#@]\s*sourceMappingURL=)([^\s*]+)", re.IGNORECASE)),
+        ("javascript", re.compile(r"['\"]([^'\"]+\.(?:m?js)(?:\?[^'\"]*)?)['\"]", re.IGNORECASE)),
+        ("source_map", re.compile(r"['\"]([^'\"]+\.map(?:\?[^'\"]*)?)['\"]", re.IGNORECASE)),
+    )
+    for kind, regex in patterns:
+        for match in regex.finditer(text):
+            raw = match.group(1).strip().rstrip("*/")
+            if raw.startswith(("data:", "blob:", "javascript:", "#")):
+                continue
+            absolute = urllib.parse.urljoin(base_url, raw)
+            parsed = urllib.parse.urlsplit(absolute)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                continue
+            absolute = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                                                parsed.query, ""))
+            found.append((absolute, kind, depth + 1))
+    return list(dict.fromkeys(found))
+
+
+def _scan_frontend_source(source: str, text: str) -> tuple[list[dict], list[dict], list[dict]]:
+    findings: list[dict] = []
+    candidates: list[dict] = []
+    public_ids: list[dict] = []
+    seen: set[str] = set()
+
+    def add(kind: str, value: str, start: int, *, provider: str = "generic",
+            severity: str = "medium", confidence: str = "candidate", evidence: str = "") -> None:
+        value = value.strip()
+        fingerprint = hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
+        if not value or fingerprint in seen:
+            return
+        seen.add(fingerprint)
+        context = text[max(0, start - 140):min(len(text), start + len(value) + 140)]
+        if _secret_is_placeholder(value, generic=provider == "generic"):
+            return
+        if provider == "generic" and _SECRET_CONTEXT_NEGATIVE_RE.search(context):
+            return
+        if provider == "private_key":
+            if not _private_key_complete(value):
+                return
+            confidence = "verified_structure"
+            evidence = "complete, decodable private-key block"
+        record = {
+            "type": kind,
+            "provider": provider,
+            "severity": severity,
+            "confidence": confidence,
+            "source": source,
+            "line": text.count("\n", 0, start) + 1,
+            "preview": _secret_redact(value),
+            "fingerprint": fingerprint[:12],
+            "evidence": evidence,
+            "_value": value,
+        }
+        (findings if confidence in {"verified_structure", "high_confidence"} else candidates).append(record)
+
+    for spec in _FRONTEND_SECRET_SPECS:
+        for match in spec["regex"].finditer(text):
+            group = int(spec.get("group") or 0)
+            add(spec["type"], match.group(group), match.start(group),
+                provider=spec["provider"], severity=spec["severity"],
+                confidence="high_confidence",
+                evidence="provider-specific secret-bearing format")
+
+    for label, regex in _FRONTEND_PUBLIC_SPECS:
+        for match in regex.finditer(text):
+            value = match.group(0)
+            fingerprint = hashlib.sha256(value.encode()).hexdigest()
+            if fingerprint in seen or _secret_is_placeholder(value):
+                continue
+            seen.add(fingerprint)
+            public_ids.append({
+                "type": label,
+                "source": source,
+                "line": text.count("\n", 0, match.start()) + 1,
+                "preview": _secret_redact(value),
+                "fingerprint": fingerprint[:12],
+                "reason": "public client identifier or endpoint; exposure alone is not a vulnerability",
+                "_value": value,
+            })
+
+    for match in _FRONTEND_JWT_RE.finditer(text):
+        value = match.group(0)
+        payload, detail = _decode_jwt_claims(value)
+        if payload is None or detail == "expired JWT":
+            continue
+        add("Embedded JWT", value, match.start(), provider="jwt", severity="medium",
+            confidence="candidate", evidence=detail)
+
+    for match in _GENERIC_SECRET_RE.finditer(text):
+        name, value = match.group("k"), match.group("v").strip()
+        entropy = _secret_entropy(value)
+        if entropy < 3.35:
+            continue
+        context = text[max(0, match.start() - 140):min(len(text), match.end() + 140)]
+        strong_name = bool(re.search(
+            r"(?i)(?:client[_-]?secret|private[_-]?key|auth[_-]?token|access[_-]?token|password|passwd)",
+            name,
+        ))
+        positive = bool(_SECRET_CONTEXT_POSITIVE_RE.search(context))
+        confidence = "high_confidence" if strong_name and positive and entropy >= 3.7 else "candidate"
+        add(f"Hardcoded {name}", value, match.start("v"), provider="generic",
+            severity="high" if confidence == "high_confidence" else "medium",
+            confidence=confidence,
+            evidence=f"secret-bearing assignment with entropy {entropy:.2f}")
+
+    return findings, candidates, public_ids
+
+
+def _frontend_secret_record_for_report(record: dict) -> dict:
+    reported = {key: value for key, value in record.items() if key != "_value"}
+    raw_value = record.get("_value")
+    if isinstance(raw_value, str) and raw_value:
+        reported["value"] = raw_value
+    return reported
 
 
 def tool_scan_js_secrets(args: dict) -> dict:
-    """AUTHORIZED PENTEST. Fetch a page, pull its inline and linked JavaScript,
-    and hunt for hardcoded secrets: cloud keys (AWS / Google / Stripe / Slack /
-    GitHub / SendGrid / Twilio / Mailgun), JWTs, Firebase/Supabase endpoints,
-    private-key blocks, basic-auth URLs, and generic apiKey/secret/token = "..."
-    assignments. This is the "scrape the front-end for keys" primitive. Read-only.
-    Gated behind red_team_enabled."""
+    """Conservative frontend-secret audit shared by Red Team and its standalone UI."""
     if not get_settings().get("red_team_enabled"):
         return {"error": "red team tools are disabled. Enable them in Settings."}
     url = _recon_prep_url((args.get("url") or args.get("target") or "").strip())
     if not url:
         return {"error": "url required"}
-    timeout = max(2.0, min(float(args.get("timeout") or 8.0), 20.0))
-    page = _recon_fetch(url, timeout=timeout, max_bytes=600000)
-    if "error" in page:
-        return {"error": f"fetch failed: {page['error']}", "url": url}
-    html = page.get("body", "") or ""
-    js_urls = []
-    for m in re.finditer(r"<script[^>]+src=[\"']([^\"']+)[\"']", html, re.IGNORECASE):
-        js_urls.append(urllib.parse.urljoin(url, m.group(1)))
-    js_urls = list(dict.fromkeys(js_urls))[:20]
+    timeout = max(2.0, min(float(args.get("timeout") or 10.0), 25.0))
+    max_files = max(1, min(int(args.get("max_files") or 60), 200))
+    max_depth = max(0, min(int(args.get("crawl_depth") or 2), 4))
+    max_bytes = max(128000, min(int(args.get("max_bytes_per_file") or 1500000), 4000000))
+    include_candidates = bool(args.get("include_candidates"))
 
-    sources = [(url + " (html)", html)]
-    skipped_out_of_scope = []
+    first = _recon_fetch(url, timeout=timeout, max_bytes=max_bytes)
+    if "error" in first:
+        return {"error": f"fetch failed: {first['error']}", "url": url}
 
-    def fetch_js(ju):
-        block = _rt_scope_block("scan_js_secrets", {"url": ju})
+    sources: list[tuple[str, str, str]] = [(url, "html", first.get("body", "") or "")]
+    queue = _frontend_resource_urls(url, sources[0][2], 0)
+    queued = {item[0] for item in queue}
+    visited = {url}
+    skipped_out_of_scope: list[str] = []
+    fetch_errors: list[dict] = []
+    bytes_scanned = len(sources[0][2].encode("utf-8", "replace"))
+
+    def fetch_resource(item: tuple[str, str, int]) -> tuple[str, str, int, dict | None, str]:
+        resource_url, kind, depth = item
+        block = _rt_scope_block("scan_js_secrets", {"url": resource_url})
         if block:
-            return (ju, "", block)
-        r = _recon_fetch(ju, timeout=timeout, max_bytes=900000)
-        return (ju, r.get("body", "") or "", "")
+            return resource_url, kind, depth, None, block
+        response = _recon_fetch(resource_url, timeout=timeout, max_bytes=max_bytes)
+        return resource_url, kind, depth, response, ""
 
-    if js_urls:
-        with ThreadPoolExecutor(max_workers=6, thread_name_prefix="jssec") as ex:
-            for ju, body, scope_note in ex.map(fetch_js, js_urls):
-                if scope_note:
-                    skipped_out_of_scope.append(ju)
+    # Fetch each discovery wave concurrently, but keep the breadth and depth
+    # caps deterministic. A large webpack build can expose dozens of chunks;
+    # serial 10-second timeouts would otherwise turn one dead CDN into a very
+    # long coffee break.
+    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="js-secret-audit") as executor:
+        while queue and len(sources) - 1 < max_files:
+            remaining = max_files - (len(sources) - 1)
+            batch: list[tuple[str, str, int]] = []
+            while queue and len(batch) < min(6, remaining):
+                item = queue.pop(0)
+                if item[0] in visited or item[2] > max_depth:
                     continue
-                if body:
-                    sources.append((ju, body))
-
-    findings, seen = [], set()
-    for src_label, text in sources:
-        for label, rx in _SECRET_PATTERNS:
-            for m in rx.finditer(text):
-                val = m.group(0)
-                if (label, val) in seen:
-                    continue
-                seen.add((label, val))
-                findings.append({"type": label, "match": val[:80], "source": src_label,
-                                 "note": "often public by design — verify it actually grants access"
-                                         if label in _OFTEN_PUBLIC else ""})
-        for m in _GENERIC_SECRET_RE.finditer(text):
-            k, v = m.group("k"), m.group("v")
-            if ("generic:" + k, v) in seen:
+                visited.add(item[0])
+                batch.append(item)
+            if not batch:
                 continue
-            seen.add(("generic:" + k, v))
-            findings.append({"type": f"hardcoded {k}",
-                             "match": (v[:60] + "…") if len(v) > 60 else v, "source": src_label,
-                             "note": "generic assignment — verify it is a real secret, not a placeholder"})
+            futures = [executor.submit(contextvars.copy_context().run, fetch_resource, item)
+                       for item in batch]
+            for item, future in zip(batch, futures):
+                try:
+                    resource_url, kind, depth, response, block = future.result()
+                except Exception as exc:
+                    fetch_errors.append({"url": item[0],
+                                         "error": f"{type(exc).__name__}: {exc}"[:180]})
+                    continue
+                if block:
+                    skipped_out_of_scope.append(resource_url)
+                    continue
+                if not response or response.get("error"):
+                    error = str((response or {}).get("error") or "empty response")[:180]
+                    fetch_errors.append({"url": resource_url, "error": error})
+                    continue
+                body = response.get("body", "") or ""
+                if not body:
+                    continue
+                sources.append((resource_url, kind, body))
+                bytes_scanned += len(body.encode("utf-8", "replace"))
+                if depth < max_depth:
+                    for child in _frontend_resource_urls(resource_url, body, depth):
+                        if child[0] not in visited and child[0] not in queued:
+                            queue.append(child)
+                            queued.add(child[0])
 
-    return {"url": url, "js_files_scanned": len(sources) - 1,
-            "skipped_out_of_scope": skipped_out_of_scope,
-            "finding_count": len(findings),
-            "findings": findings[:200],
-            "note": ("secrets found — verify each grants access before reporting; some client-side "
-                     "keys (Firebase/Supabase/Google) are public by design."
-                     if findings else "no hardcoded secrets matched in the page or its JavaScript.")}
+    findings: list[dict] = []
+    candidates: list[dict] = []
+    public_ids: list[dict] = []
+    seen_values: set[str] = set()
+    for source_url, kind, text in sources:
+        source_findings, source_candidates, source_public = _scan_frontend_source(source_url, text)
+        for collection, records in (
+            (findings, source_findings), (candidates, source_candidates), (public_ids, source_public)):
+            for record in records:
+                identity = str(record.get("fingerprint") or record.get("preview"))
+                if identity not in seen_values:
+                    seen_values.add(identity)
+                    record["resource_type"] = kind
+                    collection.append(record)
+
+    protected_value_count = _rt_remember_frontend_secret_values(
+        _rt_context_chat(), findings + candidates + public_ids)
+
+    visible_records = findings + (candidates if include_candidates else [])
+    reported = [_frontend_secret_record_for_report(record) for record in visible_records[:200]]
+    reported_public_ids = [
+        _frontend_secret_record_for_report(record) for record in public_ids[:50]
+    ]
+    resource_counts = {
+        "html": sum(1 for _url, kind, _text in sources if kind == "html"),
+        "javascript": sum(1 for _url, kind, _text in sources if kind == "javascript"),
+        "source_maps": sum(1 for _url, kind, _text in sources if kind == "source_map"),
+    }
+    return {
+        "url": url,
+        "resources_scanned": resource_counts,
+        "files_scanned": len(sources),
+        "bytes_scanned": bytes_scanned,
+        "skipped_out_of_scope": skipped_out_of_scope[:100],
+        "fetch_errors": fetch_errors[:50],
+        "finding_count": len(reported),
+        "verified_structure_count": sum(
+            1 for item in reported if item.get("confidence") == "verified_structure"),
+        "high_confidence_count": sum(
+            1 for item in reported if item.get("confidence") == "high_confidence"),
+        "candidate_count": len(candidates),
+        "candidates_included": include_candidates,
+        "public_identifier_count": len(public_ids),
+        "public_identifiers": reported_public_ids,
+        "findings": reported,
+        "provider_validation_performed": False,
+        "credential_submission_guard_active": protected_value_count > 0,
+        "note": (
+            "Provider-shaped credentials and structurally verified private keys are returned by default. "
+            "Exact matched values are included for reporting. Public client identifiers are separated and "
+            "uncertain candidates are hidden. No discovered credential was submitted to a provider "
+            "or used for a liveness check."
+        ),
+    }
 
 
 def tool_cors_probe(args: dict) -> dict:
@@ -14464,11 +16647,14 @@ TOOLS: dict[str, dict] = {
         "fn": tool_batch_probe,
     },
     "scan_js_secrets": {
-        "description": "AUTHORIZED PENTEST. Fetch a page + its inline/linked JavaScript and hunt for hardcoded secrets: cloud keys (AWS/Google/Stripe/Slack/GitHub/etc.), JWTs, Firebase/Supabase endpoints, private keys, basic-auth URLs, generic apiKey/secret/token assignments. Read-only.",
+        "description": "AUTHORIZED PENTEST. Conservative frontend secret audit. Fetches the page, linked/lazy JavaScript, and source maps; suppresses placeholders and hashes; separates public client identifiers; and returns exact matched values for reporting. It does not submit discovered credentials to providers or perform liveness checks. Read-only.",
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "Page URL to scrape (its <script src> files are fetched and scanned too)."},
+                "crawl_depth": {"type": "integer", "description": "Linked JavaScript/source-map discovery depth. Default 2, maximum 4."},
+                "max_files": {"type": "integer", "description": "Maximum linked resources to fetch. Default 60, maximum 200."},
+                "include_candidates": {"type": "boolean", "description": "Also return ambiguous high-entropy assignments and valid JWT structures. Default false."},
             },
             "required": ["url"],
         },
@@ -14510,6 +16696,29 @@ TOOLS: dict[str, dict] = {
             "required": ["domain"],
         },
         "fn": tool_recon_subdomains,
+    },
+    "recon_rdap": {
+        "description": "PASSIVE OSINT. Read public domain registration, lifecycle, nameserver, registrar, and DNSSEC data through RDAP. Contacts RDAP infrastructure only, never the target.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Apex domain, e.g. example.com."}
+            },
+            "required": ["domain"],
+        },
+        "fn": tool_recon_rdap,
+    },
+    "recon_web_archive": {
+        "description": "PASSIVE OSINT. Query the Internet Archive CDX index for known historical target URLs without visiting the target.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Apex domain, e.g. example.com."},
+                "limit": {"type": "integer", "description": "Maximum unique archived URLs, default 200, maximum 500."},
+            },
+            "required": ["domain"],
+        },
+        "fn": tool_recon_web_archive,
     },
     "recon_dns": {
         "description": "AUTHORIZED RECON. Enumerate standard DNS records (A/MX/NS/TXT/SOA/CNAME) via DoH, or a mode. Read-only except axfr.",
@@ -14774,6 +16983,165 @@ TOOLS: dict[str, dict] = {
             "required": ["command"],
         },
         "fn": tool_run_powershell,
+    },
+    "remote_shell": {
+        "description": (
+            "Run a one-shot terminal command on the paired Mac selected in the top bar. "
+            "Use this instead of PowerShell when the selected target is the Mac. Narrow "
+            "read-only commands run directly; changes always ask the user. Never falls back to the PC."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "macOS shell command."},
+                "machine": {"type": "string", "description": "Optional paired-machine id; normally omit to use the selected target."},
+                "timeout": {"type": "integer", "description": "Seconds, default from Settings, max 3600."},
+            },
+            "required": ["command"],
+        },
+        "fn": tool_remote_shell,
+    },
+    "remote_list_directory": {
+        "description": "List one allowed folder on the selected paired Mac. Read-only and confined to the roots chosen during pairing.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Mac path, absolute or ~/..."},
+                "machine": {"type": "string"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_remote_list_directory,
+    },
+    "remote_read_file": {
+        "description": "Read a chunk of a file from an allowed folder on the selected paired Mac. Returns a SHA-256 staleness token.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Mac path, absolute or ~/..."},
+                "offset": {"type": "integer", "description": "Byte offset, default 0."},
+                "length": {"type": "integer", "description": "Bytes to read, default 65536, max 262144."},
+                "machine": {"type": "string"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_remote_read_file,
+    },
+    "remote_write_file": {
+        "description": (
+            "Write UTF-8 text directly and atomically to an allowed Mac path. Use this for ordinary "
+            "new files instead of staging through the PC workspace. Always asks the user and rejects "
+            "a stale file previously read by this chat. For content already visible in a prior code "
+            "block use remote_save_code_block; for large new files use remote_file_begin/append/commit."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Mac destination, absolute or ~/..."},
+                "content": {"type": "string"},
+                "expected_sha256": {"type": "string", "description": "Optional SHA-256 returned by remote_read_file."},
+                "machine": {"type": "string"},
+            },
+            "required": ["path", "content"],
+        },
+        "fn": tool_remote_write_file,
+    },
+    "remote_save_code_block": {
+        "description": (
+            "Save a complete code fence from a prior visible assistant reply directly to the selected "
+            "Mac. Use when the user says 'save that' so the code is not regenerated inside another "
+            "large tool argument. Index 0 means the newest matching block. Always asks the user."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Allowed Mac destination path."},
+                "language": {"type": "string", "description": "Optional fence language such as html."},
+                "index": {"type": "integer", "description": "Newest matching block is 0, previous is 1."},
+                "expected_sha256": {"type": "string"},
+                "machine": {"type": "string"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_remote_save_code_block,
+    },
+    "remote_file_begin": {
+        "description": (
+            "Begin one large UTF-8 file write to the selected Mac. This asks for approval once and "
+            "returns an upload_id. Then call remote_file_append repeatedly with ordered chunks of at "
+            "most 6000 characters, followed by remote_file_commit."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Allowed Mac destination path."},
+                "machine": {"type": "string"},
+            },
+            "required": ["path"],
+        },
+        "fn": tool_remote_file_begin,
+    },
+    "remote_file_append": {
+        "description": (
+            "Append the next ordered chunk to a staged Mac file. No extra approval is requested. "
+            "Use at most 6000 characters and never repeat a chunk already acknowledged as ok."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "upload_id": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["upload_id", "content"],
+        },
+        "fn": tool_remote_file_append,
+    },
+    "remote_file_commit": {
+        "description": "Atomically write a completed staged file to the Mac and return its byte count and SHA-256.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "upload_id": {"type": "string"},
+                "sha256": {"type": "string", "description": "Optional expected SHA-256 for the complete staged content."},
+            },
+            "required": ["upload_id"],
+        },
+        "fn": tool_remote_file_commit,
+    },
+    "remote_file_abort": {
+        "description": "Discard an unfinished staged Mac file without writing it.",
+        "parameters": {
+            "type": "object",
+            "properties": {"upload_id": {"type": "string"}},
+            "required": ["upload_id"],
+        },
+        "fn": tool_remote_file_abort,
+    },
+    "remote_copy_to": {
+        "description": "Copy one PC workspace file to an allowed path on the selected Mac. Always asks the user and verifies transport success.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Existing file inside the PC workspace."},
+                "destination": {"type": "string", "description": "Allowed Mac destination path."},
+                "machine": {"type": "string"},
+            },
+            "required": ["source", "destination"],
+        },
+        "fn": tool_remote_copy_to,
+    },
+    "remote_copy_from": {
+        "description": "Copy one file from an allowed path on the selected Mac into the PC workspace. Always asks the user and verifies size plus SHA-256.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Allowed Mac source path."},
+                "destination": {"type": "string", "description": "Destination inside the PC workspace."},
+                "machine": {"type": "string"},
+            },
+            "required": ["source", "destination"],
+        },
+        "fn": tool_remote_copy_from,
     },
     "session_start": {
         "description": "Open a PERSISTENT interactive session — a long-lived process you drive statefully across turns (unlike run_powershell, which is one-shot and loses all state: cwd, env, connections). Use it to hold a shell you obtained (reverse/bind shell, ssh), or a REPL / DB client / debugger (python, sqlite3, gdb). `command` is the process to launch (defaults to a local shell). Returns a session_id + initial output; then use session_send / session_read / session_stop. The user can watch and type into the same session live in the Shell tab. Requires approval to start.",
@@ -15724,7 +18092,7 @@ _TOOL_RESULT_CAPS = {
     "sql_injection": 16000,  # dumped rows can be large
     "fuzz": 16000,           # many per-value response summaries
     "batch_probe": 16000,    # hits across many endpoints
-    "scan_js_secrets": 16000,  # many secret hits across bundles
+    "scan_js_secrets": 48000,  # exact values, including complete private-key blocks
     "tcp_send": 32000,         # raw service/bot output can be verbose
     "scan_apk": 48000,
     "decompile_apk": 24000,
@@ -15952,7 +18320,8 @@ _RT_EXPLOIT_TOOL_NAMES = {
 # front-end/CORS scanners — the model needs these to FIND something worth the
 # exploit set, so they carry every red-team turn.
 _RT_RECON_TOOL_NAMES = {
-    "recon_dns", "recon_subdomains", "recon_tls_audit", "recon_http_fingerprint",
+    "recon_dns", "recon_subdomains", "recon_rdap", "recon_web_archive",
+    "recon_tls_audit", "recon_http_fingerprint",
     "recon_port_scan", "recon_content_discovery", "recon_check_exposure",
     "recon_subdomain_takeover", "recon_cve_match", "recon_injection_probe",
     "recon_open_services", "recon_capture_evidence",
@@ -15967,13 +18336,33 @@ _RT_RECON_TOOL_NAMES = {
     "scan_js_secrets",
     "cors_probe",
 }
+# Tools permitted during a zero-direct-contact OSINT mission. Every network
+# request made by these functions goes to a public third-party data source.
+# DNS uses Google's DoH resolver; AXFR is separately refused by the guard.
+_RT_PASSIVE_TOOL_NAMES = {
+    "recon_dns", "recon_subdomains", "recon_rdap", "recon_web_archive",
+    "recon_cve_match", "encode_decode",
+}
+_RT_PASSIVE_ALLOWED_TOOL_NAMES = _RT_PASSIVE_TOOL_NAMES | {
+    "web_search",
+    "record_finding", "list_findings", "update_plan",
+    "pin_note", "unpin_note", "remember", "forget", "edit_memory",
+    "compact_history", "capability_report",
+}
 # Full suite = recon + exploit. Existing call sites (whole-suite tool gating in
 # _active_tools, mission-target detection at tool-result time) key off this
 # union; the split above only drives per-phase gating.
 _RED_TEAM_TOOL_NAMES = _RT_RECON_TOOL_NAMES | _RT_EXPLOIT_TOOL_NAMES
+_REMOTE_TOOL_NAMES = {
+    "remote_shell", "remote_list_directory", "remote_read_file",
+    "remote_write_file", "remote_save_code_block",
+    "remote_file_begin", "remote_file_append", "remote_file_commit", "remote_file_abort",
+    "remote_copy_to", "remote_copy_from",
+}
 _RT_SCOPE_AWARE_GENERIC_TOOLS = {"web_fetch", "audit_http_headers"}
 _RT_SCOPE_AWARE_COMMAND_TOOLS = {
     "run_powershell": "command",
+    "remote_shell": "command",
     "session_start": "command",
     "session_send": "input",
     "sandbox_run": "command",
@@ -16064,6 +18453,7 @@ _TOOL_BUNDLES: dict[str, set[str] | None] = {
     "rt-exploit": _RT_EXPLOIT_TOOL_NAMES,
     "analysis": _ANALYSIS_SUITE_TOOL_NAMES,
     "sandbox": {"sandbox_run"},
+    "remote": _REMOTE_TOOL_NAMES,
     "mcp": None,  # dynamic prefix: mcp_<server>_<tool>
 }
 _TOOL_BUNDLE_LOCK = threading.Lock()
@@ -16148,10 +18538,16 @@ def _excluded_tools(include_exploit: bool = True, chat_id: str = "") -> set[str]
         # UI authorization record makes the red-team schemas visible.
         if not _rt_authorized_mission(chat):
             excluded |= _RED_TEAM_TOOL_NAMES
+        elif _rt_passive_mission(chat):
+            excluded |= set(TOOLS) - _RT_PASSIVE_ALLOWED_TOOL_NAMES
         elif not include_exploit:
             excluded |= _RT_EXPLOIT_TOOL_NAMES
     if not s.get("analysis_tools_enabled"):
         excluded |= _ANALYSIS_SUITE_TOOL_NAMES
+    if (not s.get("remote_access_enabled", True)
+            or not any(m.get("status") == "ready" and m.get("enabled", True)
+                       for m in _load_remote_machines().get("machines", []))):
+        excluded |= _REMOTE_TOOL_NAMES
     # The sandbox tool is only useful once the guest is provisioned; don't pay
     # its token cost (or tempt the model to call it) before then.
     if not _sandbox_ready_cached():
@@ -16182,8 +18578,11 @@ def _visible_tool_names(include_exploit: bool = True, chat_id: str = "") -> set[
         # the supposedly autonomous path unreliable.
         active_rt = bool(_rt_authorized_mission(_chat))
         if active_rt:
-            visible |= _RT_RECON_TOOL_NAMES
-            if include_exploit:
+            if _rt_passive_mission(_chat):
+                visible |= _RT_PASSIVE_TOOL_NAMES | {"web_search"}
+            else:
+                visible |= _RT_RECON_TOOL_NAMES
+            if include_exploit and not _rt_passive_mission(_chat):
                 visible |= _RT_EXPLOIT_TOOL_NAMES
         for b in _unlocked_bundles_by_chat.get(chat_id, ()):
             btools = _TOOL_BUNDLES.get(b)
@@ -16599,7 +18998,8 @@ REWRITE_LOOP_LIMIT = 2  # original write + one rewrite; the next is blocked
 # path must not run concurrently (last-write-wins races), so they land in the
 # same serial batch.
 _WRITE_CAPABLE_TOOLS = frozenset(
-    {"write_file", "edit_file", "delete_file", "replace_ast_node"})
+    {"write_file", "edit_file", "delete_file", "replace_ast_node",
+     "remote_write_file", "remote_save_code_block", "remote_file_begin"})
 
 
 def _verification_key(path: Any) -> str:
@@ -16659,6 +19059,9 @@ _CHAT_STATE_TOOLS = frozenset(
 _ACTION_AUDIT_LOCK = threading.Lock()
 _ACTION_AUDIT_ALWAYS = frozenset({
     "run_powershell", "session_start", "session_send", "session_stop",
+    "remote_shell", "remote_write_file", "remote_save_code_block",
+    "remote_file_begin", "remote_file_append", "remote_file_commit", "remote_file_abort",
+    "remote_copy_to", "remote_copy_from",
     "open_program", "network_snapshot", "parse_event_logs",
     "hunt_persistence", "git_init", "git_clone", "git_add", "git_commit",
     "git_checkout", "git_branch", "git_merge", "git_pull", "git_push",
@@ -16844,6 +19247,27 @@ def _record_tool_result(sig: str, result) -> None:
         history[sig] = rec
 
 
+def _missing_required_tool_args(name: str, args: Any) -> list[str]:
+    """Return required schema fields that are absent or materially empty."""
+    canon = _resolve_tool_name(name)
+    spec = TOOLS.get(canon) or {}
+    required = (((spec.get("parameters") or {}).get("required")) or [])
+    values = args if isinstance(args, dict) else {}
+    missing: list[str] = []
+    for key in required:
+        if key not in values:
+            missing.append(key)
+            continue
+        value = values.get(key)
+        if value is None:
+            missing.append(key)
+        elif isinstance(value, str) and not value.strip():
+            missing.append(key)
+        elif isinstance(value, (list, dict)) and not value:
+            missing.append(key)
+    return missing
+
+
 def invoke_tool(name: str, args: dict) -> dict:
     canon = _resolve_tool_name(name)
     t = TOOLS.get(canon)
@@ -16858,6 +19282,35 @@ def invoke_tool(name: str, args: dict) -> dict:
             result.setdefault("post_state", _desktop_post_state())
         _record_action_audit(canon, args or {}, result)
         return result
+    missing = _missing_required_tool_args(canon, args)
+    if missing:
+        return _finish({
+            "error": (
+                f"Tool call was not executed because required argument(s) are missing: "
+                f"{', '.join(missing)}. Re-emit the call with those values."
+            ),
+            "tool": canon,
+            "missing_arguments": missing,
+            "not_executed": True,
+        })
+    _mission_chat = _rt_context_chat()
+    if (_rt_passive_mission(_mission_chat)
+            and canon not in _RT_PASSIVE_ALLOWED_TOOL_NAMES):
+        return _finish({
+            "error": ("refused: passive OSINT permits only public-source queries and local "
+                      "reporting. This tool could contact the target or run unscoped code."),
+            "scope_blocked": True,
+            "tool": canon,
+        })
+    _secret_block = _rt_discovered_secret_submission_block(
+        canon, args or {}, _mission_chat)
+    if _secret_block:
+        return _finish({
+            "error": _secret_block,
+            "scope_blocked": True,
+            "credential_submission_blocked": True,
+            "tool": canon,
+        })
     # HARD scope guard for red-team tools: refuse accuretta's own bridge/llama
     # ports and any user-declared out-of-scope host/port BEFORE running. The
     # model's judgement is advisory; this is not.
@@ -16870,20 +19323,20 @@ def invoke_tool(name: str, args: dict) -> dict:
         # ungated there. During an active engagement they must obey the same
         # host allowlist, otherwise the model could bypass the questionnaire
         # simply by choosing a non-red-team HTTP primitive.
-        _chat = _rt_context_chat()
+        _chat = _mission_chat
         if _rt_authorized_mission(_chat):
             _blk = _rt_scope_block(canon, args or {})
             if _blk:
                 return _finish({"error": _blk, "scope_blocked": True, "tool": canon})
     elif canon in _RT_SCOPE_AWARE_COMMAND_TOOLS:
-        _chat = _rt_context_chat()
+        _chat = _mission_chat
         if _rt_authorized_mission(_chat):
             _cmd = str((args or {}).get(_RT_SCOPE_AWARE_COMMAND_TOOLS[canon]) or "")
             _blk = _rt_command_scope_block(_cmd, _chat)
             if _blk:
                 return _finish({"error": _blk, "scope_blocked": True, "tool": canon})
     elif canon.startswith("mcp_") or canon in _DESKTOP_TOOL_NAMES:
-        _chat = _rt_context_chat()
+        _chat = _mission_chat
         if _rt_authorized_mission(_chat):
             return _finish({
                 "error": ("refused: untyped MCP/desktop automation is unavailable during an active "
@@ -18185,8 +20638,10 @@ you may occasionally append exactly one of these to the absolute end of your res
             _bp_chat = ((get_chats().get("chats", {}) or {}).get(_bp_cid)
                         if _bp_cid else None)
             _bp_rt_active = bool(_rt_authorized_mission(_bp_chat))
+            _bp_passive = _rt_passive_mission(_bp_chat)
         except Exception:
             _bp_rt_active = False
+            _bp_passive = False
         if settings.get("red_team_enabled") and _bp_rt_active:
             parts.append(
                 "red-team note: real engagements are NOT CTFs. never report a flag "
@@ -18201,16 +20656,24 @@ you may occasionally append exactly one of these to the absolute end of your res
                 "of scope. the tools hard-refuse these regardless, so aiming at them "
                 "just wastes a turn."
             )
-            parts.append(
-                "recon vs attack: when the user asks to \"look around\", \"see what you "
-                "can find\", do \"OSINT\", or \"recon\" a target, stay PASSIVE — DNS, "
-                "whois, cert transparency, subdomain enumeration, TLS/HTTP fingerprint, "
-                "exposure checks, and the osint_* tools. do NOT run intrusive/active "
-                "probes (recon_injection_probe, sql_injection, fuzz, auth spray, or "
-                "http_request as an exploit) unless the user explicitly asks to test for "
-                "vulnerabilities, exploit, or break in. gather and report what's exposed "
-                "first; escalate to active testing only on a clear go-ahead."
-            )
+            if _bp_passive:
+                parts.append(
+                    "passive OSINT policy: zero direct target contact. query only public "
+                    "third-party sources with recon_rdap, recon_dns without AXFR, "
+                    "recon_subdomains, recon_web_archive, recon_cve_match, and web_search. "
+                    "never fetch a target URL, open a target socket, run shell networking, "
+                    "or use TLS, HTTP, port, content, validation, takeover, injection, or "
+                    "exploit tools. the bridge enforces this allowlist. report which "
+                    "third-party source supports each material claim."
+                )
+            else:
+                parts.append(
+                    "recon vs attack: when the user asks to look around or recon a target, "
+                    "map and report the exposed surface before using exploit primitives. "
+                    "do not run injection probes, SQL exploitation, fuzzing, auth spray, "
+                    "or arbitrary attack requests unless the user explicitly asked for a "
+                    "vulnerability assessment or penetration test."
+                )
         if _sandbox_ready_cached():
             parts.append(
                 "sandbox: an isolated Linux guest is available via sandbox_run(command, cwd?). "
@@ -18435,6 +20898,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
     rounds = 0
     turn_tool_calls = 0
     turn_tool_errors = 0
+    turn_prompt_ms_total = 0.0
+    turn_eval_ms_total = 0.0
+    turn_compactions = 0
+    turn_compaction_failures = 0
     _profile_recorded = False
     _chat_emitters[chat_id] = emit
     with _chat_live_activity_lock:
@@ -18537,6 +21004,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 "status": str(_mission.get("status") or "active"),
                 "phase": str(_mission.get("phase") or "recon"),
                 "target": str(_mission.get("target") or ""),
+                "engagement": str(_mission.get("engagement") or "recon"),
             })
         # Objective anchor for long-horizon drift. The red-team mission block
         # only exists for authorized runs, and pin_note depends on the model
@@ -18590,6 +21058,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         # thinking block that re-narrates the plan and ends exactly like the one
         # that hit the cap in the first place.
         tool_cap_no_think = False
+        arg_loss_retries = 0
         conversation = list(messages)
         # Anything appended past this index is the model's working memory
         # for THIS turn — intermediate assistant messages with tool_calls,
@@ -18597,6 +21066,30 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         # via `final["_appended_intermediate"]` so it can be persisted and
         # the next turn replays it (instead of the model waking up amnesic).
         _start_len = len(messages)
+
+        def _finish_compaction_failure() -> dict:
+            """Persist a clear stop result after _mid_turn_fold saved the work."""
+            nonlocal turn_compaction_failures
+            turn_compaction_failures += 1
+            assistant_msg: dict = {
+                "role": "assistant",
+                "content": _COMPACTION_STOP_MESSAGE,
+                "_appended_intermediate": [],
+                "_build": _BUILD_TAG,
+                "_turn_id": _turn_id,
+                "_compaction_failed": True,
+            }
+            if _rt_dirty and _rt_chat.get("mission"):
+                assistant_msg["_mission_updates"] = dict(_rt_chat["mission"])
+            if _activity_dirty:
+                assistant_msg["_activity_updates"] = list(_activity_tail[-_ACTIVITY_MAX:])
+                assistant_msg["_continuity_updates"] = dict(_continuity_state)
+            if _verification_dirty:
+                assistant_msg["_verification_updates"] = list(_verification_debt[-20:])
+            if _carry_diag:
+                assistant_msg["_carry_diag"] = list(_carry_diag)
+            emit({"type": "final", "message": assistant_msg})
+            return assistant_msg
 
         while True:
             if cancel_ev.is_set():
@@ -18675,6 +21168,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     _fold = _mid_turn_fold(chat_id, conversation, _start_len,
                                            ctx_limit, _llama.is_vision_capable())
                     if _fold:
+                        if _fold.get("failed"):
+                            return _finish_compaction_failure()
+                        if _fold.get("folded"):
+                            turn_compactions += 1
                         _start_len = _fold["start_len"]
                         if _fold.get("conversation") is not None:
                             conversation = _fold["conversation"]
@@ -18720,6 +21217,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     _fold = _mid_turn_fold(chat_id, conversation, _start_len,
                                            ctx_limit, _llama.is_vision_capable())
                     if _fold:
+                        if _fold.get("failed"):
+                            return _finish_compaction_failure()
+                        if _fold.get("folded"):
+                            turn_compactions += 1
                         _start_len = _fold["start_len"]
                         if _fold.get("conversation") is not None:
                             conversation = _fold["conversation"]
@@ -19066,6 +21567,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             "eval_count": t.get("predicted_n"),
                             "eval_duration": int((t.get("predicted_ms") or 0) * 1e6),
                             "prompt_eval_count": t.get("prompt_n"),
+                            "prompt_eval_duration": int((t.get("prompt_ms") or 0) * 1e6),
                         }
                         continue
                     if "usage" in obj and "choices" not in obj:
@@ -19203,6 +21705,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     if t:
                         last_stats.setdefault("eval_count", t.get("predicted_n"))
                         last_stats.setdefault("prompt_eval_count", t.get("prompt_n"))
+                        last_stats.setdefault("eval_duration", int((t.get("predicted_ms") or 0) * 1e6))
+                        last_stats.setdefault("prompt_eval_duration", int((t.get("prompt_ms") or 0) * 1e6))
                 # if the stream ended while still inside reasoning (no answer
                 # tokens came), close the tag so the UI can render it cleanly.
                 if reasoning_open:
@@ -19240,6 +21744,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     # summing full-prompt counts would multiply-count rounds.
                     turn_eval_total += last_stats.get("eval_count") or 0
                     turn_prompt_total += _raw_pe
+                    turn_eval_ms_total += max(0.0, float(last_stats.get("eval_duration", 0) or 0) / 1e6)
+                    turn_prompt_ms_total += max(0.0, float(last_stats.get("prompt_eval_duration", 0) or 0) / 1e6)
                     turn_peak_prompt = max(turn_peak_prompt, int(_real_prompt or 0))
                     global _last_prompt_tokens
                     _last_prompt_tokens = _real_prompt
@@ -19396,13 +21902,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 args = repair_tool_args(slot.get("arguments", ""))
                 parsed_calls.append({"id": slot["id"], "name": slot["name"], "arguments": args})
 
-            # llama.cpp sometimes streams a tool call with the NAME but WITHOUT
-            # its arguments — the worst-hit case is a multi-arg, bulky-content
-            # tool like write_file, where the native streamer loses the
-            # <parameter=...> blocks entirely and leaves `{}`. The model's real
-            # call (with path+content) is still sitting in `full_text`, so
-            # re-parse it here and merge the richer args over the empty name.
-            # This keeps the fix independent of llama.cpp's parser quirks.
+            # llama.cpp sometimes preserves one argument (often `path`) while
+            # dropping another bulky one (`content`). Repair each missing
+            # required field independently. The old all-or-nothing check saw a
+            # non-empty path, skipped recovery, and executed an empty write.
             _merge_fallback_used = False
             if use_tools and parsed_calls and full_text:
                 for _pc in parsed_calls:
@@ -19410,18 +21913,22 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     if not isinstance(_pc_args, dict):
                         _pc["arguments"] = {}
                         _pc_args = _pc["arguments"]
-                    _has_real = any(
-                        v not in (None, "", [], {}) for v in _pc_args.values())
-                    if _has_real:
+                    _missing = _missing_required_tool_args(
+                        _pc.get("name") or "", _pc_args)
+                    if not _missing:
                         continue
                     for _fc in extract_tool_calls(full_text, python_calls=not native_tools):
                         _fname = (_fc.get("name") or _fc.get("tool") or "").lower()
                         _fargs = _fc.get("arguments")
                         if (_fname == (_pc.get("name") or "").lower()
-                                and isinstance(_fargs, dict)
-                                and any(v not in (None, "", [], {}) for v in _fargs.values())):
-                            _pc["arguments"] = {**_fargs, **_pc_args}
-                            _merge_fallback_used = True
+                                and isinstance(_fargs, dict)):
+                            for _key in _missing:
+                                _value = _fargs.get(_key)
+                                if (_value is not None
+                                        and not (isinstance(_value, str) and not _value.strip())
+                                        and not (isinstance(_value, (list, dict)) and not _value)):
+                                    _pc_args[_key] = _value
+                                    _merge_fallback_used = True
                             break
             if _merge_fallback_used:
                 # the <tool_call> block is what produced the parsed args, so don't
@@ -19576,6 +22083,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     turn_stats["eval_count"] = turn_eval_total
                 if turn_prompt_total:
                     turn_stats["prompt_eval_count"] = turn_prompt_total
+                if turn_eval_ms_total:
+                    turn_stats["eval_duration"] = int(turn_eval_ms_total * 1e6)
+                if turn_prompt_ms_total:
+                    turn_stats["prompt_eval_duration"] = int(turn_prompt_ms_total * 1e6)
                 assistant_msg["_stats"] = turn_stats
                 # Lifetime savings: add this turn's tokens to the durable counters
                 # (summed per-round, as a cloud API would bill) and push the new
@@ -19598,6 +22109,32 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         "flags": captured_flags,
                         "count": len(captured_flags),
                     }
+                # Passive OSINT is a bounded one-turn collection. Close it at
+                # the answer boundary so later ordinary chat is not trapped in
+                # the passive allowlist. Active recon/pentest missions keep
+                # their existing explicit report-driven lifecycle.
+                if _rt_on and _rt_passive_mission(_rt_chat):
+                    _rt_chat["mission"]["status"] = "closed"
+                    _rt_chat["mission"]["closed_at"] = int(time.time())
+                    _rt_dirty = True
+                    emit({
+                        "type": "rt_mission",
+                        "status": "closed",
+                        "phase": "recon",
+                        "target": str(_rt_chat["mission"].get("target") or ""),
+                        "engagement": "passive_osint",
+                    })
+                elif _rt_on and _rt_close_frontend_secret_mission(_rt_chat):
+                    # If the model somehow failed to call the one scanner, do
+                    # not leave later chat turns trapped in an active audit.
+                    _rt_dirty = True
+                    emit({
+                        "type": "rt_mission",
+                        "status": "closed",
+                        "phase": "recon",
+                        "target": str(_rt_chat["mission"].get("target") or ""),
+                        "engagement": "frontend_secrets",
+                    })
                 # Durable mission state advanced this turn — the caller persists
                 # the merged mission onto chat["mission"] (one save).
                 if _rt_dirty and _rt_chat.get("mission"):
@@ -19629,6 +22166,11 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         elapsed_s=time.time() - turn_started_at,
                         native_fallback=not native_tools,
                         completed=True,
+                        chat_id=chat_id,
+                        prompt_ms=turn_prompt_ms_total,
+                        eval_ms=turn_eval_ms_total,
+                        compactions=turn_compactions,
+                        compaction_failures=turn_compaction_failures,
                     )
                 except Exception:
                     # Passive profiling is advisory. A damaged/unwritable
@@ -19638,52 +22180,68 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 return assistant_msg
 
             conversation.append(assistant_msg)
-            # Required-args guard. llama.cpp's native parser sometimes returns a
-            # tool call with its NAME but EMPTY/missing arguments — worst case is
-            # a multi-arg, bulky-content tool like write_file (the Qwen3.5/3.6
-            # XML-dialect bug family drops the <parameter> blocks). Executing
-            # such a call is garbage-in/garbage-out: better to detect it here,
-            # tell the model exactly which call was stripped, and re-emit the
-            # call as XML text that WE parse (text-mode) — the same path that
-            # has always worked for the Gemma family.
-            _arg_loss_names: list[str] = []
+            # Required-args guard. Never execute a partial call. Native parsing
+            # can preserve a path while losing only the large content field,
+            # and text mode can also return an empty retry if the model spends
+            # the round planning instead of emitting values.
+            _arg_loss: list[tuple[str, list[str]]] = []
             if use_tools and parsed_calls:
                 for _pc in parsed_calls:
                     _nm = _resolve_tool_name(_pc.get("name") or "")
-                    _spec = TOOLS.get(_nm)
-                    _reqs = (((_spec or {}).get("parameters") or {}).get("required")) or []
-                    if not _reqs:
-                        continue
-                    _a = _pc.get("arguments")
-                    if not isinstance(_a, dict) or not all(
-                            isinstance(_a.get(r), (str, int, float, list, dict))
-                            and str(_a.get(r) or "").strip() for r in _reqs):
-                        _arg_loss_names.append(_pc.get("name") or _nm)
-            if _arg_loss_names and not _merge_fallback_used \
-                    and rounds < max_tool_rounds - 1 and native_tools:
-                _names = ", ".join(f"`{n}`" for n in dict.fromkeys(_arg_loss_names))
+                    _missing = _missing_required_tool_args(
+                        _nm, _pc.get("arguments"))
+                    if _missing:
+                        _arg_loss.append((_pc.get("name") or _nm, _missing))
+            if (_arg_loss and rounds < max_tool_rounds - 1
+                    and arg_loss_retries < 2):
+                arg_loss_retries += 1
+                _summary = "; ".join(
+                    f"`{name}` missing {', '.join(fields)}"
+                    for name, fields in _arg_loss)
+                _example_name, _example_missing = _arg_loss[0]
+                _example_canon = _resolve_tool_name(_example_name)
+                _example_spec = TOOLS.get(_example_canon) or {}
+                _example_required = list(
+                    ((_example_spec.get("parameters") or {}).get("required")) or [])
+                _example_call = next(
+                    (_pc for _pc in parsed_calls
+                     if _resolve_tool_name(_pc.get("name") or "") == _example_canon),
+                    {},
+                )
+                _example_args = _example_call.get("arguments") or {}
+                _example_lines = ["<tool_call>", f"<function={_example_name}>"]
+                for _field in _example_required:
+                    _known = _example_args.get(_field)
+                    if (isinstance(_known, str) and _known.strip()
+                            and len(_known) <= 500):
+                        _placeholder = (_known.replace("&", "&amp;")
+                                        .replace("<", "&lt;")
+                                        .replace(">", "&gt;"))
+                    else:
+                        _placeholder = (
+                            "<the complete file body>" if _field == "content"
+                            else f"<the real {_field} value>")
+                    _example_lines.extend([
+                        f"<parameter={_field}>", _placeholder, "</parameter>",
+                    ])
+                _example_lines.extend(["</function>", "</tool_call>"])
                 conversation.append({
                     "role": "user",
                     "content": (
-                        "[automatic note] Your previous tool call(s) " + _names +
-                        " were received WITHOUT arguments — the server's tool parser dropped them "
-                        "(a known strict-grammar loss, not a mistake on your part). Re-emit the "
-                        "SAME call right now with the real values, in EXACTLY this XML shape "
-                        "(the bridge parses it itself):\n"
-                        "<tool_call>\n<function=write_file>\n"
-                        "<parameter=path>\nC:\\Users\\you\\Documents\\Accuretta Workspace\\mona_lisa.html\n</parameter>\n"
-                        "<parameter=content>\n<the full file body here, may span lines>\n</parameter>\n"
-                        "</function>\n</tool_call>\n"
-                        "Replace the example values with the real ones; emit ONLY the call, then stop."
+                        "[automatic note] The previous tool call was not executed because required "
+                        "fields were lost: " + _summary + ". Re-emit the SAME call now using the "
+                        "text-parsed XML form below. Do not plan, explain, or place the file in chat. "
+                        "Begin with <tool_call> and include the actual values.\n" +
+                        "\n".join(_example_lines)
                     ),
                 })
                 emit({"type": "notice",
-                      "note": f"llama.cpp dropped tool arguments for {', '.join(_arg_loss_names)} — "
-                              f"re-emitting via the text-parsed XML path"})
+                      "note": "Tool arguments were incomplete. Retrying through the reliable text parser."})
                 # This model's native tool parsing is broken — remember it for
                 # the rest of the session so future turns skip Round 1 instead
                 # of rediscovering the loss every time.
-                _mark_native_tools_broken()
+                if native_tools:
+                    _mark_native_tools_broken()
                 # Stop handing llama-server the `tools` array for the REST of
                 # this turn: while it can see the schema, it will keep swallowing
                 # the <parameter> blocks and we'd just loop. On the text path the
@@ -19691,6 +22249,9 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 # Gemma-class parser) decodes it — the exact interaction that
                 # has worked reliably for the Gemma family all along.
                 native_tools = False
+                # The failed round spent its budget planning and emitted only a
+                # tool name. The retry spends every token on the real call.
+                tool_cap_no_think = True
                 continue
             # PARALLEL TOOL EXECUTION: submit the whole batch to the executor
             # first (bounded by _tool_executor's 8 workers), then collect in
@@ -19748,6 +22309,16 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                              result.get("exit_code") not in (None, 0))):
                         turn_tool_errors += 1
                     emit({"type": "tool_result", "name": name, "result": result})
+                    if (_rt_on
+                            and _rt_close_frontend_secret_mission(_rt_chat, name)):
+                        _rt_dirty = True
+                        emit({
+                            "type": "rt_mission",
+                            "status": "closed",
+                            "phase": "recon",
+                            "target": str(_rt_chat["mission"].get("target") or ""),
+                            "engagement": "frontend_secrets",
+                        })
                     _activity_tail.append(_tool_activity_record(name, args, result))
                     _activity_tail = _activity_tail[-_ACTIVITY_MAX:]
                     with _chat_live_activity_lock:
@@ -19796,6 +22367,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                                     "status": str(_fresh["mission"].get("status") or "active"),
                                     "phase": str(_fresh["mission"].get("phase") or "recon"),
                                     "target": str(_fresh["mission"].get("target") or ""),
+                                    "engagement": str(_fresh["mission"].get("engagement") or "recon"),
                                     "report": str(result.get("report") or "") if isinstance(result, dict) else "",
                                 })
                         except Exception:
@@ -19887,6 +22459,11 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     elapsed_s=time.time() - turn_started_at,
                     native_fallback=not native_tools,
                     completed=False,
+                    chat_id=chat_id,
+                    prompt_ms=turn_prompt_ms_total,
+                    eval_ms=turn_eval_ms_total,
+                    compactions=turn_compactions,
+                    compaction_failures=turn_compaction_failures,
                 )
             except Exception:
                 pass
@@ -21321,6 +23898,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._request_ok():
             return self._send_json(403, {"error": "forbidden"})
         try:
+            if p == "/api/client-files/upload":
+                return self._handle_client_file_upload()
             if p.startswith("/api/"):
                 return self._handle_api_post(p, parsed)
             return self._send_json(404, {"error": "not found"})
@@ -21351,6 +23930,7 @@ class Handler(BaseHTTPRequestHandler):
                         _tool_write_history.pop(cid, None)
                     with _TOOL_BUNDLE_LOCK:
                         _unlocked_bundles_by_chat.pop(cid, None)
+                    _client_context_by_chat.pop(cid, None)
                     _CTX_EST_CACHE.pop(cid, None)
                     return self._send_json(200, {"ok": True})
                 return self._send_json(404, {"error": "not found"})
@@ -21378,6 +23958,58 @@ class Handler(BaseHTTPRequestHandler):
         self._send_bytes(200, data, ctype)
 
     # ---- API routes
+
+    def _handle_client_file_upload(self):
+        """Stream one browser-selected file into Workspace/Incoming."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except Exception:
+            length = 0
+        limit = min(_remote_payload_limit(), 250 * 1024 * 1024)
+        if length <= 0:
+            return self._send_json(400, {"error": "empty upload"})
+        if length > limit:
+            return self._send_json(413, {"error": f"file exceeds the {limit // (1024 * 1024)} MB upload limit"})
+        raw_name = urllib.parse.unquote(self.headers.get("X-File-Name") or "")
+        name = Path(raw_name.replace("\\", "/")).name.strip()
+        name = re.sub(r"[\x00-\x1f<>:\"/\\|?*]", "_", name)[:180]
+        if not name or name in {".", ".."}:
+            return self._send_json(400, {"error": "invalid file name"})
+        folders = get_workspace().get("folders") or []
+        if not folders:
+            return self._send_json(409, {"error": "No workspace folder is configured."})
+        root = Path(normalize_path(folders[0]))
+        try:
+            incoming = (root / "Incoming").resolve()
+            incoming.relative_to(root.resolve())
+            incoming.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            return self._send_json(500, {"error": f"Could not prepare Incoming: {exc}"})
+        target = incoming / name
+        if target.exists():
+            target = incoming / f"{target.stem}-{uuid.uuid4().hex[:6]}{target.suffix}"
+        tmp = incoming / f".{target.name}.{uuid.uuid4().hex[:8]}.part"
+        remaining = length
+        try:
+            with tmp.open("xb") as handle:
+                while remaining:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise IOError("upload ended early")
+                    handle.write(chunk)
+                    remaining -= len(chunk)
+            tmp.replace(target)
+        except Exception as exc:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return self._send_json(500, {"error": f"upload failed: {exc}"})
+        return self._send_json(200, {
+            "ok": True, "name": target.name, "path": str(target),
+            "root": str(root), "rel": str(target.relative_to(root)).replace("\\", "/"),
+            "bytes": length,
+        })
 
     def _handle_api_get(self, p: str, parsed):
         if p == "/api/health":
@@ -21437,6 +24069,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, recommended_settings(name))
         if p == "/api/settings":
             return self._send_json(200, get_settings())
+        if p == "/api/client-context":
+            qs = urllib.parse.parse_qs(parsed.query)
+            hint = {
+                "os": (qs.get("os") or ["unknown"])[0],
+                "mobile": (qs.get("mobile") or [""])[0] == "1",
+                "secure_context": (qs.get("secure") or [""])[0] == "1",
+                "execution_target": (qs.get("target") or ["host"])[0],
+            }
+            snapshot = _tailscale_snapshot()
+            peers = [p for p in snapshot.get("peers", [])
+                     if str(p.get("os") or "").lower() in {"macos", "darwin"}]
+            return self._send_json(200, {
+                "context": _handler_client_context(self, hint),
+                "machines": [_public_remote_machine(m) for m in _load_remote_machines().get("machines", [])],
+                "mac_peers": peers,
+                "tailscale": {
+                    "ok": snapshot.get("ok", False), "state": snapshot.get("state", "unknown"),
+                    "health": snapshot.get("health", []), "self_dns": snapshot.get("self_dns", ""),
+                    "self_ips": snapshot.get("self_ips", []),
+                },
+                "serve": _tailscale_serve_status(snapshot),
+                "ssh_available": bool(_ssh_exe() and _ssh_keygen_exe()),
+            })
         if p == "/api/model-health":
             return self._send_json(200, _public_model_health())
         if p == "/api/savings":
@@ -21647,6 +24302,10 @@ class Handler(BaseHTTPRequestHandler):
                 "Referrer-Policy": "no-referrer",
                 "Cache-Control": "no-store",
             }
+            qs = urllib.parse.parse_qs(parsed.query)
+            if (qs.get("download") or [""])[0] == "1":
+                encoded_name = urllib.parse.quote(target.name, safe="")
+                extra["Content-Disposition"] = f"attachment; filename*=UTF-8''{encoded_name}"
             return self._send_bytes(200, data, ct, extra_headers=extra)
         if p == "/api/llama/detect-vram":
             # GET — best-effort GPU VRAM probe via nvidia-smi. Used by the
@@ -21784,12 +24443,33 @@ class Handler(BaseHTTPRequestHandler):
             _sbx_set(status="idle", step="", pct=0, error="", log=[])
             broadcast_event({"type": "sandbox:update"})
             return self._send_json(200, {"removed": rc == 0, "output": (out or "").strip()[:400]})
+        if p == "/api/model-health/action":
+            result = _model_health_action(
+                str(body.get("action") or ""),
+                str(body.get("recommendation_id") or ""),
+            )
+            return self._send_json(200 if result.get("ok") else 409, result)
         if p == "/api/settings":
             cur = get_settings()
             cur.update({k: v for k, v in body.items() if k in DEFAULT_SETTINGS})
             save_json(SETTINGS_FILE, cur)
             broadcast_event({"type": "settings:update"})
             return self._send_json(200, cur)
+        if p == "/api/remote/serve/enable":
+            result = enable_tailscale_serve()
+            return self._send_json(200 if result.get("ok") else 500, result)
+        if p == "/api/remote/pair/prepare":
+            result = prepare_remote_pairing(
+                body.get("node_id") or "", body.get("username") or "",
+                body.get("label") or "", body.get("allowed_roots"),
+            )
+            return self._send_json(200 if result.get("ok") else 400, result)
+        if p == "/api/remote/pair/verify":
+            result = verify_remote_pairing(body.get("machine_id") or "")
+            return self._send_json(200 if result.get("ok") else 400, result)
+        if p == "/api/remote/pair/remove":
+            result = remove_remote_pairing(body.get("machine_id") or "")
+            return self._send_json(200 if result.get("ok") else 404, result)
         if p == "/api/compact":
             # Manual compaction (frontend "compact now" button / model tool).
             # Body: {chat_id}. Folds the oldest turns into the rolling summary
@@ -22399,6 +25079,10 @@ class Handler(BaseHTTPRequestHandler):
         images = body.get("images") or []  # list of base64 data URLs
         regenerate = bool(body.get("regenerate"))
         reasoning_effort = _normalize_reasoning_effort(body.get("reasoning_effort"))
+        client_ctx = _handler_client_context(self, body.get("client_context"))
+        _client_context_by_chat[chat_id] = client_ctx
+        if client_ctx.get("execution_target") != "host":
+            _unlock_bundle(chat_id, "remote")
         if not user_text and not images and not regenerate:
             return self._send_json(400, {"error": "empty message"})
         mission_panel = body.get("mission")
@@ -22522,6 +25206,7 @@ class Handler(BaseHTTPRequestHandler):
         # extra (quick) model call fires only once the conversation actually
         # fills ~55% of the live context window, NOT on a fixed message count —
         # so short sessions keep full detail. Graceful: failure keeps the prior summary.
+        _pre_turn_compaction_failed = False
         if get_settings().get("summarize_history", True):
             try:
                 _ctx_for_summary = _llama_props_ctx() or int(get_settings().get("num_ctx") or 32768)
@@ -22545,10 +25230,20 @@ class Handler(BaseHTTPRequestHandler):
                 _log_compact(chat_id, f"pre_turn web: fill={_last_prompt_tokens_by_chat.get(chat_id, 0)} "
                                       f"trigger={_summary_trigger_limit(_ctx_for_summary)} ctx={_ctx_for_summary} "
                                       f"drop_flag={_last_dropped_by_chat.get(chat_id, False)} force={_drop_force}")
+                _pre_turn_fold_required = (
+                    _drop_force or
+                    _last_prompt_tokens_by_chat.get(chat_id, 0) >=
+                    _summary_trigger_limit(_ctx_for_summary)
+                )
+                _failure_seq_before = _summary_failure_seq_by_chat.get(chat_id, 0)
                 if _maybe_roll_summary(chat, _ctx_for_summary,
                                        force=_drop_force,
                                        reason_hint="pre_turn"):
                     save_json(CHATS_FILE, chats)
+                elif (_summary_failure_seq_by_chat.get(chat_id, 0) > _failure_seq_before or
+                      (_pre_turn_fold_required and
+                       _summary_failure_backoff_active(chat_id))):
+                    _pre_turn_compaction_failed = True
             except Exception:
                 traceback.print_exc()
         # Durable mission state (authorized red-team runs): seed the objective
@@ -22575,6 +25270,7 @@ class Handler(BaseHTTPRequestHandler):
         _set_current_chat(chat_id)
         system_prompt = build_system_prompt(include_tools=use_tools, chat_mode=mode,
                                             include_tool_list=not native_tools)
+        system_prompt += "\n\n" + _client_context_prompt(client_ctx)
         # Durable mission block + pins: NOT spliced here anymore — they change
         # mid-session and every change busted llama.cpp's cached prompt prefix.
         # run_chat_turn appends them as a tail message after the history instead
@@ -22651,6 +25347,10 @@ class Handler(BaseHTTPRequestHandler):
             broadcast_event(evt)
 
         emit({"type": "chat_start", "chat_id": chat_id})
+        if _pre_turn_compaction_failed:
+            emit({"type": "error", "error": _COMPACTION_STOP_MESSAGE})
+            emit({"type": "chat_end"})
+            return
         _undo_begin_turn(chat_id)
         if tools_off_reason:
             emit({"type": "tools_unavailable", "message": tools_off_reason})
@@ -23314,6 +26014,9 @@ def _reasoning_capability(model_path: str = "", settings: dict | None = None,
     has_native = bool(native_parameter)
     has_budget = ("thinking_budget_tokens" in signal or "thinking_budget" in signal)
     has_toggle = "enable_thinking" in signal
+    advertised_native_levels = set(re.findall(
+        r"['\"](minimal|low|medium|high|xhigh|max|none)['\"]", signal
+    ))
     native_family = any(x in name for x in ("gpt-oss", "stepfun", "step-3", "step3"))
     budget_family = any(x in name for x in (
         "qwq", "deepseek-r1", "deepseek_r1", "r1-distill",
@@ -23344,6 +26047,20 @@ def _reasoning_capability(model_path: str = "", settings: dict | None = None,
     }
     if mode == "native_effort":
         cap["native_parameter"] = native_parameter or "reasoning_effort"
+        native_map = {}
+        # The composer uses a compact, model-agnostic Auto/Low/Medium/High
+        # ladder. Some templates name their deepest tier xhigh or max. Map the
+        # UI tier to an actually advertised value instead of sending a string
+        # the template rejects. Qwen3.8, for example, accepts low/medium/xhigh.
+        if "high" not in advertised_native_levels:
+            if "xhigh" in advertised_native_levels:
+                native_map["high"] = "xhigh"
+            elif "max" in advertised_native_levels:
+                native_map["high"] = "max"
+        if native_map:
+            cap["native_effort_map"] = native_map
+        if advertised_native_levels:
+            cap["native_effort_values"] = sorted(advertised_native_levels)
     _REASONING_CAP_CACHE[cache_key] = cap
     return dict(cap)
 
@@ -23375,7 +26092,7 @@ def _resolve_reasoning_request(effort, capability: dict, settings: dict,
         enabled = True
         budget = _reasoning_budget_for_effort(level, ctx_limit)
         if capability.get("mode") == "native_effort":
-            native_effort = level
+            native_effort = (capability.get("native_effort_map") or {}).get(level, level)
     else:
         budget = legacy_budget
     if not enabled:

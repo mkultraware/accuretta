@@ -8,193 +8,168 @@
 
 # Accuretta
 
-**A local AI workspace. Your model, your machine, your files.**
+**Run a GGUF model. Give it files, terminals, previews, and guardrails.**
 
 [![License: personal use only](https://img.shields.io/badge/license-personal%20use%20only-B5544A.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Powered by llama.cpp](https://img.shields.io/badge/backend-llama.cpp-orange.svg)](https://github.com/ggml-org/llama.cpp)
-[![Runs local](https://img.shields.io/badge/runs-100%25%20local-brightgreen.svg)](#privacy)
+[![Local inference](https://img.shields.io/badge/inference-local-brightgreen.svg)](#privacy)
 
 </div>
 
 <p align="center">
-  <img src="media/accuretta-demo-loop.gif" alt="Accuretta local AI workspace demo" width="900">
+  <img src="media/Aperture.png" alt="Accuretta using the Aperture theme, with sessions and workspace files on the left, local model status and chat in the center, and preview plus terminal tools on the right." width="1100" />
 </p>
 
-<p align="center">
-  <img src="welcome_screen.png" alt="The Accuretta chat UI: session list on the left, a workspace tree, the chat with mode chips (IDE, Agent, Auto, Image, Trust writes), and a preview pane with Terminal, Backend, Shell, and Agent log tabs on the right." width="880" />
-</p>
+Accuretta is a desktop workspace for local models running through [llama.cpp](https://github.com/ggml-org/llama.cpp). It puts chat history, file tools, persistent shells, live HTML previews, approvals, remote computers, and security tools in one interface.
 
-## What it is
+The model weights, prompts, history, settings, and workspace live on the computer running the bridge. There is no hosted model account, frontend build step, npm dependency tree, or Electron shell. The core is static HTML, CSS, JavaScript, and one Python bridge you can inspect yourself.
 
-You drop a GGUF model file in a folder, point Accuretta at a llama.cpp binary, and you get a chat UI with real tool use: a live HTML preview, a workspace the model can read and write, a Python syntax checker, interactive shells, web search, and a full security-analysis toolkit. Everything runs on your computer. The model stays on your disk, and your prompts never touch anyone else's server.
+## What is included
 
-Under the hood it's a few static files and one Python script (`bridge.py`) sitting on top of `llama-server`. No build step, no npm, no Electron. You can read the whole thing in an afternoon.
+| Area | What Accuretta does |
+| --- | --- |
+| Local model runtime | Finds GGUF files, launches llama-server, switches models, watches for crashes, and restores the last working configuration. |
+| Hardware-aware tuning | Reads GGUF metadata and chooses context size, GPU offload, KV cache types, batching, and supported speculative decoding options. |
+| Agent workspace | Reads and edits files, maps projects, finds symbols and references, checks syntax, runs tests, and works with Git. |
+| Live building | Renders HTML beside the chat, saves preview versions, exposes the source, and keeps the terminal and agent log visible. |
+| Long tasks | Compacts old conversation history, preserves structured task state, tracks unfinished verification, and can recover an interrupted turn. |
+| Remote work | Serves the UI over Tailscale HTTPS and can run commands or transfer files to an allowlisted Mac over SSH. |
+| Security work | Provides an authorization-gated recon, validation, exploitation, evidence, and reporting flow for targets you are allowed to test. |
+| Local analysis | Inspects Windows events, network connections, PCAPs, APKs, native binaries, firmware, archives, and YARA matches. |
+| Extensions | Loads MCP servers from a standard JSON config and supports a Discord owner bridge with reaction approvals. |
 
-## Why I built it
+None of those rows means “the model can do anything.” Tool availability depends on the operating system, installed optional packages, the selected model, and the permissions you grant. Accuretta reports missing capabilities instead of handing the model a tool that is guaranteed to fail.
 
-I got tired of renting AI. I was paying for cloud subscriptions and watching the terms move every few weeks. One service cut quotas. Another swapped the model behind the same name without saying so. I tried Google Antigravity, decided I didn't want tools that could change under me, and started building something I actually own.
+## Why it exists
 
-Two rules from day one:
+I got tired of renting AI. Cloud subscriptions changed limits, swapped models, and kept the useful controls behind somebody else's account. I already owned the GPU, so I wanted software that treated it like mine.
 
-1. The model lives on my disk. Nothing leaves the computer unless I ask for it.
-2. No subscriptions. I already paid for the GPU.
+Accuretta started as the wiring between a GGUF file and llama.cpp. It grew because a chat box alone is not much of a workstation. A useful local model needs access to files, a way to prove its edits work, enough context to finish a long task, and a clear approval point before it touches the machine.
 
-I came from Ollama and expected llama.cpp to be a sidegrade. It wasn't. Same hardware, same model file, faster generation, and real control over KV cache quantization, flash attention, and speculative decoding. The catch is that you wire it up yourself. Accuretta is that wiring with a usable UI on top.
+Local models still have limits. A small quantized model will not match the best hosted model at every job. Accuretta gives you control over the trade: pick the model, inspect the tools, set the permissions, and keep the work on hardware you own.
 
----
+## Setup
 
-## Setup (start here)
-
-This is the whole thing, step by step. You need three items: Python, one model file, and a llama.cpp binary. Accuretta can fetch the binary for you, so really you need Python and a model.
+You need Python 3.10 or newer and one GGUF model. Accuretta can download a matching llama.cpp build during first-run setup.
 
 ### 1. Install Python
 
-Get Python 3.10 or newer from [python.org](https://www.python.org/downloads/). On Windows, tick **"Add Python to PATH"** in the installer. Confirm it worked:
+Download Python from [python.org](https://www.python.org/downloads/). On Windows, enable **Add Python to PATH** in the installer.
 
 ```
 python --version
 ```
 
-### 2. Get the code
+### 2. Get Accuretta
 
 Download or clone this repository into a folder, for example `C:\accuretta`.
 
-### 3. Install dependencies
-
-Open a terminal in that folder and run:
+### 3. Install the optional packages
 
 ```
 pip install -r requirements.txt
 ```
 
-Only Pillow is genuinely needed. Everything else is optional and loads only if it's present, so you can skip this and the app still runs. The optional packages just turn on extra tools (screenshots, APK/binary analysis, PDF parsing, the Discord bridge, and so on) when you install them.
+The core bridge uses Python's standard library. The packages in `requirements.txt` add image handling, desktop input, document parsing, code parsers, security analysis, and the Discord bridge. Missing packages remove the affected tools from the model's tool list.
 
-### 4. Get a model
+### 4. Add a model
 
-You need one GGUF model file on disk. Grab one from Hugging Face (search "GGUF"; **unsloth** and **bartowski** publish reliable ones). A `Q4_K_M` quant of a 7B to 35B model is a sane first pick. Put it anywhere, for example `D:\MODELS\`.
+Download one GGUF model from Hugging Face. A `Q4_K_M` quant of a 7B to 35B model is a practical first choice. Put it anywhere on disk, such as `D:\MODELS\`.
 
-### 5. Start it
+### 5. Start Accuretta
 
-- **Windows, the easy way:** double-click `start.bat`. It frees the port, installs the desktop-window dependency once, and opens Accuretta as its own application window. No browser, no leftover console.
-- **Any OS:** run `python bridge.py`, then open the URL it prints (usually `http://localhost:8787`) in your browser.
+- **Windows:** double-click `start.bat`. It prepares the desktop-window dependency, clears a stale Accuretta port, and opens the app without a leftover console.
+- **Browser mode on any OS:** run `python bridge.py`, then open the printed address. The default is `http://localhost:8787`.
 
-### 6. Let the setup wizard finish the job
-
-On first launch a wizard opens and walks you through the rest.
+### 6. Finish the setup wizard
 
 <p align="center">
-  <img src="media/setup_process.png" alt="The Accuretta setup wizard scanning system hardware, offering a one-click llama.cpp binary download matched to the detected GPU, and listing detected GGUF models." width="820" />
+  <img src="media/setup_process.png" alt="The Accuretta setup wizard scanning system hardware, offering a llama.cpp download matched to the detected GPU, and listing detected GGUF models." width="820" />
 </p>
 
-It does four things:
+The wizard detects the GPU, finds models, offers an appropriate llama.cpp build, and tunes the selected model before starting it. Sessions, settings, workspace pointers, memories, model profiles, and preview versions are stored under `data/`.
 
-- scans your GPU and picks the right llama.cpp build (CUDA for NVIDIA, Vulkan for AMD/Intel, CPU otherwise),
-- downloads that binary for you if you don't already have one,
-- lists the GGUF models it found on your drives,
-- auto-tunes the model you choose (context size, GPU offload split, cache type) before it starts the backend.
+## Files, code, and live previews
 
-There is no mandatory model benchmark during setup. Accuretta learns a small, content-free runtime profile from normal use instead: token counts, speed, tool-call/error counts, recovery/fallback use, and whether turns completed. It stores no prompt or tool-result text in that profile, adds no inference, and never delays a new user's first chat. Settings → Model & performance shows this as **Model Health**; cautious advice appears after eight observed turns, and the local learning can be paused there at any time.
+The model can work inside a selected workspace instead of pasting every result into chat. Its coding tools cover file reads and edits, project maps, symbol lookup, reference search, syntax checks, test runs, and Git operations.
 
-Click **Save & Start** and you're chatting. Your sessions, settings, workspace pointers, and memories land in a `data/` folder next to `bridge.py`. Back it up to keep them, delete it for a clean slate.
-
-### When something breaks
-
-A few failures are common enough to name:
-
-- **llama-server crashes instantly on NVIDIA.** You're missing the CUDA runtime DLLs. Download the `cudart-llama-bin-win-cuda-*.zip` that matches your build and extract it into the same folder as `llama-server.exe`. Match the CUDA version to your driver: run `nvidia-smi` and read the CUDA Version in the top right. A CUDA 13 build needs a 13.x driver.
-- **`error loading model: missing tensor 'blk.NN.ssm_conv1d.weight'`.** Your llama.cpp is too old for that model, usually a new MTP or hybrid GGUF. Use a non-MTP version of the same model, or update your binary.
-- **llama-server exits the moment speculative decoding turns on.** Set Settings → Speculative decoding to `off` (or `ngram-mod`) and reload. `draft-mtp` only works on models that ship MTP heads and a recent build.
-- **Port 8787 already in use.** Something else is on it. `start.bat` clears it for you; in manual mode set `ACCURETTA_PORT` to another number.
-
----
-
-## What you can do with it
-
-### Build things and watch them render
-
-Ask for a webpage and you see it render next to the chat as the model writes it. Switch between the rendered view and the source with one click. IDE mode keeps the model in "emit an HTML fence, don't wrap it in a tool call" behavior so the preview stays live.
+IDE mode expects one HTML document and renders it in the right pane while the model writes. Each result becomes a saved preview version, so an earlier page is one click away.
 
 <p align="center">
-  <img src="Coding_Agent.png" alt="Accuretta in IDE mode: the model has written an HTML page for a PR firm, the source is visible in the chat, and a polished dark 'AURELIUS' site renders live in the preview pane. The agent log streams tool activity underneath." width="880" />
+  <img src="media/accuretta-demo-loop.gif" alt="Accuretta building and rendering a web page beside the chat." width="900" />
 </p>
 
-<p align="center"><em>IDE mode. The model wrote the page, the preview pane renders it live from the HTML fence, and the agent log tracks every tool call.</em></p>
+Accuretta also records verification debt. A file edit adds the path to the task's structured state. A successful syntax check or project test clears it. Context compaction and restarts preserve that record, so an untested edit cannot quietly become “finished” because the model lost the earlier messages.
 
-### Let the agent touch the machine, with approvals in the way
+## Approvals and audit records
 
-The agent has hands. It reads and writes files, runs shell commands, opens interactive shells, fetches web pages, searches the web, takes screenshots, and inspects processes and network state. Anything that changes your system (file writes, shell commands, registry edits) is gated by an approval card, so nothing destructive happens silently. Read-only work like web fetches can run on its own when you flip on **Trust writes** or approve a class of action.
+Reads can run without stopping the conversation. File writes, shell commands, Git changes, desktop input, remote changes, and MCP calls pass through an approval card unless you have explicitly trusted that action.
 
-Host, repository, desktop, connector, sandbox, and target-touching actions also leave a bounded local provenance record in `data/action_audit.jsonl`. It records the tool, time, outcome, target, chat/authorization identity, and hashes of the arguments/result; it deliberately does not copy commands, typed text, prompts, or tool output into the log. Desktop actions return a cheap immediate observation of the active window and cursor so the model has a concrete post-action state before deciding what to do next.
+Approved actions write a bounded record to `data/action_audit.jsonl`. It stores the tool, target, time, outcome, authorization identity, and hashes of the arguments and result. It does not copy prompts, commands, typed text, or tool output into the audit file.
 
-<p align="center">
-  <img src="Approval_Gate_Plus_Discord.png" alt="An approval card in Accuretta showing a pending command, alongside the same approval arriving as a Discord message that can be approved with a reaction." width="880" />
-</p>
+The approval layer is part of the bridge, not a promise in the system prompt. The model cannot make a direct tool call around it.
 
-<p align="center"><em>The approval gate holds every write and command. The same prompt reaches you over Discord, where a reaction runs or denies it, so the safety gate works from your phone.</em></p>
+## Remote work over Tailscale
 
-### Authorized red-team tooling
+Accuretta can expose its interface through Tailscale Serve. The resulting `https://...ts.net` address works from a MacBook or phone without public port forwarding. HTTPS also restores browser clipboard access that is blocked on plain remote HTTP.
 
-Turn on **Red team tools** in Settings and the model gains a recon and exploitation suite: stealth port scanning, TLS audit, HTTP fingerprinting, passive subdomain enumeration, DNS recon, content discovery, exposure checks, subdomain-takeover detection, CVE matching, an injection and SQL-injection prober, a request fuzzer, an auth-spray primitive, a raw HTTP client, JWT decode/forge/crack, an encoder/decoder, front-end secret scanning, CORS probing, raw TCP, and evidence capture. It's off by default so a normal coding turn doesn't carry a dozen tools it will never use.
+To work on a Mac from the model running on a Windows inference PC:
 
-The Settings toggle only makes the suite available. Each chat must then pass a fresh authorization gate with an explicit target and scope. The bridge stores that authorization on the chat, exposes only recon tools at first, enforces the allowlist server-side on every typed request and redirect, and unlocks exploit tools only after a finding is validated (unless the user deliberately enables the force override). Finishing a report closes the mission. Evidence files are retained for 30 days by default so a restart does not erase the proof behind a report; set retention to `0` to restore wipe-on-start behavior. This is a harness-level guard, not an OS firewall, so point it only at systems you own or have written permission to test.
+1. Install Tailscale on both computers and sign in to the same tailnet.
+2. In Accuretta, open **Settings → Connections → Tailscale remote access** and enable the HTTPS address.
+3. Turn on **System Settings → General → Sharing → Remote Login** on the Mac.
+4. Select the Mac in Connections, enter its short account name, choose the folders Accuretta may use, and generate the pairing command.
+5. Run that command once in Mac Terminal, verify the pairing, then select the Mac from the target picker.
 
-<p align="center">
-  <img src="RedTeam_Start.png" alt="The start of an authorized red-team run in Accuretta: the model confirms authorization and begins reconnaissance against a target." width="880" />
-</p>
+The pairing key is restricted to the Accuretta PC's Tailscale address. Remote reads stay inside the configured folders. Commands, writes, and transfers still require approval. Resolved-path checks stop a symlink from escaping the allowlist.
 
-<p align="center">
-  <img src="RedTeam_Finish.png" alt="The end of a red-team run: the model has finished the flow and summarized findings." width="880" />
-</p>
+Remote writes go straight to the Mac. Large files use a staged transfer with hashes and commit checks, which avoids forcing a long HTML or source file through one oversized tool argument. A failed remote action also stays failed; Accuretta does not silently run it on the Windows PC instead.
 
-<p align="center"><em>An authorized run, start to finish. Authorization first, then recon and exploitation, then a written summary of what it found.</em></p>
+## Authorized security testing
 
-### See what's talking to your network
+Red Team tools are disabled by default. Enabling them makes the tool definitions available, but a chat still needs a fresh target and scope authorization before the bridge permits requests.
 
-Ask for a network snapshot and the model groups active TCP and UDP connections by process, flags anything odd, and summarizes recent DNS activity in a real table. A snapshot can be saved as a named known-good baseline; a later capture can return added/removed connections, listeners, DNS records, and processes. No round trip to a cloud, no API key, no rate limit.
+An engagement moves through recon, validation, exploitation, and reporting. The bridge enforces the target allowlist on requests and redirects, keeps exploitation tools closed until a finding has evidence, and closes the mission when the report is finished.
 
-<p align="center">
-  <img src="Blue_Team_Recon_NetworkSnapshot.png" alt="Accuretta running a local network snapshot and analyzing active connections grouped by process, with a summary of recent DNS activity." width="880" />
-</p>
+The scope questionnaire uses an allowlist. Leave **In scope** blank to allow the target entered above and its subdomains. If you fill it in, list every permitted host, including the main target when required. Anything not on that list is blocked automatically. Use **Out of scope** for concrete exceptions such as `admin.example.com`, `10.0.0.0/24`, or `example.com:8443`. Phrases such as `Anything else` are treated as ordinary words, not as a wildcard, and can be left out.
 
-### Take apart untrusted files
+Bug bounty programs can require a researcher identifier in every request. The optional **User agent** field stores that value with the engagement, keeps it visible to the model through long chats and context compaction, and forces it onto HTTP requests at the bridge. A model-supplied or browser-profile User-Agent cannot override the engagement value.
 
-The bridge ships a reverse-engineering toolkit. Every scanner returns one structured report the model can reason over instead of a raw dump.
+The suite includes:
 
-- **APKs.** `scan_apk` does pure-Python triage (package metadata, signing certs, dangerous permissions, exported components, and a secret hunt over DEX and native libs). `decompile_apk` shells out to [JADX](https://github.com/skylot/jadx) for Java sources when you've narrowed down what matters.
-- **Native binaries.** `binary_inspect` gives fast PE/ELF/Mach-O triage (sections with entropy, imports, packer hints, signature presence) in about 50ms. `ghidra_analyze` runs [Ghidra](https://github.com/NationalSecurityAgency/ghidra) in-process via [pyghidra](https://pypi.org/project/pyghidra/) for a full report plus C-like decompilation of a named function.
-- **Firmware.** Squashfs extraction, ELF parsing, and a multi-architecture disassembler (via `PySquashfsImage`, `pyelftools`, `capstone`) for router and IoT images.
-- **Pattern matching.** `yara_scan` runs YARA rules (a bundled malware-tell set, or your own `.yar`) over a file or directory in tens of milliseconds.
+- port, TLS, HTTP, DNS, subdomain, RDAP, archive, content, exposure, and takeover checks
+- parameter discovery, injection probes, SQL injection checks, CORS tests, fuzzing, raw HTTP, and raw TCP
+- JWT decoding and testing, encoders, request replay, controlled credential checks, and evidence capture
+- CVE matching, finding records, report generation, and retained evidence hashes
+- a standalone front-end secret scanner for HTML, JavaScript bundles, lazy-loaded chunks, and source maps
 
-Optional packages, installed only if you want the feature:
+The front-end scanner returns exact high-confidence matches for reporting, separates public identifiers, and hides weak candidates unless requested. It never submits a discovered credential to its provider or uses it for a liveness check.
 
-```
-pip install androguard              # full APK manifest / permissions / signing
-pip install pefile pyelftools yara-python
-pip install pyghidra                # needs Ghidra + JDK 21 (adoptium.net)
-```
+Scope enforcement covers requests made through Accuretta. It does not filter traffic outside the bridge, so use these tools only on systems you own or have written permission to assess.
 
-If a hard dependency is missing, Accuretta omits that tool from the model's schema instead of letting the model waste rounds discovering a guaranteed failure. The read-only `capability_report` tool explains what is available, what policy blocks, what is missing, and, on request, the approval, scope, side-effect, and result-size contract for every visible tool.
+## Host, file, and malware analysis
 
-### Run risky things in a throwaway Linux box
+Windows host tools can group active network connections by process, compare them with a saved baseline, parse event logs, and check common persistence locations.
 
-Set up the optional **sandbox** and Accuretta provisions an isolated Ubuntu guest (`accuretta-sbx`) over WSL2. The model runs offensive tools and, more to the point, unpacks untrusted files pulled back from a target inside that guest, so a booby-trapped sample can't touch your host. Your workspace is visible inside at `/mnt/...`, and the guest is kernel-isolated from Windows. One click in the Setup Wizard or Settings builds it; there's no reboot on a machine that already has WSL2.
+File analysis covers:
 
-### Drive a persistent shell
+- PCAP and PCAPNG summaries
+- APK metadata, signing certificates, permissions, exported components, and embedded secrets
+- PE, ELF, and Mach-O headers, imports, sections, entropy, signatures, and packer hints
+- Squashfs extraction and multi-architecture disassembly for firmware
+- YARA scans with bundled or supplied rules
+- optional Ghidra decompilation through `pyghidra`
 
-`run_powershell` is one-shot and forgets everything between calls. When you need state (a reverse shell you caught, an SSH session, a Python REPL, a database client, a debugger), the interactive **session** tools hold a live process across turns. You and the model share the same shell in the Shell tab, so you can watch it work and type into it yourself.
+The optional WSL2 sandbox runs tools and unpacks suspicious samples inside an Ubuntu guest. The workspace can be mounted into the guest, while the Windows host stays outside that kernel.
 
-### Agentic coding helpers
+## Persistent shells, desktop tools, and MCP
 
-Three standard-library tools keep token cost low on big projects: `read_skeleton` pulls the classes, functions, and signatures out of a 5,000-line file for a few hundred tokens; `check_syntax` runs `ast.parse` (or `node --check`) so the model verifies its own edits; and `run_tests` runs `pytest`/`npm test` and hands back only the failures and tracebacks.
+One-shot commands are useful until the task needs state. Session tools keep SSH, a Python REPL, a debugger, a database client, or another terminal process alive across model turns. The Shell tab is shared, so you can watch the same process and type into it yourself.
 
-Accuretta tracks verification debt independently of the model's prose. A successful file edit adds that path to the structured continuity record; only a harness-observed successful syntax check for that file or a successful project test run clears it. The record survives context compaction and crash recovery, so an unverified change cannot become "done" merely because the model said so.
+Optional desktop tools can capture the screen, list and focus windows, click, type, and press keys. They remain approval-gated and depend on Pillow, pyautogui, and the host desktop session.
 
-### Plug in MCP servers
-
-Accuretta speaks the Model Context Protocol through a dependency-free stdio client built into `bridge.py`. Drop a `bridge_mcp_config.json` next to the bridge (same schema Claude Desktop uses), restart, and the server's tools appear in the model's toolbelt. Every MCP call is approval-gated by default, since an MCP server can run arbitrary commands.
-
-Browser automation (playwright-mcp) works without any vision projector: accessibility snapshots are text, anonymous layout-container noise is stripped before they hit the context, and oversized results get head/tail elision instead of a dead-end "too large" stub — so big pages don't stall the agent. Screenshots come back as a note pointing the model at the text snapshot, so you never need to load an mmproj just for the browser.
+Accuretta includes a dependency-free MCP stdio client. Add servers to `bridge_mcp_config.json`, restart the bridge, and their tools appear alongside the built-in tools. MCP calls require approval by default.
 
 ```json
 {
@@ -202,81 +177,76 @@ Browser automation (playwright-mcp) works without any vision projector: accessib
     "github": {
       "command": "npx.cmd",
       "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_abc123..." }
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_example"
+      }
     }
   }
 }
 ```
 
-### A real example, start to finish
+## Context, recovery, and model health
 
-I asked the agent to tune my in-ear monitors (Linsoul 7Hz x Crinacle Zero:2) with Peace Equalizer APO. It searched audio review sites, Reddit, and AutoEQ measurement databases, picked a target curve (Harman In-Ear 2019), generated ten parametric filters with the right gain, Q, and frequency for that specific IEM, and wrote a complete `.peace` profile straight into the EqualizerAPO config folder, including a PreAmp value to prevent clipping and a note that one boost was unusually aggressive so I could dial it back.
+Long chats use rolling compaction. Older turns are folded into a structured summary while recent messages and tool results stay live. Manual compaction remains available, and failed automatic compaction stops cleanly instead of repeatedly chewing on the same old messages.
 
-<p align="center">
-  <img src="media/Sound_Question_and_search.png" alt="The agent researching IEM tuning across reference-audio-analyzer.pro, audiosciencereview.com, head-fi.org, and Reddit." width="780" />
-</p>
+Model Health learns a content-free profile for each exact model configuration. It records counts and timings such as tokens, context pressure, completion rate, tool errors, compactions, and generation speed. It does not store prompt text, replies, commands, files, screenshots, tool output, peer addresses, or account names.
 
-<p align="center">
-  <img src="media/sound_profile_applied_by_accuretta.png" alt="The agent writing a complete Peace Equalizer profile to disk with activation instructions." width="780" />
-</p>
+After at least 25 turns across three sessions, the advisor can recommend a setting change when the measurements and hardware tuner support one. **Use recommended settings** applies the exact changes. Accuretta then compares the next ten turns with the old configuration and lets you keep or undo the result.
 
-<p align="center"><em>Research, then ten filters written to disk with activation steps and a frank note about the aggressive corrections. No copy-pasting from a forum, no translating frequency tables into config syntax by hand.</em></p>
+## llama.cpp tuning
 
----
+The tuner reads the GGUF header for layer count, attention layout, expert counts, KV dimensions, trained context, and vision metadata. It uses those values to choose:
 
-## Auto-tune
+- context size and batch sizes
+- GPU layer and MoE expert offload
+- K and V cache quantization
+- flash attention when the installed binary supports it
+- speculative decoding options supported by both the model and llama.cpp build
+- memory reserves for the operating system, graphics desktop, and vision projector
 
-Picking a model in Settings (with a VRAM tier set) runs a tuner that reads the GGUF header for the model's real architecture (layer count, attention config, MoE expert count, KV head dimensions) and computes the largest context window plus the right CPU/GPU offload split for your card. No hand-picking `--n-cpu-moe`, `--ctx-size`, or `--batch-size`.
+Each GGUF keeps its own saved configuration. A failed launch can fall back to a safer setup without overwriting the last known working values. A watchdog can restart llama-server after an unexpected crash and stops retrying when repeated failures point to a bad configuration.
 
-- **GGUF-direct math.** KV cost per token comes from the model's actual `2 x n_layer x head_count_kv x head_dim x dtype_bytes`, not a size bucket. A Q3 of an architecture gets more context than a Q4 of the same one, because the smaller weights leave more VRAM for cache. Split K/V cache (`--cache-type-k q8_0 --cache-type-v q4_0`) is used when it buys real context — K is the quantization-sensitive half (KIVI, ICML 2024), V shrugs off 4-bit.
-- **MoE aware.** For mixture-of-experts models it works out the dense-vs-expert split and offloads only as many expert layers to CPU as needed to fit, gating the trade on a decode-speed estimate (RAM bandwidth ÷ active expert bytes) instead of a fixed cap. Speculative decoding is auto-disabled on MoE since it's net-negative there.
-- **Swap-aware.** Re-tuning while another model is loaded counts the running instance's RAM/VRAM as free — the swap releases it — so a re-tune at boot or model-switch can't talk itself into a crippled config. A sibling vision projector (mmproj) is budgeted too, and configs that still don't fit are never saved over a working one.
-- **Grow-only context.** If a re-tune comes back smaller than what you already had working, the larger value wins. Your saved context never shrinks behind your back.
-- **Re-runs on boot.** Auto-tune quietly re-runs in the background at startup and updates flags if the algorithm improved since you last saved. One toast tells you what changed.
+Bigger context costs memory and prompt-processing time. The tuner aims for a configuration that fits the detected hardware; it cannot make an oversized model fast.
 
-Bigger context isn't always better. Attention slows down as the window grows, even before the conversation fills it. If you care more about tokens per second than maximum length, lower the context manually for that task. On a 16 GB card with a small MoE, 32K to 65K is usually the sweet spot for sustained 30+ tok/s.
+## Troubleshooting
 
-## Reach it from your phone
-
-The bridge listens on your LAN, so any device on the same network can open `http://<your-machine-name>:8787`. Pair that with [Tailscale](https://tailscale.com) and you have a private AI server reachable from anywhere: same UI, same model, same history, nothing leaving your tailnet. No cloud relay, no port forwarding, no open hole to the internet. Install Tailscale on the host and on whatever you want to chat from, and the URL just works. The mobile UI is built for exactly this.
-
-The Discord bridge is the other remote path, and it's better for firing off a task from your lock screen. Accuretta runs as a bot that connects outbound to Discord, so your machine stays closed. It obeys exactly one Discord user id (yours), and every write still needs approval, which you give by reacting.
-
-```
-pip install discord.py
-```
-
-Then create an app at [discord.com/developers](https://discord.com/developers/applications), copy the bot token, turn on the Message Content Intent, paste the token and your user id into Settings → Discord remote bridge, toggle it on, and restart. DM the bot and it does anything you'd ask in the web UI, prompting for approval on anything that touches the machine.
+- **llama-server closes immediately on NVIDIA:** the matching CUDA runtime DLLs may be missing. Put the `cudart-llama-bin-win-cuda-*.zip` contents beside `llama-server.exe`, and match the build to the CUDA version shown by `nvidia-smi`.
+- **A model reports a missing tensor:** the llama.cpp build may be older than the model architecture. Update llama.cpp or use a compatible GGUF.
+- **Speculative decoding crashes during load:** set it to `off` or `ngram-mod`. `draft-mtp` requires MTP heads in the model and support in the installed binary.
+- **Port 8787 is occupied:** `start.bat` clears a stale Accuretta process. In manual mode, set `ACCURETTA_PORT` to another port.
+- **A tool is missing:** run the read-only capability report in Accuretta. It names the package, operating-system feature, setting, or authorization that tool needs.
 
 ## Privacy
 
-Model inference, prompts, chat history, settings, and workspace files stay on your computer. The bridge has no telemetry, analytics, account, or cloud-sync service.
+Model inference, prompts, chat history, settings, and workspace files stay on the bridge computer. Accuretta has no telemetry, analytics account, or cloud-sync service.
 
-There are two deliberate sources of ordinary outbound traffic. Agent web-search and fetch tools contact the sites the model chooses for your task. The interface also loads fonts, icons, syntax highlighting, export helpers, and QR-code support from Google Fonts, unpkg, and jsDelivr; those providers receive normal web-request metadata, but not your chats or files. If those assets are blocked, core local chat still works, while the affected presentation and export features may be unavailable.
+Outbound traffic occurs when you ask the agent to search or fetch the web, enable Tailscale Serve, connect a Discord bot, call an MCP server that uses the network, or run a security tool against an authorized target. The interface also loads fonts, icons, syntax highlighting, export helpers, and QR support from Google Fonts, unpkg, and jsDelivr. Those providers receive normal request metadata, not chat or workspace contents.
 
-For a network-silent session, block both the bridge and its browser/webview at the firewall, or disconnect the machine after the model is loaded. Local inference and ordinary chat do not require an internet connection.
+For a network-silent session, block the bridge and its browser or webview at the firewall after the model is loaded. Local inference, files, and ordinary chat continue to work.
 
-## What it doesn't do
+## Limits
 
-- It isn't a polished commercial product. There are rough edges, and the docs are mostly this file.
-- A 24B model on a laptop won't beat Claude or GPT-5. Local is local. Pick the right tool for the job.
-- It doesn't replace llama.cpp. It's a front end on `llama-server`.
-- It isn't a code editor. It's a chat workspace that happens to render code, preview HTML, and check Python syntax.
+- Accuretta is a personal project with rough edges and limited documentation.
+- Output quality depends on the local model. A weak model with many tools can make a larger mess faster.
+- The permission layer reduces accidental damage. It cannot judge whether an approved command is a good idea.
+- Accuretta is a front end and tool harness for llama.cpp. It does not replace llama.cpp.
+- The live preview is useful for HTML work, but Accuretta is not a full source-code editor.
+- Several analysis and desktop features need optional packages or external programs.
 
 ## Repository layout
 
-```
+```text
 accuretta/
-  bridge.py              the Python bridge (model launcher, tool runtime, HTTP server)
-  accuretta_app.py       desktop launcher (native window via pywebview, no console)
-  start.bat              Windows one-click launcher
-  index.html             the UI shell
-  app.js                 all UI logic
-  app.css                main stylesheet
+  bridge.py              model launcher, tool runtime, approvals, and HTTP server
+  accuretta_app.py       desktop launcher using pywebview
+  start.bat              Windows launcher
+  index.html             interface shell
+  app.js                 interface logic
+  app.css                layout and component styles
   colors_and_type.css    theme tokens
-  requirements.txt       optional Python dependencies
+  requirements.txt       optional Python packages
   data/                  runtime state, created on first run
-  media/                 readme assets (screenshots, demo video)
+  media/                 README images and demo media
 ```
 
 ## Status

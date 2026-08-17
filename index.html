@@ -21,10 +21,11 @@
 <script>
   (function () {
     var theme = localStorage.getItem('accuretta:theme') || 'light';
+    if (theme === 'neobrutalism-dark' || theme === 'kinetic') theme = 'aperture';
     document.documentElement.setAttribute('data-theme', theme);
   })();
 </script>
-<link rel="stylesheet" href="/app.css?v=28">
+  <link rel="stylesheet" href="/app.css?v=36">
 <script src="https://unpkg.com/@phosphor-icons/web"></script>
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer></script>
@@ -52,7 +53,7 @@
         <img class="brand-mark brand-mark-light" src="/logo-mark-light.png" alt="" aria-hidden="true">
         <img class="brand-mark brand-mark-dark" src="/logo-mark-dark.png" alt="" aria-hidden="true">
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.7.3</span>
+        <span class="v" id="brand-v">v0.7.4</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -167,6 +168,12 @@
         <span id="chat-meta">local</span>
       </div>
       <div class="actions">
+        <div class="client-context-control" title="Browser device and command target">
+          <span class="client-context-badge" id="client-context-badge"><i class="ph ph-device-mobile"></i><span>this PC</span></span>
+          <select id="execution-target-select" aria-label="Command and file target">
+            <option value="host">Inference PC</option>
+          </select>
+        </div>
         <button class="iconbtn" id="btn-toggle-plan" title="Plan" aria-pressed="false"><i class="ph ph-list-checks"></i></button>
         <button class="iconbtn" id="btn-session-desktop" title="Desktop automation for this chat only" hidden><i class="ph ph-desktop"></i></button>
         <button class="iconbtn" id="btn-cmd-history" title="PowerShell command history"><i class="ph ph-terminal-window"></i></button>
@@ -213,8 +220,10 @@
             <button class="chip" id="mode-agent" data-mode="agent"><i class="ph ph-terminal-window"></i>Agent</button>
             <button class="chip on" id="mode-auto" data-mode="auto"><i class="ph ph-lightning"></i>Auto</button>
             <button class="chip" id="btn-attach-image" title="Attach image — the vision model reads it and hands a description to the main model"><i class="ph ph-image"></i>Image</button>
+            <button class="chip" id="btn-attach-file" title="Upload files from this browser into the PC workspace"><i class="ph ph-paperclip"></i>File</button>
             <button class="chip" id="btn-trust-writes" title="Trust writes — auto-approve saving and editing files in your workspace. Registry edits, Windows system folders, file deletion, PowerShell, and git operations (commit, push, checkout...) still require approval."><i class="ph ph-pencil-simple-line"></i>Trust writes</button>
             <input type="file" id="file-image" accept="image/*" multiple hidden>
+            <input type="file" id="file-client" multiple hidden>
             <div class="toolbar-overflow-wrap">
               <button class="toolbar-overflow" id="btn-toolbar-overflow" title="Build options"><i class="ph ph-sliders-horizontal"></i></button>
               <div class="toolbar-overflow-menu" id="toolbar-overflow-menu">
@@ -224,8 +233,10 @@
                 <div class="overflow-section-label">Network</div>
                 <button class="chip" id="quick-netscan-mothership" title="Inserts a prompt asking the model to scan THIS machine's active TCP/UDP connections and recent DNS, then flag anything weird"><i class="ph ph-radio"></i>Netscan inference device</button>
                 <div class="overflow-section-label">Red team</div>
-                <button class="chip" id="quick-recon-target" title="Authorized external recon on a target domain. Gated by an authorization prompt, then runs stealth port scan, TLS audit, HTTP fingerprint, passive subdomain enum and DNS recon, then summarizes."><i class="ph ph-crosshair"></i>Recon target (authorized)</button>
-                <button class="chip" id="quick-gain-access" title="Authorized autonomous pentest. Gated by an authorization prompt, then the model chains recon, exposure checks, weakness identification and access attempts (default creds, exposed services), captures proof, and reports. Only on systems you own or are authorized to test."><i class="ph ph-lock-key-open"></i>Find a way in (authorized)</button>
+                <button class="chip" id="quick-passive-osint" title="Public-source intelligence only. Queries search, registry, DNS, certificate-transparency and archive providers without connecting directly to the target."><i class="ph ph-binoculars"></i>Passive OSINT</button>
+                <button class="chip" id="quick-recon-target" title="Authorized target reconnaissance using scoped DNS, TLS, HTTP and port checks."><i class="ph ph-crosshair"></i>Target Recon</button>
+                <button class="chip" id="quick-frontend-secrets" title="Authorized read-only audit of frontend JavaScript, lazy chunks, and source maps for exposed credentials."><i class="ph ph-file-js"></i>Frontend Secrets</button>
+                <button class="chip" id="quick-gain-access" title="Authorized red-team assessment. Chains reconnaissance, validation and non-destructive exploitation, then captures evidence and reports."><i class="ph ph-shield-chevron"></i>Red Team</button>
                 <div class="overflow-section-label">Blue team</div>
                 <button class="chip" id="quick-health-check" title="Read-only host triage: logon/service/scheduled-task event log review (last 24h) plus a persistence sweep, then a summary of anything worth a look. Nothing is changed."><i class="ph ph-shield-check"></i>Health check (read-only)</button>
                 <button class="chip" id="quick-persistence-hunt" title="Read-only sweep of startup keys, startup folders, scheduled tasks, services and WMI event subscriptions — flags anything hiding to survive a reboot. Nothing is changed."><i class="ph ph-shield-warning"></i>Persistence hunt (read-only)</button>
@@ -245,20 +256,19 @@
             <div class="composer-foot-actions">
               <div class="effort-control hidden" id="reasoning-effort-control">
                 <button class="effort-pill" id="reasoning-effort-pill" type="button" aria-haspopup="dialog" aria-expanded="false" title="Reasoning effort for the next message">
-                  <i class="ph ph-brain"></i>
                   <span class="effort-pill-label">Effort</span>
-                  <strong id="reasoning-effort-value">Auto</strong>
+                  <strong id="reasoning-effort-value">Default</strong>
+                  <i class="ph ph-caret-up-down effort-pill-caret"></i>
                 </button>
                 <div class="effort-popover" id="reasoning-effort-popover" role="dialog" aria-label="Reasoning effort">
                   <div class="effort-popover-head">
-                    <span>Reasoning effort</span>
-                    <strong id="reasoning-effort-popover-value">Auto</strong>
+                    <span>Effort</span>
+                    <strong id="reasoning-effort-popover-value">Default</strong>
                   </div>
                   <input id="reasoning-effort-slider" class="effort-slider" type="range" min="0" max="3" step="1" value="0" aria-label="Reasoning effort: auto, low, medium, or high">
                   <div class="effort-levels" aria-hidden="true">
-                    <span>Auto</span><span>Low</span><span>Med</span><span>High</span>
+                    <span>Default</span><span>Low</span><span>Med</span><span>Deep</span>
                   </div>
-                  <p id="reasoning-effort-note">Uses this model's default.</p>
                 </div>
               </div>
               <button class="model-pill" id="model-pill" title="Click to change model"><span class="model-pill-name">select model</span><i class="ph ph-caret-down model-pill-caret"></i></button>
@@ -433,41 +443,59 @@
 <div class="modal-scrim" id="recon-scrim"></div>
 <aside class="modal" id="recon-modal" aria-hidden="true">
   <div class="modal-head">
-    <i class="ph ph-crosshair"></i>
-    <h3>Authorized recon</h3>
+    <i class="ph ph-crosshair" id="recon-modal-icon"></i>
+    <h3>Target Recon</h3>
     <button class="iconbtn" id="btn-close-recon"><i class="ph ph-x"></i></button>
   </div>
   <div class="modal-body">
     <div id="recon-panel">
-      <div class="recon-disclaimer">
-        <i class="ph ph-warning"></i>
-        <div><strong>Authorized testing only.</strong> Test only systems you own or have explicit written permission to test. Unauthorized scanning may be illegal where you are. You alone are responsible for how these tools are used and for the consequences.</div>
+      <div class="recon-disclaimer" id="recon-disclaimer">
+        <i class="ph ph-warning" id="recon-disclaimer-icon"></i>
+        <div id="recon-disclaimer-text"><strong>Authorized testing only.</strong> Test only systems you own or have explicit written permission to test. Unauthorized scanning may be illegal where you are. You alone are responsible for how these tools are used and for the consequences.</div>
       </div>
 
-      <label class="recon-label" for="recon-target-input">Target domain or host</label>
+      <label class="recon-label" id="recon-target-label" for="recon-target-input">Target domain or host</label>
       <input type="text" id="recon-target-input" class="recon-input" placeholder="example.com" autocomplete="off" spellcheck="false">
 
-      <label class="recon-check">
+      <label class="recon-check" data-recon-active-only>
         <input type="checkbox" id="recon-auth-check">
         <span class="custom-checkbox"></span>
         <span>I own this target or have written authorization to test it.</span>
       </label>
 
-      <label class="recon-label">Scope <span class="recon-opt">optional</span></label>
-      <input type="text" id="recon-scope-in" class="recon-input" placeholder="in scope: hosts / IPs / CIDRs, comma-separated" autocomplete="off" spellcheck="false">
-      <input type="text" id="recon-scope-out" class="recon-input" placeholder="out of scope: hosts to leave alone" autocomplete="off" spellcheck="false">
+      <div class="recon-secret-options" data-recon-secret-only>
+        <label class="recon-check">
+          <input type="checkbox" id="recon-secret-thorough" checked>
+          <span class="custom-checkbox"></span>
+          <span>Thorough scan: follow lazy chunks and source maps.</span>
+        </label>
+        <label class="recon-check">
+          <input type="checkbox" id="recon-secret-candidates">
+          <span class="custom-checkbox"></span>
+          <span>Include uncertain candidates in a separate section.</span>
+        </label>
+      </div>
 
-      <label class="recon-label">Objective <span class="recon-opt">optional</span></label>
-      <div class="recon-chips" id="recon-objective-chips">
+      <label class="recon-label" data-recon-active-only>Scope <span class="recon-opt">optional</span></label>
+      <input type="text" id="recon-scope-in" class="recon-input" data-recon-active-only placeholder="in scope: hosts / IPs / CIDRs, comma-separated" autocomplete="off" spellcheck="false">
+      <input type="text" id="recon-scope-out" class="recon-input" data-recon-active-only placeholder="out of scope: hosts to leave alone" autocomplete="off" spellcheck="false">
+      <p class="recon-field-hint" data-recon-active-only>Leave In scope blank to use the target above. If you fill it in, list every permitted host. Anything not listed is blocked automatically; Out of scope is for explicit exceptions.</p>
+
+      <label class="recon-label" for="recon-user-agent" data-recon-active-only data-recon-suite-only>User agent <span class="recon-opt">optional</span></label>
+      <input type="text" id="recon-user-agent" class="recon-input" data-recon-active-only data-recon-suite-only maxlength="512" placeholder="program-required User-Agent value" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <p class="recon-field-hint" data-recon-active-only data-recon-suite-only>When set, Accuretta applies this value to HTTP requests for the engagement, including requests the model builds itself.</p>
+
+      <label class="recon-label" data-recon-suite-only>Objective <span class="recon-opt">optional</span></label>
+      <div class="recon-chips" id="recon-objective-chips" data-recon-active-only data-recon-suite-only>
         <button type="button" class="recon-chip" data-val="Map the attack surface and report findings.">Recon only</button>
-        <button type="button" class="recon-chip" data-val="Find a way in and prove access.">Find a way in</button>
+        <button type="button" class="recon-chip" data-val="Assess and verify exploitable risk.">Full assessment</button>
         <button type="button" class="recon-chip" data-val="Test a specific vulnerability class.">Specific vuln</button>
         <button type="button" class="recon-chip" data-val="Prove a data-access / exfil path.">Prove data access</button>
       </div>
-      <input type="text" id="recon-objective-text" class="recon-input" placeholder="what does &quot;done&quot; look like?" autocomplete="off">
+      <input type="text" id="recon-objective-text" class="recon-input" data-recon-suite-only placeholder="what does &quot;done&quot; look like?" autocomplete="off">
 
-      <label class="recon-label">Constraints <span class="recon-opt">optional</span></label>
-      <div class="recon-chips" id="recon-constraint-chips">
+      <label class="recon-label" data-recon-active-only data-recon-suite-only>Constraints <span class="recon-opt">optional</span></label>
+      <div class="recon-chips" id="recon-constraint-chips" data-recon-active-only data-recon-suite-only>
         <button type="button" class="recon-chip" data-group="noise" data-val="stay quiet / low-footprint">Quiet</button>
         <button type="button" class="recon-chip" data-group="noise" data-val="loud is OK">Loud OK</button>
         <button type="button" class="recon-chip" data-group="env" data-val="production, extra care">Prod</button>
@@ -475,11 +503,11 @@
         <button type="button" class="recon-chip" data-group="time" data-val="quick pass">Quick</button>
         <button type="button" class="recon-chip" data-group="time" data-val="thorough, take the time">Thorough</button>
       </div>
-      <input type="text" id="recon-constraint-text" class="recon-input" placeholder="time budget or other limits" autocomplete="off">
+      <input type="text" id="recon-constraint-text" class="recon-input" data-recon-active-only data-recon-suite-only placeholder="time budget or other limits" autocomplete="off">
 
-      <div id="recon-blank-notice" class="recon-notice hidden">
+      <div id="recon-blank-notice" class="recon-notice hidden" data-recon-active-only data-recon-suite-only>
         <i class="ph ph-info"></i>
-        <span>With scope, objective, and constraints left blank, the run targets wider: it sends more requests to more surface, takes longer, and may touch hosts you did not intend.</span>
+        <span>Blank In scope is limited to the target above. Blank objective or constraints let the run choose broader coverage within that allowed target and may take longer.</span>
       </div>
 
       <div class="recon-actions">
@@ -513,8 +541,8 @@
     <div class="faq-q">what is netscan inference device?</div>
     <p>a one-click prompt under the <svg class="faq-svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="8" cy="6" r="2" fill="currentColor"/><circle cx="16" cy="12" r="2" fill="currentColor"/><circle cx="10" cy="18" r="2" fill="currentColor"/></svg> button that asks the model to scan <i>this</i> machine's active TCP/UDP connections, listening ports, and recent DNS cache, then flag anything weird (unknown processes phoning home, suspicious remote IPs, etc.). a chart card renders inline showing connection counts, top processes, and top remote endpoints — favicons fetched from DuckDuckGo. all data is gathered locally via PowerShell — nothing leaves your machine.</p>
 
-    <div class="faq-q">what are the authorized recon / pentest buttons?</div>
-    <p>under <b>Build options → Red team</b> there are two gated one-click actions. <b>Recon target</b> runs passive + active reconnaissance on a domain (DNS, passive subdomains via cert-transparency, TLS/cert audit, HTTP fingerprint, stealthy port scan) and writes a clean report. <b>Find a way in</b> is an autonomous pentest: the model chains recon, then exposure checks (readable <code>.git</code>/<code>.env</code>, directory listing, Spring actuator), subdomain-takeover detection, unauthenticated-service checks (Redis/Elasticsearch/Docker/Memcached), CVE correlation, injection probes, and default-credential spraying — and for anything it can confirm it captures a proof artifact under <code>data/recon_evidence/</code> with a sha256, then reports what's broken and what it reached. both fire an <b>authorization gate first</b> (you must confirm you have explicit permission) with a disclaimer that you alone are responsible for use. the port scan is deliberately quiet — capped concurrency, randomized order, jitter — not an nmap blast. <i>use only against systems you own or are contracted to test.</i></p>
+    <div class="faq-q">what are the security assessment buttons?</div>
+    <p>under <b>Build options → Red team</b> there are four modes. <b>Passive OSINT</b> queries public search, registry, DNS, certificate-transparency and archive providers without connecting directly to the target. <b>Target Recon</b> adds scoped TLS, HTTP and port checks. <b>Frontend Secrets</b> performs a read-only audit of frontend bundles, lazy chunks, and source maps while suppressing placeholders and public client identifiers. Confirmed values are shown exactly for reporting and are never submitted to their provider for validation. <b>Red Team</b> runs the full non-destructive assessment: reconnaissance, finding validation, exploitation, evidence capture and reporting. Active modes require you to confirm ownership or written permission before they run. <i>Use active modes only against systems you own or are contracted to test.</i></p>
 
     <div class="faq-q">does it render markdown?</div>
     <p>yes — pipe tables, ATX headings (<code>#</code>…<code>######</code>), ordered/unordered lists, horizontal rules, inline <code>**bold**</code>/<code>*italic*</code>/<code>`code`</code>, and fenced code blocks all render properly in chat bubbles.</p>
@@ -710,7 +738,7 @@
       <span class="hint" id="autotune-notes" style="display:block;line-height:1.5;"></span>
     </div>
 
-    <div class="form-group">Model Health <span class="hint" style="font-size:10px;font-weight:normal;text-transform:none;letter-spacing:0;">&middot; learned quietly from normal use</span></div>
+    <div class="form-group">Model Health <span class="hint" style="font-size:10px;font-weight:normal;text-transform:none;letter-spacing:0;">&middot; local setup advisor</span></div>
     <div class="model-health-card" id="model-health-card" data-state="loading">
       <div class="model-health-head">
         <div class="model-health-mark"><i class="ph ph-pulse"></i></div>
@@ -727,6 +755,7 @@
         <div class="model-health-metric"><span>Context use</span><strong>&mdash;</strong></div>
       </div>
       <div class="model-health-advice" id="model-health-advice">Keep using the model normally. Accuretta will surface recurring operational problems here.</div>
+      <div class="model-health-recommendation" id="model-health-recommendation" hidden></div>
       <div class="model-health-privacy"><i class="ph ph-lock-key"></i><span id="model-health-privacy">Local numbers only. No prompts, replies, commands, files, screenshots, or tool output.</span></div>
       <div class="form-row inline model-health-toggle-row">
         <label>Learn from normal usage</label>
@@ -851,8 +880,7 @@
         <option value="operator">Operator</option>
         <option value="neumorphic">Neumorphic</option>
         <option value="neobrutalism">Neobrutalism</option>
-        <option value="neobrutalism-dark">Neobrutalism Dark</option>
-        <option value="kinetic">Kinetic</option>
+        <option value="aperture">Aperture</option>
         <option value="soft">Soft</option>
         <option value="pastel">Pastel</option>
         <option value="velvet">Velvet</option>
@@ -979,6 +1007,65 @@
         <div class="desc" id="sandbox-card-desc"></div>
         <pre id="sandbox-card-log" class="sandbox-log" style="display:none;"></pre>
       </div>
+    </div>
+
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+      <span>Tailscale remote access</span>
+      <span class="grow" style="flex:1;"></span>
+      <button class="btn sm" id="btn-remote-refresh" type="button"><i class="ph ph-arrow-clockwise"></i>Refresh</button>
+    </div>
+    <div class="form-row">
+      <div class="remote-status-card" id="remote-status-card">
+        <div class="remote-status-title" id="remote-status-title">Checking Tailscale…</div>
+        <div class="hint" id="remote-status-detail">This stays private to your tailnet.</div>
+      </div>
+    </div>
+    <div class="form-row inline">
+      <label>Enable remote tools</label>
+      <div class="sw" id="sw-remote-enabled"></div>
+    </div>
+    <div class="form-row remote-actions">
+      <button class="btn sm" id="btn-tailscale-serve" type="button"><i class="ph ph-lock-key"></i>Enable HTTPS address</button>
+      <a class="remote-serve-link" id="remote-serve-url" href="#" target="_blank" rel="noopener" hidden></a>
+    </div>
+    <div class="form-row">
+      <span class="hint">HTTPS fixes browser clipboard restrictions on the Mac. Tailscale Serve publishes only inside your tailnet; no router ports are opened.</span>
+    </div>
+    <div class="form-row">
+      <label>Mac on your tailnet</label>
+      <select id="remote-peer-select"><option value="">No Mac detected</option></select>
+      <span class="hint">On the Mac, first turn on System Settings &rarr; General &rarr; Sharing &rarr; Remote Login. Allow access for the account you enter below.</span>
+    </div>
+    <div class="form-row inline remote-pair-row">
+      <label>macOS account name</label>
+      <input type="text" id="remote-username" placeholder="short account name" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="form-row inline remote-pair-row">
+      <label>Display name</label>
+      <input type="text" id="remote-label" placeholder="MacBook Pro" autocomplete="off">
+    </div>
+    <div class="form-row">
+      <label>Folders Accuretta may use on the Mac</label>
+      <textarea id="remote-roots" rows="3" spellcheck="false">~/Desktop&#10;~/Documents&#10;~/Downloads</textarea>
+    </div>
+    <div class="form-row remote-actions">
+      <button class="btn sm" id="btn-remote-prepare" type="button"><i class="ph ph-key"></i>Create pairing command</button>
+    </div>
+    <div class="form-row remote-pair-command" id="remote-pair-command-row" hidden>
+      <label>Run this once in Terminal on the Mac</label>
+      <textarea id="remote-pair-command" rows="5" readonly spellcheck="false"></textarea>
+      <button class="btn sm" id="btn-copy-pair-command" type="button"><i class="ph ph-copy"></i>Copy command</button>
+    </div>
+    <div class="form-row">
+      <div class="remote-machine-list" id="remote-machine-list"></div>
+    </div>
+    <div class="form-row inline">
+      <label>Remote command timeout (seconds)</label>
+      <input type="number" id="set-remote-timeout" min="10" max="3600" step="10" value="120" style="width:100px;">
+    </div>
+    <div class="form-row inline">
+      <label>File transfer limit (MB)</label>
+      <input type="number" id="set-remote-file-mb" min="1" max="1024" step="1" value="100" style="width:100px;">
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
@@ -1123,7 +1210,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
-<script src="/app.js?v=202608122030"></script>
+  <script src="/app.js?v=2026081707"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {
