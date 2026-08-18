@@ -60,6 +60,9 @@ versions/
 # MCP server config — holds API keys (Shodan, VirusTotal, etc.). Local per-machine.
 bridge_mcp_config.json
 
+# user-curated skills (markdown procedures) — per-machine, may name local paths
+skills/
+
 # user workspace content — kept out of git, same reason as ./data
 Workspace/
 

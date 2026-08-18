@@ -70,6 +70,16 @@ except Exception:
     _pgw = None  # type: ignore
     _HAVE_PGW = False
 
+# ---- scoped browser automation (optional) ---------------------------------
+# Playwright runs on a dedicated worker thread because its synchronous API is
+# thread-affine. Red-team browser sessions never share the generic MCP path.
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright  # type: ignore
+    _HAVE_PLAYWRIGHT = True
+except Exception:
+    _sync_playwright = None  # type: ignore
+    _HAVE_PLAYWRIGHT = False
+
 # ---- firmware analysis (optional) ----------------------------------------
 # Signature scanning is pure-Python (no binwalk dependency — the pip
 # "binwalk" package is a broken stub unrelated to the real tool).
@@ -217,6 +227,15 @@ SYSTEM_CONTEXT_FILE = DATA / "ACCURETTA.md"
 MEMORIES_FILE = DATA / "memories.jsonl"
 MEMORIES_MAX_INJECT = 15          # how many to load into every system prompt
 MEMORIES_TEXT_CAP = 220           # per-entry char cap — token-efficient
+
+# User-curated skills: plain .md procedures in skills/ (frontmatter
+# name/description/budget). Lazily loaded ONLY on demand — zero context cost
+# otherwise. SKILL_BODY_CAP_CHARS is the compress cap for a loaded body;
+# SKILL_MAX_BODY_CHARS is the scanner's sanity ceiling (larger files are
+# ignored entirely rather than loaded chopped).
+SKILLS_DIR = ROOT / "skills"
+SKILL_BODY_CAP_CHARS = 16000
+SKILL_MAX_BODY_CHARS = 64000
 
 
 def safe_exists(path: str | Path | None) -> bool:
@@ -3016,6 +3035,19 @@ def _maybe_roll_summary_unlocked(chat: dict, ctx_limit: int, force: bool = False
         chat["rolling_summary"] = new_summary
         chat["summary_through"] = cut
         _refresh_continuity_state(chat)
+        # Persistent fold marker for the UI: a subtle inline divider rendered at
+        # this boundary in the chat ("compaction happened here — the model then
+        # did X, Y, Z"). Survives chat reloads; _enforce_chat_retention keeps
+        # summary_through aligned with the same message list, so the marker
+        # stays anchored to the right place in history.
+        _fold_tokens = int(sum(_count_msg_tokens(m) for m in msgs[through:cut]))
+        chat["fold_mark"] = {
+            "through": cut,
+            "folded": cut - through,
+            "folded_tokens": _fold_tokens,
+            "summary_chars": len(new_summary),
+            "t": int(time.time()),
+        }
         # Immediately refresh the per-chat fill so the gauge drops right after
         # a fold instead of showing the stale pre-fold number until the next
         # round's stats event lands (that was the visible "gauge lag").
@@ -3030,12 +3062,13 @@ def _maybe_roll_summary_unlocked(chat: dict, ctx_limit: int, force: bool = False
         except Exception:
             pass
         _record_fold_event(chat, reason_hint, force, True, "ok", ctx_limit, real_fill,
-                           through, cut,
-                           sum(_count_msg_tokens(m) for m in msgs[through:cut]))
+                           through, cut, _fold_tokens)
         try:
             if _notify:
                 broadcast_event({"type": "summary_folded", "chat_id": chat_id,
-                                 "folded": cut - through})
+                                 "folded": cut - through, "through": cut,
+                                 "folded_tokens": _fold_tokens,
+                                 "summary_chars": len(new_summary)})
         except Exception:
             pass
         return True
@@ -3734,6 +3767,476 @@ def _rt_apply_mission_user_agent(headers: dict | None = None) -> dict:
     return result
 
 
+def _rt_browser_policy(chat: dict | None) -> dict | None:
+    """Immutable mission policy handed to the Playwright worker thread."""
+    mission = _rt_authorized_mission(chat)
+    if not mission:
+        return None
+    allowed = tuple(_rt_scope_in_tokens(chat))
+    denied = tuple(_rt_scope_out_tokens(chat))
+    return {
+        "authorization_id": str(mission.get("authorization_id") or ""),
+        "allowed": allowed,
+        "denied": denied,
+        "user_agent": _rt_clean_user_agent(mission.get("user_agent")),
+        "self_ports": tuple(sorted(_rt_self_ports())),
+    }
+
+
+def _rt_browser_url_block(url: str, policy: dict | None) -> str | None:
+    """Return a refusal reason for a browser network request outside policy."""
+    if not policy:
+        return "browser session has no active authorization policy"
+    raw = str(url or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except Exception:
+        return "browser request has an invalid URL"
+    scheme = parsed.scheme.lower()
+    if scheme in {"about", "data", "blob"}:
+        return None
+    if scheme not in {"http", "https", "ws", "wss"}:
+        return f"browser scheme {scheme or '(missing)'} is not allowed"
+    host = (parsed.hostname or "").lower().strip("[]")
+    if not host:
+        return "browser request has no hostname"
+    try:
+        port = parsed.port
+    except ValueError:
+        return "browser request has an invalid port"
+    if port is None:
+        port = 443 if scheme in {"https", "wss"} else 80
+    if port in set(policy.get("self_ports") or ()) and _rt_resolves_to_local(host):
+        return f"browser request targets Accuretta's own service at {host}:{port}"
+    denied = tuple(policy.get("denied") or ())
+    if any(_rt_tok_matches(token, host, port) for token in denied):
+        return f"browser request targets out-of-scope host {host}:{port}"
+    allowed = tuple(policy.get("allowed") or ())
+    if not any(_rt_tok_matches(token, host, port) for token in allowed):
+        return f"browser request targets {host}:{port}, outside the authorized allowlist"
+    return None
+
+
+def _rt_browser_session_name(value: Any) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", str(value or "default"))[:64]
+    return name or "default"
+
+
+_MCP_URL_RE = re.compile(r"^(?i:https?|wss?)://")
+
+
+def _rt_mcp_args_urls(args: Any) -> list[str]:
+    """Every URL-looking string anywhere in an MCP tool call's arguments.
+    MCP connectors are third-party, so the bridge must not guess where a
+    connector hid a target: keys, nested dicts, and lists are all walked."""
+    found: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, str):
+            s = node.strip()
+            if _MCP_URL_RE.match(s):
+                found.append(s)
+        elif isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                walk(value)
+
+    walk(args)
+    return found
+
+
+def _rt_scope_mcp_calls(name: str, args: dict) -> str | None:
+    """Mission gate for dynamic MCP tool calls. With an active mission, the
+    URL-bearing arguments get the same checks as rt_browser (same allowlist,
+    self-service block, out-of-scope tokens, and phase locks). Without a
+    mission there is no scope to enforce, so MCP calls run under approval
+    alone, exactly as before. Returns a refusal reason or None."""
+    if not name.startswith("mcp_"):
+        return None
+    if not _rt_authorized_mission(_rt_context_chat()):
+        return None
+    for value in _rt_mcp_args_urls(args):
+        reason = _rt_scope_block("rt_browser", {"action": "navigate", "url": value})
+        if reason:
+            return f"blocked for MCP {name}: {value} — {reason}"
+    return None
+
+
+class _ScopedBrowserWorker:
+    """Own persistent Playwright objects on one dedicated daemon thread."""
+
+    def __init__(self):
+        self._jobs: Queue = Queue()
+        self._thread: threading.Thread | None = None
+        self._start_lock = threading.Lock()
+
+    def _ensure_started(self) -> None:
+        with self._start_lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(
+                target=self._run, name="accuretta-rt-browser", daemon=True)
+            self._thread.start()
+
+    def call(self, payload: dict) -> dict:
+        if not _HAVE_PLAYWRIGHT or _sync_playwright is None:
+            return {
+                "error": "Playwright is not installed. Run: pip install playwright, then: python -m playwright install chromium",
+                "dependency_missing": "playwright",
+            }
+        self._ensure_started()
+        response: Queue = Queue(maxsize=1)
+        self._jobs.put((dict(payload), response))
+        timeout = max(5.0, min(float(payload.get("timeout") or 30.0), 45.0)) + 10.0
+        try:
+            return response.get(timeout=timeout)
+        except Empty:
+            return {"error": "browser worker timed out", "session": payload.get("session", "default")}
+
+    @staticmethod
+    def _append_event(state: dict, event: dict) -> None:
+        events = state.setdefault("events", [])
+        events.append(event)
+        if len(events) > 500:
+            del events[:-500]
+
+    def _new_session(self, browser: Any, name: str, policy: dict) -> dict:
+        options: dict[str, Any] = {
+            "ignore_https_errors": True,
+            "accept_downloads": False,
+            "service_workers": "block",
+        }
+        if policy.get("user_agent"):
+            options["user_agent"] = policy["user_agent"]
+        context = browser.new_context(**options)
+        state = {
+            "name": name,
+            "context": context,
+            "page": None,
+            "events": [],
+            "policy": dict(policy),
+            "policy_key": json.dumps(policy, sort_keys=True),
+            "last_used": time.monotonic(),
+        }
+
+        def route_request(route: Any, request: Any) -> None:
+            reason = _rt_browser_url_block(request.url, state["policy"])
+            event = {
+                "kind": "request",
+                "method": request.method,
+                "url": request.url,
+                "resource_type": request.resource_type,
+                "blocked": bool(reason),
+            }
+            if reason:
+                event["reason"] = reason
+            self._append_event(state, event)
+            if reason:
+                route.abort()
+            else:
+                route.continue_()
+
+        def record_response(response: Any) -> None:
+            self._append_event(state, {
+                "kind": "response", "status": response.status, "url": response.url,
+            })
+
+        def cancel_download(download: Any) -> None:
+            self._append_event(state, {
+                "kind": "download", "url": download.url, "blocked": True,
+                "reason": "downloads require a separate evidence-safe transfer path",
+            })
+            try:
+                download.cancel()
+            except Exception:
+                pass
+
+        def activate_page(page: Any) -> None:
+            if page not in state.setdefault("pages", []):
+                state["pages"].append(page)
+                page.on("download", cancel_download)
+            state["page"] = page
+
+        def route_websocket(socket_route: Any) -> None:
+            reason = _rt_browser_url_block(socket_route.url, state["policy"])
+            self._append_event(state, {
+                "kind": "websocket", "url": socket_route.url,
+                "blocked": bool(reason), **({"reason": reason} if reason else {}),
+            })
+            if reason:
+                socket_route.close(code=1008, reason="outside authorized scope")
+            else:
+                socket_route.connect_to_server()
+
+        context.route("**/*", route_request)
+        if not hasattr(context, "route_web_socket"):
+            context.close()
+            raise RuntimeError("Playwright 1.48 or newer is required for WebSocket scope enforcement")
+        context.route_web_socket("**/*", route_websocket)
+        context.add_init_script(
+            """(() => {
+              for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'WebTransport']) {
+                try {
+                  Object.defineProperty(globalThis, name, {
+                    value: undefined, writable: false, configurable: false
+                  });
+                } catch (_) {}
+              }
+            })();"""
+        )
+        context.on("response", record_response)
+        context.on("page", activate_page)
+        page = context.new_page()
+        activate_page(page)
+        return state
+
+    @staticmethod
+    def _snapshot(page: Any, max_chars: int) -> dict:
+        text = ""
+        try:
+            text = page.locator("body").inner_text(timeout=5000)
+        except Exception:
+            pass
+        elements = page.locator(
+            "a,button,input,textarea,select,[role=button],[contenteditable=true]"
+        ).evaluate_all(
+            """els => els.slice(0, 100).map((el) => {
+              const esc = (v) => CSS.escape(String(v));
+              const tag = el.tagName.toLowerCase();
+              let selector = el.id ? `#${esc(el.id)}` : '';
+              if (!selector && el.getAttribute('name')) {
+                selector = `${tag}[name=\"${esc(el.getAttribute('name'))}\"]`;
+              }
+              if (!selector) {
+                const parts = [];
+                let node = el;
+                while (node && node.nodeType === 1 && parts.length < 5) {
+                  const nodeTag = node.tagName.toLowerCase();
+                  const siblings = Array.from(node.parentElement?.children || [])
+                    .filter((item) => item.tagName === node.tagName);
+                  const nth = siblings.length > 1 ? `:nth-of-type(${siblings.indexOf(node) + 1})` : '';
+                  parts.unshift(nodeTag + nth);
+                  node = node.parentElement;
+                }
+                selector = parts.join(' > ');
+              }
+              return {
+                selector,
+                tag,
+                type: el.getAttribute('type') || '',
+                name: el.getAttribute('name') || '',
+                text: (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 100),
+                placeholder: el.getAttribute('placeholder') || '',
+                href: el.href || '',
+                disabled: Boolean(el.disabled)
+              };
+            })"""
+        )
+        return {
+            "url": page.url,
+            "title": page.title(),
+            "text": text[:max_chars],
+            "text_truncated": len(text) > max_chars,
+            "elements": elements,
+        }
+
+    def _execute(self, browser: Any, sessions: dict, payload: dict) -> dict:
+        action = str(payload.get("action") or "snapshot").strip().lower()
+        name = _rt_browser_session_name(payload.get("session"))
+        policy = dict(payload.get("policy") or {})
+        policy_key = json.dumps(policy, sort_keys=True)
+        authorization_id = str(policy.get("authorization_id") or "missing-authorization")
+        session_key = f"{authorization_id}:{name}"
+        now = time.monotonic()
+        for stale_key, stale in list(sessions.items()):
+            if now - float(stale.get("last_used") or now) <= 1800:
+                continue
+            try:
+                stale["context"].close()
+            finally:
+                sessions.pop(stale_key, None)
+        state = sessions.get(session_key)
+        if state and state.get("policy_key") != policy_key:
+            try:
+                state["context"].close()
+            finally:
+                sessions.pop(session_key, None)
+            state = None
+        if action == "close":
+            if not state:
+                return {"ok": True, "session": name, "closed": False}
+            state["context"].close()
+            sessions.pop(session_key, None)
+            return {"ok": True, "session": name, "closed": True}
+        if not state:
+            state = self._new_session(browser, name, policy)
+            sessions[session_key] = state
+        state["last_used"] = now
+        page = state["page"]
+        timeout_ms = int(max(2.0, min(float(payload.get("timeout") or 20.0), 40.0)) * 1000)
+        page.set_default_timeout(timeout_ms)
+
+        def finish(result: dict) -> dict:
+            blocked = [event for event in state.get("events", []) if event.get("blocked")]
+            result["blocked_request_count"] = len(blocked)
+            if blocked:
+                result["blocked_requests"] = blocked[-10:]
+            return result
+
+        try:
+            if action in {"open", "navigate"}:
+                url = str(payload.get("url") or "").strip()
+                if not url:
+                    return {"error": "url required", "session": name}
+                if "://" not in url:
+                    url = "https://" + url
+                response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                result = self._snapshot(
+                    page, min(max(int(payload.get("max_chars") or 16000), 1000), 32000))
+                result.update({"ok": True, "session": name,
+                               "status": response.status if response else None})
+                return finish(result)
+            if action == "snapshot":
+                result = self._snapshot(
+                    page, min(max(int(payload.get("max_chars") or 16000), 1000), 32000))
+                result.update({"ok": True, "session": name})
+                return finish(result)
+            if action == "click":
+                selector = str(payload.get("selector") or "").strip()
+                if not selector:
+                    return {"error": "selector required", "session": name}
+                before = page.url
+                page.locator(selector).first.click(timeout=timeout_ms)
+                page.wait_for_timeout(min(int(payload.get("wait_ms") or 600), 5000))
+                active_page = state.get("page") or page
+                return finish({"ok": True, "session": name, "before_url": before,
+                               "url": active_page.url, "title": active_page.title(),
+                               "popup_opened": active_page is not page})
+            if action == "fill":
+                selector = str(payload.get("selector") or "").strip()
+                if not selector:
+                    return {"error": "selector required", "session": name}
+                page.locator(selector).first.fill(str(payload.get("value") or ""), timeout=timeout_ms)
+                if payload.get("submit"):
+                    page.locator(selector).first.press("Enter", timeout=timeout_ms)
+                    page.wait_for_timeout(min(int(payload.get("wait_ms") or 600), 5000))
+                active_page = state.get("page") or page
+                return finish({"ok": True, "session": name, "url": active_page.url,
+                               "filled": selector, "submitted": bool(payload.get("submit"))})
+            if action == "press":
+                key = str(payload.get("key") or "").strip()
+                if not key:
+                    return {"error": "key required", "session": name}
+                selector = str(payload.get("selector") or "").strip()
+                if selector:
+                    page.locator(selector).first.press(key, timeout=timeout_ms)
+                else:
+                    page.keyboard.press(key)
+                page.wait_for_timeout(min(int(payload.get("wait_ms") or 400), 5000))
+                return finish({"ok": True, "session": name, "url": page.url, "key": key})
+            if action == "wait":
+                waited = min(max(int(payload.get("wait_ms") or 500), 0), 5000)
+                page.wait_for_timeout(waited)
+                return finish({"ok": True, "session": name, "url": page.url,
+                               "waited_ms": waited})
+            if action == "requests":
+                limit = min(max(int(payload.get("limit") or 100), 1), 300)
+                events = list(state.get("events") or [])[-limit:]
+                return {"ok": True, "session": name, "url": page.url,
+                        "events": events, "blocked_count": sum(bool(e.get("blocked")) for e in events)}
+            if action == "pages":
+                pages = [candidate for candidate in state.get("pages", []) if not candidate.is_closed()]
+                state["pages"] = pages
+                return {"ok": True, "session": name, "pages": [
+                    {"index": index, "url": candidate.url, "title": candidate.title(),
+                     "active": candidate is state.get("page")}
+                    for index, candidate in enumerate(pages)
+                ]}
+            if action == "select_page":
+                pages = [candidate for candidate in state.get("pages", []) if not candidate.is_closed()]
+                index = int(payload.get("page_index") or 0)
+                if index < 0 or index >= len(pages):
+                    return {"error": f"page_index {index} is not available", "session": name}
+                state["pages"] = pages
+                state["page"] = pages[index]
+                return finish({"ok": True, "session": name, "page_index": index,
+                               "url": pages[index].url, "title": pages[index].title()})
+            if action == "screenshot":
+                evidence_dir = DATA / "recon_evidence"
+                evidence_dir.mkdir(parents=True, exist_ok=True)
+                label = re.sub(r"[^A-Za-z0-9_.-]", "_", str(payload.get("label") or "browser"))[:60]
+                host = re.sub(r"[^A-Za-z0-9_.-]", "_", urllib.parse.urlsplit(page.url).netloc or "target")
+                path = evidence_dir / f"{time.strftime('%Y%m%d-%H%M%S')}_{label}_{host}.png"
+                page.screenshot(path=str(path), full_page=bool(payload.get("full_page", True)))
+                raw = path.read_bytes()
+                return finish({"ok": True, "session": name, "url": page.url,
+                               "evidence_saved": str(path),
+                               "evidence_sha256": hashlib.sha256(raw).hexdigest(),
+                               "bytes": len(raw)})
+            return {"error": f"unknown browser action: {action}", "session": name}
+        except Exception as exc:
+            blocked = [event for event in state.get("events", [])[-25:] if event.get("blocked")]
+            return {
+                "error": str(exc), "session": name, "url": getattr(page, "url", ""),
+                "scope_blocked": bool(blocked), "blocked_requests": blocked[-10:],
+            }
+
+    def _run(self) -> None:
+        engine = None
+        browser = None
+        sessions: dict[str, dict] = {}
+        while True:
+            payload, response = self._jobs.get()
+            try:
+                if engine is None:
+                    engine = _sync_playwright().start()
+                    browser = engine.chromium.launch(headless=True, args=[
+                        "--disable-background-networking",
+                        "--disable-component-update",
+                        "--disable-sync",
+                        "--no-default-browser-check",
+                    ])
+                result = self._execute(browser, sessions, payload)
+            except Exception as exc:
+                message = str(exc)
+                if "Executable doesn't exist" in message or "playwright install" in message.lower():
+                    message += " Run: python -m playwright install chromium"
+                result = {"error": message, "browser_unavailable": True}
+                for state in sessions.values():
+                    try:
+                        state["context"].close()
+                    except Exception:
+                        pass
+                sessions.clear()
+                try:
+                    if browser:
+                        browser.close()
+                    if engine:
+                        engine.stop()
+                except Exception:
+                    pass
+                browser = None
+                engine = None
+            response.put(result)
+
+
+_RT_BROWSER_WORKER = _ScopedBrowserWorker()
+
+
+def tool_rt_browser(args: dict) -> dict:
+    """Run a persistent Chromium session bound to the active mission policy."""
+    chat = _rt_context_chat()
+    policy = _rt_browser_policy(chat)
+    if not policy:
+        return {"error": "an active authorized Red Team mission is required"}
+    payload = dict(args or {})
+    payload["session"] = _rt_browser_session_name(payload.get("session"))
+    payload["policy"] = policy
+    return _RT_BROWSER_WORKER.call(payload)
+
+
 _RT_DISCOVERED_SECRET_LOCK = threading.Lock()
 _RT_DISCOVERED_SECRET_VALUES: dict[str, tuple[str, ...]] = {}
 
@@ -4305,8 +4808,30 @@ def is_blocked_path(p: str) -> bool:
     return False
 
 
+def _desktop_wide_enabled(settings: dict | None = None) -> bool:
+    """Desktop automation toggle is the opt-in for system-wide tool use.
+
+    Kept separate from get_settings() (which reads settings.json on every call)
+    so the common inside-workspace path of is_in_workspace() never pays for a
+    disk read; the toggle is only consulted once a path is already known to be
+    outside the configured workspace folders.
+    """
+    try:
+        s = settings if settings is not None else load_json(SETTINGS_FILE, {})
+        return bool(s.get("desktop_enabled")) if isinstance(s, dict) else False
+    except Exception:
+        return False
+
+
 def is_in_workspace(p: str) -> bool:
-    """True if path is inside any workspace folder. Empty workspace = open access."""
+    """True if path is inside any workspace folder. Empty workspace = open access.
+
+    When desktop automation is switched ON, workspace tools may also operate
+    system-wide (outside the configured folders) — the opt-in the user asked
+    for. All existing hard blocks still apply downstream of this call:
+    is_blocked_path (Windows/System32, registry), _catastrophic_cmd,
+    bridge_self_threat, approval gates, and the red-team scope blocks.
+    """
     ws = get_workspace().get("folders", [])
     if not ws:
         return True
@@ -4315,6 +4840,8 @@ def is_in_workspace(p: str) -> bool:
         f = normalize_path(folder).lower()
         if n == f or n.startswith(f + os.sep):
             return True
+    if _desktop_wide_enabled():
+        return not is_blocked_path(p)
     return False
 
 
@@ -15688,6 +16215,7 @@ def _capability_health(chat_id: str = "") -> dict:
 
     py_caps = {
         "desktop_automation": bool(_HAVE_PYAUTOGUI),
+        "scoped_browser": bool(_HAVE_PLAYWRIGHT),
         "image_processing": bool(_HAVE_PIL),
         "apk_deep_metadata": bool(_HAVE_ANDROGUARD),
         "native_pe": bool(_HAVE_PEFILE),
@@ -15725,6 +16253,9 @@ def _capability_health(chat_id: str = "") -> dict:
             recommendations.append("Install evtx or python-evtx for Windows event-log analysis.")
         if not py_caps["ghidra"]:
             recommendations.append("Install pyghidra plus Ghidra/JDK 21 for decompilation; binary triage still works without it.")
+    if settings.get("red_team_enabled") and not py_caps["scoped_browser"]:
+        recommendations.append(
+            "Install playwright and its Chromium browser to validate JavaScript-heavy findings inside the engagement scope.")
     try:
         current_profile = (_model_runtime_profiles().get("models", {}) or {}).get(
             _model_profile_key(settings.get("model") or ""), {})
@@ -16255,6 +16786,16 @@ def _load_mcp_servers():
             
             def make_tool_callable(mcp_client, name, desc, kind):
                 def wrapper(args: dict):
+                    # Mission-scoped URL filter. MCP connectors are
+                    # third-party; the bridge cannot see inside them, so
+                    # when a mission is active the URL-bearing arguments
+                    # are checked against the mission allowlist with the
+                    # same gate as rt_browser before the call leaves the
+                    # process. Outside missions nothing is enforced here —
+                    # the approval flow below remains the only gate.
+                    scope_reason = _rt_scope_mcp_calls(name, args)
+                    if scope_reason:
+                        return {"error": scope_reason}
                     # ALWAYS APPROVAL GATE MCP TOOLS. `kind` is the stable
                     # prefixed tool name so "remember this action for this session"
                     # (approve with always=true) session-allows THIS mcp tool and
@@ -16565,6 +17106,30 @@ TOOLS: dict[str, dict] = {
             "required": ["url"],
         },
         "fn": tool_http_request,
+    },
+    "rt_browser": {
+        "description": "AUTHORIZED PENTEST. Persistent scope-enforced Chromium for JavaScript-heavy validation after a real finding is confirmed. Every HTTP, WebSocket, iframe, popup, redirect, and subresource request is checked against the engagement allowlist before it leaves the browser. Use navigate, snapshot, click, fill, press, wait, requests, pages, select_page, screenshot, or close. Downloads and arbitrary JavaScript evaluation are intentionally unavailable.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["navigate", "snapshot", "click", "fill", "press", "wait", "requests", "pages", "select_page", "screenshot", "close"], "description": "Browser operation."},
+                "session": {"type": "string", "description": "Persistent browser session name. Default: default."},
+                "url": {"type": "string", "description": "In-scope URL for action=navigate."},
+                "selector": {"type": "string", "description": "CSS selector from snapshot output for click, fill, or press."},
+                "value": {"type": "string", "description": "Text for action=fill."},
+                "key": {"type": "string", "description": "Playwright key name for action=press, such as Enter or Escape."},
+                "submit": {"type": "boolean", "description": "Press Enter after filling the selected element."},
+                "wait_ms": {"type": "integer", "description": "Post-action wait, capped at 5000 ms."},
+                "timeout": {"type": "number", "description": "Action timeout in seconds, capped at 40."},
+                "max_chars": {"type": "integer", "description": "Maximum visible text returned by snapshot. Default 16000."},
+                "limit": {"type": "integer", "description": "Maximum recent request/response events returned by requests. Default 100, maximum 300."},
+                "page_index": {"type": "integer", "description": "Page index returned by action=pages, used by select_page."},
+                "label": {"type": "string", "description": "Evidence label for screenshot."},
+                "full_page": {"type": "boolean", "description": "Capture the full page. Default true."}
+            },
+            "required": ["action"]
+        },
+        "fn": tool_rt_browser,
     },
     "encode_decode": {
         "description": "AUTHORIZED PENTEST. Encode/decode a string (Burp Decoder equivalent) to inspect/forge tokens instead of doing it by hand. No I/O.",
@@ -18081,9 +18646,14 @@ _TOOL_RESULT_CAPS = {
     "recon_cve_match": 24000,
     "recon_injection_probe": 16000,
     "recon_open_services": 16000,
+    # The full bundle catalog behind list_more_tools is big; chopping it to a
+    # blind "_truncated" envelope is what used to make models re-emit the call
+    # with the same args (see compress_tool_result's list-field sampling).
+    "list_more_tools": 48000,
     # Exploit responses (SSTI output, dumped configs, flag-bearing bodies) need
     # room so the model can read the whole thing and confirm access.
     "http_request": 16000,
+    "rt_browser": 32000,
     # Interactive sessions self-cap their output in read_model(); these are the
     # outer safety nets for the serialized envelope.
     "session_start": 16000,
@@ -18113,6 +18683,10 @@ _TOOL_RESULT_CAPS = {
     "git_diff": 64000,
     "git_show": 48000,
     "git_log": 24000,
+    # Skill bodies are user-curated procedures; the cap keeps a loaded skill
+    # from crowding out the conversation (tool_load_skill also refuses over-cap
+    # files outright, so compress never has to chop a procedure mid-step).
+    "load_skill": SKILL_BODY_CAP_CHARS,
 }
 
 # Aging for replayed tool results. The caps above only bite ONCE, at append
@@ -18288,6 +18862,33 @@ def compress_tool_result(name: str, result: Any, cap: int) -> str:
             if per_field <= 256:
                 break  # can't tighten further usefully
 
+    # Large list-valued fields (tool catalogs, folder listings, match sets):
+    # sample the HEAD of each so the model still sees real entries and a
+    # count, and knows it can re-call with narrower args to see more. The
+    # blind truncation envelope below hides EVERYTHING, which is what makes
+    # models re-emit the same call ("list more tools" → same args → same
+    # envelope → loop-breaker refusal → repeat).
+    big_list_fields = sorted(
+        k for k, v in result.items()
+        if isinstance(v, list) and len(v) > 5 and k not in _BULK_TOOL_FIELDS)
+    if big_list_fields:
+        for sample_n in (200, 100, 50, 20, 10, 5):
+            sampled = dict(result)
+            for k in big_list_fields:
+                items = result[k]
+                if len(items) > sample_n:
+                    sampled[k] = items[:sample_n]
+            s = json.dumps(sampled, ensure_ascii=False, default=str)
+            if len(s) <= cap:
+                sampled["_truncated"] = True
+                bodies = "; ".join(
+                    f"{k}: showing first {sample_n} of {len(result[k])} items"
+                    for k in big_list_fields if len(result[k]) > sample_n)
+                sampled["_note"] = (bodies +
+                                    " — re-call the tool with narrower/filtered args "
+                                    "to see the rest")
+                return json.dumps(sampled, ensure_ascii=False, default=str)
+
     # Final fallback: minimal envelope. Always valid JSON.
     return _truncation_envelope(result, cap, len(s_full))
 
@@ -18303,6 +18904,7 @@ _RT_EXPLOIT_TOOL_NAMES = {
     # Active exploitation primitive — lets the flow actually breach, not just
     # flag suspicion.
     "http_request",
+    "rt_browser",
     # JWT decode/forge/crack — modern auth attacks (alg:none, weak-secret).
     "jwt_tool",
     # sqlmap-lite and param fuzzer/enumerator.
@@ -18473,6 +19075,174 @@ def _base_core_tool_names() -> set[str]:
     return _CORE_TOOL_NAMES
 
 
+# ---- skills: user-curated markdown procedures -------------------------------
+# A skill is a plain .md file in skills/ with a `---` frontmatter block:
+#   ---
+#   name: rt-report-loop
+#   description: Produce engagement reports for red-team missions...
+#   budget: 2400          # token-ish estimate shown in the picker (informational)
+#   ---
+#   <procedure body>
+# The body enters context ONLY when the user picks the skill or the model calls
+# load_skill. One active slot per chat — loading replaces the previous skill.
+
+_FRONTMATTER_RE = re.compile(r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", re.DOTALL)
+_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+_SKILLS_CACHE: dict[str, tuple[float, dict[str, dict]]] = {}
+
+
+def _parse_skill_frontmatter(text: str) -> dict:
+    m = _FRONTMATTER_RE.match(text)
+    if not m:
+        return {}
+    out: dict[str, object] = {}
+    for raw in m.group(1).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        out[k.strip().lower()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _scan_skills() -> dict[str, dict]:
+    """name -> {name, description, budget, path, mtime, body_chars}.
+    Cached on the directory's newest mtime (like .accurettaignore rules). A
+    missing skills/ dir is never cached — it is rechecked so the first file
+    the user drops in is picked up immediately."""
+    if not SKILLS_DIR.is_dir():
+        return {}
+    try:
+        mtime = max(p.stat().st_mtime for p in SKILLS_DIR.iterdir())
+    except Exception:
+        mtime = 0.0
+    cached = _SKILLS_CACHE.get(str(SKILLS_DIR))
+    if cached and cached[0] == mtime:
+        return cached[1]
+    found: dict[str, dict] = {}
+    for p in sorted(SKILLS_DIR.glob("*.md")):
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+            size = text.count("\n") + 1
+            if len(text) > SKILL_MAX_BODY_CHARS:
+                continue
+        except Exception:
+            continue
+        m = _FRONTMATTER_RE.match(text)
+        body = text[m.end():].strip() if m else text.strip()
+        if not body:
+            continue
+        fm = _parse_skill_frontmatter(text)
+        name = str(fm.get("name") or p.stem).strip()
+        if not name or not _SKILL_NAME_RE.fullmatch(name):
+            continue
+        try:
+            budget = int(str(fm.get("budget") or "0"))
+        except (TypeError, ValueError):
+            budget = 0
+        found[name] = {
+            "name": name,
+            "description": str(fm.get("description") or "").strip(),
+            "budget": max(0, budget),
+            "path": str(p),
+            "mtime": p.stat().st_mtime,
+            "body_chars": len(body),
+            "lines": size,
+        }
+    _SKILLS_CACHE[str(SKILLS_DIR)] = (mtime, found)
+    return found
+
+
+def _skills_catalog() -> list[dict]:
+    return [
+        {"name": s["name"], "description": s["description"][:220],
+         "budget": s["budget"], "body_chars": s["body_chars"], "lines": s["lines"]}
+        for s in sorted(_scan_skills().values(), key=lambda x: x["name"].lower())
+    ]
+
+
+def _read_skill_body(entry: dict) -> str | None:
+    try:
+        text = Path(entry["path"]).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    m = _FRONTMATTER_RE.match(text)
+    return (text[m.end():].strip() if m else text.strip()) or None
+
+
+def _set_active_skill(chat_id: str, skill_name: str | None, budget: int = 0):
+    """Persist the user-chosen active skill on the chat record (survives chat
+    reloads; serialized like fold_mark/summary_through). Swapping replaces."""
+    if not chat_id:
+        return
+    try:
+        chats = get_chats()
+        chat = (chats.get("chats") or {}).get(chat_id)
+        if chat is None:
+            return
+        if skill_name:
+            chat["active_skill"] = skill_name
+            chat["active_skill_budget"] = max(0, int(budget or 0))
+        else:
+            chat.pop("active_skill", None)
+            chat.pop("active_skill_budget", None)
+        save_json(CHATS_FILE, chats)
+    except Exception:
+        pass
+
+
+def tool_load_skill(args: dict) -> dict:
+    """Load a user-curated skill (markdown procedure from skills/) into this
+    chat. One active slot per chat — loading replaces the previous skill."""
+    name = str(args.get("name") or "").strip()
+    chat_id = str(args.get("chat_id") or "") or (_get_current_chat() or "")
+    catalog = _scan_skills()
+    if not name:
+        _set_active_skill(chat_id, None)
+        try:
+            broadcast_event({"type": "skill:cleared", "chat_id": chat_id})
+        except Exception:
+            pass
+        return {"skill": None, "active": False,
+                "note": "active skill cleared"}
+    entry = catalog.get(name)
+    if entry is None:
+        return {"error": f"unknown skill '{name}' — available: {sorted(catalog)}",
+                "available": sorted(catalog)}
+    body = _read_skill_body(entry)
+    if body is None:
+        return {"error": f"skill '{name}' could not be read from disk"}
+    if len(body) > SKILL_BODY_CAP_CHARS:
+        return {"error": f"skill '{name}' body is {len(body)} chars — over the "
+                         f"{SKILL_BODY_CAP_CHARS}-char load cap; trim the file"}
+    replaced = None
+    if chat_id:
+        try:
+            prev = (get_chats().get("chats") or {}).get(chat_id, {}).get("active_skill")
+            if prev and prev != name:
+                replaced = prev
+        except Exception:
+            pass
+    _set_active_skill(chat_id, name, budget=entry["budget"])
+    try:
+        ev = {"type": "skill:loaded", "chat_id": chat_id, "skill": name,
+              "budget": entry["budget"], "body_chars": entry["body_chars"]}
+        if replaced:
+            ev["replaced"] = replaced
+        broadcast_event(ev)
+    except Exception:
+        pass
+    result: dict = {"skill": name, "active": True,
+                    "description": entry["description"],
+                    "budget": entry["budget"],
+                    "body_chars": entry["body_chars"],
+                    "content": body}
+    if replaced:
+        result["replaced"] = replaced
+        result["note"] = f"loaded '{name}', replacing the previously active skill '{replaced}'"
+    return result
+
+
 def _unlock_bundle(chat_id: str, bundle: str) -> bool:
     """Load a bundle's schemas for this chat. Returns True if the bundle was
     newly unlocked (False = unknown bundle or already loaded)."""
@@ -18500,6 +19270,8 @@ def _unavailable_runtime_tools() -> dict[str, str]:
     if not _HAVE_PGW:
         for n in ("list_windows", "desktop_focus_window", "desktop_close_window"):
             missing[n] = "window control requires pygetwindow"
+    if not _HAVE_PLAYWRIGHT:
+        missing["rt_browser"] = "requires playwright and its Chromium browser"
     if not _HAVE_SQUASHFS:
         missing["extract_squashfs"] = "requires PySquashfsImage"
     if not _HAVE_CAPSTONE:
@@ -18593,7 +19365,12 @@ def _visible_tool_names(include_exploit: bool = True, chat_id: str = "") -> set[
             visible |= btools
     if active_rt:
         visible -= _DESKTOP_TOOL_NAMES
-        visible = {n for n in visible if not n.startswith("mcp_")}
+        # Only the playwright MCP server stays visible during a mission: its
+        # calls are URL-filtered at the wrapper (same gate as rt_browser),
+        # which is what makes a third-party browser safe to extend the
+        # first-party worker. Every other MCP connector remains hidden.
+        visible = {n for n in visible
+                   if not (n.startswith("mcp_") and not n.startswith("mcp_playwright_"))}
     return {n for n in visible if n in TOOLS and n not in excluded}
 
 
@@ -18682,6 +19459,32 @@ TOOLS["compact_history"] = {
         "required": [],
     },
     "fn": tool_compact_history,
+}
+
+
+TOOLS["load_skill"] = {
+    "description": (
+        "Load a user-curated skill: a markdown procedure kept in the app's "
+        "skills/ folder (frontmatter: name/description/budget). Use it when the "
+        "task matches a skill the user prepared — the body then guides how you "
+        "proceed, step by step. Loading a skill REPLACES the previously active "
+        "one (one slot per chat). If you are unsure whether a skill applies, do "
+        "NOT guess and do NOT enumerate the folder: ask the user which skill to "
+        "use. Call with an empty name to clear the active skill. The skill body "
+        "is bounded by a hard size cap, so it cannot blow up context."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Skill name from the app's skills/ folder "
+                                "(user-curated). Empty string clears the active skill.",
+            }
+        },
+        "required": ["name"],
+    },
+    "fn": tool_load_skill,
 }
 
 
@@ -18961,8 +19764,15 @@ def _unclosed_tool_tail(text: str) -> str:
 _tool_history_lock = threading.Lock()
 _tool_call_history: dict[str, dict[str, dict]] = {}    # chat_id -> sig -> rec
 _tool_write_history: dict[str, dict[str, int]] = {}    # chat_id -> path -> count
+# Cross-tool URL tracking: web_fetch and http_request are separate tools with
+# independent loop-breaker streaks, but the model ping-pongs between them on the
+# same URL to dodge per-tool limits. Track fetches at the URL level across all
+# fetch-like tools so the combined count trips the breaker.
+_tool_url_history: dict[str, dict[str, int]] = {}      # chat_id -> url_key -> count
+_FETCH_LIKE_TOOLS = frozenset({"web_fetch", "http_request"})
 TOOL_REPEAT_LIMIT = 3       # 4th SAME-RESULT call in a row gets refused.
 TOOL_REPEAT_HARD_LIMIT = 20  # absolute backstop for wobbly-output tools (below max_tool_rounds).
+URL_CROSS_TOOL_LIMIT = 5     # same URL hit 5× via ANY fetch tool combo → refuse.
 
 # Per-turn context — chat_id and other state reachable from deep inside tool
 # implementations without threading the id through every function signature.
@@ -18984,6 +19794,7 @@ def _reset_tool_call_history(chat_id: str) -> None:
     with _tool_history_lock:
         _tool_call_history[chat_id] = {}
         _tool_write_history[chat_id] = {}
+        _tool_url_history[chat_id] = {}
 
 
 # Rewrite-loop breaker: count full write_file rewrites per path per turn so a
@@ -19049,7 +19860,7 @@ def _update_verification_debt(debt: list[dict], name: str, args: dict,
 # same round), so they serialize with each other within a batch.
 _CHAT_STATE_TOOLS = frozenset(
     {"pin_note", "unpin_note", "update_plan", "remember", "forget",
-     "edit_memory", "compact_history"})
+     "edit_memory", "compact_history", "load_skill"})
 
 
 # Durable, content-minimised provenance for actions that can change files,
@@ -19247,6 +20058,46 @@ def _record_tool_result(sig: str, result) -> None:
         history[sig] = rec
 
 
+def _fetch_url_key(args: dict) -> str:
+    """Normalize a URL to scheme://host:port/path for cross-tool dedup.
+    Query params are stripped so GET /login.php and POST /login.php with a body
+    share the same key — the model is hitting the same endpoint either way."""
+    raw = (args.get("url") or args.get("target") or "").strip()
+    if not raw:
+        return ""
+    try:
+        u = urllib.parse.urlsplit(raw)
+        host = (u.hostname or "").lower()
+        port = f":{u.port}" if u.port else ""
+        scheme = (u.scheme or "http").lower()
+        return f"{scheme}://{host}{port}{u.path}"
+    except Exception:
+        return raw[:200]
+
+
+def _record_url_fetch(canon: str, args: dict) -> None:
+    """Increment the cross-tool URL counter for fetch-like tools."""
+    if canon not in _FETCH_LIKE_TOOLS:
+        return
+    key = _fetch_url_key(args)
+    if not key:
+        return
+    cid = _get_current_chat()
+    with _tool_history_lock:
+        urls = _tool_url_history.setdefault(cid, {})
+        urls[key] = urls.get(key, 0) + 1
+
+
+def _url_fetch_count(args: dict) -> int:
+    """Return how many times ANY fetch-like tool has hit this URL this turn."""
+    key = _fetch_url_key(args)
+    if not key:
+        return 0
+    cid = _get_current_chat()
+    with _tool_history_lock:
+        return _tool_url_history.get(cid, {}).get(key, 0)
+
+
 def _missing_required_tool_args(name: str, args: Any) -> list[str]:
     """Return required schema fields that are absent or materially empty."""
     canon = _resolve_tool_name(name)
@@ -19345,11 +20196,35 @@ def invoke_tool(name: str, args: dict) -> dict:
                 "scope_blocked": True,
                 "tool": canon,
             })
+    # Cross-tool URL dedup. web_fetch and http_request are separate tools with
+    # separate per-tool loop-breaker streaks.  The model exploits this by
+    # ping-ponging: hit the web_fetch wall, switch to http_request on the same
+    # URL, hit that wall, switch back.  This catches the pattern by tracking
+    # the TARGET URL across all fetch-like tools.
+    if canon in _FETCH_LIKE_TOOLS:
+        _url_hits = _url_fetch_count(args or {})
+        if _url_hits >= URL_CROSS_TOOL_LIMIT:
+            _url_key = _fetch_url_key(args or {})
+            return _finish({
+                "error": (
+                    f"refused: the URL {_url_key} has already been fetched "
+                    f"{_url_hits} times this turn via web_fetch/http_request. "
+                    f"Switching between fetch tools on the same URL does not "
+                    f"help \u2014 the page content is the same. Try a DIFFERENT "
+                    f"approach: use a different tool (e.g. recon_content_discovery, "
+                    f"sql_injection, fuzz), change the URL path, or report what "
+                    f"you found so far."
+                ),
+                "repeat_count": _url_hits,
+                "tool": canon,
+                "loop_breaker": True,
+                "cross_tool_url_dedup": True,
+            })
     # Loop-breaker (result-aware). Refuse only when the SAME call has returned the
-    # SAME result TOOL_REPEAT_LIMIT times running — genuinely stuck, nothing
+    # SAME result TOOL_REPEAT_LIMIT times running \u2014 genuinely stuck, nothing
     # moving. A changed result resets the streak (see _record_tool_result), so a
     # model that re-reads a file it just edited, re-runs a check after a fix, or
-    # re-calls the same args because state actually moved is NOT blocked — that was
+    # re-calls the same args because state actually moved is NOT blocked \u2014 that was
     # the false-positive we kept hitting. `total` is a high absolute backstop for
     # tools whose output wobbles every call. Session tools poll live state and are
     # fully exempt.
@@ -19368,7 +20243,7 @@ def invoke_tool(name: str, args: dict) -> dict:
         return _finish({
             "error": (
                 f"refused: {canon} has {reason} {n} times this turn with the SAME "
-                f"arguments and nothing changed. Repeating won't help — change the "
+                f"arguments and nothing changed. Repeating won\u2019t help \u2014 change the "
                 f"arguments{suggestion_blob}, do something that actually moves the state "
                 f"(edit the file, apply the fix, then re-check), or end the turn and "
                 f"tell the user what you found so far."
@@ -19383,6 +20258,7 @@ def invoke_tool(name: str, args: dict) -> dict:
         traceback.print_exc()
         result = {"error": str(e)}
     _record_tool_result(sig, result)
+    _record_url_fetch(canon, args or {})
     return _finish(result)
 
 
@@ -20432,6 +21308,27 @@ def llama_post_stream(path: str, payload: dict, base: str | None = None,
     return _StallGuardedStream(resp, stall_t)
 
 
+_HTTP_ERROR_BODY_CACHE: dict[int, str] = {}
+
+
+def _http_error_body(e: Exception, limit: int = 60000) -> str:
+    """Read + cache the body of an HTTPError so it can be classified and then
+    surfaced without double-consuming the response stream (e.read() consumes
+    the buffer — a second read returns empty)."""
+    import urllib.error
+    if not isinstance(e, urllib.error.HTTPError):
+        return ""
+    key = id(e)
+    cached = _HTTP_ERROR_BODY_CACHE.get(key)
+    if cached is None:
+        try:
+            cached = e.read().decode("utf-8", "replace")
+        except Exception:
+            cached = ""
+        _HTTP_ERROR_BODY_CACHE[key] = cached
+    return cached[:limit]
+
+
 def _is_ctx_overflow(e: Exception) -> bool:
     """True when a llama-server request failed because the prompt exceeded n_ctx.
     With --no-context-shift the server rejects (HTTP error) rather than sliding
@@ -20439,16 +21336,28 @@ def _is_ctx_overflow(e: Exception) -> bool:
     import urllib.error
     if not isinstance(e, urllib.error.HTTPError):
         return False
-    body = ""
-    try:
-        body = e.read().decode("utf-8", "replace")
-    except Exception:
-        pass
-    blob = (body + " " + str(e)).lower()
+    blob = (_http_error_body(e) + " " + str(e)).lower()
     return (("context" in blob and "exceed" in blob)
             or "context shift" in blob
             or "n_ctx" in blob
             or "exceeds the available context" in blob)
+
+
+def _is_transient_server_error(e: Exception) -> bool:
+    """True when a llama-server failure is likely transient — a 5xx from the
+    server's own handler, or a body that names GPU/OOM pressure — as opposed to
+    a dead process (connection refused). Worth a short backoff retry before we
+    fail the turn. Observed in the field: llama-server returns HTTP 500 with
+    CUDA/OOM bodies mid-turn on long agentic runs, then serves the next request
+    fine."""
+    import urllib.error
+    if isinstance(e, urllib.error.HTTPError) and e.code in (500, 502, 503, 504):
+        return True
+    blob = (_http_error_body(e) + " " + str(e)).lower()
+    return any(frag in blob for frag in (
+        "failed to allocate", "out of memory", "out of gpu memory",
+        "cuda error", "cuda failure", "cuda out of memory",
+        "no memory", "oom"))
 
 
 def describe_image(b64: str, hint: str = "") -> str:
@@ -20567,7 +21476,7 @@ rules:
 8. NEVER re-emit full file content you already generated in a previous turn. if the user asks you to save something you already built, call write_file with the content but do NOT dump the full code in the visible chat text — just confirm "saved to <path>".
 9. proactive suggestions: if there are obvious, highly actionable next steps for the user, output up to 3 short suggestions at the end of your message in this exact format: <cascade>["Action 1", "Action 2"]</cascade>. Only do this if genuinely applicable. Keep suggestions under 5 words.
 10. editing: use edit_file for small changes (it verifies the match itself); write_file only for new files or full rewrites. after writing a file, TRUST it — you can't run it, so don't rewrite "to be safe". never rewrite the same file from scratch twice — imagined flaws aren't real flaws; fix a SPECIFIC defect with edit_file instead. when SHOWING a code change in chat (not writing it), put a unified diff in a ```diff fence (add path=<file> if known) instead of re-pasting the whole file — it renders as a proper side-by-side/inline diff.
-11. don't loop on refusals: if a tool returns "path outside workspace" or a sandbox/approval refusal, STOP — name what you tried and tell the user how to fix it (add the folder, approve). do not retry variants or fall back to powershell.
+11. don't loop on refusals: if a tool returns "path outside workspace" or a sandbox/approval refusal, STOP — name what you tried and tell the user how to fix it (add the folder, approve). do not retry variants or fall back to powershell. when desktop automation is enabled (see desktop: notice in rule 6), workspace tools may be used system-wide — paths outside the workspace folders are then allowed unless the tool itself says otherwise; you still never touch blocked system paths (Windows/System32), and destructive actions still require approval.
 12. surgical & simple: write the minimum that solves the request — no speculative features, no abstractions for single-use code. when editing, touch ONLY what the task needs; don't refactor or restyle working code, match the existing style, and make every changed line trace to what was asked.
 
 keep responses tight."""
@@ -20712,7 +21621,11 @@ you may occasionally append exactly one of these to the absolute end of your res
 
     # === WORKSPACE (compact) ===
     ws = get_workspace().get("folders", [])
-    if ws:
+    if get_settings().get("desktop_enabled"):
+        parts.append("workspace: full system access (desktop automation enabled; Windows/System32 protected)")
+        if ws:
+            parts.append("workspace folders:\n" + "\n".join(f"- {f}" for f in ws))
+    elif ws:
         parts.append("workspace:\n" + "\n".join(f"- {f}" for f in ws))
     else:
         parts.append("workspace: none (file tools will refuse)")
@@ -20857,6 +21770,25 @@ def _looks_unfinished(text: str, finish_reason: str = None) -> bool:
     return False
 
 
+def _graceful_server_failure(conversation: list[dict], start_len: int,
+                             turn_id: str, reasons: list[str]) -> dict:
+    """Build a final result that PRESERVES the turn's completed tool work when
+    llama-server faults, instead of returning None — None drops the working
+    memory (tool calls + results + intermediate notes) into the void until an
+    app restart triggers journal recovery. The caller persists `final`'s
+    `_appended_intermediate`, so the user keeps the evidence and the next turn
+    can continue from a sane state instead of a burned 120-round turn."""
+    notes = " ".join(reasons) or "llama-server failed mid-turn"
+    return {
+        "role": "assistant",
+        "content": f"(response lost — {notes})",
+        "_appended_intermediate": list(conversation[start_len:]),
+        "_build": "server-fault-v1",
+        "_turn_id": turn_id,
+        "_server_fault": True,
+    }
+
+
 def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                   native_tools: bool = True, reasoning_effort: str = "auto"):
     """
@@ -20927,6 +21859,15 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         rounds = 0
         empty_retries = 0    # blank-reply-after-tools nudges used this turn
         auto_continues = 0   # mid-plan stall bumps used this turn (see _looks_unfinished)
+        # Turn-level loop guard: consecutive rounds where EVERY call came back as
+        # a loop-breaker refusal (the model keeps re-emitting a call the harness
+        # already refused). Two such rounds in a row -> tools off, one forced
+        # final generation, turn ends. The per-call loop-breaker alone cannot
+        # stop this: its refusal is just another message the model reads and
+        # ignores (observed on Qwen3-family models).
+        refused_streak = 0
+        refused_broke = False
+        refused_names: set = set()
         # Carry-over of an in-flight <tool_call> truncated by the output budget.
         # Big file writes (write_file bodies) can exceed even the expanded
         # max_tokens — "re-emit the whole call" can never fit and loops forever.
@@ -21467,7 +22408,14 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # makes the server reject rather than slide the window), trim older
             # turns harder and retry instead of failing the whole turn — the
             # tools-overhead estimate above can undershoot the real inlined spec.
+            # Transient 5xx / OOM bodies get a short backoff retry: llama-server
+            # has been observed returning HTTP 500 with a CUDA-OOM body mid-turn
+            # on long agentic runs, then serving the very next request fine.
+            # Whatever the outcome, NEVER drop the turn's completed tool work —
+            # a fatal path returns _graceful_server_failure(...) so the caller
+            # persists the intermediates instead of losing the whole turn.
             resp = None
+            _transient_retries = 0
             for _ctx_attempt in range(4):
                 try:
                     resp = llama_post_stream("/v1/chat/completions", payload)
@@ -21480,7 +22428,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                                     f"{_LLAMA_FIRST_TOKEN_TIMEOUT_S}s — it is either prefilling a very "
                                     f"large prompt or stuck. Try the turn again; if this repeats, "
                                     f"restart the server (Settings → Restart server).")})
-                    return None
+                    return _graceful_server_failure(
+                        conversation, _start_len, _turn_id,
+                        [f"llama-server produced no output within "
+                         f"{_LLAMA_FIRST_TOKEN_TIMEOUT_S}s (prefill stall)"])
                 except Exception as e:
                     if _ctx_attempt < 3 and _is_ctx_overflow(e):
                         pad = max(2048, int(ctx_limit * 0.12)) * (_ctx_attempt + 1)
@@ -21493,18 +22444,44 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         emit({"type": "notice",
                               "note": "prompt exceeded the context window — trimmed older turns and retrying"})
                         continue
+                    if _transient_retries < 2 and _is_transient_server_error(e):
+                        _transient_retries += 1
+                        _wait = 2.0 * _transient_retries
+                        time.sleep(_wait)
+                        _det = getattr(e, "code", None) or type(e).__name__
+                        _body_tail = _http_error_body(e).strip().replace("\n", " ")[-160:]
+                        emit({"type": "notice",
+                              "note": (f"llama-server faulted ({_det}) — retrying in {int(_wait)}s"
+                                       + (f" · server said: …{_body_tail}" if _body_tail else ""))})
+                        continue
                     if _is_ctx_overflow(e):
                         emit({"type": "error",
                               "error": ("prompt still exceeds the context window after trimming — the system "
                                         "prompt + tool specs alone are near your num_ctx. Raise num_ctx in "
                                         "Settings, or turn off some tools for this turn.")})
-                    else:
-                        emit({"type": "error",
-                              "error": f"llama-server request failed at {LLAMA}: {e}. Is it running? "
-                                       f"Start it with: llama-server -m <model.gguf> --host 127.0.0.1 --port 8080 --jinja"})
-                    return None
+                        return _graceful_server_failure(
+                            conversation, _start_len, _turn_id,
+                            ["prompt still exceeds the context window after trimming"])
+                    if isinstance(e, urllib.error.HTTPError):
+                        _detail = (_http_error_body(e).strip()
+                                   .replace("\n", " ")[-400:] or str(e))
+                        _note = (f"llama-server returned HTTP {e.code} — {_detail}. "
+                                 "The inference server faulted mid-turn; the turn's completed tool "
+                                 "work was preserved. Retry the turn, or restart the server "
+                                 "(Settings → Restart server) if this repeats.")
+                        emit({"type": "error", "error": _note})
+                        return _graceful_server_failure(
+                            conversation, _start_len, _turn_id, [_note])
+                    _note = (f"llama-server request failed at {LLAMA}: {e}. Is it running? "
+                             f"Start it with: llama-server -m <model.gguf> --host 127.0.0.1 "
+                             f"--port 8080 --jinja. The turn's completed tool work was preserved.")
+                    emit({"type": "error", "error": _note})
+                    return _graceful_server_failure(
+                        conversation, _start_len, _turn_id, [_note])
             if resp is None:
-                return None
+                return _graceful_server_failure(
+                    conversation, _start_len, _turn_id,
+                    ["could not open the inference stream"])
             _set_cancel_resp(chat_id, resp)
 
             content_buf: list[str] = []
@@ -22280,6 +23257,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         break
                 else:
                     _batches.append([_call])
+            _round_all_refused = True
             for batch in _batches:
                 _futures: dict[int, object] = {}
                 for call in batch:
@@ -22308,6 +23286,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             (result.get("error") or result.get("ok") is False or
                              result.get("exit_code") not in (None, 0))):
                         turn_tool_errors += 1
+                    if isinstance(result, dict) and result.get("loop_breaker"):
+                        refused_names.add(_resolve_tool_name(name))
+                    else:
+                        _round_all_refused = False
                     emit({"type": "tool_result", "name": name, "result": result})
                     if (_rt_on
                             and _rt_close_frontend_secret_mission(_rt_chat, name)):
@@ -22430,6 +23412,36 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     except Exception as _journal_error:
                         print(f"[turn-journal] checkpoint failed for {chat_id}: {_journal_error}",
                               file=sys.stderr)
+            if _batches and _round_all_refused:
+                # Every call this round came back as a loop-breaker refusal: the
+                # model is re-emitting calls the harness already refused. One such
+                # round can be a transient misunderstanding, but two in a row means
+                # the model is stuck in a refusal loop (Qwen3-family models do this:
+                # they read the refusal, narrate "I need to stop", then re-emit the
+                # SAME call). Force the turn to end with a real answer instead of
+                # burning the rest of max_tool_rounds on the same call.
+                refused_streak += 1
+            else:
+                refused_streak = 0
+            if refused_streak >= 2 and not refused_broke:
+                refused_broke = True
+                use_tools = False
+                rounds = max_tool_rounds
+                _rb_names = ", ".join(sorted(refused_names))[:200] or "a tool"
+                conversation.append({
+                    "role": "system",
+                    "content": (
+                        "[loop guard] The harness refused your repeated identical "
+                        f"tool call(s) ({_rb_names}) several times this turn and the "
+                        "result never changed. The turn is being ended. Do NOT call "
+                        "any tool again. Write your FINAL answer now: summarize what "
+                        "you actually accomplished this turn and what blocked you, "
+                        "plain text only."
+                    ),
+                })
+                emit({"type": "notice",
+                      "note": f"loop guard: repeated identical tool refusals ({_rb_names}) — "
+                              "ending the turn with a final answer"})
             if tool_cap_no_think and _batches:
                 # A real tool call executed this round — the delayed-answer mode
                 # was only to protect a WRITE body from a thinking-hog. Once the
@@ -24131,6 +25143,11 @@ class Handler(BaseHTTPRequestHandler):
                     continue
             out.sort(key=lambda m: m["rel"].lower())
             return self._send_json(200, {"files": out, "count": len(out), "truncated": len(out) >= 4000})
+        if p == "/api/skills":
+            # Catalog of user-curated markdown skills (frontmatter
+            # name/description/budget). Names only — bodies load via load_skill.
+            lst = _skills_catalog()
+            return self._send_json(200, {"skills": lst, "count": len(lst)})
         if p == "/api/link_preview":
             # Hover-preview support for clickable links inside chat bubbles.
             # Lightweight: fetches the page, pulls Open Graph + <title>, caches
@@ -24798,6 +25815,10 @@ class Handler(BaseHTTPRequestHandler):
                 }
             _tool_executor.submit(_do_job)
             return self._send_json(202, {"job_id": job_id, "status": "queued"})
+        if p == "/api/skills/clear":
+            # Unload the active skill for a chat (route form of
+            # load_skill with an empty name — emits skill:cleared to SSE).
+            return self._send_json(200, tool_load_skill({"name": "", "chat_id": body.get("chat_id") or ""}))
         if p == "/api/chat":
             return self._handle_chat(body)
         if p == "/api/shutdown":

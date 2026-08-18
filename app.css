@@ -2315,6 +2315,164 @@ button {
   transform: translateY(-2px);
 }
 
+/* Settled fold divider: persists in chat history exactly at the boundary where
+   the rolling summary absorbed the older turns, so on scroll you can tell
+   "compaction happened here — the model then did X, Y, Z". Deliberately faint,
+   centered, and symmetric: line · label · line. */
+.compaction-inline-row.is-divider {
+  margin: 2px auto 9px;
+  width: min(560px, calc(100% - 16px));
+  gap: 9px;
+  animation: none;
+  transition: none;
+  pointer-events: none;
+  user-select: none;
+  opacity: 1;
+}
+
+.compaction-inline-row.is-divider .fold-line {
+  flex: 1 1 auto;
+  height: 1px;
+  min-width: 10px;
+  background: var(--fg-faint);
+  border-radius: 1px;
+  opacity: 0.55;
+}
+
+.compaction-inline-row.is-divider .fold-label {
+  flex: 0 0 auto;
+  color: var(--fg-faint);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  opacity: 0.78;
+}
+
+/* ---- skills: user-curated procedures ---- */
+
+/* The l16 "drawer" loader: draws a little frame in the accent color while the
+   loaded skill is guiding the current turn. Settles (stops + dims) on
+   turn end / skill cleared, like the compaction dots. */
+.skill-loader {
+  width: 60px;
+  height: 16px;
+  display: grid;
+  flex: 0 0 auto;
+}
+
+.skill-loader:before,
+.skill-loader:after {
+  content: "";
+  grid-area: 1/1;
+  --c: no-repeat linear-gradient(var(--accent) 0 0);
+  background: var(--c), var(--c), var(--c);
+  animation: skill-l16-1 1.5s infinite linear, skill-l16-2 1.5s infinite linear;
+  transform: scale(var(--s, 1)) translate(3px, -3px);
+}
+
+.skill-loader:after {
+  --s: -1;
+}
+
+@keyframes skill-l16-1 {
+  0%,
+  3%    { background-size: 0    4px, 4px 0  , 0    4px; }
+  16.67%{ background-size: 100% 4px, 4px 0  , 0    4px; }
+  33.33%{ background-size: 100% 4px, 4px 100%, 0    4px; }
+  46%,
+  54%   { background-size: 100% 4px, 4px 100%, 100% 4px; }
+  66.67%{ background-size: 0    4px, 4px 100%, 100% 4px; }
+  83.33%{ background-size: 0    4px, 4px 0  , 100% 4px; }
+  96%,
+  100%  { background-size: 0    4px, 4px 0  , 0    4px; }
+}
+
+@keyframes skill-l16-2 {
+  0%,
+  49.9% { background-position: 0 0, 100% 0, 100% 100%; }
+  50%,
+  100%  { background-position: 100% 0, 100% 100%, 0 100%; }
+}
+
+.revealer-card.skill-load .skill-load-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.revealer-card.skill-load .notification-text {
+  white-space: normal;
+}
+
+.revealer-card.skill-load.is-done .skill-loader:before,
+.revealer-card.skill-load.is-done .skill-loader:after {
+  animation: none;
+  opacity: 0.45;
+}
+
+.revealer-card.skill-load.is-done .notification-text {
+  opacity: 0.75;
+}
+
+.notification-dot.is-skill {
+  background: var(--accent);
+}
+
+.mention-item.is-skill {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.mention-item.is-skill .mention-name {
+  color: var(--accent);
+}
+
+/* Active-skill pill in the composer toolbar. */
+.skill-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 4px 0 8px;
+  padding: 2px 8px 2px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  max-width: 240px;
+  overflow: hidden;
+}
+
+.skill-pill i {
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.skill-pill-x {
+  border: none;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.skill-pill-x:hover {
+  color: var(--danger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skill-loader:before,
+  .skill-loader:after {
+    animation: none;
+    opacity: 0.5;
+  }
+}
+
 @keyframes compaction-dot-pulse {
   0%, 100% { opacity: 0.16; transform: scale(0.74); }
   34% { opacity: 0.92; transform: scale(1); }
@@ -2328,6 +2486,7 @@ button {
 
 @media (max-width: 600px) {
   .compaction-inline-row { margin-left: 4px; }
+  .compaction-inline-row.is-divider { margin-left: auto; }
 }
 
 @media (prefers-reduced-motion: reduce) {

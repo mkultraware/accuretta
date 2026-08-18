@@ -26,6 +26,9 @@
     streaming: false,
     abortCtl: null,
     approvals: new Map(),
+    skills: null,            // [ {name, description, budget, body_chars, lines} ] catalog
+    skillsAt: 0,
+    activeSkill: null,       // { name, budget, body_chars } of the chat's active skill
     compactingChats: new Set(),
     compactionRows: new Map(),
     mobileTab: "chat",
@@ -187,6 +190,47 @@
     }, 260);
   }
 
+  function compactStatsLabel(stats) {
+    if (!stats) return "history condensed into the session summary";
+    const msgs = Number(stats.folded) || 0;
+    let tok = "";
+    if (Number.isFinite(stats.folded_tokens) && stats.folded_tokens > 0) {
+      const t = stats.folded_tokens;
+      tok = ` · ~${t >= 1000 ? (t / 1000).toFixed(1) + "K" : t} tokens`;
+    }
+    return `compacted · ${msgs} msgs${tok}`;
+  }
+
+  function buildFoldDivider(stats, opts) {
+    const el = opts && opts.el || document.createElement("div");
+    el.className = "compaction-inline-row is-divider";
+    if (opts && opts.chatId) el.dataset.chatId = opts.chatId;
+    if (opts && opts.persistent !== false) el.dataset.foldDivider = "1";
+    el.setAttribute("role", "note");
+    el.innerHTML = `<span class="fold-line" aria-hidden="true"></span>` +
+      `<span class="fold-label">${esc(compactStatsLabel(stats))}</span>` +
+      `<span class="fold-line" aria-hidden="true"></span>`;
+    return el;
+  }
+
+  // Visible-message index of the fold boundary for a raw chat record. The
+  // stored summary_through points into the RAW message list (which includes
+  // internal assistants and tool results); the bubble renderer only shows
+  // user/assistant non-internal messages, so the divider must be anchored
+  // after the last VISIBLE message that precedes the boundary.
+  function foldBoundaryVisibleIdx(chat) {
+    if (!chat || !chat.messages) return { idx: -1, stats: null };
+    const mark = chat.fold_mark || null;
+    const through = mark ? Number(mark.through) : (Number(chat.summary_through) || 0);
+    if (!through) return { idx: -1, stats: null };
+    let idx = 0;
+    for (let i = 0; i < Math.min(through, chat.messages.length); i++) {
+      const m = chat.messages[i];
+      if ((m.role === "user" || m.role === "assistant") && !m._internal) idx++;
+    }
+    return { idx, stats: mark };
+  }
+
   function ensureCompactionRow(chatId) {
     if (!chatId || chatId !== state.chatId) return null;
     const inner = $("#chat-inner");
@@ -220,11 +264,37 @@
     return row;
   }
 
-  function finishCompactionRow(chatId, outcome = "done") {
+  function finishCompactionRow(chatId, outcome = "done", stats) {
     state.compactingChats.delete(chatId);
     const row = compactionRowFor(chatId);
     if (!row) return;
     clearTimeout(row._safetyTimer);
+    if (outcome === "done") {
+      // Settle into a PERSISTENT divider: hides the dot matrix, keeps the row
+      // in the flow at the fold point so history shows "here compaction
+      // happened". Re-renders recreate it from the stored fold_mark.
+      const _after = state.chats?.chats?.[chatId];
+      if (_after && stats) {
+        _after.fold_mark = {
+          through: Number(stats.through) || _after.summary_through || 0,
+          folded: Number(stats.folded) || 0,
+          folded_tokens: stats.folded_tokens,
+          summary_chars: stats.summary_chars,
+          t: undefined,
+        };
+      }
+      const div = buildFoldDivider(stats, { el: row, chatId });
+      div.classList.add("is-done");
+      state.compactionRows.delete(chatId);
+      const follow = isNearBottom();
+      if (follow) requestAnimationFrame(() => scrollToBottom(true));
+      return;
+    }
+    clearTimeout(row._removeTimer);
+    if (outcome === "clear") {
+      removeCompactionRow(chatId, row);
+      return;
+    }
     row.classList.remove("is-working");
     row.classList.add(outcome === "failed" ? "is-failed" : "is-done");
     const label = row.querySelector(".compaction-inline-label");
@@ -2329,6 +2399,11 @@
   function selectChat(id) {
     state.chatId = id;
     const chat = state.chats.chats[id];
+    state.activeSkill = null;
+    if (chat && chat.active_skill) {
+      state.activeSkill = { name: chat.active_skill, budget: chat.active_skill_budget || 0, body_chars: 0 };
+    }
+    renderSkillPill();
     
     // Scan past messages to populate the image-to-source map
     state.imageUrlToSourceMap.clear();
@@ -2360,6 +2435,14 @@
       : [];
     state.messageWindowStart = Math.max(
       0, state.messages.length - state.messageWindowSize);
+    if (chat) {
+      const boundary = foldBoundaryVisibleIdx(chat);
+      state.foldBoundaryIdx = boundary.idx;
+      state.foldMark = boundary.stats;
+    } else {
+      state.foldBoundaryIdx = -1;
+      state.foldMark = null;
+    }
     $("#chat-title").textContent = chat ? chat.title : "new session";
     // restore the last-used mode for this chat so the toolbar feels sticky.
     // on mobile we drop IDE — there's no preview pane to render into — and
@@ -2787,6 +2870,20 @@
     for (const m of state.messages.slice(start)) {
       if (m.invisible) continue;
       inner.appendChild(renderBubble(m));
+    }
+    // Persistent fold divider: sits exactly where the rolling summary absorbed
+    // the older turns, so past conversations visibly show "compaction happened
+    // here — the model then did X, Y, Z" without hunting for it.
+    if (state.foldBoundaryIdx > start && state.foldBoundaryIdx <= state.messages.length) {
+      const bubbles = Array.from(
+        inner.querySelectorAll("#chat-inner > .bubble-row"));
+      const at = Math.max(0, state.foldBoundaryIdx - start);
+      const anchor = bubbles[at];
+      if (anchor) {
+        inner.insertBefore(buildFoldDivider(state.foldMark), anchor);
+      } else {
+        inner.appendChild(buildFoldDivider(state.foldMark));
+      }
     }
     if (state.compactingChats.has(state.chatId)) ensureCompactionRow(state.chatId);
     renderRegenerateChip();
@@ -3580,6 +3677,7 @@
         osintCardFinalize(agentRow);
         secretRailFinalize(agentRow);
         attackRailFinalize(agentRow);
+        maybeSettleSkillCards();
         const revealerDeck = document.querySelector("#revealer-deck");
         if (revealerDeck) delete revealerDeck.dataset.rtEngagement;
       }
@@ -6991,14 +7089,66 @@
         appendAgentLog("Context compaction started — condensing older turns into the session summary.");
       } else if (evt.type === "summary_folded") {
         window._lastCompactionAt = Date.now();
-        finishCompactionRow(evt.chat_id || state.chatId, "done");
+        const chatId = evt.chat_id || state.chatId;
+        // A previous live divider for this chat is stale once the boundary
+        // moved forward (multi-fold turns); drop it before the new one lands.
+        if (state.chats && state.chats.chats && state.chats.chats[chatId]) {
+          const raw = state.chats.chats[chatId];
+          raw.fold_mark = raw.fold_mark || {};
+          raw.fold_mark.folded = Number(evt.folded) || raw.fold_mark.folded || 0;
+          raw.fold_mark.folded_tokens = evt.folded_tokens;
+          raw.fold_mark.summary_chars = evt.summary_chars;
+          if (typeof evt.through === "number") {
+            raw.fold_mark.through = evt.through;
+            raw.summary_through = evt.through;
+          }
+          if (chatId === state.chatId) {
+            const boundary = foldBoundaryVisibleIdx(raw);
+            state.foldBoundaryIdx = boundary.idx;
+            state.foldMark = boundary.stats;
+          }
+        }
+        const inner = $("#chat-inner");
+        if (inner) {
+          const escId = String(chatId).replace(/["\\]/g, "\\$&");
+          const stale = inner.querySelector(`.compaction-inline-row.is-divider[data-chat-id="${escId}"]`);
+          if (stale) try { stale.remove(); } catch {}
+        }
+        finishCompactionRow(chatId, "done", evt);
+      } else if (evt.type === "skill:loaded") {
+        const chatId = evt.chat_id || state.chatId;
+        if (state.chats && state.chats.chats && state.chats.chats[chatId]) {
+          const raw = state.chats.chats[chatId];
+          raw.active_skill = evt.skill;
+          raw.active_skill_budget = evt.budget || 0;
+        }
+        if (chatId === state.chatId) {
+          state.activeSkill = { name: evt.skill, budget: evt.budget || 0, body_chars: evt.body_chars || 0 };
+          renderSkillPill();
+          skillDeckCard(evt);
+        }
+        appendAgentLog(`Skill loaded: ${evt.skill}${evt.replaced ? ` (replaced ${evt.replaced})` : ""}.`);
+      } else if (evt.type === "skill:cleared") {
+        const chatId = evt.chat_id || state.chatId;
+        if (state.chats && state.chats.chats && state.chats.chats[chatId]) {
+          delete state.chats.chats[chatId].active_skill;
+          delete state.chats.chats[chatId].active_skill_budget;
+        }
+        if (chatId === state.chatId) {
+          state.activeSkill = null;
+          renderSkillPill();
+          clearSkillDeckCard();
+        }
+        appendAgentLog("Active skill cleared.");
       } else if (evt.type === "summary_fold_failed") {
         const chatId = evt.chat_id || state.chatId;
         finishCompactionRow(chatId, "failed");
         if (chatId && chatId !== state.chatId) return;
         toast("Compaction could not produce a valid summary, so this response was stopped before older context could be discarded. Saved messages and completed actions are intact. Use Compact to try again now, wait three minutes and retry, or continue in a new session.", "warn", 11000, "summary-fold-fail");
       } else if (evt.type === "summary_fold_finished") {
-        finishCompactionRow(evt.chat_id || state.chatId, "done");
+        // No state change (nothing foldable / no_change): the working row
+        // must not settle into a divider — just clear it.
+        finishCompactionRow(evt.chat_id || state.chatId, "clear");
       } else if (evt.type === "desktop:panic") {
         if (evt.on) toast("desktop automation PANICKED — all actions blocked", "warn", 6000, "desktop-panic");
         else toast("desktop automation resumed", "ok", 2000, "desktop-panic");
@@ -9439,7 +9589,7 @@
     if (ta && ta.id === "composer-input") updateComposerMirror();
   }
 
-  // ===== @-mention: reference workspace files in the composer =====
+  // ===== @/# mention: @ references workspace files, # loads a skill =====
   // Type "@" → pick a workspace file; it renders as an accent chip (via a
   // mirror layer behind the textarea) in the box and in chat, and on send the
   // model is quietly handed the resolved path so it knows which file you mean.
@@ -9507,7 +9657,7 @@
     mirror.scrollLeft = ta.scrollLeft;
   }
 
-  // ---- the @ autocomplete menu ----
+  // ---- the @/# autocomplete menu ----
   let _mentionItems = [];
   let _mentionActive = 0;
   function composerMentionQuery() {
@@ -9515,24 +9665,43 @@
     if (!ta || ta.selectionStart !== ta.selectionEnd) return null;
     const pos = ta.selectionStart;
     const before = ta.value.slice(0, pos);
-    const m = before.match(/(?:^|[\s(])@([\w./-]*)$/);
+    // @ = workspace files, # = skills. Both are <trigger><query>$ after a
+    // boundary, so the menu can be driven by either at the caret.
+    const m = before.match(/(?:^|[\s(])([@#])([\w./-]*)$/);
     if (!m) return null;
-    return { query: m[1], at: pos - m[1].length - 1 };
+    return { trigger: m[1], query: m[2], at: pos - m[2].length - 1 };
   }
   function updateMentionMenu() {
     const q = composerMentionQuery();
     if (!q) { hideMentionMenu(); return; }
-    loadWorkspaceFiles();
-    const files = state._wsFiles || [];
     const ql = q.query.toLowerCase();
-    let items = files;
-    if (ql) {
-      items = files.filter(f => f.name.toLowerCase().includes(ql) || f.rel.toLowerCase().includes(ql));
-      items.sort((a, b) =>
-        (a.name.toLowerCase().startsWith(ql) ? 0 : 1) - (b.name.toLowerCase().startsWith(ql) ? 0 : 1)
-        || a.rel.length - b.rel.length);
+    let items = [];
+    if (q.trigger === "#") {
+      // Skills: the user-curated catalog, loaded on first use (20s cache).
+      loadSkills();
+      const skills = (state.skills || []).filter(s =>
+        !ql || s.name.toLowerCase().includes(ql) ||
+        (s.description || "").toLowerCase().includes(ql))
+        .map(s => ({ kind: "skill", skill: s }));
+      if (ql) {
+        skills.sort((a, b) =>
+          (a.skill.name.toLowerCase().startsWith(ql) ? 0 : 1) -
+          (b.skill.name.toLowerCase().startsWith(ql) ? 0 : 1));
+      }
+      items = skills.slice(0, 8);
+    } else {
+      // Workspace files: match + sort the existing lazy-loaded list.
+      loadWorkspaceFiles();
+      let fItems = (state._wsFiles || []).map(f => ({ kind: "file", file: f }));
+      if (ql) {
+        fItems = fItems.filter(f =>
+          f.file.name.toLowerCase().includes(ql) || f.file.rel.toLowerCase().includes(ql));
+        fItems.sort((a, b) =>
+          (a.file.name.toLowerCase().startsWith(ql) ? 0 : 1) - (b.file.name.toLowerCase().startsWith(ql) ? 0 : 1)
+          || a.file.rel.length - b.file.rel.length);
+      }
+      items = fItems.slice(0, 8);
     }
-    items = items.slice(0, 8);
     if (!items.length) { hideMentionMenu(); return; }
     _mentionItems = items;
     if (_mentionActive >= items.length) _mentionActive = 0;
@@ -9541,10 +9710,20 @@
   function showMentionMenu() {
     const menu = document.getElementById("mention-menu");
     if (!menu) return;
-    menu.innerHTML = _mentionItems.map((f, i) =>
-      `<div class="mention-item${i === _mentionActive ? " active" : ""}" data-i="${i}">` +
+    menu.innerHTML = _mentionItems.map((it, i) => {
+      const active = i === _mentionActive ? " active" : "";
+      if (it.kind === "skill") {
+        const s = it.skill;
+        const tag = s.budget ? `skill · ~${kTokens(s.budget)} tok` : "skill";
+        return `<div class="mention-item is-skill${active}" data-i="${i}">` +
+          `<i class="ph ph-book-open-text"></i><span class="mention-name">${esc(s.name)}</span>` +
+          `<span class="mention-rel">${esc(tag)}</span></div>`;
+      }
+      const f = it.file;
+      return `<div class="mention-item${active}" data-i="${i}">` +
         `<i class="ph ph-file"></i><span class="mention-name">${esc(f.name)}</span>` +
-        `<span class="mention-rel">${esc(f.rel)}</span></div>`).join("");
+        `<span class="mention-rel">${esc(f.rel)}</span></div>`;
+    }).join("");
     menu.classList.remove("hidden");
     menu.querySelectorAll(".mention-item").forEach(el =>
       el.addEventListener("mousedown", (e) => { e.preventDefault(); insertMention(_mentionItems[+el.dataset.i]); }));
@@ -9567,10 +9746,29 @@
     if (e.key === "Escape") { hideMentionMenu(); e.preventDefault(); return true; }
     return false;
   }
-  function insertMention(file) {
+  function insertMention(item) {
     const ta = document.getElementById("composer-input");
     const q = composerMentionQuery();
-    if (!ta || !q || !file) { hideMentionMenu(); return; }
+    if (!ta || !q || !item) { hideMentionMenu(); return; }
+    if (item.kind === "skill") {
+      // User picked a skill: consume the #token (q.at sits on the trigger
+      // char, so the same slice works for @ files and # skills) and fire
+      // load_skill through the existing /api/tools/call path. The result
+      // lands via the skill:loaded SSE event (deck card + pill + per-chat
+      // active slot).
+      const before = ta.value.slice(0, q.at);
+      const after = ta.value.slice(ta.selectionStart);
+      ta.value = before + after;
+      const pos = before.length;
+      ta.setSelectionRange(pos, pos);
+      hideMentionMenu();
+      autoResize(ta);
+      if (state.chatId) localStorage.setItem("accuretta:draft:" + state.chatId, ta.value);
+      ta.focus();
+      activateSkill(item.skill);
+      return;
+    }
+    const file = item.file;
     const before = ta.value.slice(0, q.at);
     const after = ta.value.slice(ta.selectionStart);
     // Use the rel path when the bare name is ambiguous (duplicate filenames in
@@ -9584,6 +9782,126 @@
     autoResize(ta);
     if (state.chatId) localStorage.setItem("accuretta:draft:" + state.chatId, ta.value);
     ta.focus();
+  }
+
+  // ===== skills: user-curated markdown procedures =====
+  const _SKILL_ICON = '<i class="ph ph-book-open-text"></i>';
+
+  async function loadSkills(force) {
+    if (!force && state.skills && Date.now() - state.skillsAt < 20000) return state.skills;
+    try {
+      const r = await (await fetch("/api/skills")).json();
+      state.skills = (r && r.skills) || [];
+      state.skillsAt = Date.now();
+    } catch { state.skills = state.skills || []; }
+    return state.skills;
+  }
+
+  function fireToolCall(name, argumentsObj) {
+    return fetch("/api/tools/call", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, arguments: argumentsObj })
+    }).then(r => r.json()).catch(() => null);
+  }
+
+  function kTokens(n) {
+    n = Number(n) || 0;
+    return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, "") + "K" : String(n);
+  }
+
+  function activateSkill(skill) {
+    if (!skill || !state.chatId) return;
+    appendAgentLog(`User activated skill: ${skill.name}.`);
+    fireToolCall("load_skill", { name: skill.name, chat_id: state.chatId })
+      .then(res => { if (res && res.error && state.chatId) toast("Skill failed to load: " + res.error, "err", 4000, "skill-load-fail"); })
+      .catch(() => {});
+  }
+
+  function clearActiveSkill() {
+    if (!state.chatId) return;
+    fireToolCall("load_skill", { name: "", chat_id: state.chatId });
+  }
+
+  function renderSkillPill() {
+    const pill = document.getElementById("skill-pill");
+    if (!pill) return;
+    const s = state.activeSkill;
+    if (!s || !state.chatId) {
+      pill.classList.add("hidden");
+      pill.innerHTML = "";
+      return;
+    }
+    const suffix = s.budget ? ` · ~${kTokens(s.budget)} tok` : "";
+    pill.innerHTML = `${_SKILL_ICON}<span>skill: ${esc(s.name)}${suffix}</span>` +
+      `<button class="skill-pill-x" title="Unload active skill" aria-label="Unload active skill">×</button>`;
+    pill.classList.remove("hidden");
+    pill.querySelector(".skill-pill-x").addEventListener("click", (e) => {
+      e.stopPropagation();
+      clearActiveSkill();
+    });
+  }
+
+  function skillDeckCard(evt) {
+    const deck = $("#revealer-deck");
+    if (!deck) return null;
+    // One live skill card at a time: a re-load (replaced skill) swaps the old.
+    const old = deck.querySelector(".revealer-card.skill-load");
+    if (old && !old._settled) old.remove();
+    const card = document.createElement("div");
+    card.className = "revealer-card notifications skill-load";
+    card.dataset.cardType = "notifications";
+    card.dataset.skill = evt.skill || "";
+    const budget = evt.budget ? ` · ~${kTokens(evt.budget)} tok` : "";
+    const replaced = evt.replaced ? ` · replaced ${esc(evt.replaced)}` : "";
+    card.innerHTML =
+      `<span class="notification-dot is-skill"></span>` +
+      `<div class="skill-load-body">` +
+      `<div class="skill-loader" aria-hidden="true"></div>` +
+      `<span class="notification-text">skill <strong>${esc(evt.skill)}</strong>${budget}${replaced} — guiding this turn</span>` +
+      `</div>`;
+    deck.appendChild(card);
+    if (!state.streaming) scheduleSkillSettle(card);
+    return card;
+  }
+
+  function scheduleSkillSettle(card) {
+    if (!card || card._settled) return;
+    clearTimeout(card._settleTimer);
+    card._settleTimer = setTimeout(() => {
+      if (state.streaming) { scheduleSkillSettle(card); return; }
+      settleSkillCard(card);
+    }, 2500);
+  }
+
+  // Turn ended (or the skill loaded outside a turn): stop the loader, dim the
+  // card to a settled "active" state. It persists until cleared/replaced.
+  function settleSkillCard(card) {
+    if (!card || card._settled) return;
+    card._settled = true;
+    clearTimeout(card._settleTimer);
+    card.classList.add("is-done");
+    const txt = card.querySelector(".notification-text");
+    const name = card.dataset.skill || "skill";
+    if (txt) txt.textContent = `skill ${name} — active in this chat`;
+  }
+
+  function maybeSettleSkillCards() {
+    const deck = $("#revealer-deck");
+    if (!deck) return;
+    deck.querySelectorAll(".revealer-card.skill-load:not(.is-done)").forEach(c => {
+      if (!state.streaming) { settleSkillCard(c); }
+    });
+  }
+
+  function clearSkillDeckCard() {
+    const deck = $("#revealer-deck");
+    if (!deck) return;
+    deck.querySelectorAll(".revealer-card.skill-load").forEach(c => {
+      settleSkillCard(c);
+      c.classList.add("fade-out");
+      setTimeout(() => { c.remove(); if (deck.children.length === 0) deck.innerHTML = ""; }, 220);
+    });
   }
 
   // ---- send-time + render-time helpers ----
@@ -10185,7 +10503,7 @@
     });
     $("#composer-input").addEventListener("input", e => autoResize(e.target));
     $("#composer-input").addEventListener("keydown", e => {
-      if (mentionMenuKeydown(e)) return;   // ↑↓/Enter/Tab/Esc drive the @ picker
+      if (mentionMenuKeydown(e)) return;   // ↑↓/Enter/Tab/Esc drive the @/# picker
       if (e.key !== "Enter") return;
       if (e.shiftKey) return; // newline
       e.preventDefault();

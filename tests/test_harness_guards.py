@@ -7,6 +7,7 @@ import tempfile
 import time
 import urllib.error
 import io
+import json
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -36,6 +37,268 @@ def _synthetic_credential(prefix, reversed_suffix):
     return prefix + reversed_suffix[::-1]
 
 
+class SkillLoaderTests(unittest.TestCase):
+    """Skills: user-curated markdown procedures, lazily loaded with one active
+    slot per chat. Covers the scanner, frontmatter parsing, the budget cap,
+    replace-on-load, and the skill:loaded SSE surface."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._old_dir = bridge.SKILLS_DIR
+        bridge.SKILLS_DIR = Path(self.tmp.name)
+        bridge._SKILLS_CACHE.clear()
+        self.addCleanup(lambda: (setattr(bridge, "SKILLS_DIR", self._old_dir),
+                                 bridge._SKILLS_CACHE.clear()))
+
+    def _write(self, fname, body, fm=None):
+        fm = fm or "name: {n}\ndescription: {d}\nbudget: {b}"
+        text = fm.format(n=fname.replace(".md", ""), d="a test skill", b=1200)
+        p = Path(self.tmp.name) / fname
+        p.write_text("---\n" + text + "\n---\n" + body + "\n", encoding="utf-8")
+        return p
+
+    def test_scan_skills_parses_frontmatter(self):
+        self._write("rt-report-loop.md", "# do\n1. find\n2. report\n")
+        catalog = bridge._skills_catalog()
+        self.assertEqual(len(catalog), 1)
+        self.assertEqual(catalog[0]["name"], "rt-report-loop")
+        self.assertEqual(catalog[0]["description"], "a test skill")
+        self.assertEqual(catalog[0]["budget"], 1200)
+        self.assertGreater(catalog[0]["body_chars"], 0)
+
+    def test_scan_skills_name_defaults_to_stem_and_quoted_values(self):
+        self._write("nikto.md", "scan stuff\n",
+                    fm='name: "nikto-playbook"\ndescription: \'run scans\'\nbudget: 400')
+        catalog = bridge._skills_catalog()
+        self.assertEqual(catalog[0]["name"], "nikto-playbook")
+        self.assertEqual(catalog[0]["description"], "run scans")
+        self.assertEqual(catalog[0]["budget"], 400)
+
+    def test_scan_skills_skips_invalid_and_oversized(self):
+        self._write("ok.md", "fine\n")
+        bad = Path(self.tmp.name) / "bad name!.md"
+        bad.write_text("---\nname: bad name!\ndescription: x\n---\nbody\n", encoding="utf-8")
+        big = Path(self.tmp.name) / "huge.md"
+        big.write_text("---\nname: huge\ndescription: x\n---\n" + ("h" * (bridge.SKILL_MAX_BODY_CHARS + 10)), encoding="utf-8")
+        names = [s["name"] for s in bridge._skills_catalog()]
+        self.assertEqual(names, ["ok"])
+
+    def test_load_skill_sets_active_skill_and_broadcasts(self):
+        self._write("rt-report-loop.md", "procedure body\n")
+        chat = {"id": "sk-chat", "messages": []}
+        chats = {"chats": {"sk-chat": chat}, "order": ["sk-chat"]}
+        saved = []
+        events = []
+        with patch.object(bridge, "get_chats", return_value=chats), \
+                patch.object(bridge, "save_json", side_effect=lambda _p, v: saved.append(v)), \
+                patch.object(bridge, "broadcast_event", side_effect=events.append):
+            result = bridge.tool_load_skill({"name": "rt-report-loop", "chat_id": "sk-chat"})
+        self.assertTrue(result["active"])
+        self.assertEqual(result["skill"], "rt-report-loop")
+        self.assertIn("procedure body", result["content"])
+        self.assertEqual(chat["active_skill"], "rt-report-loop")
+        self.assertEqual(chat["active_skill_budget"], 1200)
+        self.assertTrue(saved)
+        loaded = [e for e in events if e.get("type") == "skill:loaded"]
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["skill"], "rt-report-loop")
+        self.assertEqual(loaded[0]["chat_id"], "sk-chat")
+        self.assertNotIn("replaced", loaded[0])
+
+    def test_load_skill_replaces_previous_active(self):
+        self._write("alpha.md", "alpha body\n")
+        self._write("beta.md", "beta body\n")
+        chat = {"id": "sk-chat", "messages": [], "active_skill": "alpha"}
+        chats = {"chats": {"sk-chat": chat}, "order": ["sk-chat"]}
+        events = []
+        with patch.object(bridge, "get_chats", return_value=chats), \
+                patch.object(bridge, "save_json"), \
+                patch.object(bridge, "broadcast_event", side_effect=events.append):
+            result = bridge.tool_load_skill({"name": "beta", "chat_id": "sk-chat"})
+        self.assertEqual(result["replaced"], "alpha")
+        self.assertIn("replacing", result.get("note", ""))
+        loaded = [e for e in events if e.get("type") == "skill:loaded"]
+        self.assertEqual(loaded[0]["replaced"], "alpha")
+        self.assertEqual(chat["active_skill"], "beta")
+
+    def test_load_skill_unknown_and_clear(self):
+        self._write("alpha.md", "alpha body\n")
+        chat = {"id": "sk-chat", "messages": [], "active_skill": "alpha"}
+        chats = {"chats": {"sk-chat": chat}, "order": ["sk-chat"]}
+        events = []
+        with patch.object(bridge, "get_chats", return_value=chats), \
+                patch.object(bridge, "save_json"), \
+                patch.object(bridge, "broadcast_event", side_effect=events.append):
+            missing = bridge.tool_load_skill({"name": "nope", "chat_id": "sk-chat"})
+            cleared = bridge.tool_load_skill({"name": "", "chat_id": "sk-chat"})
+        self.assertIn("unknown skill", missing["error"])
+        self.assertFalse(cleared["active"])
+        self.assertEqual(cleared["skill"], None)
+        self.assertNotIn("active_skill", chat)
+        self.assertEqual([e.get("type") for e in events], ["skill:cleared"])
+
+    def test_load_skill_refuses_over_cap_body(self):
+        p = self._write("big.md", "")
+        p.write_text("---\nname: big\ndescription: x\nbudget: 100\n---\n"
+                     + ("x" * (bridge.SKILL_BODY_CAP_CHARS + 5)), encoding="utf-8")
+        bridge._SKILLS_CACHE.clear()
+        chat = {"id": "sk-chat", "messages": []}
+        chats = {"chats": {"sk-chat": chat}, "order": ["sk-chat"]}
+        with patch.object(bridge, "get_chats", return_value=chats), \
+                patch.object(bridge, "save_json"), \
+                patch.object(bridge, "broadcast_event"):
+            result = bridge.tool_load_skill({"name": "big", "chat_id": "sk-chat"})
+        self.assertIn("over the", result["error"])
+        self.assertNotIn("active_skill", chat)
+
+    def test_load_skill_no_workspace_call_without_chat(self):
+        self._write("alpha.md", "alpha body\n")
+        chat = {"id": "sk-chat", "messages": []}
+        chats = {"chats": {"sk-chat": chat}, "order": ["sk-chat"]}
+        with patch.object(bridge, "get_chats", return_value=chats), \
+                patch.object(bridge, "save_json"), \
+                patch.object(bridge, "broadcast_event"):
+            result = bridge.tool_load_skill({"name": "alpha"})
+        self.assertTrue(result["active"])
+        self.assertNotIn("active_skill", chat)
+
+class McpScopeGuardTests(unittest.TestCase):
+    """Mission-scoped MCP calls: URL-bearing arguments of dynamic MCP tools
+    get the same gate as rt_browser (allowlist, self-service block, phase
+    locks), and only the playwright MCP server stays visible in missions."""
+
+    def setUp(self):
+        self.settings = {
+            "red_team_enabled": True,
+            "rt_mission_state": True,
+            "desktop_enabled": False,
+            "analysis_tools_enabled": False,
+            "rt_force_exploit": False,
+        }
+
+    def _chat(self, authorized=True, phase="recon", status="active", engagement="redteam"):
+        return {
+            "id": "rt-chat",
+            "mission": {
+                "target": "example.com",
+                "scope": "in: example.com | out: admin.example.com",
+                "objective": "authorized test",
+                "facts": [],
+                "phase": phase,
+                "status": status,
+                "authorized": authorized,
+                "engagement": engagement,
+            },
+        }
+
+    def _patch_state(self, chat):
+        return patch.multiple(
+            bridge,
+            get_settings=lambda: dict(self.settings),
+            get_chats=lambda: {"chats": {"rt-chat": chat}, "order": ["rt-chat"]},
+        )
+
+    @contextmanager
+    def _active_chat(self):
+        token = bridge._current_chat_id.set("rt-chat")
+        try:
+            yield
+        finally:
+            bridge._current_chat_id.reset(token)
+
+    def test_mcp_args_urls_walks_nested_args(self):
+        found = bridge._rt_mcp_args_urls({
+            "url": "https://example.com/app",
+            "nested": {"target": "wss://chat.example.com/socket"},
+            "list": ["https://lib.example.com/x.js", "not-a-url", 42],
+            "label": "https://example.com",
+        })
+        self.assertEqual(found, [
+            "https://example.com/app", "wss://chat.example.com/socket",
+            "https://lib.example.com/x.js", "https://example.com"])
+
+    def test_no_mission_means_no_filter(self):
+        chat = self._chat(authorized=False)
+        with self._patch_state(chat), self._active_chat():
+            reason = bridge._rt_scope_mcp_calls(
+                "mcp_playwright_browser_navigate", {"url": "https://anywhere.example/"})
+        self.assertIsNone(reason)
+
+    def test_mission_allowlist_passes_in_scope_and_refuses_outside(self):
+        chat = self._chat(phase="exploit")
+        with self._patch_state(chat), self._active_chat():
+            ok = bridge._rt_scope_mcp_calls(
+                "mcp_playwright_browser_navigate", {"url": "https://example.com/app"})
+            outside = bridge._rt_scope_mcp_calls(
+                "mcp_playwright_browser_navigate", {"url": "https://example.net/"})
+            explicit_out = bridge._rt_scope_mcp_calls(
+                "mcp_playwright_browser_navigate", {"url": "https://admin.example.com/"})
+        self.assertIsNone(ok)
+        self.assertIn("not in the user-authorized scope", outside)
+        self.assertIn("OUT OF SCOPE", explicit_out)
+        self.assertIn("mcp_playwright_browser_navigate", outside)
+
+    def test_mcp_scope_refuses_own_bridge_port(self):
+        chat = self._chat(phase="exploit")
+        with self._patch_state(chat), self._active_chat(), \
+                patch.object(bridge.socket, "getaddrinfo",
+                             return_value=[(2, 1, 6, "", ("127.0.0.1", 0))]):
+            reason = bridge._rt_scope_mcp_calls(
+                "mcp_playwright_browser_navigate",
+                {"url": f"https://example.com:{bridge.PORT}/"})
+        self.assertIn("OWN", reason)
+
+    def test_mcp_browser_locked_during_recon_like_rt_browser(self):
+        chat = self._chat(phase="recon")
+        with self._patch_state(chat), self._active_chat():
+            reason = bridge._rt_scope_mcp_calls(
+                "mcp_playwright_browser_navigate", {"url": "https://example.com/"})
+        self.assertIn("exploit tools are locked", reason)
+
+    def test_mcp_browser_refused_in_passive_osint(self):
+        chat = self._chat(phase="recon", engagement="passive_osint")
+        with self._patch_state(chat), self._active_chat():
+            reason = bridge._rt_scope_mcp_calls(
+                "mcp_playwright_browser_navigate", {"url": "https://example.com/"})
+        self.assertIn("passive OSINT", reason)
+
+    def test_click_args_without_url_pass_after_checked_navigation(self):
+        chat = self._chat(phase="exploit")
+        with self._patch_state(chat), self._active_chat():
+            reason = bridge._rt_scope_mcp_calls(
+                "mcp_playwright_browser_click", {"selector": "button#go"})
+        self.assertIsNone(reason)
+
+    def test_non_mcp_tool_never_filtered(self):
+        chat = self._chat(phase="exploit")
+        with self._patch_state(chat), self._active_chat():
+            reason = bridge._rt_scope_mcp_calls(
+                "web_fetch", {"url": "https://example.net/"})
+        self.assertIsNone(reason)
+
+    def test_mission_visibility_keeps_playwright_mcp_only(self):
+        chat = self._chat()
+        fake = {
+            "mcp_playwright_browser_navigate": {"description": "fake", "fn": lambda a: {}},
+            "mcp_osint_query": {"description": "fake", "fn": lambda a: {}},
+        }
+        added = {}
+        for key, spec in fake.items():
+            if key not in bridge.TOOLS:
+                bridge.TOOLS[key] = spec
+                added[key] = True
+        try:
+            with self._patch_state(chat), self._active_chat(), \
+                    patch.dict(bridge._unlocked_bundles_by_chat, {"rt-chat": {"mcp"}}):
+                visible = bridge._visible_tool_names(True, "rt-chat")
+        finally:
+            for key in added:
+                bridge.TOOLS.pop(key, None)
+        self.assertIn("mcp_playwright_browser_navigate", visible)
+        self.assertNotIn("mcp_osint_query", visible)
+
+
 class CompactionGuardTests(unittest.TestCase):
     def test_failed_turn_is_included_in_passive_model_telemetry(self):
         settings = {"model": "failing.gguf", "num_ctx": 8192, "max_tool_rounds": 2,
@@ -54,7 +317,9 @@ class CompactionGuardTests(unittest.TestCase):
             result = bridge.run_chat_turn(
                 "fail", [_msg("system", "system"), _msg("user", "work")],
                 use_tools=False, emit=lambda _e: None, native_tools=True)
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        self.assertTrue(result.get("_server_fault"))
+        self.assertIn("response lost", result.get("content", ""))
         self.assertEqual(len(observations), 1)
         self.assertFalse(observations[0][1]["completed"])
 
@@ -429,7 +694,7 @@ class CompactionGuardTests(unittest.TestCase):
                     patch.object(bridge, "_refresh_continuity_state"), \
                     patch.object(bridge, "_estimate_context_tokens", return_value=100), \
                     patch.object(bridge, "_record_fold_event"), \
-                    patch.object(bridge, "broadcast_event"):
+                    patch.object(bridge, "broadcast_event") as mock_broadcast:
                 folded = bridge._maybe_roll_summary_unlocked(
                     chat, 8192, force=True, reason_hint="manual")
         finally:
@@ -440,6 +705,22 @@ class CompactionGuardTests(unittest.TestCase):
         self.assertTrue(folded)
         summarize.assert_called_once()
         self.assertGreater(chat["summary_through"], 0)
+        self.assertIn("fold_mark", chat)
+        self.assertEqual(chat["fold_mark"]["through"], chat["summary_through"])
+        self.assertGreater(chat["fold_mark"]["folded"], 0)
+        self.assertGreater(chat["fold_mark"]["folded_tokens"], 0)
+        self.assertIsInstance(chat["fold_mark"]["folded_tokens"], int)
+        self.assertEqual(chat["fold_mark"]["summary_chars"], len("valid summary"))
+        self.assertIsInstance(chat["fold_mark"]["t"], int)
+        folded_payloads = [
+            c for c in mock_broadcast.call_args_list
+            if c.args and c.args[0].get("type") == "summary_folded"
+        ]
+        self.assertEqual(len(folded_payloads), 1)
+        payload = folded_payloads[0].args[0]
+        self.assertEqual(payload["through"], chat["summary_through"])
+        self.assertEqual(payload["folded_tokens"], chat["fold_mark"]["folded_tokens"])
+        self.assertEqual(payload["summary_chars"], len("valid summary"))
 
     def test_agent_loop_stops_before_generation_after_final_compaction_failure(self):
         chat_id = "compaction-safe-stop"
@@ -479,6 +760,177 @@ class CompactionGuardTests(unittest.TestCase):
         self.assertEqual(final["_appended_intermediate"], [])
         self.assertIn("stopped this response", final["content"])
         self.assertTrue(any(event.get("type") == "final" for event in events))
+
+    def test_agent_loop_ends_when_every_round_is_refused(self):
+        call_delta = {"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "c1", "function": {
+                "name": "update_plan",
+                "arguments": '{"steps":[{"title":"run the ping","status":"pending"}]}'}}]},
+            "finish_reason": "tool_calls"}]}
+        refused = {"error": "refused: update_plan has been called 3 times this turn with "
+                            "the SAME arguments and nothing changed. Repeating won't help",
+                   "repeat_count": 3, "tool": "update_plan", "loop_breaker": True}
+        streams = iter([
+            _FakeStream([call_delta, {"timings": {"predicted_n": 8, "predicted_ms": 100, "prompt_n": 100}}]),
+            _FakeStream([call_delta, {"timings": {"predicted_n": 8, "predicted_ms": 100, "prompt_n": 120}}]),
+            _FakeStream([{"choices": [{"delta": {"content": "final answer"},
+                                       "finish_reason": "stop"}]},
+                         {"timings": {"predicted_n": 3, "predicted_ms": 50, "prompt_n": 140}}]),
+        ])
+        used = {"n": 0}
+
+        def open_stream(*_a, **_k):
+            used["n"] += 1
+            return next(streams)
+
+        settings = {
+            "model": "fake.gguf", "num_ctx": 8192, "max_tool_rounds": 8,
+            "summarize_history": True, "thinking_budget": 0,
+            "enable_thinking": False, "red_team_enabled": False,
+            "rt_mission_state": True, "passive_model_telemetry": False,
+        }
+        chat = {"id": "loop", "messages": [_msg("user", "scan the target")],
+                "task_anchor": {"original": "scan the target", "current": "scan the target"}}
+        events = []
+        with patch.object(bridge, "get_settings", return_value=settings), \
+                patch.object(bridge, "get_chats", return_value={
+                    "chats": {"loop": chat}, "order": ["loop"]}), \
+                patch.object(bridge, "_llama_props_ctx", return_value=8192), \
+                patch.object(bridge, "_conversation_token_scale", return_value=1.0), \
+                patch.object(bridge, "_tools_spec_overhead_tokens", return_value=0), \
+                patch.object(bridge, "llama_post_stream", side_effect=open_stream), \
+                patch.object(bridge, "invoke_tool", return_value=refused), \
+                patch.object(bridge, "_record_model_observation"), \
+                patch.object(bridge, "_turn_journal_checkpoint"), \
+                patch.object(bridge, "_turn_journal_clear"), \
+                patch.object(bridge, "_savings_add", return_value={"tok_in": 220, "tok_out": 11,
+                    "turns": 1, "since": 1}), \
+                patch.object(bridge._llama, "is_vision_capable", return_value=False):
+            final = bridge.run_chat_turn(
+                "loop", [_msg("system", "system"), _msg("user", "scan the target")],
+                use_tools=True, emit=events.append, native_tools=True)
+        self.assertEqual(final["content"], "final answer")
+        self.assertEqual(used["n"], 3)
+        self.assertTrue(any(e.get("type") == "notice" and "loop guard" in e.get("note", "")
+                            for e in events))
+
+    def _http500(self, body: str = '{"error":"cuda out of memory"}'):
+        return urllib.error.HTTPError(
+            "http://127.0.0.1:8080", 500, "Internal Server Error",
+            {}, io.BytesIO(body.encode("utf-8")))
+
+    def test_transient_server_500_is_retried_then_succeeds(self):
+        stream = _FakeStream([
+            {"choices": [{"delta": {"content": "recovered answer"}, "finish_reason": "stop"}]},
+            {"timings": {"predicted_n": 3, "predicted_ms": 50, "prompt_n": 100}},
+        ])
+        attempts = {"n": 0}
+
+        def open_stream(*_a, **_k):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise self._http500()
+            return stream
+
+        settings = {
+            "model": "fake.gguf", "num_ctx": 8192, "max_tool_rounds": 8,
+            "summarize_history": True, "thinking_budget": 0,
+            "enable_thinking": False, "red_team_enabled": False,
+            "rt_mission_state": True, "passive_model_telemetry": False,
+        }
+        chat = {"id": "retry", "messages": [_msg("user", "work")]}
+        events = []
+        with patch.object(bridge, "get_settings", return_value=settings), \
+                patch.object(bridge, "get_chats", return_value={
+                    "chats": {"retry": chat}, "order": ["retry"]}), \
+                patch.object(bridge, "_llama_props_ctx", return_value=8192), \
+                patch.object(bridge, "_conversation_token_scale", return_value=1.0), \
+                patch.object(bridge, "_tools_spec_overhead_tokens", return_value=0), \
+                patch.object(bridge, "llama_post_stream", side_effect=open_stream), \
+                patch.object(bridge, "_record_model_observation"), \
+                patch.object(bridge, "_turn_journal_checkpoint"), \
+                patch.object(bridge, "_turn_journal_clear"), \
+                patch.object(bridge, "_savings_add", return_value={"tok_in": 220, "tok_out": 11,
+                    "turns": 1, "since": 1}), \
+                patch.object(bridge._llama, "is_vision_capable", return_value=False):
+            final = bridge.run_chat_turn(
+                "retry", [_msg("system", "system"), _msg("user", "work")],
+                use_tools=False, emit=events.append, native_tools=True)
+        self.assertEqual(attempts["n"], 2)
+        self.assertEqual(final["content"], "recovered answer")
+        self.assertTrue(any(e.get("type") == "notice" and "retrying" in e.get("note", "")
+                            for e in events))
+
+    def test_persistent_server_500_preserves_completed_tool_work(self):
+        call_delta = {"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "c1", "function": {
+                "name": "update_plan",
+                "arguments": '{"steps":[{"title":"scan","status":"pending"}]}'}}]},
+            "finish_reason": "tool_calls"}]}
+        first = _FakeStream([
+            call_delta,
+            {"timings": {"predicted_n": 8, "predicted_ms": 100, "prompt_n": 100}},
+        ])
+        attempts = {"n": 0}
+
+        def open_stream(*_a, **_k):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                return first
+            raise self._http500('{"error":"Internal Server Error"}')
+
+        settings = {
+            "model": "fake.gguf", "num_ctx": 8192, "max_tool_rounds": 8,
+            "summarize_history": True, "thinking_budget": 0,
+            "enable_thinking": False, "red_team_enabled": False,
+            "rt_mission_state": True, "passive_model_telemetry": False,
+        }
+        chat = {"id": "fault", "messages": [_msg("user", "work")],
+                "task_anchor": {"original": "work", "current": "work"}}
+        events = []
+        with patch.object(bridge, "get_settings", return_value=settings), \
+                patch.object(bridge, "get_chats", return_value={
+                    "chats": {"fault": chat}, "order": ["fault"]}), \
+                patch.object(bridge, "_llama_props_ctx", return_value=8192), \
+                patch.object(bridge, "_conversation_token_scale", return_value=1.0), \
+                patch.object(bridge, "_tools_spec_overhead_tokens", return_value=0), \
+                patch.object(bridge, "llama_post_stream", side_effect=open_stream), \
+                patch.object(bridge, "invoke_tool", return_value={"ok": True, "steps": 1}), \
+                patch.object(bridge, "_record_model_observation"), \
+                patch.object(bridge, "_turn_journal_checkpoint"), \
+                patch.object(bridge, "_turn_journal_clear"), \
+                patch.object(bridge, "_savings_add", return_value={"tok_in": 220, "tok_out": 11,
+                    "turns": 1, "since": 1}), \
+                patch.object(bridge._llama, "is_vision_capable", return_value=False):
+            final = bridge.run_chat_turn(
+                "fault", [_msg("system", "system"), _msg("user", "work")],
+                use_tools=True, emit=events.append, native_tools=True)
+        self.assertIsNotNone(final)
+        self.assertTrue(final["_server_fault"])
+        self.assertIn("response lost", final["content"])
+        roles = [m.get("role") for m in final["_appended_intermediate"]]
+        self.assertIn("assistant", roles)
+        self.assertIn("tool", roles)
+        self.assertTrue(any(e.get("type") == "error" and "HTTP 500" in e.get("error", "")
+                            for e in events))
+
+    def test_large_list_field_result_is_sampled_not_blind_envelope(self):
+        result = {"bundle": "rt-exploit", "loaded": True,
+                  "tools": ["tool_%03d" % i for i in range(500)]}
+        out = bridge.compress_tool_result("list_more_tools", result, cap=600)
+        parsed = json.loads(out)
+        self.assertTrue(parsed["_truncated"])
+        self.assertIn("showing first", parsed["_note"])
+        self.assertNotIn("keys_present", parsed)
+        self.assertLessEqual(len(parsed["tools"]), 20)
+        self.assertEqual(bridge._tool_result_cap("list_more_tools"), 48000)
+
+    def test_plain_envelope_still_used_when_lists_are_unhelpful(self):
+        result = {"data": {"nested": {k: v for k, v in
+                                      [("k%d" % i, "x" * 40) for i in range(300)]}}}
+        out = bridge.compress_tool_result("mystery_tool", result, cap=600)
+        parsed = json.loads(out)
+        self.assertIn("keys_present", parsed)
 
     def test_structured_continuity_uses_harness_state(self):
         chat = {
@@ -1285,7 +1737,10 @@ class RedTeamEnforcementTests(unittest.TestCase):
         chat = self._chat(phase="recon")
         with self._patch_state(chat), self._active_chat():
             reason = bridge._rt_scope_block("http_request", {"url": "https://example.com/"})
+            browser_reason = bridge._rt_scope_block(
+                "rt_browser", {"action": "navigate", "url": "https://example.com/"})
         self.assertIn("exploit tools are locked", reason)
+        self.assertIn("exploit tools are locked", browser_reason)
 
     def test_live_turn_phase_unlocks_next_worker_before_disk_commit(self):
         persisted = self._chat(phase="recon")
@@ -1336,6 +1791,138 @@ class RedTeamEnforcementTests(unittest.TestCase):
                 bridge.TOOLS.pop(fake_name, None)
             else:
                 bridge.TOOLS[fake_name] = old
+
+    def test_scoped_browser_policy_blocks_network_escape(self):
+        chat = self._chat(phase="exploit")
+        chat["mission"]["authorization_id"] = "auth-123"
+        chat["mission"]["user_agent"] = "Researcher bug-bounty"
+        policy = bridge._rt_browser_policy(chat)
+
+        self.assertEqual(policy["authorization_id"], "auth-123")
+        self.assertEqual(policy["user_agent"], "Researcher bug-bounty")
+        self.assertIsNone(bridge._rt_browser_url_block(
+            "https://api.example.com/app.js", policy))
+        self.assertIn("out-of-scope", bridge._rt_browser_url_block(
+            "https://admin.example.com/panel", policy))
+        self.assertIn("outside the authorized allowlist", bridge._rt_browser_url_block(
+            "https://example.net/collect", policy))
+        self.assertIn("scheme", bridge._rt_browser_url_block(
+            "file:///C:/Windows/System32/drivers/etc/hosts", policy))
+
+    def test_browser_context_intercepts_subresources_and_websockets(self):
+        class FakePage:
+            def on(self, _event, _handler):
+                pass
+
+        class FakeContext:
+            def __init__(self):
+                self.route_handler = None
+                self.websocket_handler = None
+
+            def route(self, _pattern, handler):
+                self.route_handler = handler
+
+            def route_web_socket(self, _pattern, handler):
+                self.websocket_handler = handler
+
+            def add_init_script(self, _script):
+                pass
+
+            def on(self, _event, _handler):
+                pass
+
+            def new_page(self):
+                return FakePage()
+
+            def close(self):
+                pass
+
+        class FakeBrowser:
+            def __init__(self):
+                self.context = FakeContext()
+
+            def new_context(self, **_options):
+                return self.context
+
+        class FakeRoute:
+            def __init__(self):
+                self.aborted = False
+                self.continued = False
+
+            def abort(self):
+                self.aborted = True
+
+            def continue_(self):
+                self.continued = True
+
+        class FakeRequest:
+            def __init__(self, url):
+                self.url = url
+                self.method = "GET"
+                self.resource_type = "script"
+
+        class FakeSocketRoute:
+            def __init__(self, url):
+                self.url = url
+                self.closed = False
+                self.connected = False
+
+            def close(self, **_kwargs):
+                self.closed = True
+
+            def connect_to_server(self):
+                self.connected = True
+
+        worker = bridge._ScopedBrowserWorker()
+        policy = {
+            "authorization_id": "auth-123",
+            "allowed": ("example.com",),
+            "denied": ("admin.example.com",),
+            "user_agent": "",
+            "self_ports": (),
+        }
+        browser = FakeBrowser()
+        state = worker._new_session(browser, "test", policy)
+
+        allowed_route = FakeRoute()
+        browser.context.route_handler(
+            allowed_route, FakeRequest("https://cdn.example.com/app.js"))
+        blocked_route = FakeRoute()
+        browser.context.route_handler(
+            blocked_route, FakeRequest("https://tracker.example.net/pixel"))
+        allowed_socket = FakeSocketRoute("wss://socket.example.com/events")
+        browser.context.websocket_handler(allowed_socket)
+        blocked_socket = FakeSocketRoute("wss://example.net/events")
+        browser.context.websocket_handler(blocked_socket)
+
+        self.assertTrue(allowed_route.continued)
+        self.assertTrue(blocked_route.aborted)
+        self.assertTrue(allowed_socket.connected)
+        self.assertTrue(blocked_socket.closed)
+        self.assertEqual(sum(bool(event.get("blocked")) for event in state["events"]), 2)
+
+    def test_browser_tool_uses_live_mission_policy(self):
+        chat = self._chat(phase="exploit")
+        chat["mission"]["authorization_id"] = "auth-live"
+        chat["mission"]["user_agent"] = "Researcher browser-test"
+        with self._patch_state(chat), self._active_chat(), self._live_rt_chat(chat), \
+                patch.object(bridge._RT_BROWSER_WORKER, "call",
+                             side_effect=lambda payload: {"payload": payload}):
+            result = bridge.invoke_tool("rt_browser", {
+                "action": "navigate", "session": "browser one",
+                "url": "https://app.example.com/",
+            })
+
+        payload = result["payload"]
+        self.assertEqual(payload["session"], "browser_one")
+        self.assertEqual(payload["policy"]["authorization_id"], "auth-live")
+        self.assertEqual(payload["policy"]["user_agent"], "Researcher browser-test")
+
+    def test_browser_reports_missing_optional_dependency(self):
+        worker = bridge._ScopedBrowserWorker()
+        with patch.object(bridge, "_HAVE_PLAYWRIGHT", False):
+            result = worker.call({"action": "snapshot"})
+        self.assertEqual(result["dependency_missing"], "playwright")
 
     def test_closed_mission_requires_fresh_gate(self):
         chat = self._chat(status="closed")
@@ -1446,6 +2033,10 @@ class RedTeamEnforcementTests(unittest.TestCase):
                 "url": "https://example.com/api/profile",
                 "headers": {"Authorization": f"Bearer {github_token}"},
             })
+            blocked_browser = bridge.invoke_tool("rt_browser", {
+                "action": "fill", "session": "audit", "selector": "#token",
+                "value": github_token,
+            })
 
         self.assertEqual(result["resources_scanned"]["javascript"], 1)
         self.assertEqual(result["resources_scanned"]["source_maps"], 1)
@@ -1456,6 +2047,7 @@ class RedTeamEnforcementTests(unittest.TestCase):
         self.assertFalse(result["provider_validation_performed"])
         self.assertTrue(result["credential_submission_guard_active"])
         self.assertTrue(blocked["credential_submission_blocked"])
+        self.assertTrue(blocked_browser["credential_submission_blocked"])
         self.assertIn("may be displayed and written into reports", blocked["error"])
         serialized = __import__("json").dumps(result)
         self.assertIn(github_token, serialized)
@@ -1569,6 +2161,35 @@ class RedTeamEnforcementTests(unittest.TestCase):
         self.assertEqual(live["mission"]["status"], "closed")
         self.assertTrue(saved)
 
+    def test_is_in_workspace_outside_folder_refused_when_desktop_off(self):
+        ws = {"folders": [r"C:\WorkspaceFoo"]}
+        with patch.object(bridge, "get_workspace", return_value=ws), \
+                patch.object(bridge, "_desktop_wide_enabled", return_value=False):
+            self.assertFalse(bridge.is_in_workspace(r"C:\Users\Anyone\Documents\target.txt"))
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_is_in_workspace_outside_folder_allowed_when_desktop_on(self):
+        ws = {"folders": [r"C:\WorkspaceFoo"]}
+        with patch.object(bridge, "get_workspace", return_value=ws), \
+                patch.object(bridge, "_desktop_wide_enabled", return_value=True):
+            self.assertTrue(bridge.is_in_workspace(r"C:\Users\Anyone\Documents\target.txt"))
+            self.assertTrue(bridge.is_in_workspace(r"D:\MODELS\qwen.gguf"))
+
+    def test_is_in_workspace_blocked_path_still_refused_when_desktop_on(self):
+        ws = {"folders": [r"C:\WorkspaceFoo"]}
+        with patch.object(bridge, "get_workspace", return_value=ws), \
+                patch.object(bridge, "_desktop_wide_enabled", return_value=True):
+            self.assertFalse(bridge.is_in_workspace(r"C:\Windows\System32\drivers\hosts"))
+            self.assertFalse(bridge.is_in_workspace(r"C:\Windows\System32\config\SAM"))
+
+    def test_is_in_workspace_inside_folder_always_allowed(self):
+        ws = {"folders": [r"C:\WorkspaceFoo"]}
+        with patch.object(bridge, "get_workspace", return_value=ws), \
+                patch.object(bridge, "_desktop_wide_enabled", return_value=False):
+            self.assertTrue(bridge.is_in_workspace(r"C:\WorkspaceFoo"))
+            self.assertTrue(bridge.is_in_workspace(r"C:\WorkspaceFoo\src\main.py"))
+
+    def test_desktop_wide_enabled_reads_settings_toggle(self):
+        self.assertFalse(bridge._desktop_wide_enabled({"desktop_enabled": False}))
+        self.assertTrue(bridge._desktop_wide_enabled({"desktop_enabled": True}))
+        self.assertFalse(bridge._desktop_wide_enabled({"desktop_enabled": None}))
+        self.assertFalse(bridge._desktop_wide_enabled("not a dict"))

@@ -141,10 +141,15 @@ The suite includes:
 - port, TLS, HTTP, DNS, subdomain, RDAP, archive, content, exposure, and takeover checks
 - parameter discovery, injection probes, SQL injection checks, CORS tests, fuzzing, raw HTTP, and raw TCP
 - JWT decoding and testing, encoders, request replay, controlled credential checks, and evidence capture
+- scope-enforced Chromium sessions for JavaScript-heavy validation after a finding is confirmed
 - CVE matching, finding records, report generation, and retained evidence hashes
 - a standalone front-end secret scanner for HTML, JavaScript bundles, lazy-loaded chunks, and source maps
 
 The front-end scanner returns exact high-confidence matches for reporting, separates public identifiers, and hides weak candidates unless requested. It never submits a discovered credential to its provider or uses it for a liveness check.
+
+Browser-backed validation uses a first-party Playwright worker (`rt_browser`). Every network request a session makes, including redirects, popups, iframes, subresources, and WebSockets, is checked against the engagement allowlist; only `about`, `data`, and `blob` schemes are exempt, and they carry no network traffic. Downloads and arbitrary JavaScript evaluation are unavailable. Install the optional browser once with `python -m playwright install chromium` after installing `requirements.txt`.
+
+If a Playwright MCP server is connected, its tools get the same treatment during an engagement: while a mission is active it is the only MCP server kept visible, and URL-bearing arguments are checked against the mission allowlist with the same gate as `rt_browser` before the call reaches the server. Outside an engagement, MCP tools run under approval alone and carry no allowlist.
 
 Scope enforcement covers requests made through Accuretta. It does not filter traffic outside the bridge, so use these tools only on systems you own or have written permission to assess.
 
@@ -184,6 +189,23 @@ Accuretta includes a dependency-free MCP stdio client. Add servers to `bridge_mc
   }
 }
 ```
+
+## Skills
+
+Recurring procedures can be packaged as markdown skills and loaded on demand. Drop a `.md` file into `skills/` in the app folder. Each file starts with YAML frontmatter that names the skill, describes when to use it, and estimates its context cost:
+
+````markdown
+---
+name: my-procedure
+description: What this procedure is for.
+budget: 2000
+---
+
+# My procedure
+(instructions the model follows while the skill is active)
+````
+
+Type `#` in the composer to pick one (the built-in picker also lists them). A skill loads into the current chat, one skill per chat, and loading another one replaces it. The model reads the procedure until you unload it with the × button next to the skill pill. Bodies over 16,000 characters refuse to load. `skills/` is per-machine user content, so it is gitignored; the format above is all a new user needs.
 
 ## Context, recovery, and model health
 
