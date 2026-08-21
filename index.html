@@ -25,11 +25,11 @@
     document.documentElement.setAttribute('data-theme', theme);
   })();
 </script>
-  <link rel="stylesheet" href="/app.css?v=36">
+  <link rel="stylesheet" href="/app.css?v=50">
 <script src="https://unpkg.com/@phosphor-icons/web"></script>
-<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js?v=2" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js?v=2" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js?v=2" defer></script>
 <style>
   img[src^="/accuMOTION/"] {
     height: 44px !important;
@@ -50,10 +50,16 @@
       <div class="brand-row">
         <!-- Two images, one per theme variant. CSS hides whichever doesn't
              match [data-theme] on <html>. -->
-        <img class="brand-mark brand-mark-light" src="/logo-mark-light.png" alt="" aria-hidden="true">
-        <img class="brand-mark brand-mark-dark" src="/logo-mark-dark.png" alt="" aria-hidden="true">
+        <svg class="brand-mark" viewBox="0 0 348 282" aria-hidden="true" draggable="false">
+          <g class="logo-slab">
+            <path d="M164 6 L226 6 Q240 6 233.7 18.5 L111.3 261.5 Q105 274 91 274 L24 274 Q10 274 16.5 261.6 L143.5 18.4 Q150 6 164 6 Z"/>
+          </g>
+          <g class="logo-purple">
+            <path d="M225 135 L260 135 Q272 135 277.2 145.8 L332.8 261.2 Q338 272 326 272 L269 272 Q257 272 253.3 260.6 L216.7 146.4 Q213 135 225 135 Z"/>
+          </g>
+        </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.7.4</span>
+        <span class="v" id="brand-v">v0.7.5</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -175,6 +181,7 @@
           </select>
         </div>
         <button class="iconbtn" id="btn-toggle-plan" title="Plan" aria-pressed="false"><i class="ph ph-list-checks"></i></button>
+        <button class="iconbtn" id="btn-github-activity" title="GitHub Activity"><i class="ph ph-git-branch"></i></button>
         <button class="iconbtn" id="btn-session-desktop" title="Desktop automation for this chat only" hidden><i class="ph ph-desktop"></i></button>
         <button class="iconbtn" id="btn-cmd-history" title="PowerShell command history"><i class="ph ph-terminal-window"></i></button>
         <button class="iconbtn" id="btn-palette" title="Switch session (⌘K / Ctrl+K)"><i class="ph ph-magnifying-glass"></i></button>
@@ -221,7 +228,7 @@
             <button class="chip on" id="mode-auto" data-mode="auto"><i class="ph ph-lightning"></i>Auto</button>
             <button class="chip" id="btn-attach-image" title="Attach image — the vision model reads it and hands a description to the main model"><i class="ph ph-image"></i>Image</button>
             <button class="chip" id="btn-attach-file" title="Upload files from this browser into the PC workspace"><i class="ph ph-paperclip"></i>File</button>
-            <button class="chip" id="btn-trust-writes" title="Trust writes — auto-approve saving and editing files in your workspace. Registry edits, Windows system folders, file deletion, PowerShell, and git operations (commit, push, checkout...) still require approval."><i class="ph ph-pencil-simple-line"></i>Trust writes</button>
+            <button class="chip" id="btn-perms" title="Access — approval mode for agent actions. Soft = autonomous, medium = trust writes, hard = every action asks. Windows/System32 and registry changes always require the hold-to-approve card. Click to cycle."><i class="ph ph-keyhole"></i>Access</button>
             <input type="file" id="file-image" accept="image/*" multiple hidden>
             <input type="file" id="file-client" multiple hidden>
             <div class="toolbar-overflow-wrap">
@@ -256,19 +263,20 @@
             <span class="composer-hint">⌘⏎ send · Shift⏎ newline</span>
             <div class="composer-foot-actions">
               <div class="effort-control hidden" id="reasoning-effort-control">
-                <button class="effort-pill" id="reasoning-effort-pill" type="button" aria-haspopup="dialog" aria-expanded="false" title="Reasoning effort for the next message">
-                  <span class="effort-pill-label">Effort</span>
-                  <strong id="reasoning-effort-value">Default</strong>
-                  <i class="ph ph-caret-up-down effort-pill-caret"></i>
+                <button class="effort-pill" id="reasoning-effort-pill" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Reasoning effort: Default" title="Reasoning effort for the next message">
+                  <i class="ph-bold ph-brain effort-pill-icon" aria-hidden="true"></i>
+                  <span class="effort-pill-label" id="reasoning-effort-value" aria-hidden="true">Default</span>
                 </button>
-                <div class="effort-popover" id="reasoning-effort-popover" role="dialog" aria-label="Reasoning effort">
+                <div class="effort-popover" id="reasoning-effort-popover" role="menu" aria-label="Reasoning effort">
                   <div class="effort-popover-head">
                     <span>Effort</span>
                     <strong id="reasoning-effort-popover-value">Default</strong>
                   </div>
-                  <input id="reasoning-effort-slider" class="effort-slider" type="range" min="0" max="3" step="1" value="0" aria-label="Reasoning effort: auto, low, medium, or high">
-                  <div class="effort-levels" aria-hidden="true">
-                    <span>Default</span><span>Low</span><span>Med</span><span>Deep</span>
+                  <div class="effort-menu" id="reasoning-effort-menu">
+                    <button type="button" class="effort-option active" role="menuitemradio" aria-checked="true" data-level="auto"><i class="ph ph-magic-wand" aria-hidden="true"></i><span>Default</span><i class="ph ph-check effort-check" aria-hidden="true"></i></button>
+                    <button type="button" class="effort-option" role="menuitemradio" aria-checked="false" data-level="low"><i class="ph ph-leaf" aria-hidden="true"></i><span>Low</span><i class="ph ph-check effort-check" aria-hidden="true"></i></button>
+                    <button type="button" class="effort-option" role="menuitemradio" aria-checked="false" data-level="medium"><i class="ph ph-lightning" aria-hidden="true"></i><span>Medium</span><i class="ph ph-check effort-check" aria-hidden="true"></i></button>
+                    <button type="button" class="effort-option" role="menuitemradio" aria-checked="false" data-level="high"><i class="ph ph-fire" aria-hidden="true"></i><span>Deep</span><i class="ph ph-check effort-check" aria-hidden="true"></i></button>
                   </div>
                 </div>
               </div>
@@ -597,6 +605,18 @@
   </div>
 </aside>
 
+<!-- ====== GITHUB ACTIVITY MODAL ====== -->
+<div class="modal-scrim" id="github-activity-scrim"></div>
+<aside class="modal github-activity-modal" id="github-activity-modal" aria-hidden="true">
+  <div class="modal-head">
+    <i class="ph ph-git-branch"></i>
+    <h3>GitHub Activity</h3>
+    <span class="gh-activity-login" id="gh-activity-login"></span>
+    <button class="iconbtn" id="btn-close-github-activity"><i class="ph ph-x"></i></button>
+  </div>
+  <div class="modal-body gh-activity-body" id="gh-activity-body"></div>
+</aside>
+
 <!-- ====== SETTINGS DRAWER ====== -->
 <!-- ====== COMMAND PALETTE (⌘K) ====== -->
 <div class="palette-scrim hidden" id="palette-scrim"></div>
@@ -755,6 +775,7 @@
         <div class="model-health-metric"><span>Tool success</span><strong>&mdash;</strong></div>
         <div class="model-health-metric"><span>Context use</span><strong>&mdash;</strong></div>
       </div>
+      <div id="model-health-compare"></div>
       <div class="model-health-advice" id="model-health-advice">Keep using the model normally. Accuretta will surface recurring operational problems here.</div>
       <div class="model-health-recommendation" id="model-health-recommendation" hidden></div>
       <div class="model-health-privacy"><i class="ph ph-lock-key"></i><span id="model-health-privacy">Local numbers only. No prompts, replies, commands, files, screenshots, or tool output.</span></div>
@@ -882,6 +903,7 @@
         <option value="neumorphic">Neumorphic</option>
         <option value="neobrutalism">Neobrutalism</option>
         <option value="aperture">Aperture</option>
+        <option value="aperture-dark">Aperture Dark</option>
         <option value="soft">Soft</option>
         <option value="pastel">Pastel</option>
         <option value="velvet">Velvet</option>
@@ -1089,6 +1111,22 @@
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+      <span>GitHub integration</span>
+      <span class="grow" style="flex:1;"></span>
+      <span id="github-conn-status" class="hint" style="font-size:10px;">not connected</span>
+    </div>
+    <div class="form-row">
+      <span class="hint">powers the GitHub Activity dashboard — contribution graph, recent repos, and branch creation. create a <b>fine-grained personal access token</b> at github.com/settings/personal-access-tokens; the branch workflow additionally needs <b>Contents: Read and write</b> (and Metadata: Read) on the repos you want to work on. the token is stored on this PC only and never sent to the model.</span>
+    </div>
+    <div class="form-row inline">
+      <label>Fine-grained PAT</label>
+      <div style="display:flex;gap:6px;flex:1;min-width:0;">
+        <input type="password" id="set-github-pat" placeholder="github_pat_…" autocomplete="off" spellcheck="false" style="flex:1;min-width:0;font-family:ui-monospace,Consolas,monospace;font-size:12px;">
+        <button class="btn sm" id="btn-github-connect" type="button"><i class="ph ph-plugs-connected"></i>Connect</button>
+      </div>
+    </div>
+
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
       <span>Desktop automation</span>
       <span class="grow" style="flex:1;"></span>
       <span id="desktop-deps-badge" class="hint" style="font-size:10px;"></span>
@@ -1211,7 +1249,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
-  <script src="/app.js?v=2026081707"></script>
+  <script src="/app.js?v=2026082103"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {

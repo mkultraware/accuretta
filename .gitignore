@@ -79,3 +79,6 @@ github_stats.db
 promo_video/
 AUDIT_AND_ROADMAP.md
 media/holographic_bg.jpg
+
+# internal test suite — not shipped to users
+tests/

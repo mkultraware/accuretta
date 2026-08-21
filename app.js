@@ -68,11 +68,11 @@
   function showDeckToast(msg, kind, ms = 3000) {
     const deck = $("#revealer-deck");
     if (!deck) return null;
-    
+
     const row = document.createElement("div");
     row.className = `revealer-card notifications ${kind}`;
     row.dataset.cardType = "notifications";
-    
+
     const iconMap = {
       info: '<i class="ph ph-info" style="color:var(--accent)"></i>',
       ok: '<i class="ph ph-check-circle" style="color:var(--success)"></i>',
@@ -80,23 +80,49 @@
       err: '<i class="ph ph-x-circle" style="color:var(--danger)"></i>'
     };
     const iconHtml = iconMap[kind] || iconMap.info;
-    
+
     row.innerHTML = `
       <span class="notification-dot is-${kind}"></span>
       <span class="notification-icon">${iconHtml}</span>
       <span class="notification-text">${msg}</span>
     `;
+    // Stacked-deck entrance: start collapsed + dropped, then let the
+    // transition settle it into place (transitions re-run smoothly when a
+    // newer card buries this one and its depth class changes).
+    row.classList.add("note-pre");
     deck.appendChild(row);
-    
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      row.classList.remove("note-pre");
+      _syncDeckStack();
+    }));
+
     setTimeout(() => {
       row.classList.add("fade-out");
+      _syncDeckStack();
       setTimeout(() => {
         row.remove();
+        _syncDeckStack();
         if (deck.children.length === 0) deck.innerHTML = "";
-      }, 220);
+      }, 260);
     }, ms);
-    
+
     return row;
+  }
+
+  // Tag each live notification with how deeply it is buried under newer
+  // ones (0 = front card). Drives the stacked-deck transforms in CSS; older
+  // cards visibly "settle back" as a new one lands on top of them.
+  function _syncDeckStack() {
+    const deck = $("#revealer-deck");
+    if (!deck) return;
+    const notes = [...deck.querySelectorAll(".revealer-card.notifications:not(.fade-out)")];
+    const total = notes.length;
+    notes.forEach((el, i) => {
+      const depth = Math.min(total - 1 - i, 3);
+      el.classList.toggle("depth-1", depth === 1);
+      el.classList.toggle("depth-2", depth === 2);
+      el.classList.toggle("depth-3", depth >= 3);
+    });
   }
 
   function toast(msg, kind = "info", ms = 3000, key = null, html = false) {
@@ -609,7 +635,7 @@
   const _LOGO_SLAB_D = "M164 6 L226 6 Q240 6 233.7 18.5 L111.3 261.5 Q105 274 91 274 L24 274 Q10 274 16.5 261.6 L143.5 18.4 Q150 6 164 6 Z";
   const _LOGO_PURPLE_D = "M225 135 L260 135 Q272 135 277.2 145.8 L332.8 261.2 Q338 272 326 272 L269 272 Q257 272 253.3 260.6 L216.7 146.4 Q213 135 225 135 Z";
   const _LOGO_SVG = (cls) => `<svg class="avatar-mark ${cls}" viewBox="0 0 348 282" aria-hidden="true" draggable="false"><g class="logo-slab"><path d="${_LOGO_SLAB_D}"/></g><g class="logo-purple"><path d="${_LOGO_PURPLE_D}"/></g></svg>`;
-  const AGENT_AVATAR_HTML = `<div class="avatar">${_LOGO_SVG("avatar-mark-light")}${_LOGO_SVG("avatar-mark-dark")}</div>`;
+  const AGENT_AVATAR_HTML = `<div class="avatar">${_LOGO_SVG("")}</div>`;
 
   // Render web-search chips into the head's chip strip. New searches REPLACE
   // the chip set with a fade-in animation — gives the "rotating sources" feel
@@ -1147,14 +1173,20 @@
   // tokenizing across ~40 languages, plus auto-detection for untagged blocks —
   // and falls back to the built-in lightweight highlighter when hljs isn't
   // loaded (offline / CDN blocked). Returns { html, lang }.
-  function highlightForCard(src, lang) {
+  function highlightForCard(src, lang, opts = {}) {
+    const streaming = !!opts.streaming;
     const hl = window.hljs;
     if (hl) {
       try {
         const known = _hljsLang(lang);
         if (known) return { html: hl.highlight(src, { language: known, ignoreIllegals: true }).value, lang: known };
-        const auto = hl.highlightAuto(src);
-        if (auto && auto.value) return { html: auto.value, lang: auto.language || (lang === "text" ? "" : lang) || "text" };
+        // highlightAuto tries EVERY language — far too slow to run per paint
+        // on a growing untagged block. During streaming fall through to the
+        // cheap built-in detector; the final render auto-detects once.
+        if (!streaming) {
+          const auto = hl.highlightAuto(src);
+          if (auto && auto.value) return { html: auto.value, lang: auto.language || (lang === "text" ? "" : lang) || "text" };
+        }
       } catch (_) { /* fall through to the built-in highlighter */ }
     }
     let l = lang;
@@ -1648,9 +1680,171 @@
     return html ? `<div class="answer-interim">${html}</div>` : "";
   }
 
+  // ---------- streaming pipeline helpers ----------
+  // Line-anchored fence state for a live buffer. A fence only opens when a
+  // ``` run STARTS A LINE (<=3 spaces indent) and only closes on a bare
+  // backtick line — mid-prose ``` runs can therefore never pair up and
+  // swallow whole paragraphs into a phantom code card.
+  function scanOpenFenceState(text) {
+    const lines = String(text || "").split("\n");
+    let inFence = false, infoStr = "", bodyLen = 0, openIdx = -1, bodyStart = -1;
+    let pos = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const ln = lines[i];
+      if (!inFence) {
+        if (/^[ \t]*`{3,}/.test(ln)) {
+          inFence = true;
+          infoStr = ln.replace(/^[ \t]*`{3,}/, "").trim();
+          openIdx = pos;
+          bodyStart = pos + ln.length + 1;
+          bodyLen = 0;
+        }
+      } else if (/^[ \t]*`{3,}[ \t]*$/.test(ln)) {
+        inFence = false;
+        infoStr = "";
+      } else {
+        bodyLen += ln.length + 1;
+      }
+      pos += ln.length + 1;
+    }
+    return { inFence, infoStr, bodyLen, openIdx, bodyStart };
+  }
+
+  // Does an unlabeled (or labeled) fence body actually read like code? Long
+  // bodies must earn code treatment via punctuation/keyword density; long
+  // rambling prose after a stray fence renders as prose instead. Short
+  // bodies get the benefit of the doubt so real snippets never flicker.
+  function fenceBodyLooksLikeCode(body, infoStr) {
+    const lang = (infoStr || "").split(/\s+/)[0].toLowerCase();
+    if (lang && _isKnownLang(lang)) return true;
+    if (/path=/i.test(infoStr || "")) return true;
+    const b = String(body || "");
+    if (b.length < 500) return true;
+    const signals = (b.match(/[{};<>=()[\]]|=>|->|::|\b(?:function|return|def|class|import|export|const|let|var|public|void|SELECT|INSERT)\b/g) || []).length;
+    const sentences = (b.match(/[.!?]["')\]]?(?:\s|$)/g) || []).length;
+    return signals * 12 >= b.length || sentences < 4;
+  }
+
+  // Largest position in `text` at or after `minLen` where the answer can be
+  // split into "frozen prefix" + "volatile tail" with IDENTICAL markdown
+  // rendering: a blank-line block boundary, outside any open fence, whose
+  // next line starts a fresh block (not a list/table/quote/indent
+  // continuation). Returns 0 when no safe cut exists yet.
+  function findStableCut(text, minLen) {
+    const t = String(text || "");
+    if (t.length < 600) return 0;
+    const lines = t.split("\n");
+    let pos = 0, inFence = false, cut = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const ln = lines[i];
+      const lineEnd = pos + ln.length;
+      if (!inFence && /^[ \t]*`{3,}/.test(ln)) inFence = true;
+      else if (inFence && /^[ \t]*`{3,}[ \t]*$/.test(ln)) inFence = false;
+      else if (!inFence && ln.trim() === "" && lineEnd + 1 >= minLen && i + 1 < lines.length) {
+        const nxt = lines[i + 1];
+        const continuation = /^\s*(?:[-*+]\s|\d+[.)]\s|>|\||\t| {4,})/.test(nxt);
+        if (!continuation && nxt.trim() !== "") cut = lineEnd + 1;
+      }
+      pos = lineEnd + 1;
+    }
+    return cut;
+  }
+
+  // DEFAULT-DIM promotion: while a reasoning-capable model's untagged output
+  // has not yet proven it is the ANSWER, it presents as working notes. These
+  // structural shapes promote immediately; plain prose promotes once it is
+  // long enough to stop matching the planning-prose heuristics.
+  function shouldPromoteAnswer(text) {
+    const s = String(text || "").trimStart();
+    if (!s) return false;
+    if (/^(?:#{1,6}\s|```|\*\*[^\s*]|[-*+]\s|\d+\.\s)/.test(s)) return true;
+    return s.length >= 160 && !isLikelyLiveWorkingNotes(s);
+  }
+
+  // Bracket matcher for the linear JSON tool-call stripper — string-aware,
+  // no backtracking, bounded by the caller.
+  function matchBracket(text, start) {
+    const open = text[start];
+    const close = open === "{" ? "}" : "]";
+    let depth = 0, inStr = false, esc = false;
+    for (let i = start; i < text.length; i++) {
+      const c = text[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === "\\") esc = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') inStr = true;
+      else if (c === open) depth++;
+      else if (c === close) {
+        depth--;
+        if (!depth) return i;
+      }
+    }
+    return -1;
+  }
+
+  // Linear replacement for the old nested-lazy regexes that stripped
+  // {name,arguments} blobs — those could backtrack catastrophically on
+  // JSON-array-shaped prose and freeze the tab. Walks candidates left to
+  // right; matched segments are removed without ever re-scanning them.
+  function stripJsonToolCallShapes(text) {
+    let t = String(text || "");
+    let i = 0;
+    while (i < t.length) {
+      const c = t[i];
+      if (c !== "{" && c !== "[") { i++; continue; }
+      const end = matchBracket(t, i);
+      if (end === -1 || end - i > 4000) { i++; continue; }
+      const seg = t.slice(i, end + 1);
+      if (/"name"\s*:/.test(seg) && /"(?:arguments|parameters?|function)"\s*:/.test(seg)) {
+        t = t.slice(0, i) + t.slice(end + 1);
+        continue;
+      }
+      i++;
+    }
+    return t;
+  }
+
+  // renderMarkdown's fence extractor — same line-anchored rules as
+  // scanOpenFenceState so streaming and final renders always agree. Fenced
+  // regions become \x00F{i}\x00 placeholders; an unclosed fence at EOF is
+  // only treated as code when the body reads like code (the ramble guard).
+  function extractLineAnchoredFences(text, fences) {
+    const lines = String(text || "").split("\n");
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+      const openM = /^[ \t]*`{3,}([^\n`]*)$/.exec(lines[i]);
+      if (!openM) { out.push(lines[i]); i++; continue; }
+      const infoStr = (openM[1] || "").trim();
+      const body = [];
+      let j = i + 1;
+      let closed = false;
+      while (j < lines.length) {
+        if (/^[ \t]*`{3,}[ \t]*$/.test(lines[j])) { closed = true; break; }
+        body.push(lines[j]);
+        j++;
+      }
+      const bodyText = body.join("\n");
+      if (!closed && !fenceBodyLooksLikeCode(bodyText, infoStr)) {
+        // stray fence opener inside prose — keep it as literal text
+        out.push(lines[i]);
+        i++;
+        continue;
+      }
+      fences.push({ infoStr, code: maybeUnescapeJsonFence(bodyText) });
+      out.push(`\x00F${fences.length - 1}\x00`);
+      i = closed ? j + 1 : j;
+    }
+    return out.join("\n");
+  }
+
   // ---------- markdown-lite for chat bubbles ----------
   // Preserves code fences, ignores tool_call tags (rendered as tool cards separately).
-  function renderMarkdown(text) {
+  function renderMarkdown(text, opts = {}) {
+    const streaming = !!opts.streaming;
     if (!text) return "";
 
     // === FAILSAFE: STRIP CASCADE TAGS ===
@@ -1706,10 +1900,9 @@
     text = text.replace(/<functions>[\s\S]*?<\/functions>/gi, "");
     text = text.replace(/<invoke>[\s\S]*?<\/invoke>/gi, "");
     text = text.replace(/<tool>[\s\S]*?<\/tool>/gi, "");
-    text = text.replace(/\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/g, "");
-    text = text.replace(/\{\s*"function"\s*:\s*"[^"]+"\s*,\s*"parameter(?:s)?"\s*:\s*\{[\s\S]*?\}\s*\}/g, "");
-    text = text.replace(/\[[\s\S]*?\{[\s\S]*?"name"[\s\S]*?"arguments"[\s\S]*?\}[\s\S]*?\]/g, "");
-    text = text.replace(/\[[\s\S]*?\{[\s\S]*?"function"[\s\S]*?"parameter(?:s)?"[\s\S]*?\}[\s\S]*?\]/g, "");
+    // {name, arguments} / [..{name, function}..] blobs — linear scanner, no
+    // backtracking (the old nested-lazy regexes could hang the tab).
+    text = stripJsonToolCallShapes(text);
     text = text.replace(/\*\*Tool call:.*?\*\*/gi, "");
     text = text.replace(/\*\*Function call:.*?\*\*/gi, "");
     text = text.replace(/Calling\s+\w+\s*\(.*?\)\s*\.\.\./gi, "");
@@ -1717,12 +1910,11 @@
     text = text.replace(/\n{3,}/g, "\n\n");
     text = text.trim();
 
-    // extract code fences
+    // extract code fences — line-anchored (see extractLineAnchoredFences):
+    // mid-prose ``` runs no longer pair into phantom code cards, and an
+    // unclosed fence only renders as code when the body reads like code.
     const fences = [];
-    text = text.replace(/```([^\n]+)?\n?([\s\S]*?)```/g, (_m, infoStr, code) => {
-      fences.push({ infoStr: infoStr || "", code: maybeUnescapeJsonFence(code) });
-      return `\x00F${fences.length - 1}\x00`;
-    });
+    text = extractLineAnchoredFences(text, fences);
 
     // extract short-term memory markers (bridge.py wraps prior <think> blocks
     // as [scratchpad-from-earlier-turn]…[/scratchpad-from-earlier-turn] — the
@@ -1891,7 +2083,7 @@
         const dpm = (infoStr || "").match(/path=([^\s]+)/i);
         return renderDiffCard(src, dpm ? dpm[1] : "");
       }
-      const hl = highlightForCard(src, displayLang);
+      const hl = highlightForCard(src, displayLang, { streaming });
       if (hl.lang) displayLang = hl.lang;
       const lined = wrapCodeLines(hl.html);
       // Dynamic single-line detection for super compact visual density
@@ -2430,7 +2622,8 @@
     // turn — but those aren't bubbles, the renderer skips them.
     state.messages = chat
       ? (chat.messages || []).filter(
-          m => (m.role === "user" || m.role === "assistant") && !m._internal
+          m => (m.role === "user" || m.role === "assistant"
+                || (m.role === "system" && m._note)) && !m._internal
         )
       : [];
     state.messageWindowStart = Math.max(
@@ -2707,7 +2900,7 @@
       { kind: "cmd", icon: "ph-gear-six", label: "Open Settings", action: () => { closePalette(); openSettings(); } },
       { kind: "cmd", icon: "ph-brain", label: "Open Long-term memory", action: () => { closePalette(); openSettings(); setTimeout(() => revealSettingsControl("#btn-mem-refresh"), 80); } },
       { kind: "cmd", icon: "ph-arrow-counter-clockwise", label: "Regenerate last reply", action: () => { closePalette(); regenerateLast(); } },
-      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / neobrutalism / aperture / soft / pastel / velvet / cartograph / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
+      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / neobrutalism / aperture / aperture-dark / soft / pastel / velvet / cartograph / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
       { kind: "cmd", icon: "ph-browser", label: "Toggle preview pane", action: () => { closePalette(); app.classList.toggle("preview-collapsed"); } },
       { kind: "cmd", icon: "ph-camera", label: "Screenshot preview", action: () => { closePalette(); screenshotPreview(); } },
       { kind: "cmd", icon: "ph-package", label: "Export project", action: () => { closePalette(); exportProjectZip(); } },
@@ -2781,7 +2974,9 @@
       // chat-circle. The active row also shows the colored dot bullet via
       // the `.chatrow.active::before` rule in app.css — the icon is the
       // SECONDARY signal, the dot is the primary.
-      const iconClass = c.origin === "mobile" ? "ph ph-device-mobile" : "ph ph-chat-circle";
+      const iconClass = c.origin === "mobile" ? "ph ph-device-mobile"
+        : (c.origin === "github" ? "ph ph-git-branch" : "ph ph-chat-circle");
+      if (c.origin === "github") row.classList.add("gh-branch");
       row.innerHTML = `
         <i class="${iconClass}"></i>
         <span class="t">${esc(c.title)}</span>
@@ -2942,6 +3137,16 @@
   }
 
   function renderBubble(m) {
+    if (m.role === "system" && m._note) {
+      const row = document.createElement("div");
+      row.className = "bubble-row github-event-row";
+      row.innerHTML = `
+        <div class="github-event-bubble">
+          <svg class="github-event-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+          <div class="github-event-text">${esc(m.content || "")}</div>
+        </div>`;
+      return row;
+    }
     const row = document.createElement("div");
     row.className = "bubble-row " + (m.role === "user" ? "user" : "");
     const avatar = m.role === "user"
@@ -3043,137 +3248,47 @@
   // Wire Copy / Preview action buttons on rendered code cards. For legacy
   // <pre> blocks (e.g. tool output) we still graft on a floating copy
   // button so they're not left bare. Idempotent via data-enhanced.
+  // Shared text extractor for code cards — used by the delegated click
+  // handlers below. Line-span bodies must be re-joined with \n (the spans
+  // are display:block, so textContent concatenates without separators).
+  function getCodeText(pre) {
+    const codeEl = pre.querySelector("code");
+    if (codeEl) {
+      const lines = codeEl.querySelectorAll(".code-line");
+      if (lines.length) {
+        return Array.from(lines).map(l => l.textContent).join("\n");
+      }
+      return codeEl.textContent || "";
+    }
+    return pre.textContent || "";
+  }
+
   function enhanceCodeBlocks(root) {
     const pres = root.querySelectorAll("pre");
     pres.forEach(pre => {
       if (pre.dataset.enhanced === "1") return;
       pre.dataset.enhanced = "1";
       pre.classList.add("code-block");
-
-      const codeEl = pre.querySelector("code");
-      // wrapCodeLines() emits each source line as a <span class="code-line">
-      // and joins them with NO newline (because the spans are display:block
-      // and a literal \n inside the <pre> would render as an extra blank
-      // row). That makes the visual layout right but breaks copy-paste —
-      // .textContent on the <code> returns every line concatenated with no
-      // separator, so pasting comes out as one long line.
-      // Fix: when the body uses our line spans, walk them and join with \n.
-      // For legacy / tool-output <pre> blocks that don't have line spans,
-      // fall back to plain textContent (which already has real newlines).
-      const getText = () => {
-        if (codeEl) {
-          const lines = codeEl.querySelectorAll(".code-line");
-          if (lines.length) {
-            return Array.from(lines).map(l => l.textContent).join("\n");
-          }
-          return codeEl.textContent || "";
-        }
-        return pre.textContent || "";
-      };
-
-      // Modern code-card path — buttons emitted by renderMarkdown live inline or in tabs header.
-      const container = pre.closest(".code-card-tabs-container");
-      const copyAct = pre.querySelector(".cc-copy") || container?.querySelector(".cc-copy");
-      const previewAct = pre.querySelector(".cc-preview") || container?.querySelector(".cc-preview");
-      const openAct = container?.querySelector(".cc-open-file");
-
-      if (openAct) {
-        openAct.addEventListener("click", () => {
-          const filename = openAct.dataset.filename;
-          const rootFolder = (state.workspace && state.workspace.folders && state.workspace.folders[0]) || "";
-          if (!rootFolder) {
-            toast("No workspace folder configured", "warn", 2000);
-            return;
-          }
-          if (filename.endsWith(".html")) {
-            previewWorkspaceHtml(rootFolder, filename, filename);
-          } else if (filename.endsWith(".md")) {
-            previewWorkspaceMarkdown(rootFolder, filename, filename);
-          } else if (filename.endsWith(".py")) {
-            runPythonCheck(rootFolder, filename, filename);
-          } else {
-            previewWorkspaceSource(rootFolder, filename, filename);
-          }
-        });
-      }
-
-      if (copyAct) {
-        copyAct.addEventListener("click", async () => {
-          try {
-            await copyText(getText());
-            const labelEl = copyAct.querySelector("span");
-            const iconEl = copyAct.querySelector("i");
-            const prevLabel = labelEl ? labelEl.textContent : "";
-            if (iconEl) { iconEl.classList.remove("ph-copy"); iconEl.classList.add("ph-check"); }
-            if (labelEl) labelEl.textContent = "Copied";
-            copyAct.classList.add("copied");
-            setTimeout(() => {
-              if (iconEl) { iconEl.classList.add("ph-copy"); iconEl.classList.remove("ph-check"); }
-              if (labelEl) labelEl.textContent = prevLabel || "Copy";
-              copyAct.classList.remove("copied");
-            }, 1200);
-          } catch {
-            toast("Clipboard blocked", "warn", 2000);
-          }
-        });
-      }
-
-      if (previewAct) {
-        previewAct.addEventListener("click", () => {
-          const code = getText();
-          if (!code.trim()) { toast("Code block is empty", "warn", 1800); return; }
-          // Push the block into the preview pipeline. Reuse state.currentHtml +
-          // renderPreview() so the existing iframe/srcdoc path handles sandbox,
-          // tailwind injection, and the code-view tab.
-          state.currentHtml = code;
-          state.currentFiles = {};
-          state.view = "preview";
-          $("#btn-view-preview")?.classList.add("active");
-          $("#btn-view-code")?.classList.remove("active");
-          if (app.classList.contains("preview-collapsed") && !isMobile()) {
-            app.classList.remove("preview-collapsed");
-          }
-          renderPreview();
-          toast("Loaded into preview pane", "info", 1500);
-        });
-      }
-
-      // Legacy fallback — older <pre> blocks that didn't go through the
-      // code-card emit (tool result lines, short-term memory tails, etc.) still
-      // get a small floating copy button so they're not bare.
-      if (!copyAct) {
+      // Click actions (copy / preview / open-file / legacy copy button) are
+      // handled by ONE delegated document listener — see installCodeCardActions.
+      // Per-paint innerHTML rebuilds recreate these nodes, so per-node
+      // listeners would re-wire O(every block) on every streaming paint.
+      if (!pre.querySelector(".cc-copy") && !pre.closest(".code-card-tabs-container")) {
         const btn = document.createElement("button");
         btn.className = "copy-code";
         btn.type = "button";
         btn.innerHTML = '<i class="ph ph-copy"></i>';
         btn.title = "Copy";
-        btn.addEventListener("click", async () => {
-          try {
-            await copyText(getText());
-            btn.innerHTML = '<i class="ph ph-check"></i>';
-            setTimeout(() => (btn.innerHTML = '<i class="ph ph-copy"></i>'), 1200);
-          } catch { toast("Clipboard blocked", "warn", 2000); }
-        });
         pre.appendChild(btn);
       }
     });
 
-    // Diff cards aren't <pre>, so the loop above skips them. Wire their copy
-    // button here — it copies the raw unified diff stashed in .diff-raw.
+    // Diff cards aren't <pre>, so the loop above skips them. Their copy
+    // button copies the raw unified diff stashed in .diff-raw (delegated —
+    // see installCodeCardActions; no per-node listener needed here).
     root.querySelectorAll(".diff-card").forEach(card => {
       if (card.dataset.enhanced === "1") return;
       card.dataset.enhanced = "1";
-      const btn = card.querySelector(".cc-copy");
-      const holder = card.querySelector(".diff-raw");
-      if (!btn || !holder) return;
-      btn.addEventListener("click", async () => {
-        try {
-          await copyText(holder.value);
-          const icon = btn.querySelector("i");
-          if (icon) { icon.classList.remove("ph-copy"); icon.classList.add("ph-check"); }
-          setTimeout(() => { if (icon) { icon.classList.add("ph-copy"); icon.classList.remove("ph-check"); } }, 1200);
-        } catch { toast("Clipboard blocked", "warn", 2000); }
-      });
     });
 
     // Code-only bubbles: when the agent reply is essentially just one code
@@ -4602,6 +4717,203 @@
     if (card && mission.status === "closed") osintCardFinalize(row);
   }
 
+  // ---- streaming paint pipeline ----
+  // One paint per animation frame, coalesced across deltas. All DOM writes
+  // for a delta batch happen here, aligned with the compositor.
+  function scheduleStreamPaint(row, paint) {
+    if (!row || !row.isConnected) { paint(); return; }
+    row._paintNext = paint;   // always run the LATEST state
+    if (row._paintRaf) return;
+    row._paintRaf = requestAnimationFrame(() => {
+      row._paintRaf = null;
+      const fn = row._paintNext;
+      row._paintNext = null;
+      if (fn) {
+        try { fn(); } catch (e) { console.error("stream paint failed", e); }
+      }
+    });
+  }
+
+  function cancelStreamPaint(row) {
+    if (!row) return;
+    if (row._paintRaf) cancelAnimationFrame(row._paintRaf);
+    row._paintRaf = null;
+    row._paintNext = null;
+  }
+
+  // splitThinking memo — the base-split below re-parses the SAME prefix
+  // every paint (buf only grows at the tail), so cache by input identity.
+  function splitThinkingMemo(row, buf) {
+    const m = row._stMemo;
+    if (m && m.buf === buf) return m.res;
+    const res = splitThinking(buf);
+    row._stMemo = { buf, res };
+    return res;
+  }
+
+  function baseSplitMemo(row, newBuf, base) {
+    if (!base) return "";
+    const src = newBuf.slice(0, base);
+    const m = row._baseMemo;
+    if (m && m.base === base && m.src === src) return m.out;
+    const out = splitCascade(splitThinking(src).content).content;
+    row._baseMemo = { base, src, out };
+    return out;
+  }
+
+  function paintStreamDelta(ctx) {
+    const { bubble } = ctx;
+    const row = ctx.row;
+    if (!row || !row.isConnected || !bubble) return;
+    const newBuf = ctx.getBuf();
+    // Controlled cadence on top of the rAF alignment. Remote browsers get a
+    // calmer cadence because older laptops benefit far more than they
+    // notice the extra 40 ms.
+    const paintNow = performance.now();
+    const paintInterval = state.clientContext?.remote ? 90 : 50;
+    if (row._lastStreamPaint && paintNow - row._lastStreamPaint < paintInterval) return;
+    row._lastStreamPaint = paintNow;
+
+    let { thinking, content } = splitThinkingMemo(row, newBuf);
+    if (row._channelThinking) {
+      // reasoning rides its own SSE channel; buf is pure answer text
+      thinking = "";
+    } else if (!thinking && content
+        && state.settings.enable_thinking !== false
+        && state.reasoningCapability?.supported) {
+      // DEFAULT-DIM presentation: untagged early output shows as working
+      // notes and is PROMOTED to the answer once it stops reading like
+      // planning prose. The old answer-first/demote-later flow rendered a
+      // fake answer that then vanished mid-scroll.
+      if (!row._answerPromoted) {
+        if (isLikelyLiveWorkingNotes(content)) { thinking = content; content = ""; }
+        else if (shouldPromoteAnswer(content)) row._answerPromoted = true;
+        else { thinking = content; content = ""; }
+      }
+    }
+    const cascadeRes = splitCascade(content);
+    content = cascadeRes.content;
+
+    if (thinking && !row._channelThinking) {
+      const thinkContent = row.querySelector(".think-content");
+      if (thinkContent) {
+        thinkContent._fullText = thinking;
+        if (!thinkContent.classList.contains("hidden")) {
+          thinkContent.textContent = thinking;
+        }
+      }
+    }
+    // Status line: tool running -> its own label; answer streaming ->
+    // "Writing response"; reasoning only -> "Thinking…" / "Thinking about <file>".
+    const _toolRunning = ctx.toolStack && ctx.toolStack.querySelector(".tool-line.running");
+    if (!_toolRunning) {
+      updateThinkLine(row, true, content.trim() ? "Writing response" : thinkingLabel());
+    }
+
+    // Live cascade chips render into the parent container regardless of other content
+    if (cascadeRes.cascade && cascadeRes.cascade.length > 0) {
+      let btns = cascadeRes.cascade.map(text =>
+        `<button class="cascade-chip" data-prompt="${esc(text)}"><i class="ph ph-sparkle"></i>${esc(text)}</button>`
+      ).join("");
+      let container = row.querySelector(".cascade-container");
+      if (!container) {
+        container = document.createElement("div");
+        container.className = "cascade-container";
+        bubble.parentNode.appendChild(container);
+      }
+      container.innerHTML = btns;
+    } else {
+      let container = row.querySelector(".cascade-container");
+      if (container) container.remove();
+    }
+
+    // INTERIM narration (before the last tool call) vs live ANSWER (after).
+    let interim = "";
+    let answer = content;
+    const _base = row._answerBufBase || 0;
+    if (_base > 0) {
+      const before = baseSplitMemo(row, newBuf, _base);
+      if (before && before.trim() && content.startsWith(before)) {
+        interim = before;
+        answer = content.slice(before.length);
+      }
+    }
+    row._interimText = interim;   // reused by the final re-render
+
+    if (content.trim()) {
+      // cancel any in-flight collapse — real content arrived
+      if (bubble._collapsing) {
+        clearTimeout(bubble._collapseTimer);
+        bubble._collapsing = false;
+        bubble.classList.remove("collapsing");
+      }
+      bubble.classList.remove("hidden");
+      const interimHtml = interim.trim() ? renderWorkingNotesBlock(interim) : "";
+
+      // Incremental rendering: blocks before the last safe cut are frozen —
+      // their HTML is cached and reused verbatim; only the volatile tail
+      // re-renders per paint. Prefix mismatch (reclassification / round
+      // reset) falls back to a full render automatically.
+      let inc = bubble._incRender;
+      if (!(inc && inc.src && answer.startsWith(inc.src))) {
+        inc = bubble._incRender = { src: "", html: "" };
+      }
+      const cut = findStableCut(answer, inc.src.length);
+      if (cut > inc.src.length) {
+        inc.html += renderMarkdown(answer.slice(inc.src.length, cut));
+        inc.src = answer.slice(0, cut);
+      }
+      const tailStart = inc.src.length;
+
+      // Big code-in-progress: stream the fence body as PLAIN text rows
+      // (cheap esc, no highlight, no line spans) instead of swapping the
+      // content away for a progress placeholder. Highlighting happens once,
+      // at the final render.
+      const fence = scanOpenFenceState(answer);
+      if (fence.inFence && fence.bodyLen > 4000
+          && fenceBodyLooksLikeCode(answer.slice(fence.bodyStart), fence.infoStr)) {
+        const now = Date.now();
+        if (now - (bubble._lastPlainAt || 0) >= 250) {
+          bubble._lastPlainAt = now;
+          const lang = (fence.infoStr || "code").split(/\s+/)[0].toLowerCase() || "code";
+          const lines = (answer.slice(fence.bodyStart).match(/\n/g) || []).length + 1;
+          const kb = (fence.bodyLen / 1024).toFixed(1);
+          const head = answer.slice(tailStart, fence.openIdx);
+          const headHtml = head ? renderMarkdown(head, { streaming: true }) : "";
+          bubble.innerHTML = interimHtml + inc.html + headHtml +
+            `<div class="stream-code-hint"><i class="ph ph-code"></i><span>writing <strong>${esc(lang)}</strong> — ${lines} lines, ${kb} KB · syntax colors land when the block closes</span></div>` +
+            `<pre class="code-card streaming-plain"><code>${esc(answer.slice(fence.bodyStart))}</code></pre>`;
+        }
+      } else {
+        bubble._lastPlainAt = 0;
+        // Unclosed fences reach renderMarkdown as-is: the line-anchored
+        // extractor keeps code-like bodies as code cards and releases
+        // prose-like ones back to text — no parity guessing here anymore.
+        const tailHtml = answer.length > tailStart
+          ? renderMarkdown(answer.slice(tailStart), { streaming: true }) : "";
+        bubble.innerHTML = interimHtml + inc.html + tailHtml;
+        enhanceCodeBlocks(bubble);
+      }
+      // NB: no updateThinkLine(false) here — the status line stays a live
+      // shimmering indicator; the finally block finalizes it once at turn end.
+    } else if ((bubble.innerHTML || !bubble.classList.contains("hidden")) && !bubble._collapsing) {
+      // Content was demoted into thinking or stripped (partial </tool_call>,
+      // reclassification). Fade the bubble out instead of popping it away,
+      // and hold autoscroll so the viewport doesn't jump twice.
+      bubble._collapsing = true;
+      bubble.classList.add("collapsing");
+      row._scrollHoldUntil = Date.now() + 420;
+      bubble._collapseTimer = setTimeout(() => {
+        bubble._collapsing = false;
+        bubble.classList.remove("collapsing");
+        bubble.innerHTML = "";
+        bubble._incRender = null;
+        bubble.classList.add("hidden");
+      }, 200);
+    }
+    if (Date.now() >= (row._scrollHoldUntil || 0)) scrollToBottom();
+  }
+
   function handleEvent(evt, ctx) {
     const { bubble, toolStack, toolCards, row } = ctx;
     if (evt.type === "delta") {
@@ -4644,131 +4956,29 @@
           }
         }
       }
-      // Rebuilding markdown and scanning the complete growing buffer for every
-      // token is quadratic work. Paint at a controlled cadence; the buffer and
-      // counters above still consume every delta, and the final event always
-      // performs one authoritative full render. Remote browsers get a calmer
-      // cadence because older laptops benefit far more than they notice 50 ms.
-      const paintNow = performance.now();
-      const paintInterval = state.clientContext?.remote ? 90 : 50;
-      if (ctx.row && ctx.row._lastStreamPaint
-          && paintNow - ctx.row._lastStreamPaint < paintInterval) {
-        return;
+      // Painting is frame-aligned and coalesced: at most one paint per
+      // animation frame, still throttled to the cadence inside
+      // paintStreamDelta. The buffer and counters above consume every delta;
+      // the final event always performs one authoritative full render.
+      scheduleStreamPaint(ctx.row, () => paintStreamDelta(ctx));
+    } else if (evt.type === "thinking_start") {
+      // Reasoning arrived on its own SSE channel (bridge saw
+      // reasoning_content) — no tag parsing, no answer/thinking ambiguity.
+      if (ctx.row) {
+        ctx.row._channelThinking = true;
+        updateThinkLine(ctx.row, true, thinkingLabel());
       }
-      if (ctx.row) ctx.row._lastStreamPaint = paintNow;
-      let { thinking, content } = splitThinking(newBuf);
-      if (!thinking && content && ctx.row
-          && state.settings.enable_thinking !== false
-          && state.reasoningCapability?.supported
-          && isLikelyLiveWorkingNotes(content)) {
-        thinking = content;
-        content = "";
+    } else if (evt.type === "thinking_delta") {
+      const r = ctx.row;
+      if (!r) return;
+      r._thinkBuf = (r._thinkBuf || "") + evt.content;
+      const tc = r.querySelector(".think-content");
+      if (tc) {
+        tc._fullText = r._thinkBuf;
+        if (!tc.classList.contains("hidden")) tc.textContent = r._thinkBuf;
       }
-      const cascadeRes = splitCascade(content);
-      content = cascadeRes.content;
-      
-      if (thinking && ctx.row) {
-        const thinkContent = ctx.row.querySelector(".think-content");
-        if (thinkContent) {
-          thinkContent._fullText = thinking;
-          if (!thinkContent.classList.contains("hidden")) {
-            thinkContent.textContent = thinking;
-          }
-        }
-      }
-      // Status line = a live, shimmering PHASE indicator, not a parrot of the
-      // request. It tracks what's actually happening, in priority order:
-      //   tool running     -> the tool's own label (set on tool_start; left alone)
-      //   answer streaming -> "Writing response"
-      //   reasoning only   -> thinkingLabel() ("Thinking…" / "Thinking about <file>")
-      // It shimmers until the turn ends; the finally block freezes it to
-      // "Thought for Xs" once, so it never flips mid-stream.
-      const _toolRunning = ctx.toolStack && ctx.toolStack.querySelector(".tool-line.running");
-      if (ctx.row && !_toolRunning) {
-        updateThinkLine(ctx.row, true, content.trim() ? "Writing response" : thinkingLabel());
-      }
-      
-      // Render live cascade chips into the parent container regardless of other content
-      if (cascadeRes.cascade && cascadeRes.cascade.length > 0) {
-        let btns = cascadeRes.cascade.map(text => 
-          `<button class="cascade-chip" data-prompt="${esc(text)}"><i class="ph ph-sparkle"></i>${esc(text)}</button>`
-        ).join("");
-        let container = ctx.row.querySelector(".cascade-container");
-        if (!container) {
-          container = document.createElement("div");
-          container.className = "cascade-container";
-          bubble.parentNode.appendChild(container);
-        }
-        container.innerHTML = btns;
-      } else {
-        let container = ctx.row.querySelector(".cascade-container");
-        if (container) container.remove();
-      }
-
-      // Split the visible text into INTERIM narration (everything the model
-      // said up to its last tool call this turn) and the live ANSWER (after it).
-      // base = buf length captured at the last tool_start. If the model later
-      // folds that narration into a <think> block, `before` stops being a prefix
-      // of content and we demote nothing — safe fallback to plain rendering.
-      let interim = "";
-      let answer = content;
-      const _base = ctx.row ? (ctx.row._answerBufBase || 0) : 0;
-      if (_base > 0) {
-        let before = splitCascade(splitThinking(newBuf.slice(0, _base)).content).content;
-        if (before && before.trim() && content.startsWith(before)) {
-          interim = before;
-          answer = content.slice(before.length);
-        }
-      }
-      if (ctx.row) ctx.row._interimText = interim;   // reused by the final re-render
-
-      if (content.trim()) {
-        bubble.classList.remove("hidden");
-        // Interim narration renders dimmed + small; only the live answer gets
-        // full markdown treatment below.
-        const interimHtml = interim.trim()
-          ? renderWorkingNotesBlock(interim) : "";
-        // Detect an in-progress LARGE code fence in the ANSWER. The full markdown
-        // render is O(N); for a 700-line dump we swap to a cheap progress
-        // placeholder. Everything else streams token-by-token like normal.
-        const openFenceMatch = answer.match(/```(\w*)\n([\s\S]*)$/);
-        const inOpenFence = openFenceMatch && (answer.match(/```/g) || []).length % 2 === 1;
-        const fenceBodyLen = inOpenFence ? openFenceMatch[2].length : 0;
-
-        if (inOpenFence && fenceBodyLen > 4000) {
-          // Big code-in-progress: throttle to 400ms and skip highlighting.
-          // The final-event handler does the proper render at the end so the
-          // user still gets the full code-card with syntax colors.
-          const now = Date.now();
-          if (now - (bubble._lastProgressAt || 0) >= 400) {
-            const lang = (openFenceMatch[1] || "code").toLowerCase();
-            const lines = (openFenceMatch[2].match(/\n/g) || []).length + 1;
-            const kb = (fenceBodyLen / 1024).toFixed(1);
-            bubble.innerHTML = interimHtml + `<div class="code-progress"><i class="ph ph-code code-progress-icon"></i><span class="code-progress-text">writing <strong>${esc(lang)}</strong> — ${lines} lines, ${kb} KB so far…</span></div>`;
-            bubble._lastProgressAt = now;
-          }
-        } else {
-          // Plain text or small code: render every delta. Reset the
-          // progress flag so the next big-code stream starts fresh.
-          bubble._lastProgressAt = 0;
-          let renderable = answer;
-          const openCount = (renderable.match(/```/g) || []).length;
-          if (openCount % 2 === 1) renderable = renderable + "\n```";
-          bubble.innerHTML = interimHtml + renderMarkdown(renderable);
-          enhanceCodeBlocks(bubble);
-        }
-        // NB: no updateThinkLine(false) here — the status line stays a live
-        // shimmering indicator; the finally block finalizes it once at turn end.
-      } else if (bubble.innerHTML && !bubble.classList.contains("hidden")) {
-        // Content was stripped to empty (e.g. model emitted only a partial
-        // </tool_call> that splitThinking's junk filters cleaned out).
-        // Reset the bubble + re-hide so the end-of-stream empty-bubble
-        // fallback can fire ("model ended turn without a reply…") instead
-        // of leaving stale partial characters from before the strip.
-        bubble.innerHTML = "";
-        bubble.classList.add("hidden");
-      }
-      scrollToBottom();
+    } else if (evt.type === "thinking_end") {
+      // boundary only — answer deltas follow as plain delta events
     } else if (evt.type === "tool_start") {
       secretRailToolStart(row, evt.name, evt.arguments);
       attackRailToolStart(row, evt.name, evt.arguments);
@@ -5130,6 +5340,11 @@
         // the code-card.
         const finalBubble = lastRow.querySelector(".bubble.agent");
         if (finalBubble) {
+          // The authoritative render supersedes any queued streaming paint —
+          // cancel it and drop the incremental cache so nothing re-paints a
+          // stale buffer over this result.
+          cancelStreamPaint(lastRow);
+          finalBubble._incRender = null;
           const { content: finalContent } = splitThinking(full);
           // Keep interim narration dimmed in the final render too, reusing the
           // string captured during streaming. If it's no longer a clean prefix
@@ -5145,6 +5360,11 @@
           if (finalContent.trim()) {
             const rendered = renderMarkdown(answerText);
             if ((rendered && rendered.trim()) || interimHtml) {
+              if (finalBubble._collapsing) {
+                clearTimeout(finalBubble._collapseTimer);
+                finalBubble._collapsing = false;
+                finalBubble.classList.remove("collapsing");
+              }
               finalBubble.classList.remove("hidden");
               finalBubble.innerHTML = interimHtml + rendered;
               enhanceCodeBlocks(finalBubble);
@@ -5195,6 +5415,19 @@
       renderTurnChanges(row, evt);
     } else if (evt.type === "plan") {
       renderPlanPanel(evt.steps || []);
+    } else if (evt.type === "chat:note") {
+      // A GitHub branch event (or any UI note) persisted into the current
+      // session's history — mirror it into the live view. Dedupe against
+      // notes already present (the persisting request may have just loaded
+      // them into state.messages).
+      if (evt.chat_id && evt.chat_id !== state.chatId) return;
+      if (!evt.content) return;
+      if (state.messages.some(m => m._note && m.content === evt.content)) return;
+      state.messages.push({
+        role: "system", content: evt.content,
+        t: Math.floor(Date.now() / 1000), _note: true,
+      });
+      renderMessages();
     } else if (evt.type === "error") {
       bubble.innerHTML = `<span style="color: var(--danger)">error: ${esc(evt.error)}</span>`;
     }
@@ -5204,6 +5437,24 @@
   // Rendered from the `turn_changes` event the bridge emits at turn end. The
   // Undo button reverts every file the turn wrote via /api/undo (backend keeps a
   // pre-write snapshot journal). Pure frontend otherwise — costs no model tokens.
+  // Deepest directory shared by every changed path (case-insensitive compare
+  // for Windows drive letters). Returns "" when there is no meaningful common
+  // ancestor (e.g. files spread across workspace roots).
+  function _commonDirOf(paths) {
+    const ps = (paths || []).filter(Boolean);
+    if (!ps.length) return "";
+    if (ps.length === 1) return ps[0].replace(/[\\/][^\\/]*$/, "");
+    let prefix = ps[0];
+    for (const q of ps.slice(1)) {
+      let i = 0;
+      while (i < prefix.length && i < q.length && prefix[i].toLowerCase() === q[i].toLowerCase()) i++;
+      prefix = prefix.slice(0, i);
+      if (!prefix) break;
+    }
+    const cut = Math.max(prefix.lastIndexOf("\\"), prefix.lastIndexOf("/"));
+    return cut > 0 ? prefix.slice(0, cut) : "";
+  }
+
   function renderTurnChanges(row, evt) {
     if (!row || !evt || !Array.isArray(evt.files) || !evt.files.length) return;
     const col = row.querySelector(".bubble-col");
@@ -5215,12 +5466,20 @@
                 : (f.removed ? `<span class="tc-tag tc-del-tag">deleted</span>` : "");
       return `<span class="tc-file" title="${esc(f.path || f.name)}"><i class="ph ph-file-text"></i><span class="tc-name">${esc(f.name)}</span>${tag}<span class="tc-stat"><span class="tc-add">+${f.added|0}</span> <span class="tc-del">−${f.deleted|0}</span></span></span>`;
     }).join("");
+    // "Open folder" target: the shared parent of this turn's files; falls back
+    // to the first workspace root when the files span roots or lack paths.
+    const wsRoots = ((state.workspace && state.workspace.folders) || []).map(s => String(s).replace(/[\\/]+$/, ""));
+    let openDir = _commonDirOf(evt.files.map(f => f.path));
+    if (openDir && wsRoots.length && !wsRoots.some(r => openDir.toLowerCase().startsWith(r.toLowerCase()))) {
+      openDir = "";   // common ancestor fell outside every root — use a root instead
+    }
     const bar = document.createElement("div");
     bar.className = "turn-changes";
     bar.dataset.turnId = evt.turn_id || "";
     bar.innerHTML = `
       <div class="tc-head">
         <span class="tc-title">${n} file${n === 1 ? "" : "s"} changed <span class="tc-add">+${evt.added | 0}</span> <span class="tc-del">−${evt.deleted | 0}</span></span>
+        <button class="tc-openfolder" type="button" title="Open the folder these files live in"><i class="ph ph-folder-open"></i><span>Open folder</span></button>
         <button class="tc-undo" type="button"><i class="ph ph-arrow-counter-clockwise"></i><span>Undo</span></button>
       </div>
       <div class="tc-files">${files}</div>`;
@@ -5236,6 +5495,21 @@
     };
     filesEl.addEventListener("scroll", syncFade, { passive: true });
     requestAnimationFrame(syncFade);
+    const openBtn = bar.querySelector(".tc-openfolder");
+    openBtn.addEventListener("click", async () => {
+      const dir = openDir || wsRoots[0] || "";
+      if (!dir) { toast("No folder to open", "warn", 2200); return; }
+      try {
+        const resp = await fetch("/api/open-folder", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: dir }),
+        });
+        const r = await resp.json();
+        if (!(r && r.ok)) toast(r && r.error ? r.error : "Could not open folder", "err", 3200);
+      } catch (e) {
+        toast("Could not open folder: " + (e.message || e), "err", 3200);
+      }
+    });
     const btn = bar.querySelector(".tc-undo");
     btn.addEventListener("click", async () => {
       if (btn.disabled) return;
@@ -5407,6 +5681,320 @@
     // Ensure it's in the right container after an update (e.g. if preview was
     // toggled between plan events).
     _reparentPlan();
+  }
+
+  // ---------- GitHub Activity ----------
+  function ghActivityOpen() {
+    const scrim = $("#github-activity-scrim"), modal = $("#github-activity-modal");
+    if (!scrim || !modal) return;
+    scrim.classList.add("open");
+    modal.classList.add("open");
+    modal.setAttribute("aria-hidden", "false");
+    loadGitHubActivity();
+  }
+
+  function ghActivityClose() {
+    const scrim = $("#github-activity-scrim"), modal = $("#github-activity-modal");
+    if (!scrim || !modal) return;
+    scrim.classList.remove("open");
+    modal.classList.remove("open");
+    modal.setAttribute("aria-hidden", "true");
+  }
+
+  async function loadGitHubActivity() {
+    const body = $("#gh-activity-body");
+    if (!body) return;
+    body.innerHTML = `<div class="gh-loading"><i class="ph ph-circle-notch gh-spin"></i><span>fetching contributions…</span></div>`;
+    let data;
+    try {
+      data = await api("/api/github/activity");
+    } catch (e) {
+      body.innerHTML = `<div class="gh-error"><i class="ph ph-warning-circle"></i><p>could not reach the bridge: ${esc(e.message || e)}</p></div>`;
+      return;
+    }
+    if (!data || !data.connected) {
+      const msg = (data && data.error) ? esc(String(data.error)) : "not connected";
+      body.innerHTML = `
+        <div class="gh-error">
+          <i class="ph ph-plugs-connected"></i>
+          <p>GitHub is ${msg}. Connect a fine-grained PAT in Settings → GitHub integration.</p>
+          <button class="btn accent sm" id="gh-open-settings"><i class="ph ph-gear-six"></i>Open Settings</button>
+        </div>`;
+      const btn = $("#gh-open-settings");
+      if (btn) btn.addEventListener("click", () => { ghActivityClose(); openSettings(); });
+      return;
+    }
+    const loginEl = $("#gh-activity-login");
+    if (loginEl) {
+      loginEl.innerHTML = data.login
+        ? (data.avatar_url
+            ? `<img class="gh-login-avatar" src="${esc(data.avatar_url)}" alt="">`
+            : `<i class="ph ph-github-logo"></i>`)
+          + `<span>${esc(data.login)}</span>`
+        : "";
+    }
+    const total = Number(data.total_contributions || 0);
+    const nonzeroDays = (data.weeks || []).reduce(
+      (n, w) => n + (w || []).filter(d => (d && d.count > 0)).length, 0);
+    body.innerHTML = `
+      <div class="gh-graph-wrap">
+        <div class="gh-graph-head">
+          <span class="gh-graph-title">${total.toLocaleString()} contributions in the last year</span>
+        </div>
+        <div class="gh-graph" id="gh-graph"></div>
+        <div class="gh-legend"><span>Less</span><span class="gh-legend-cells"><i class="gh-cell lv0"></i><i class="gh-cell lv1"></i><i class="gh-cell lv2"></i><i class="gh-cell lv3"></i><i class="gh-cell lv4"></i></span><span>More</span></div>
+        ${total === 0 || nonzeroDays < 7 ? `
+        <div class="gh-empty-hint"><i class="ph ph-git-commit"></i><span>no counted contributions yet — GitHub only counts commits that reach the <b>default branch</b> (or a merged PR) and are authored by an email <b>verified on your account</b>. unmerged branch work, forks, and unrecognized author emails don't count — add your commit email at github.com/settings/emails and the dots will light up.</span></div>` : ""}
+      </div>
+      <div class="gh-repos-head">Recent repositories</div>
+      <div class="gh-repos" id="gh-repos"></div>`;
+    renderGhGraph(data.weeks || []);
+    renderGhRepos(data.repos || []);
+  }
+
+  function ghMonthName(iso) {
+    const d = new Date(iso + "T00:00:00");
+    return d.toLocaleString(undefined, { month: "short" });
+  }
+
+  function renderGhGraph(weeks) {
+    const wrap = document.getElementById("gh-graph");
+    if (!wrap) return;
+    if (!weeks.length) {
+      wrap.innerHTML = `<span class="hint">no contribution data yet — make some commits!</span>`;
+      return;
+    }
+    // Month labels across the top (label spans the weeks it covers).
+    const months = [];
+    let lastMonth = "";
+    weeks.forEach((w, wi) => {
+      const first = w && w[0] && w[0].date;
+      if (!first) return;
+      const m = first.slice(0, 7);
+      if (m !== lastMonth) {
+        months.push({ label: ghMonthName(first), count: 1, wi });
+        lastMonth = m;
+      } else if (months.length) {
+        months[months.length - 1].count++;
+      }
+    });
+    let monthRow = "";
+    for (const ml of months) {
+      monthRow += `<span class="gh-month" style="flex:${ml.count} 0 0">${ml.label}</span>`;
+    }
+    // Day labels sit at fixed rows: Mon(1), Wed(3), Fri(5) like GitHub's grid.
+    const days = [
+      { label: "Mon", row: 1 }, { label: "Wed", row: 3 }, { label: "Fri", row: 5 },
+    ];
+    let dayHtml = "";
+    for (let r = 0; r < 7; r++) {
+      const d = days.find(x => x.row === r);
+      dayHtml += `<span class="gh-day" style="grid-row:${r + 1}">${d ? d.label : ""}</span>`;
+    }
+    // Cells flow column-first over a 7-row grid; the first partial week is
+    // padded at the top so columns align exactly like GitHub's calendar.
+    const cells = [];
+    weeks.forEach((w, wi) => {
+      if (wi === 0 && w.length < 7) {
+        for (let p = 0; p < 7 - w.length; p++) cells.push(`<div class="gh-cell gh-cell-empty"></div>`);
+      }
+      for (const d of w) {
+        cells.push(`<div class="gh-cell lv${d.level}" data-date="${esc(d.date)}" title="${esc(d.date)} — ${d.count} contribution${d.count === 1 ? "" : "s"}" style="--gd:${(Math.random() * 650).toFixed(0)}ms"></div>`);
+      }
+    });
+    wrap.innerHTML = `
+      <div class="gh-months">${monthRow}</div>
+      <div class="gh-grid">
+        <div class="gh-days">${dayHtml}</div>
+        <div class="gh-cells">${cells.join("")}</div>
+      </div>`;
+    // Brief "glitter like stars" entrance: every dot starts empty, flashes the
+    // current theme's accent once (staggered via --gd), then fades into its
+    // static green intensity as the class drops. The safety sweep below lands
+    // any dot whose animationend never fired (hidden tab, reduced motion,
+    // canceled animation) instead of leaving it stuck dark forever.
+    const all = wrap.querySelectorAll(".gh-cell:not(.gh-cell-empty)");
+    all.forEach(c => c.classList.add("gh-glitter"));
+    let done = 0;
+    all.forEach(c => {
+      c.addEventListener("animationend", () => {
+        c.classList.remove("gh-glitter");
+        if (++done >= all.length) wrap.classList.add("gh-glitter-done");
+      }, { once: true });
+    });
+    setTimeout(() => {
+      all.forEach(c => c.classList.remove("gh-glitter"));
+      wrap.classList.add("gh-glitter-done");
+    }, 1500);
+  }
+
+  function renderGhRepos(repos) {
+    const wrap = document.getElementById("gh-repos");
+    if (!wrap) return;
+    if (!repos.length) {
+      wrap.innerHTML = `<span class="hint">no repositories yet.</span>`;
+      return;
+    }
+    wrap.innerHTML = repos.map(r => `
+      <div class="gh-repo-card">
+        <div class="gh-repo-info">
+          <span class="gh-repo-name" title="${esc(r.name)}">${esc(r.name)}</span>
+          <span class="gh-repo-stars" title="stargazers"><i class="ph ph-star"></i>${Number(r.stars || 0).toLocaleString()}</span>
+        </div>
+        <button class="btn sm accent" data-gh-work="${esc(r.name)}" data-gh-owner="${esc(r.owner || "")}" title="Create a new branch on GitHub and check it out in the workspace"><i class="ph ph-git-branch"></i>Work on this repo</button>
+      </div>`).join("");
+    wrap.querySelectorAll("[data-gh-work]").forEach(btn => {
+      btn.addEventListener("click", () => workOnRepo(btn.dataset.ghOwner, btn.dataset.ghWork, btn));
+    });
+  }
+
+  // Promised input dialog — the branch-name prompt for "Work on this repo".
+  // Modeled on confirmModal so it matches the app's modal system. Resolves
+  // with the trimmed string, or null on cancel / Escape / scrim click.
+  function promptModal(opts = {}) {
+    const {
+      title = "Enter a value",
+      message = "",
+      placeholder = "",
+      confirmText = "OK",
+      cancelText = "Cancel",
+      validate = null,
+    } = opts;
+    return new Promise((resolve) => {
+      const scrim = document.createElement("div");
+      scrim.className = "modal-scrim";
+      const modal = document.createElement("aside");
+      modal.className = "modal prompt-modal";
+      modal.setAttribute("role", "dialog");
+      modal.setAttribute("aria-modal", "true");
+      modal.innerHTML = `
+        <div class="modal-head">
+          <i class="ph ph-git-branch"></i>
+          <h3>${esc(title)}</h3>
+          <button class="iconbtn" data-act="cancel" aria-label="Cancel"><i class="ph ph-x"></i></button>
+        </div>
+        <div class="modal-body">
+          ${message ? `<p>${esc(message)}</p>` : ""}
+          <input type="text" class="prompt-modal-input" placeholder="${esc(placeholder)}" autocomplete="off" spellcheck="false">
+          <div class="prompt-modal-err" data-err></div>
+          <div class="confirm-actions">
+            <button class="btn" data-act="cancel">${esc(cancelText)}</button>
+            <button class="btn accent" data-act="confirm">${esc(confirmText)}</button>
+          </div>
+        </div>`;
+      document.body.appendChild(scrim);
+      document.body.appendChild(modal);
+      requestAnimationFrame(() => { scrim.classList.add("open"); modal.classList.add("open"); });
+      const input = modal.querySelector(".prompt-modal-input");
+      const errEl = modal.querySelector("[data-err]");
+      const confirmBtn = modal.querySelector('[data-act="confirm"]');
+      setTimeout(() => { if (input) input.focus(); }, 120);
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        document.removeEventListener("keydown", onKey);
+        scrim.classList.remove("open");
+        modal.classList.remove("open");
+        setTimeout(() => { scrim.remove(); modal.remove(); }, 220);
+        resolve(result);
+      };
+      const submit = () => {
+        const v = (input && input.value || "").trim();
+        if (validate) {
+          const errMsg = validate(v);
+          if (errMsg) {
+            if (errEl) { errEl.textContent = errMsg; errEl.style.display = "block"; }
+            if (input) input.focus();
+            return;
+          }
+        }
+        finish(v || null);
+      };
+      const onKey = (e) => {
+        if (e.key === "Escape") { e.preventDefault(); finish(null); }
+        else if (e.key === "Enter") { e.preventDefault(); submit(); }
+      };
+      document.addEventListener("keydown", onKey);
+      scrim.addEventListener("click", () => finish(null));
+      modal.querySelectorAll('[data-act="cancel"]').forEach(b => b.addEventListener("click", () => finish(null)));
+      confirmBtn.addEventListener("click", submit);
+    });
+  }
+
+  async function workOnRepo(owner, repo, btn) {
+    if (!owner || !repo) return;
+    const name = await promptModal({
+      title: `Work on ${repo}`,
+      message: `Create a new branch on ${owner}/${repo}, then check it out in the workspace.`,
+      placeholder: "branch name, e.g. feature/my-change",
+      confirmText: "Create & checkout",
+      validate: (v) => /^[A-Za-z0-9._/-]{1,256}$/.test(v)
+        ? "" : "use letters, digits, dots, underscores, slashes and hyphens (max 256 chars)",
+    });
+    if (!name) return;
+    const oldHtml = btn ? btn.innerHTML : "";
+    if (btn) { btn.disabled = true; btn.innerHTML = `<i class="ph ph-circle-notch gh-spin"></i> creating…`; }
+    try {
+      const r = await api("/api/github/branch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ owner, repo, branch: name }),
+      });
+      if (!r || !r.ok) throw new Error((r && r.error) || "branch creation failed");
+      // checkout worked — get the dashboard out of the way so the new
+      // branch session is visible immediately (kept open on failure).
+      ghActivityClose();
+      await openBranchSession(r, name);
+      toast(`branch \`${name}\` created and checked out${r.cloned ? " — cloned into the workspace" : ""} — new session opened`, "ok", 3500);
+    } catch (e) {
+      toast("branch creation failed: " + (e.message || e), "err", 4500);
+    } finally {
+      if (btn) { btn.disabled = false; btn.innerHTML = oldHtml; }
+    }
+  }
+
+  // Open a fresh session for the branch work and put the branch event there
+  // as its first (icon) note — the chat row shows a git-branch glyph instead
+  // of the usual glow dot, so it reads as a "branch session" in the list.
+  async function openBranchSession(r, branch) {
+    const text = `Created branch \`${branch}\` on ${r.owner}/${r.repo} (from \`${r.default_branch || "default"}\`) and checked it out${r.cloned ? " — repo was cloned into the workspace" : ""} at ${r.repo_dir || ""}.`;
+    const c = await api("/api/chats", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: `work on ${r.repo}`, origin: "github" }),
+    });
+    if (!c || !c.id) throw new Error("could not create the session");
+    // persist the note first so the session's first message is already there
+    // when we switch to it (the broadcast is ignored because the current chat
+    // is still the old one at this point).
+    await api("/api/chat/note", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: c.id, text }),
+    }).catch(() => {});
+    await loadChats();
+    selectChat(c.id);
+    const ta = $("#composer-input");
+    if (ta) { ta.value = ""; autoResize(ta); }
+  }
+
+  async function refreshGitHubStatus() {
+    const badge = $("#github-conn-status");
+    if (!badge) return;
+    try {
+      const r = await api("/api/github/status");
+      if (r && r.connected && r.login) {
+        badge.textContent = `connected as ${r.login}`;
+        badge.style.color = "var(--mint-3)";
+      } else {
+        badge.textContent = "not connected";
+        badge.style.color = "";
+      }
+    } catch {
+      badge.textContent = "not connected";
+      badge.style.color = "";
+    }
   }
 
   // Collapse the finished work (thinking + tools) under one "Worked for Xs"
@@ -6847,36 +7435,30 @@
         </div>
       `;
     } else if (kind === "delete") {
-      // Show WHICH file/folder is going away — "DELETE" alone is useless for
-      // approving. details.path is the full normalized path from the bridge.
+      // Show WHICH file/folder is going away
       const path = details.path || a.command || "(unknown path)";
       const isDir = details.dir ? "folder" : "file";
-      const short = path.length > 110 ? path.slice(0, 107) + "..." : path;
       html += `
         <div class="permission-item">
           <span class="permission-item-icon warning"><i class="ph ph-warning"></i></span>
-          <span class="permission-item-text">Delete ${isDir}: <code>${esc(short)}</code></span>
+          <span class="permission-item-text">Delete ${isDir}: <code>${esc(path)}</code></span>
         </div>
       `;
     } else if (kind === "git") {
-      // Show the real git command line — the user shouldn't need to know
-      // which verbs are dangerous by heart; the card tells them exactly what
-      // will run (push/commit/checkout/reset...) so they can eyeball it.
+      // Show the real git command line
       const cmd = a.command || "git ...";
-      const shortCmd = cmd.length > 90 ? cmd.slice(0, 87) + "..." : cmd;
       html += `
         <div class="permission-item">
           <span class="permission-item-icon warning"><i class="ph ph-git-branch"></i></span>
-          <span class="permission-item-text">Run: <code>${esc(shortCmd)}</code></span>
+          <span class="permission-item-text">Run: <code>${esc(cmd)}</code></span>
         </div>
       `;
     } else if (kind === "powershell" || kind === "run_powershell" || kind === "command") {
       const cmd = a.command || "";
-      const shortCmd = cmd.length > 50 ? cmd.slice(0, 47) + "..." : cmd;
       html += `
         <div class="permission-item">
           <span class="permission-item-icon warning"><i class="ph ph-warning"></i></span>
-          <span class="permission-item-text">Execute command: <code>${esc(shortCmd)}</code></span>
+          <span class="permission-item-text">Execute command: <code>${esc(cmd)}</code></span>
         </div>
       `;
     } else if (kind === "recon_s3") {
@@ -7517,6 +8099,45 @@
       <div class="model-health-metric"><span>Finished</span><strong>${turns ? pct(observed.completion_rate) : "&mdash;"}</strong></div>
       <div class="model-health-metric"><span>Tool success</span><strong>${calls ? pct(1 - (Number(observed.tool_error_rate) || 0)) : "&mdash;"}</strong></div>
       <div class="model-health-metric"><span>Busy context</span><strong>${peakContext && context ? pct(contextRatio) : "&mdash;"}</strong></div>`;
+
+    const compareEl = $("#model-health-compare");
+    if (compareEl) {
+      const others = Array.isArray(data?.comparison) ? data.comparison : [];
+      const currentSpeed = Number(observed.output_tok_s) || 0;
+      const currentTool = calls ? 1 - (Number(observed.tool_error_rate) || 0) : null;
+      const rows = [];
+      if (data?.model) {
+        rows.push({
+          model: data.model, current: true,
+          turns, finished: turns ? pct(observed.completion_rate) : "&mdash;",
+          tool: currentTool == null ? "&mdash;" : pct(currentTool),
+          speed: currentSpeed ? currentSpeed.toFixed(1) : "&mdash;",
+        });
+      }
+      others.forEach(o => rows.push({
+        model: o.model, current: false,
+        turns: Number(o.turns) || 0,
+        finished: pct(o.completion_rate),
+        tool: pct(o.tool_success),
+        speed: Number(o.output_tok_s) ? Number(o.output_tok_s).toFixed(1) : "&mdash;",
+      }));
+      compareEl.hidden = rows.length < 2;
+      if (rows.length >= 2) {
+        compareEl.innerHTML = `
+          <details class="model-health-compare">
+            <summary><i class="ph ph-arrows-left-right"></i>Compare with other models</summary>
+            <div class="mhc-row mhc-head"><span>Model</span><span>Turns</span><span>Finished</span><span>Tool ok</span><span>tok/s</span></div>
+            ${rows.map(r => `
+              <div class="mhc-row ${r.current ? "mhc-current" : ""}">
+                <span>${esc(r.model)}${r.current ? " <i class='ph ph-asterisk' title='current model'></i>" : ""}</span>
+                <b>${r.turns}</b>
+                <b>${r.finished}</b>
+                <b>${r.tool}</b>
+                <b>${r.speed}</b>
+              </div>`).join("")}
+          </details>`;
+      }
+    }
 
     const adviceEl = $("#model-health-advice");
     if (!enabled) {
@@ -8362,6 +8983,7 @@
     if (al) al.value = (s.desktop_app_allowlist || []).join("\n");
     fill("#set-desktop-rate", s.desktop_max_actions_per_minute || 30);
     refreshDesktopStatus();
+    refreshGitHubStatus();
     // memories panel
     loadMemories();
   }
@@ -8514,7 +9136,7 @@
     "neobrutalism-dark": "aperture",
     kinetic: "aperture",
   });
-  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "neobrutalism", "aperture", "soft", "pastel", "velvet", "cartograph", "light"];
+  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "neobrutalism", "aperture", "aperture-dark", "soft", "pastel", "velvet", "cartograph", "light"];
   const THEME_ICONS = {
     dark:              "ph ph-moon",
     dim:               "ph ph-moon-stars",
@@ -8525,6 +9147,7 @@
     neumorphic:        "ph ph-drop-half",
     neobrutalism:      "ph ph-lightning",
     aperture:          "ph ph-aperture",
+    "aperture-dark":   "ph ph-moon",
     soft:              "ph ph-cloud",
     pastel:            "ph ph-flower-tulip",
     velvet:            "ph ph-crown",
@@ -9302,18 +9925,21 @@
       }
     }
     const idx = REASONING_EFFORT_LEVELS.indexOf(level);
-    const slider = $("#reasoning-effort-slider");
     const label = REASONING_EFFORT_LABELS[idx];
-    if (slider) {
-      slider.value = String(idx);
-      slider.style.setProperty("--effort-fill", `${(idx / 3) * 100}%`);
-    }
+    document.querySelectorAll("#reasoning-effort-menu .effort-option").forEach(opt => {
+      const active = opt.dataset.level === level;
+      opt.classList.toggle("active", active);
+      opt.setAttribute("aria-checked", String(active));
+    });
     const pillValue = $("#reasoning-effort-value");
     const popValue = $("#reasoning-effort-popover-value");
     if (pillValue) pillValue.textContent = label;
     if (popValue) popValue.textContent = label;
+    const pill = $("#reasoning-effort-pill");
+    if (pill) pill.setAttribute("aria-label", `Reasoning effort: ${label}`);
     const control = $("#reasoning-effort-control");
     if (control) {
+      control.classList.toggle("effort-active", level !== "auto");
       control.classList.remove("is-changing");
       requestAnimationFrame(() => control.classList.add("is-changing"));
       setTimeout(() => control.classList.remove("is-changing"), 260);
@@ -9349,29 +9975,43 @@
     const control = $("#reasoning-effort-control");
     const pill = $("#reasoning-effort-pill");
     const popover = $("#reasoning-effort-popover");
-    const slider = $("#reasoning-effort-slider");
-    if (!control || !pill || !popover || !slider) return;
+    const menu = $("#reasoning-effort-menu");
+    if (!control || !pill || !popover || !menu) return;
+    const close = () => {
+      popover.classList.remove("open");
+      pill.setAttribute("aria-expanded", "false");
+    };
     pill.addEventListener("click", (event) => {
       event.stopPropagation();
       const open = !popover.classList.contains("open");
       popover.classList.toggle("open", open);
       pill.setAttribute("aria-expanded", String(open));
-      if (open) slider.focus({ preventScroll: true });
+      if (open) menu.querySelector(".effort-option.active")?.focus({ preventScroll: true });
     });
-    slider.addEventListener("input", () => {
-      const idx = Math.max(0, Math.min(3, Number(slider.value) || 0));
-      setReasoningEffort(REASONING_EFFORT_LEVELS[idx]);
+    menu.addEventListener("click", (event) => {
+      const opt = event.target.closest(".effort-option");
+      if (!opt) return;
+      setReasoningEffort(opt.dataset.level);
+      close();
+      pill.focus({ preventScroll: true });
+    });
+    // Arrow keys walk the menu like a native select list
+    menu.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+      event.preventDefault();
+      const opts = [...menu.querySelectorAll(".effort-option")];
+      const cur = opts.indexOf(document.activeElement);
+      const next = event.key === "ArrowDown"
+        ? Math.min(opts.length - 1, cur + 1)
+        : Math.max(0, cur - 1);
+      opts[next]?.focus({ preventScroll: true });
     });
     document.addEventListener("click", (event) => {
-      if (!control.contains(event.target)) {
-        popover.classList.remove("open");
-        pill.setAttribute("aria-expanded", "false");
-      }
+      if (!control.contains(event.target)) close();
     });
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape" && popover.classList.contains("open")) {
-        popover.classList.remove("open");
-        pill.setAttribute("aria-expanded", "false");
+        close();
         pill.focus();
       }
     });
@@ -9833,7 +10473,7 @@
       return;
     }
     const suffix = s.budget ? ` · ~${kTokens(s.budget)} tok` : "";
-    pill.innerHTML = `${_SKILL_ICON}<span>skill: ${esc(s.name)}${suffix}</span>` +
+    pill.innerHTML = `${_SKILL_ICON}<span class="skill-pill-name">skill: ${esc(s.name)}${suffix}</span>` +
       `<button class="skill-pill-x" title="Unload active skill" aria-label="Unload active skill">×</button>`;
     pill.classList.remove("hidden");
     pill.querySelector(".skill-pill-x").addEventListener("click", (e) => {
@@ -10024,7 +10664,7 @@
   // sidesteps the problem entirely. IDE stays hidden by CSS (no preview
   // pane at this width). The Build / Network items already live in the
   // menu, so the chips just join them.
-  const _MOBILE_TOOLBAR_IDS = ["mode-agent", "mode-auto", "btn-attach-image", "btn-attach-file", "btn-trust-writes"];
+  const _MOBILE_TOOLBAR_IDS = ["mode-agent", "mode-auto", "btn-attach-image", "btn-attach-file", "btn-perms"];
   function applyMobileToolbarLayout() {
     const tools = document.querySelector(".composer-tools");
     const menu = document.getElementById("toolbar-overflow-menu");
@@ -10116,6 +10756,9 @@
       const hidden = panel.classList.toggle("plan-hidden");
       setPlanBtn(!hidden);
     });
+    $("#btn-github-activity")?.addEventListener("click", ghActivityOpen);
+    $("#btn-close-github-activity")?.addEventListener("click", ghActivityClose);
+    $("#github-activity-scrim")?.addEventListener("click", ghActivityClose);
     $("#btn-close-cmd-history")?.addEventListener("click", closeCmdHistory);
     $("#cmd-history-scrim")?.addEventListener("click", closeCmdHistory);
     $("#btn-cmd-history-refresh")?.addEventListener("click", loadCmdHistory);
@@ -10355,6 +10998,31 @@
     });
     $("#set-discord-token")?.addEventListener("change", _saveDiscord);
     $("#set-discord-owner")?.addEventListener("change", _saveDiscord);
+    // GitHub integration — the PAT goes straight to the bridge for validation
+    // and storage; it is never echoed back into this page.
+    $("#btn-github-connect")?.addEventListener("click", async () => {
+      const input = $("#set-github-pat");
+      const token = ((input && input.value) || "").trim();
+      if (!token) { toast("paste a fine-grained PAT first", "warn", 2000); return; }
+      const btn = $("#btn-github-connect");
+      const oldHtml = btn ? btn.innerHTML : "";
+      if (btn) { btn.disabled = true; btn.innerHTML = `<i class="ph ph-circle-notch gh-spin"></i> checking…`; }
+      try {
+        const r = await api("/api/github/validate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+        });
+        if (!r || !r.ok) throw new Error((r && r.error) || "GitHub rejected the token");
+        if (input) input.value = "";
+        toast(`connected as ${r.login}`, "ok", 2500);
+        refreshGitHubStatus();
+      } catch (e) {
+        toast("connect failed: " + (e.message || e), "err", 4000);
+      } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = oldHtml; }
+      }
+    });
     $("#btn-desktop-panic")?.addEventListener("click", async () => {
       try {
         await api("/api/desktop/panic", { method: "POST" });
@@ -10525,22 +11193,22 @@
     $("#btn-attach-image")?.addEventListener("click", () => $("#file-image").click());
     $("#btn-attach-file")?.addEventListener("click", () => $("#file-client").click());
 
-    // trust-writes toggle: auto-approve in-workspace file writes/edits. Styled
-    // like the mode chips (.chip.on). Registry/system/PowerShell still prompt.
-    const trustBtn = $("#btn-trust-writes");
-    if (trustBtn) {
-      // .trust-on gets a quiet amber tint (see app.css) so the active state
-      // reads as caution rather than a normal accent-lit mode chip.
-      const syncTrust = () => trustBtn.classList.toggle("trust-on", !!(state.settings && state.settings.auto_approve_write));
-      syncTrust();
-      trustBtn.addEventListener("click", async () => {
-        const next = !(state.settings && state.settings.auto_approve_write);
-        trustBtn.classList.toggle("trust-on", next);
-        try { await saveSettings({ auto_approve_write: next }); } catch (_) {}
-        syncTrust();
-        toast(next ? "Trust writes on — files save and edit without asking. Registry, Windows system folders, and PowerShell still require approval."
-                   : "Trust writes off — file writes ask for approval again.",
-              next ? "warn" : "info", next ? 5000 : 3000);
+    // Access toggle: cycles approval mode soft -> medium -> hard, mirroring
+    // Settings -> Approvals. Short synonym for "permissions" on purpose.
+    const permsBtn = $("#btn-perms");
+    if (permsBtn) {
+      const permsToast = {
+        soft:   ["Soft mode - agent runs autonomously. Deletions, launches, desktop actions and protected ops still ask.", "warn", 4500],
+        medium: ["Medium mode - workspace file writes save without asking; everything else asks.", "info", 3000],
+        hard:   ["Hard mode - every action asks for approval.", "info", 3000],
+      };
+      permsBtn.addEventListener("click", async () => {
+        const cur = (state.settings && state.settings.approval_mode) ||
+          ((state.settings && state.settings.auto_approve_write) ? "medium" : "hard");
+        const next = cur === "soft" ? "medium" : cur === "medium" ? "hard" : "soft";
+        try { await saveSettings({ approval_mode: next, auto_approve_write: next !== "hard" }); } catch (_) {}
+        syncApprovalMode();
+        toast(...permsToast[next]);
       });
     }
     // Approval mode: soft | medium | hard (Settings -> Approvals)
@@ -10549,8 +11217,11 @@
         ((state.settings && state.settings.auto_approve_write) ? "medium" : "hard");
       document.querySelectorAll("#seg-approval-mode .chip").forEach(c =>
         c.classList.toggle("on", c.dataset.mode === mode));
-      const tb = $("#btn-trust-writes");
-      if (tb) tb.classList.toggle("trust-on", mode !== "hard");
+      const tb = $("#btn-perms");
+      if (tb) {
+        tb.classList.toggle("on", mode !== "hard");
+        tb.title = "Access - approval mode: " + mode + ". Soft = agent runs autonomously, medium = trust writes (workspace files save without asking), hard = every action asks. Windows/System32 and registry changes always require the hold-to-approve card. Click to cycle.";
+      }
     };
     syncApprovalMode();
     document.querySelectorAll("#seg-approval-mode .chip").forEach(c =>
@@ -11162,7 +11833,7 @@
       // user knows what the tap will do, mirroring the desktop cycle.
       const cur = document.documentElement.getAttribute("data-theme") || "light";
       const next = nextTheme(cur);
-      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", neumorphic: "Neumorphic", neobrutalism: "Neobrutalism", aperture: "Aperture", soft: "Soft", pastel: "Pastel", velvet: "Velvet", cartograph: "Cartograph", light: "Light" }[next] || next;
+      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", neumorphic: "Neumorphic", neobrutalism: "Neobrutalism", aperture: "Aperture", "aperture-dark": "Aperture Dark", soft: "Soft", pastel: "Pastel", velvet: "Velvet", cartograph: "Cartograph", light: "Light" }[next] || next;
       const lbl = $("#mm-theme-label");
       if (lbl) lbl.textContent = `Switch to ${niceName.toLowerCase()}`;
       mm.classList.add("open"); mmScrim.classList.add("open");
@@ -11368,6 +12039,82 @@
           const codeEl = logPre.querySelector("code") || logPre;
           codeEl.innerHTML = "";
         }
+      }
+    });
+
+    // ----- code-card click actions (delegated) -----
+    // One document-level listener replaces the per-node copy/preview/open
+    // listeners: streaming paints rebuild bubble innerHTML many times a
+    // second, so per-node wiring was O(every block) per paint.
+    document.addEventListener("click", async (e) => {
+      const openAct = e.target.closest(".cc-open-file");
+      if (openAct) {
+        const filename = openAct.dataset.filename;
+        const rootFolder = (state.workspace && state.workspace.folders && state.workspace.folders[0]) || "";
+        if (!rootFolder) {
+          toast("No workspace folder configured", "warn", 2000);
+          return;
+        }
+        if (filename.endsWith(".html")) {
+          previewWorkspaceHtml(rootFolder, filename, filename);
+        } else if (filename.endsWith(".md")) {
+          previewWorkspaceMarkdown(rootFolder, filename, filename);
+        } else if (filename.endsWith(".py")) {
+          runPythonCheck(rootFolder, filename, filename);
+        } else {
+          previewWorkspaceSource(rootFolder, filename, filename);
+        }
+        return;
+      }
+
+      const previewAct = e.target.closest(".cc-preview");
+      if (previewAct) {
+        const pre = previewAct.closest("pre");
+        const code = pre ? getCodeText(pre) : "";
+        if (!code.trim()) { toast("Code block is empty", "warn", 1800); return; }
+        // Push the block into the preview pipeline. Reuse state.currentHtml +
+        // renderPreview() so the existing iframe/srcdoc path handles sandbox,
+        // tailwind injection, and the code-view tab.
+        state.currentHtml = code;
+        state.currentFiles = {};
+        state.view = "preview";
+        $("#btn-view-preview")?.classList.add("active");
+        $("#btn-view-code")?.classList.remove("active");
+        if (app.classList.contains("preview-collapsed") && !isMobile()) {
+          app.classList.remove("preview-collapsed");
+        }
+        renderPreview();
+        toast("Loaded into preview pane", "info", 1500);
+        return;
+      }
+
+      const copyBtn = e.target.closest(".cc-copy, .copy-code");
+      if (!copyBtn) return;
+      try {
+        let text = "";
+        const diffCard = copyBtn.closest(".diff-card");
+        if (diffCard) {
+          text = diffCard.querySelector(".diff-raw")?.value || "";
+        } else {
+          const pre = copyBtn.closest("pre");
+          text = pre ? getCodeText(pre) : "";
+        }
+        await copyText(text);
+        const labelEl = copyBtn.querySelector("span");
+        const iconEl = copyBtn.querySelector("i");
+        const prevLabel = labelEl ? labelEl.textContent : "";
+        if (iconEl) { iconEl.classList.remove("ph-copy"); iconEl.classList.add("ph-check"); }
+        else if (copyBtn.matches(".copy-code")) copyBtn.innerHTML = '<i class="ph ph-check"></i>';
+        if (labelEl) labelEl.textContent = "Copied";
+        copyBtn.classList.add("copied");
+        setTimeout(() => {
+          if (iconEl) { iconEl.classList.add("ph-copy"); iconEl.classList.remove("ph-check"); }
+          else if (copyBtn.matches(".copy-code")) copyBtn.innerHTML = '<i class="ph ph-copy"></i>';
+          if (labelEl) labelEl.textContent = prevLabel || "Copy";
+          copyBtn.classList.remove("copied");
+        }, 1200);
+      } catch {
+        toast("Clipboard blocked", "warn", 2000);
       }
     });
 
