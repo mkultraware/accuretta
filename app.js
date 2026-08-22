@@ -60,6 +60,17 @@
 
   const app = $("#app");
   const isMobile = () => window.matchMedia("(max-width: 600px)").matches;
+  const isCompactViewport = () => window.matchMedia("(max-width: 820px)").matches;
+  let wasCompactViewport = false;
+
+  function syncCompactShell() {
+    const compact = !isMobile() && isCompactViewport();
+    document.body.classList.toggle("is-compact", compact);
+    if (compact && !wasCompactViewport) {
+      app.classList.add("sidebar-collapsed", "preview-collapsed");
+    }
+    wasCompactViewport = compact;
+  }
 
   // ---------- utilities ----------
   // simple toast system — bottom-right, auto-dismiss. keyed toasts replace each other.
@@ -608,7 +619,7 @@
   // collapsed into a single chevron group to keep the chat readable.
   const COMMAND_TOOLS = new Set([
     "write_file", "delete_file", "edit_file", "patch_file",
-    "run_powershell", "open_program",
+    "run_powershell", "run_tests", "sandbox_run", "sandbox_nmap", "sandbox_sqlmap", "open_program",
     "remote_shell", "remote_write_file", "remote_save_code_block",
     "remote_file_begin", "remote_file_append", "remote_file_commit",
     "remote_copy_to", "remote_copy_from",
@@ -621,6 +632,12 @@
   // bypasses it anymore. That's what stops the vertical stacking.
   const RICH_RESULT_TOOLS = new Set(["network_snapshot"]);
   function isCommandTool(name) { return COMMAND_TOOLS.has(name); }
+  function toolResultFailed(result) {
+    if (!result) return false;
+    const exitCode = result.exit_code ?? result.exit ?? result.returncode;
+    return Boolean(result.error || result.ok === false
+      || (exitCode !== undefined && exitCode !== null && Number(exitCode) !== 0));
+  }
 
   // Real SVG wrench (not a phosphor font glyph) — crisper at small sizes and
   // cleaner with our breathing/spin animation. Used as fallback in the tool
@@ -837,7 +854,8 @@
       case "write_file":     return `Writing ${shortPath(args.path)}…`;
       case "edit_file":      return `Editing ${shortPath(args.path)}…`;
       case "delete_file":    return `Deleting ${shortPath(args.path)}…`;
-      case "run_powershell": return `Running command…`;
+      case "run_powershell": return `Running on host…`;
+      case "sandbox_run":    return `Running in WSL guest…`;
       case "remote_shell":   return `Running on Mac…`;
       case "remote_write_file": return `Writing ${shortPath(args.path)} on Mac…`;
       case "remote_save_code_block": return `Saving chat code to ${shortPath(args.path)} on Mac…`;
@@ -880,7 +898,16 @@
       case "run_powershell": {
         const out = (res.stdout || "").trim();
         const first = out.split(/\r?\n/)[0] || "(no output)";
-        return `Done · ${first.slice(0, 120)}`;
+        return `Host done · ${first.slice(0, 120)}`;
+      }
+      case "run_tests": {
+        const summary = res.result || res.details || {};
+        return summary.passed ? "Host tests passed" : "Host tests failed";
+      }
+      case "sandbox_run": {
+        const out = (res.output || "").trim();
+        const first = out.split(/\r?\n/)[0] || "(no output)";
+        return `WSL guest done · ${first.slice(0, 120)}`;
       }
       case "open_program":   return `Opened ${res.name || ""}`;
       case "web_fetch":      return `Fetched ${shortPath(res.url)}`;
@@ -2374,6 +2401,7 @@
   async function boot() {
     // on-device hint
     if (isMobile()) document.body.classList.add("is-mobile");
+    syncCompactShell();
 
     await Promise.all([
       loadSettings(),
@@ -2637,16 +2665,14 @@
       state.foldMark = null;
     }
     $("#chat-title").textContent = chat ? chat.title : "new session";
-    // restore the last-used mode for this chat so the toolbar feels sticky.
-    // on mobile we drop IDE — there's no preview pane to render into — and
-    // fall back to agent so the user lands in a sensible default.
+    // Restore the last-used mode for this chat so the toolbar feels sticky.
+    // IDE is unavailable in compact layouts because the preview pane is hidden.
     if (chat && chat.last_mode && ["auto", "ide", "agent"].includes(chat.last_mode)) {
-      state.mode = chat.last_mode;
-      if (isMobile() && state.mode === "ide") state.mode = "agent";
-      $$('[data-mode]').forEach(x => x.classList.toggle("on", x.dataset.mode === state.mode));
+      setComposerMode(chat.last_mode);
     } else if (isMobile() && state.mode === "ide") {
-      state.mode = "agent";
-      $$('[data-mode]').forEach(x => x.classList.toggle("on", x.dataset.mode === state.mode));
+      setComposerMode("agent");
+    } else {
+      setComposerMode(state.mode);
     }
     let chatPromptTok = 0;
     let chatOutTok = 0;
@@ -2715,6 +2741,8 @@
     if (isMobile()) {
       state.mobileTab = "chat";
       applyMobileTab();
+    } else if (isCompactViewport()) {
+      app.classList.add("sidebar-collapsed");
     }
     // start context-stats polling
     clearInterval(state._ctxPoll);
@@ -3042,7 +3070,8 @@
           </div>
         </div>`;
       initWelcomeScreen();
-      scrollToBottom(true);
+      const chatScroll = $("#chat-scroll");
+      if (chatScroll) chatScroll.scrollTop = 0;
       return;
     }
     const start = Math.max(0, Math.min(
@@ -3332,6 +3361,8 @@
 
     const agentRow = document.createElement("div");
     agentRow.className = "bubble-row";
+    agentRow._attackRailEnabled = false;
+    agentRow._rtEngagement = "";
     agentRow.innerHTML = `
       ${AGENT_AVATAR_HTML}
       <div class="bubble-col">
@@ -3588,6 +3619,10 @@
     // placeholder agent bubble
     const agentRow = document.createElement("div");
     agentRow.className = "bubble-row";
+    // Security presentation is opt-in per turn. Tool names alone are not
+    // enough: ordinary code work can legitimately use overlapping tools.
+    agentRow._attackRailEnabled = opts?.mission?.engagement === "pentest";
+    agentRow._rtEngagement = opts?.mission?.engagement || "";
     agentRow.innerHTML = `
       ${AGENT_AVATAR_HTML}
       <div class="bubble-col">
@@ -4133,6 +4168,9 @@
     return !!name && (name.startsWith("recon_") || name === "encode_decode"
       || name === "scan_js_secrets" || isExploitTool(name) || RT_WORKFLOW_TOOLS.has(name));
   }
+  function isAttackRailEnabled(row) {
+    return row?._attackRailEnabled === true;
+  }
   // Short path helper: strip scheme+host, keep path+query, cap length.
   function arPath(u, cap = 40) {
     u = String(u || "");
@@ -4214,7 +4252,7 @@
     }
   }
   function ensureAttackRail(row, mission = {}) {
-    if (!row) return null;
+    if (!row || !isAttackRailEnabled(row)) return null;
     let rail = row.querySelector(".attack-rail") || document.querySelector("#revealer-deck .attack-rail");
     if (rail) {
       const target = rail.querySelector(".ar-target-title");
@@ -4316,7 +4354,8 @@
   }
   function attackRailToolStart(row, name, args) {
     // Tool starts update activity. They do not authorize or complete a phase.
-    if (!isRedTeamTool(name) || isPassiveOsint(row) || isFrontendSecretAudit(row)) return;
+    if (!isAttackRailEnabled(row) || !isRedTeamTool(name)
+        || isPassiveOsint(row) || isFrontendSecretAudit(row)) return;
     const rail = ensureAttackRail(row);
     if (!rail) return;
     rail.dataset.state = "active";
@@ -4328,7 +4367,7 @@
     renderRail(rail);
   }
   function attackRailToolResult(row, name, result) {
-    if (!isRedTeamTool(name) || isFrontendSecretAudit(row)) return;
+    if (!isAttackRailEnabled(row) || !isRedTeamTool(name) || isFrontendSecretAudit(row)) return;
     const rail = (row && row.querySelector(".attack-rail"))
       || document.querySelector("#revealer-deck .attack-rail");
     if (!rail) return;
@@ -4356,6 +4395,7 @@
     renderRail(rail);
   }
   function attackRailMission(row, mission) {
+    if (!isAttackRailEnabled(row)) return;
     const rail = ensureAttackRail(row, mission || {});
     if (!rail) return;
     const target = rail.querySelector(".ar-target-title");
@@ -4376,6 +4416,7 @@
     renderRail(rail);
   }
   function attackRailFinalize(row) {
+    if (!isAttackRailEnabled(row)) return;
     const rail = (row && row.querySelector(".attack-rail"))
       || document.querySelector("#revealer-deck .attack-rail");
     if (!rail || rail.dataset.status === "closed") return;
@@ -4384,6 +4425,7 @@
     renderRail(rail);
   }
   function attackRailBreach(row, stage) {
+    if (!isAttackRailEnabled(row)) return;
     const rail = (row && row.querySelector(".attack-rail")) || document.querySelector("#revealer-deck .attack-rail");
     if (!rail) return;
     const raw = Math.max(1, parseInt(stage, 10) || 1);
@@ -4979,6 +5021,63 @@
       }
     } else if (evt.type === "thinking_end") {
       // boundary only — answer deltas follow as plain delta events
+    } else if (evt.type === "command_requested") {
+      const target = executionTarget(evt);
+      const item = executionActivity(row, evt);
+      if (item) {
+        item.status = "requested";
+        item.target = target;
+        item.command = evt.command || item.command;
+      }
+      appendAgentLog(`${target === "sandbox" ? "WSL GUEST" : "HOST"} command requested: ${evt.command || ""}`);
+      updateRevealerDeck(row);
+    } else if (evt.type === "command_spawned") {
+      const target = executionTarget(evt);
+      const item = executionActivity(row, evt);
+      if (item) {
+        item.status = "running";
+        item.target = target;
+        item.command = evt.command || item.command;
+        item.t0 = Date.now();
+        item.duration = "";
+      }
+      const heading = target === "sandbox"
+        ? "[WSL GUEST · accuretta-sbx · Windows interop off]"
+        : `[HOST · ${evt.name === "run_tests" ? "project tests" : "Windows PowerShell"}]`;
+      appendExecutionText(target, `\n${heading}\n$ ${evt.command || ""}\n`, false, true);
+      appendAgentLog(`${target === "sandbox" ? "WSL GUEST" : "HOST"} command started: ${evt.command || ""}`);
+      updateRevealerDeck(row);
+    } else if (evt.type === "command_finished") {
+      const target = executionTarget(evt);
+      const exitCode = evt.exit_code ?? 0;
+      const failed = Boolean(evt.error || evt.killed || evt.timed_out || Number(exitCode) !== 0);
+      const item = executionActivity(row, evt, false);
+      if (item) {
+        item.status = failed ? "err" : "ok";
+        item.duration = evt.duration_ms != null
+          ? (evt.duration_ms < 1000 ? `${evt.duration_ms}ms` : `${(evt.duration_ms / 1000).toFixed(1)}s`)
+          : fmtToolDuration(item.t0);
+      }
+      const suffix = evt.killed ? " (killed)" : evt.timed_out ? " (timed out)" : "";
+      appendExecutionText(target, `\nCommand finished with exit code ${exitCode}${suffix}\n`, failed, true);
+      appendAgentLog(`${target === "sandbox" ? "WSL GUEST" : "HOST"} command finished: exit code ${exitCode}${suffix}`);
+      updateRevealerDeck(row);
+    } else if (evt.type === "command_not_executed") {
+      const target = executionTarget(evt);
+      const item = executionActivity(row, evt);
+      if (item) {
+        item.status = "err";
+        item.duration = "not run";
+      }
+      const reason = evt.message || evt.reason || "blocked before execution";
+      appendExecutionText(
+        target,
+        `\n[${target === "sandbox" ? "WSL GUEST" : "HOST"} · NOT EXECUTED]\n$ ${evt.command || ""}\n${reason}\n`,
+        true,
+        true,
+      );
+      appendAgentLog(`${target === "sandbox" ? "WSL GUEST" : "HOST"} command was not executed: ${reason}`);
+      updateRevealerDeck(row);
     } else if (evt.type === "tool_start") {
       secretRailToolStart(row, evt.name, evt.arguments);
       attackRailToolStart(row, evt.name, evt.arguments);
@@ -4989,11 +5088,7 @@
       if (evt.name === "session_start") {
         surfaceShell(evt.arguments?.session_id || evt.arguments?.id || "");
       }
-      if (evt.name === "run_powershell") {
-        const cmd = evt.arguments?.command || "";
-        appendTerminalText(`\n$ ${cmd}\n`, false);
-        appendAgentLog(`Command execution started: ${cmd}`);
-      } else {
+      if (!["run_powershell", "run_tests", "sandbox_run", "sandbox_nmap", "sandbox_sqlmap"].includes(evt.name)) {
         const lbl = toolLabel(evt.name, evt.arguments);
         appendAgentLog(`Tool started: ${evt.name} -> ${lbl}`);
       }
@@ -5023,13 +5118,6 @@
             existing.status = "running";
             if (lines > 0) existing.added = lines;
           }
-        } else if (evt.name === "run_powershell") {
-          act.commands.push({
-            command: evt.arguments?.command || "",
-            status: "running",
-            t0: Date.now(),
-            duration: ""
-          });
         } else if (evt.name && evt.name.startsWith("mcp_")) {
           act.mcp.push({
             name: evt.name,
@@ -5054,8 +5142,12 @@
       renderCostWidget();
       scrollToBottom();
     } else if (evt.type === "tool_stream") {
-      if (evt.name === "run_powershell") {
-        appendTerminalText(evt.text || "", false);
+      const streamTarget = evt.target || (evt.name && evt.name.startsWith("sandbox_") ? "sandbox"
+        : (["run_powershell", "run_tests"].includes(evt.name) ? "host" : ""));
+      if (streamTarget === "host") {
+        appendTerminalText((evt.text || "") + "\n", false);
+      } else if (streamTarget === "sandbox") {
+        appendSandboxText((evt.text || "") + "\n", false, false);
       }
       const running = Array.from(toolStack.querySelectorAll(".tool-line.running")).filter(c => c.dataset.name === evt.name);
       // FIFO pairing: with parallel same-name calls, the Nth result belongs to
@@ -5086,12 +5178,8 @@
           }
         });
       }
-      if (evt.name === "run_powershell") {
-        const isErr = evt.result && evt.result.error;
-        const exitCode = evt.result && evt.result.exit_code !== undefined ? evt.result.exit_code : (isErr ? 1 : 0);
-        appendTerminalText(`\nCommand finished with exit code ${exitCode}\n`, isErr);
-        appendAgentLog(`Command execution finished: exit code ${exitCode}`);
-      } else {
+      const isExecutionTool = ["run_powershell", "run_tests", "sandbox_run", "sandbox_nmap", "sandbox_sqlmap"].includes(evt.name);
+      if (!isExecutionTool) {
         const label = toolResultLabel(evt.name, evt.result);
         appendAgentLog(`Tool finished: ${evt.name} -> ${label}`);
       }
@@ -5100,7 +5188,7 @@
       // The record survives in _activities for the collapsed turn-end history.
       if (row && row._activities) {
         const act = row._activities;
-        const st = (evt.result && evt.result.error) ? "err" : "ok";
+        const st = toolResultFailed(evt.result) ? "err" : "ok";
         if (evt.name === "write_file" || evt.name === "edit_file") {
           const path = (evt.result && evt.result.path) || "";
           const runningWrites = act.writes.filter(x => x.status === "running");
@@ -5110,8 +5198,11 @@
             if (evt.result && typeof evt.result.added === "number") w.added = evt.result.added;
             if (evt.result && typeof evt.result.deleted === "number") w.deleted = evt.result.deleted;
           }
-        } else if (evt.name === "run_powershell") {
-          const c = act.commands.find(x => x.status === "running");
+        } else if (isExecutionTool) {
+          const c = (evt.call_id && act.commands.find(x => x.callId === evt.call_id
+              && (x.status === "requested" || x.status === "running")))
+            || act.commands.find(x => (x.status === "requested" || x.status === "running") && x.tool === evt.name)
+            || act.commands.find(x => x.status === "requested" || x.status === "running");
           if (c) { c.status = st; c.duration = fmtToolDuration(c.t0); }
         } else if (evt.name && evt.name.startsWith("mcp_")) {
           const runningMcp = act.mcp.filter(x => x.status === "running");
@@ -5124,7 +5215,7 @@
       const doneCount = Array.from(toolStack.querySelectorAll(".tool-line.done, .tool-line.err")).filter(c => c.dataset.name === evt.name).length;
       const card = running[doneCount] || running[0];
       if (card) {
-        const isErr = evt.result && evt.result.error;
+        const isErr = toolResultFailed(evt.result);
         card.classList.remove("running");
         card.classList.add(isErr ? "err" : "done");
         const customIcon = toolIconHtml(evt.name, isErr ? "err" : "done");
@@ -5392,6 +5483,7 @@
     } else if (evt.type === "notice") {
       toast(evt.note || "", "info", 3000, "ctx-notice");
     } else if (evt.type === "breach") {
+      if (!isAttackRailEnabled(row)) return;
       // Cyber-range / CTF: a FLAG{...} was captured in a tool response = a
       // confirmed breach. Advance the attack-chain rail and surface a toast.
       attackRailBreach(row, evt.stage);
@@ -5401,12 +5493,12 @@
       toast(`${breachFlag} Breach — stage ${esc(String(evt.stage))}: ${esc(evt.flag)} (via ${esc(evt.via)})`, "ok", 6000, null, true);
     } else if (evt.type === "rt_phase") {
       // Recon -> exploit gate opened. Subtle marker only (see rtPhaseMarker).
-      rtPhaseMarker(row, evt.via);
+      if (isAttackRailEnabled(row)) rtPhaseMarker(row, evt.via);
     } else if (evt.type === "rt_mission") {
       if (evt.engagement === "passive_osint") passiveIntelMission(row, evt);
       else if (evt.engagement === "frontend_secrets") secretRailMission(row, evt);
-      else {
-        if (row) row._rtEngagement = evt.engagement || "recon";
+      else if (evt.engagement === "pentest" && isAttackRailEnabled(row)) {
+        if (row) row._rtEngagement = "pentest";
         const deck = document.querySelector("#revealer-deck");
         if (deck) delete deck.dataset.rtEngagement;
         attackRailMission(row, evt);
@@ -5962,7 +6054,16 @@
     const c = await api("/api/chats", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: `work on ${r.repo}`, origin: "github" }),
+      body: JSON.stringify({
+        title: `work on ${r.repo}`,
+        origin: "github",
+        github_worktree: {
+          owner: r.owner,
+          repo: r.repo,
+          branch,
+          path: r.repo_dir,
+        },
+      }),
     });
     if (!c || !c.id) throw new Error("could not create the session");
     // persist the note first so the session's first message is already there
@@ -7217,6 +7318,40 @@
     return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
   }
 
+  function executionTarget(evt) {
+    return evt?.target === "sandbox" ? "sandbox" : "host";
+  }
+
+  function executionActivity(row, evt, create = true) {
+    if (!row) return null;
+    if (!row._activities) row._activities = { writes: [], commands: [], mcp: [] };
+    const commands = row._activities.commands;
+    const callId = evt.call_id || "";
+    let item = callId ? commands.find(c => c.callId === callId) : null;
+    if (!item) {
+      item = commands.find(c => (c.status === "requested" || c.status === "running")
+        && c.tool === evt.name && c.command === (evt.command || c.command));
+    }
+    if (!item && create) {
+      item = {
+        callId,
+        command: evt.command || "",
+        tool: evt.name || "command",
+        target: executionTarget(evt),
+        status: "requested",
+        t0: 0,
+        duration: "",
+      };
+      commands.push(item);
+    }
+    return item;
+  }
+
+  function appendExecutionText(target, text, isError = false, activate = true) {
+    if (target === "sandbox") appendSandboxText(text, isError, activate);
+    else appendTerminalText(text, isError);
+  }
+
   // A small kill control shown ONLY on the live commands card (live=true) for an
   // in-progress command. Kills just that command via /api/kill-command; the turn
   // continues. Not shown on writes/MCP — there's no process to kill there.
@@ -7273,26 +7408,30 @@
     const count = commands.length;
     const bodyHtml = commands.map(c => {
       const statusIcon = c.status === "running" ? '<i class="ph ph-circle-notch spinning" style="color:var(--accent)"></i>'
-        : (c.status === "err" ? '<i class="ph ph-x-circle" style="color:var(--danger)"></i>' : '<i class="ph ph-check-circle" style="color:var(--success)"></i>');
+        : c.status === "requested" ? '<i class="ph ph-shield" style="color:var(--warning)"></i>'
+        : c.status === "err" ? '<i class="ph ph-x-circle" style="color:var(--danger)"></i>'
+        : '<i class="ph ph-check-circle" style="color:var(--success)"></i>';
       const shortCmd = c.command.length > 60 ? c.command.slice(0, 57) + "..." : c.command;
       return `
         <div class="revealer-row command-row">
           <span class="row-status">${statusIcon}</span>
+          <span class="command-target ${c.target === "sandbox" ? "is-sandbox" : "is-host"}">${c.target === "sandbox" ? "WSL GUEST" : "HOST"}</span>
           <span class="command-text" title="${esc(c.command)}"><code>${esc(shortCmd)}</code></span>
           <span class="grow"></span>
-          <span class="row-time">${c.duration || "running..."}</span>
+          <span class="row-time">${c.duration || (c.status === "requested" ? "waiting..." : "running...")}</span>
         </div>
       `;
     }).join("");
     
+    const hasRunning = commands.some(c => c.status === "running");
     return `
       <div class="revealer-card commands ${collapsed ? 'collapsed' : ''}" data-card-type="commands">
         <div class="revealer-card-head">
           <span class="revealer-card-icon"><i class="ph ph-terminal-window"></i></span>
-          <span class="revealer-card-title">Running shell commands...</span>
+          <span class="revealer-card-title">${hasRunning ? "Running commands..." : "Command requests"}</span>
           <span class="revealer-card-stats">${count} command${count === 1 ? "" : "s"}</span>
           <span class="grow"></span>
-          ${killBtnHtml(live)}
+          ${killBtnHtml(live && hasRunning)}
           <button class="revealer-card-toggle" type="button"><i class="ph ph-caret-down"></i></button>
         </div>
         <div class="revealer-card-body">
@@ -7365,7 +7504,7 @@
     // finalizeToolGroup at turn end). live=true renders the per-card kill button.
     const running = {
       writes: activities.writes.filter(w => w.status === "running"),
-      commands: activities.commands.filter(c => c.status === "running"),
+      commands: activities.commands.filter(c => c.status === "running" || c.status === "requested"),
       mcp: activities.mcp.filter(m => m.status === "running"),
     };
 
@@ -7453,12 +7592,56 @@
           <span class="permission-item-text">Run: <code>${esc(cmd)}</code></span>
         </div>
       `;
+    } else if (kind === "session") {
+      const cmd = a.command || "";
+      html += `
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-terminal-window"></i></span>
+          <span class="permission-item-text">${details.session_id ? "Send input to" : "Start"} a persistent process on the <strong>Windows host</strong>: <code>${esc(cmd)}</code></span>
+          <span class="permission-item-badge">HOST</span>
+        </div>
+        ${details.cwd ? `<div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-folder-open"></i></span>
+          <span class="permission-item-text">Working folder: <code>${esc(details.cwd)}</code></span>
+        </div>` : ""}
+      `;
     } else if (kind === "powershell" || kind === "run_powershell" || kind === "command") {
       const cmd = a.command || "";
       html += `
         <div class="permission-item">
           <span class="permission-item-icon warning"><i class="ph ph-warning"></i></span>
-          <span class="permission-item-text">Execute command: <code>${esc(cmd)}</code></span>
+          <span class="permission-item-text">Run on the <strong>Windows host</strong>: <code>${esc(cmd)}</code></span>
+          <span class="permission-item-badge">HOST</span>
+        </div>
+      `;
+    } else if (kind === "test") {
+      const cmd = a.command || "";
+      html += `
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-terminal-window"></i></span>
+          <span class="permission-item-text">Run project code on the <strong>Windows host</strong>: <code>${esc(cmd)}</code></span>
+          <span class="permission-item-badge">HOST</span>
+        </div>
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-folder-open"></i></span>
+          <span class="permission-item-text">Working folder: <code>${esc(details.cwd || "project workspace")}</code></span>
+        </div>
+      `;
+    } else if (kind === "sandbox") {
+      const cmd = a.command || "";
+      html += `
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-linux-logo"></i></span>
+          <span class="permission-item-text">Run in the <strong>accuretta-sbx WSL guest</strong>: <code>${esc(cmd)}</code></span>
+          <span class="permission-item-badge">WSL GUEST</span>
+        </div>
+        ${details.cwd ? `<div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-folder-open"></i></span>
+          <span class="permission-item-text">Working folder: <code>${esc(details.cwd)}</code></span>
+        </div>` : ""}
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-warning-octagon"></i></span>
+          <span class="permission-item-text">Windows programs are disabled, but <code>/mnt</code> still exposes real host files. Do not use this guest to execute unknown malware.</span>
         </div>
       `;
     } else if (kind === "recon_s3") {
@@ -7496,6 +7679,15 @@
         </div>
       `;
     }
+    if (details.red_team_context && details.executes_code
+        && String(details.target || "").startsWith("host")) {
+      html += `
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-warning-octagon"></i></span>
+          <span class="permission-item-text">This runs code on your real PC during a security assessment. Do not approve it for a file recovered from the target.</span>
+        </div>
+      `;
+    }
     return html;
   }
 
@@ -7521,7 +7713,7 @@
       card.innerHTML = `
         <div class="revealer-card-head">
           <span class="revealer-card-icon"><i class="ph ph-shield-check"></i></span>
-          <span class="revealer-card-title">This request wants to perform actions</span>
+          <span class="revealer-card-title">${esc(a.title || "Review requested action")}</span>
           <span class="revealer-card-stats">Review and confirm the actions the agent will take.</span>
           <span class="grow"></span>
           <div class="perm-head-actions">
@@ -7831,19 +8023,9 @@
           "warn", 15000, "llama-watchdog"
         );
       } else if (evt.type === "sandbox:stream") {
-        const pre = document.getElementById("sandbox-log-pre");
-        if (!pre) return;
         const line = evt.line || "";
-        const span = document.createElement("span");
-        span.textContent = line + "\n";
-        if (/\b(err(or)?|failed|failure|cannot|no such|not found|traceback|abort(ed)?|fatal|out of memory|oom|segmentation|assert(ion)?|invalid|exception|denied)\b/i.test(line))
-          span.className = "t-err";
-        else if (/\b(warning|warn|deprecated)\b/i.test(line))
-          span.className = "t-warn";
-        const codeEl = pre.querySelector("code");
-        if (codeEl) codeEl.appendChild(span);
-        else pre.appendChild(span);
-        pre.scrollTop = pre.scrollHeight;
+        const isError = /\b(err(or)?|failed|failure|cannot|no such|not found|traceback|abort(ed)?|fatal|out of memory|oom|segmentation|assert(ion)?|invalid|exception|denied)\b/i.test(line);
+        appendSandboxText(line + "\n", isError, false);
       }
     };
     es.onerror = () => {
@@ -7887,7 +8069,7 @@
     {
       id: "security",
       title: "Security lab",
-      subtitle: "Red team, analysis and isolated execution",
+      subtitle: "Red team, analysis and WSL guest execution",
       icon: "ph-crosshair",
       headings: ["Red team tools", "Red team stealth", "Analysis tools", "Sandbox"],
     },
@@ -8403,6 +8585,7 @@
     if (busy) _sbxChip("installing", p.step || "setting up…");
     else if (st.state === "ready") _sbxChip("ready", "ready");
     else if (st.state === "no_wsl") _sbxChip("no_wsl", "WSL not installed");
+    else if (st.state === "needs_hardening") _sbxChip("warn", "security update required");
     else if (st.state === "present_unprovisioned") _sbxChip("warn", "needs provisioning");
     else _sbxChip("off", "not set up");
 
@@ -8411,7 +8594,9 @@
       setupBtn.dataset.reinstall = st.state === "ready" ? "1" : "";
       setupBtn.innerHTML = st.state === "ready"
         ? '<i class="ph ph-arrow-clockwise"></i>Reinstall'
-        : '<i class="ph ph-cube"></i>Set up sandbox';
+        : st.state === "needs_hardening"
+          ? '<i class="ph ph-shield-check"></i>Apply security update'
+          : '<i class="ph ph-cube"></i>Set up WSL guest';
     }
     if (testBtn) testBtn.disabled = busy || st.state !== "ready";
     if (rmBtn) rmBtn.disabled = busy || !st.sandbox_present;
@@ -8714,8 +8899,8 @@
   }
 
   // ---------- Command history drawer ----------
-  // PowerShell command audit log. Backend logs every _run_powershell call
-  // to data/cmd_history.jsonl (with chat_id, exit code, stdout/stderr, and
+  // Host and WSL guest command audit log. Backend records target, tool,
+  // chat, exit code, stdout/stderr, and
   // duration); this drawer fetches /api/cmd-history on open and renders
   // each entry as a collapsed row + click-to-expand detail. Reusing the
   // same scrim mechanism as Settings keeps the open/close UX consistent.
@@ -8747,7 +8932,7 @@
     const body = $("#cmd-history-body");
     if (!body) return;
     if (!entries.length) {
-      body.innerHTML = `<div class="cmd-history-empty">No PowerShell commands recorded yet.<br><br><span style="font-size:11px;">Anything the agent runs via <code>run_powershell</code> shows up here.</span></div>`;
+      body.innerHTML = `<div class="cmd-history-empty">No commands recorded yet.<br><br><span style="font-size:11px;">Host PowerShell, project tests, and WSL guest commands show up here after they actually start.</span></div>`;
       return;
     }
     const chatsMap = (state.chats && state.chats.chats) || {};
@@ -8768,9 +8953,12 @@
         : `<pre class="cmd-detail-pre empty">(empty)</pre>`;
       const dur = e.duration_ms != null ? `${e.duration_ms.toLocaleString()} ms` : "—";
       const noteLine = e.timed_out ? "<b>Timed out</b> · " : (e.spawn_error ? "<b>Spawn error</b> · " : "");
+      const target = e.target === "sandbox" ? "WSL GUEST" : "HOST";
+      const targetClass = e.target === "sandbox" ? "is-sandbox" : "is-host";
       return `<div class="cmd-row" data-idx="${idx}">
   <div class="cmd-row-summary">
     <span class="cmd-row-time">${esc(when)}</span>
+    <span class="cmd-row-target ${targetClass}">${target}</span>
     <span class="cmd-row-exit ${okClass}">${esc(exitLabel)}</span>
     <span class="cmd-row-cmd" title="${esc(cmdPreview)}">${esc(cmdPreview)}</span>
     <span class="cmd-row-chev">${chevSvg}</span>
@@ -8791,6 +8979,8 @@
     <div class="cmd-detail-meta">
       ${noteLine}<span><b>Duration:</b> ${esc(dur)}</span>
       <span><b>Chat:</b> ${esc(chatLabel)}</span>
+      <span><b>Tool:</b> ${esc(e.tool || "run_powershell")}</span>
+      ${e.cwd ? `<span><b>Folder:</b> ${esc(e.cwd)}</span>` : ""}
     </div>
   </div>
 </div>`;
@@ -8822,7 +9012,7 @@
   async function clearCmdHistory() {
     const ok = await confirmModal({
       title: "Clear command history",
-      message: "Clear all PowerShell command history? This can't be undone.",
+      message: "Clear all host and WSL guest command history? This can't be undone.",
       confirmText: "Clear history",
       danger: true,
       icon: "ph-trash",
@@ -9199,6 +9389,24 @@
     else stopBackendLogPoll();
     if (tabId === "shell") startShellPoll();
     else stopShellPoll();
+    updateTerminalClearButton(tabId);
+  }
+
+  function updateTerminalClearButton(tabId) {
+    const button = document.getElementById("btn-term-clear");
+    if (!button) return;
+    const labels = {
+      terminal: "Host output",
+      sandbox: "WSL Guest output",
+      backend: "Backend output",
+      shell: "Shell output",
+      agentlog: "Agent log",
+    };
+    const clearable = new Set(["terminal", "sandbox", "agentlog"]).has(tabId);
+    const label = labels[tabId] || "active console output";
+    button.disabled = !clearable;
+    button.title = clearable ? `Clear ${label}` : `${label} is live and cannot be cleared here`;
+    button.setAttribute("aria-label", button.title);
   }
 
   // ---- llama.cpp backend log (Backend terminal tab) ----
@@ -9358,6 +9566,21 @@
       codeEl.insertAdjacentHTML("beforeend", safeText);
     }
     activateTerminalTab("terminal");
+    if (pane && stick) pane.scrollTop = pane.scrollHeight;
+  }
+
+  function appendSandboxText(text, isError = false, activate = false) {
+    const sandboxPre = document.getElementById("sandbox-log-pre");
+    if (!sandboxPre) return;
+    const codeEl = sandboxPre.querySelector("code") || sandboxPre;
+    const pane = sandboxPre.closest(".term-tab-pane");
+    const stick = !pane || pane.classList.contains("hidden")
+      || (pane.scrollHeight - pane.scrollTop - pane.clientHeight < 60);
+    const safeText = isError
+      ? `<span class="term-err">${esc(text)}</span>`
+      : esc(text);
+    codeEl.insertAdjacentHTML("beforeend", safeText);
+    if (activate) activateTerminalTab("sandbox");
     if (pane && stick) pane.scrollTop = pane.scrollHeight;
   }
 
@@ -9894,6 +10117,129 @@
       const mm = state.loadedMmproj ? String(state.loadedMmproj).split(/[\\/]/).pop() : "mmproj";
       badge.title = `vision: native — ${mm}`;
     }
+  }
+
+  const COMPOSER_MODES = {
+    auto: { label: "Auto", icon: "ph-lightning" },
+    agent: { label: "Agent", icon: "ph-terminal-window" },
+    ide: { label: "IDE", icon: "ph-code" },
+  };
+
+  function setComposerMode(mode, { announce = false } = {}) {
+    mode = String(mode || "auto").toLowerCase();
+    if (!Object.prototype.hasOwnProperty.call(COMPOSER_MODES, mode)) mode = "auto";
+    if (mode === "ide" && isCompactViewport()) {
+      if (announce) toast("IDE mode needs a wider window for the preview pane.", "info", 2600);
+      mode = "agent";
+    }
+    state.mode = mode;
+    const meta = COMPOSER_MODES[mode];
+    document.querySelectorAll("#composer-mode-menu .mode-option").forEach(option => {
+      const active = option.dataset.composerMode === mode;
+      option.classList.toggle("active", active);
+      option.setAttribute("aria-checked", String(active));
+      option.tabIndex = active ? 0 : -1;
+    });
+    const value = $("#composer-mode-value");
+    const popoverValue = $("#composer-mode-popover-value");
+    const icon = $("#composer-mode-icon");
+    const pill = $("#composer-mode-pill");
+    if (value) value.textContent = meta.label;
+    if (popoverValue) popoverValue.textContent = meta.label;
+    if (icon) icon.className = `ph ${meta.icon} mode-pill-icon`;
+    if (pill) pill.setAttribute("aria-label", `Composer mode: ${meta.label}`);
+  }
+
+  function renderComposerMode() {
+    const ideOption = document.querySelector('#composer-mode-menu [data-composer-mode="ide"]');
+    if (ideOption) {
+      const unavailable = isCompactViewport();
+      ideOption.setAttribute("aria-disabled", String(unavailable));
+      ideOption.classList.toggle("disabled", unavailable);
+      ideOption.title = unavailable ? "IDE mode needs a wider window for the preview pane" : "Build and preview an interface";
+    }
+    setComposerMode(state.mode);
+  }
+
+  function wireComposerMode() {
+    const control = $("#composer-mode-control");
+    const pill = $("#composer-mode-pill");
+    const popover = $("#composer-mode-popover");
+    const menu = $("#composer-mode-menu");
+    if (!control || !pill || !popover || !menu) return;
+    const close = () => {
+      popover.classList.remove("open");
+      pill.setAttribute("aria-expanded", "false");
+    };
+    const options = () => [...menu.querySelectorAll(".mode-option")];
+    const focusOption = option => {
+      if (!option) return;
+      options().forEach(item => { item.tabIndex = item === option ? 0 : -1; });
+      option.focus({ preventScroll: true });
+    };
+    const openMenu = focusLast => {
+      popover.classList.add("open");
+      pill.setAttribute("aria-expanded", "true");
+      const items = options();
+      focusOption(focusLast ? items[items.length - 1]
+        : menu.querySelector(".mode-option.active") || items[0]);
+    };
+    pill.addEventListener("click", event => {
+      event.stopPropagation();
+      const open = !popover.classList.contains("open");
+      if (open) openMenu(false);
+      else close();
+    });
+    pill.addEventListener("keydown", event => {
+      if (!['ArrowDown', 'ArrowUp'].includes(event.key)) return;
+      event.preventDefault();
+      openMenu(event.key === 'ArrowUp');
+    });
+    menu.addEventListener("click", event => {
+      const option = event.target.closest(".mode-option");
+      if (!option) return;
+      if (option.getAttribute("aria-disabled") === "true") {
+        toast("IDE mode needs a wider window for the preview pane.", "info", 2600);
+        focusOption(option);
+        return;
+      }
+      setComposerMode(option.dataset.composerMode, { announce: true });
+      close();
+      pill.focus({ preventScroll: true });
+    });
+    menu.addEventListener("keydown", event => {
+      if (event.key === "Tab") {
+        setTimeout(close, 0);
+        return;
+      }
+      if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const items = options();
+      const current = Math.max(0, items.indexOf(document.activeElement));
+      let next = current;
+      if (event.key === "ArrowDown") next = (current + 1) % items.length;
+      if (event.key === "ArrowUp") next = (current - 1 + items.length) % items.length;
+      if (event.key === "Home") next = 0;
+      if (event.key === "End") next = items.length - 1;
+      focusOption(items[next]);
+    });
+    control.addEventListener("focusout", () => {
+      setTimeout(() => { if (!control.contains(document.activeElement)) close(); }, 0);
+    });
+    document.addEventListener("click", event => {
+      if (!control.contains(event.target)) close();
+    });
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape" && popover.classList.contains("open")) {
+        close();
+        pill.focus({ preventScroll: true });
+      }
+    });
+    window.addEventListener("resize", () => {
+      renderComposerMode();
+      close();
+    });
+    renderComposerMode();
   }
 
   const REASONING_EFFORT_KEY = "accuretta:reasoning-effort:v1";
@@ -10656,15 +11002,9 @@
       if (menu.classList.contains("open")) positionMenu();
     }, true);
   }
-  // On mobile, EVERYTHING goes into the overflow (sliders) menu — Agent,
-  // Auto, Image — leaving just `[sliders] [send]` visible inline. The
-  // previous "send button is clipping into the sliders chip" complaint was
-  // really "there are too many chips fighting for room next to a round
-  // send button on a 390px-wide screen". Collapsing to a single trigger
-  // sidesteps the problem entirely. IDE stays hidden by CSS (no preview
-  // pane at this width). The Build / Network items already live in the
-  // menu, so the chips just join them.
-  const _MOBILE_TOOLBAR_IDS = ["mode-agent", "mode-auto", "btn-attach-image", "btn-attach-file", "btn-perms"];
+  // Keep mode selection visible as one compact button. Less-used attachment
+  // and access controls move into the overflow menu on narrow screens.
+  const _MOBILE_TOOLBAR_IDS = ["btn-attach-image", "btn-attach-file", "btn-perms"];
   function applyMobileToolbarLayout() {
     const tools = document.querySelector(".composer-tools");
     const menu = document.getElementById("toolbar-overflow-menu");
@@ -10672,17 +11012,15 @@
     if (!tools || !menu || !wrap) return;
     const mobile = isMobile();
     if (mobile) {
-      // ensure a "Mode" section label sits at the top of the menu
-      let modeLabel = menu.querySelector('.overflow-section-label[data-section="mode"]');
-      if (!modeLabel) {
-        modeLabel = document.createElement("div");
-        modeLabel.className = "overflow-section-label";
-        modeLabel.dataset.section = "mode";
-        modeLabel.textContent = "Mode";
-        menu.insertBefore(modeLabel, menu.firstChild);
+      let toolsLabel = menu.querySelector('.overflow-section-label[data-section="tools"]');
+      if (!toolsLabel) {
+        toolsLabel = document.createElement("div");
+        toolsLabel.className = "overflow-section-label";
+        toolsLabel.dataset.section = "tools";
+        toolsLabel.textContent = "Tools";
+        menu.insertBefore(toolsLabel, menu.firstChild);
       }
-      // place each chip immediately after the Mode label, in declared order
-      let cursor = modeLabel.nextSibling;
+      let cursor = toolsLabel.nextSibling;
       _MOBILE_TOOLBAR_IDS.forEach((id) => {
         const el = document.getElementById(id);
         if (!el) return;
@@ -10701,8 +11039,8 @@
           tools.insertBefore(el, wrap);
         }
       });
-      const modeLabel = menu.querySelector('.overflow-section-label[data-section="mode"]');
-      if (modeLabel) modeLabel.remove();
+      const toolsLabel = menu.querySelector('.overflow-section-label[data-section="tools"]');
+      if (toolsLabel) toolsLabel.remove();
     }
   }
 
@@ -11130,6 +11468,7 @@
       }
     });
     wireModelMenu();
+    wireComposerMode();
     wireReasoningEffort();
     $("#set-model").addEventListener("change", async () => {
       const sel = $("#set-model");
@@ -11198,7 +11537,7 @@
     const permsBtn = $("#btn-perms");
     if (permsBtn) {
       const permsToast = {
-        soft:   ["Soft mode - agent runs autonomously. Deletions, launches, desktop actions and protected ops still ask.", "warn", 4500],
+        soft:   ["Soft mode allows routine low-risk actions. Commands, tests, deletions, launches and protected actions still ask.", "warn", 5000],
         medium: ["Medium mode - workspace file writes save without asking; everything else asks.", "info", 3000],
         hard:   ["Hard mode - every action asks for approval.", "info", 3000],
       };
@@ -11216,20 +11555,20 @@
       const mode = (state.settings && state.settings.approval_mode) ||
         ((state.settings && state.settings.auto_approve_write) ? "medium" : "hard");
       document.querySelectorAll("#seg-approval-mode .chip").forEach(c =>
-        c.classList.toggle("on", c.dataset.mode === mode));
+        c.classList.toggle("on", c.dataset.approvalMode === mode));
       const tb = $("#btn-perms");
       if (tb) {
         tb.classList.toggle("on", mode !== "hard");
-        tb.title = "Access - approval mode: " + mode + ". Soft = agent runs autonomously, medium = trust writes (workspace files save without asking), hard = every action asks. Windows/System32 and registry changes always require the hold-to-approve card. Click to cycle.";
+        tb.title = "Access mode: " + mode + ". Host or WSL commands, project tests, and persistent host-session input always ask. Soft allows routine low-risk actions, medium also trusts workspace writes, and hard asks for every action. Click to cycle.";
       }
     };
     syncApprovalMode();
     document.querySelectorAll("#seg-approval-mode .chip").forEach(c =>
       c.addEventListener("click", async () => {
-        const mode = c.dataset.mode;
+        const mode = c.dataset.approvalMode;
         try { await saveSettings({ approval_mode: mode, auto_approve_write: mode !== "hard" }); } catch (_) {}
         syncApprovalMode();
-        toast(mode === "soft" ? "Soft mode - agent runs autonomously. Deletions, launches, desktop actions and protected ops still ask."
+        toast(mode === "soft" ? "Soft mode allows routine low-risk actions. Commands, tests, deletions, launches and protected actions still ask."
           : mode === "medium" ? "Medium mode - workspace file writes save without asking; everything else asks."
           : "Hard mode - every action asks for approval.",
           mode === "soft" ? "warn" : "info", 4500);
@@ -11374,15 +11713,6 @@
       if (state.chatId) {
         localStorage.setItem("accuretta:draft:" + state.chatId, e.target.value);
       }
-    });
-
-    // mode chips
-    $$('[data-mode]').forEach(b => {
-      b.addEventListener("click", () => {
-        state.mode = b.dataset.mode;
-        $$('[data-mode]').forEach(x => x.classList.remove("on"));
-        b.classList.add("on");
-      });
     });
 
     // IDE toolbar: Tailwind CDN toggle
@@ -11826,7 +12156,11 @@
     const mm = $("#mobile-menu");
     const mmScrim = $("#mobile-menu-scrim");
     const mmBtn = $("#btn-mobile-menu");
-    const closeMM = () => { mm.classList.remove("open"); mmScrim.classList.remove("open"); };
+    const closeMM = () => {
+      mm.classList.remove("open");
+      mmScrim.classList.remove("open");
+      mmBtn?.setAttribute("aria-expanded", "false");
+    };
     const openMM = () => {
       // Mobile menu shows the NEXT theme as the action label
       // ("Switch to dim", "Switch to light", "Switch to dark") so the
@@ -11836,7 +12170,15 @@
       const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", neumorphic: "Neumorphic", neobrutalism: "Neobrutalism", aperture: "Aperture", "aperture-dark": "Aperture Dark", soft: "Soft", pastel: "Pastel", velvet: "Velvet", cartograph: "Cartograph", light: "Light" }[next] || next;
       const lbl = $("#mm-theme-label");
       if (lbl) lbl.textContent = `Switch to ${niceName.toLowerCase()}`;
-      mm.classList.add("open"); mmScrim.classList.add("open");
+      const targetSelect = $("#execution-target-select");
+      const targetLabel = $("#mm-target-label");
+      if (targetSelect && targetLabel) {
+        const selected = targetSelect.selectedOptions?.[0]?.textContent?.trim() || "Inference PC";
+        targetLabel.textContent = `Command target: ${selected}`;
+      }
+      mm.classList.add("open");
+      mmScrim.classList.add("open");
+      mmBtn?.setAttribute("aria-expanded", "true");
     };
     mmBtn?.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -11847,6 +12189,18 @@
       const a = it.dataset.mm;
       closeMM();
       if (a === "theme") { $("#btn-theme").click(); return; }
+      if (a === "target") {
+        const select = $("#execution-target-select");
+        if (!select || select.options.length < 2) {
+          toast("Only the inference PC is available.", "info", 1800);
+          return;
+        }
+        select.selectedIndex = (select.selectedIndex + 1) % select.options.length;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+        return;
+      }
+      if (a === "github") { $("#btn-github-activity")?.click(); return; }
+      if (a === "history") { $("#btn-cmd-history")?.click(); return; }
       if (a === "settings") { openSettings(); return; }
       if (a === "faq") { $("#btn-faq")?.click(); return; }
       if (a === "chat" || a === "sessions" || a === "approvals") {
@@ -11858,6 +12212,7 @@
     // responsive
     window.addEventListener("resize", () => {
       document.body.classList.toggle("is-mobile", isMobile());
+      syncCompactShell();
       applyMobileToolbarLayout();
     });
 
@@ -12031,7 +12386,7 @@
         const logPre = document.getElementById("sandbox-log-pre");
         if (logPre) {
           const codeEl = logPre.querySelector("code") || logPre;
-          codeEl.innerHTML = "[system] Sandbox isolated guest environment logs...<br>";
+          codeEl.innerHTML = "[system] accuretta-sbx WSL guest. Windows executable interop is disabled. Drives mounted under /mnt are still real host files.<br>";
         }
       } else if (tabId === "agentlog") {
         const logPre = document.getElementById("term-agent-log-pre");

@@ -102,15 +102,26 @@ def _acquire_single_instance(lock_port: int = 8799) -> bool:
         return False
 
 
-# Themes whose splash background needs the dark-colored logo mark. Keep this in
+# Themes whose splash background needs the dark-ink logo mark. Keep this in
 # sync with the actual palette luminance, including the softer and pastel sets.
 _LIGHT_THEMES = {"", "light", "soft", "pastel", "retro", "neumorphic", "neobrutalism", "aperture"}
+_KNOWN_THEMES = {
+    "light", "dark", "dim", "retro", "aurora", "nebula", "operator",
+    "neumorphic", "neobrutalism", "aperture", "aperture-dark", "soft",
+    "pastel", "velvet", "cartograph",
+}
+_THEME_ALIASES = {
+    "neobrutalism-dark": "aperture",
+    "kinetic": "aperture",
+}
 
 
 def _read_saved_theme() -> str:
     """The last theme the user saved (settings.json). '' / unknown -> light."""
     try:
-        return (bridge.get_settings().get("theme") or "").strip().lower()
+        theme = str(bridge.get_settings().get("theme") or "").strip().lower()
+        theme = _THEME_ALIASES.get(theme, theme)
+        return theme if theme in _KNOWN_THEMES else ""
     except Exception:
         return ""
 
@@ -163,7 +174,7 @@ def _splash_palette(theme: str) -> dict:
 def _logo_data_uri(theme: str) -> str:
     """Base64-embed the theme-appropriate logo. The splash renders before the
     bridge serves files, so an http path (/logo-mark-*.png) can't load here."""
-    fname = "logo-mark-dark.png" if theme in _LIGHT_THEMES else "logo-mark-light.png"
+    fname = "logo-mark-light.png" if theme in _LIGHT_THEMES else "logo-mark-dark.png"
     try:
         raw = (bridge.ROOT / fname).read_bytes()
         return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
@@ -177,57 +188,61 @@ def _build_splash_html() -> str:
     Design rules: the saved theme supplies the entire palette (bg / fg /
     muted / accent) and the matching logo variant; every surface is FLAT —
     no blur, no translucency, no glow, no gradient field, no film grain.
-    One accent use only (the progress fill). The dot grid glitters like
-    stars: three sparse, off-phase twinkle layers with non-square tiles and
-    co-prime periods composite into an asymmetric scatter of blinking dots
-    over the static field. window.__splashStage(label, pct) stays the live
-    progress contract.
+    The dot grid carries a small hand-balanced field of independent points.
+    Staggered one-shot twinkles cover a warm launch, while eight quiet repeaters
+    keep a slow boot alive without turning the background into a light show.
+    window.__splashStage(label, pct) stays the live progress contract.
     """
     theme = _read_saved_theme()
     pal = _splash_palette(theme)
     logo = _logo_data_uri(theme)
     accent = pal["accent"]
-    is_light = theme in _LIGHT_THEMES
-    edge = "rgba(18, 18, 20, 0.16)" if is_light else "rgba(255, 255, 255, 0.14)"
-    theme_label = re.sub(r"[^a-z0-9 -]", "", (theme or "light").replace("-", "")).strip() or "light"
+    theme_label = re.sub(r"[^a-z0-9 -]", "", (theme or "light").replace("-", " ")).strip() or "light"
     logo_html = (f'<img src="{logo}" class="logo-img" alt="">' if logo
                  else '<span class="logo-fallback">a</span>')
+    stars = (
+        (7, 18, 2.1, 0.03, 0.48, "repeat", 4.1),
+        (14, 72, 2.3, 0.46, 0.54, "accent repeat", 3.7),
+        (21, 31, 1.1, 0.19, 0.43, "", 6.2),
+        (27, 84, 1.0, 0.83, 0.49, "", 5.4),
+        (33, 15, 1.9, 0.58, 0.46, "accent repeat", 4.5),
+        (39, 25, 1.0, 0.31, 0.51, "", 5.8),
+        (46, 10, 1.2, 0.86, 0.45, "", 6.3),
+        (55, 20, 2.1, 0.11, 0.53, "repeat", 3.9),
+        (63, 13, 2.4, 0.70, 0.47, "accent repeat", 4.7),
+        (71, 28, 1.0, 0.38, 0.44, "", 5.6),
+        (79, 17, 1.2, 0.91, 0.48, "", 6.1),
+        (88, 34, 1.1, 0.24, 0.56, "accent", 5.9),
+        (94, 61, 1.0, 0.77, 0.43, "", 5.3),
+        (85, 79, 2.2, 0.52, 0.50, "repeat", 3.5),
+        (75, 90, 1.0, 0.08, 0.46, "accent", 6.4),
+        (66, 73, 1.2, 0.89, 0.52, "", 5.8),
+        (58, 87, 1.0, 0.34, 0.42, "", 5.6),
+        (45, 92, 2.0, 0.64, 0.55, "accent repeat", 4.3),
+        (34, 75, 1.0, 0.15, 0.47, "", 5.4),
+        (23, 62, 1.2, 0.88, 0.50, "", 6.0),
+        (11, 49, 1.0, 0.41, 0.44, "", 5.7),
+        (92, 11, 1.9, 0.61, 0.49, "accent repeat", 3.8),
+        (18, 44, 1.0, 0.27, 0.48, "", 5.5),
+        (30, 56, 1.2, 0.73, 0.45, "accent", 6.0),
+        (70, 52, 1.0, 0.47, 0.51, "", 5.3),
+        (83, 47, 1.2, 0.17, 0.46, "", 6.4),
+    )
+    star_html = "".join(
+        f'<i class="star {kind}" style="--x:{x}%;--y:{y}%;--s:{size}px;'
+        f'--delay:{delay}s;--duration:{duration}s;--cycle:{cycle}s;'
+        f'--repeat-delay:{-((x * 0.071 + y * 0.037) % cycle):.2f}s"></i>'
+        for x, y, size, delay, duration, kind, cycle in stars
+    )
 
-    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body>
-  <div class="grid" aria-hidden="true">
-    <i class="tw t1"></i><i class="tw t2"></i><i class="tw t3"></i>
-  </div>
-
-  <header class="chrome mast">
-    <span class="mast-item"><i class="dot"></i>local runtime</span>
-    <span class="mast-item dim">profile / {theme_label}</span>
-  </header>
-
-  <main class="lockup">
-    <div class="mark">{logo_html}</div>
-    <h1>accuretta</h1>
-    <section class="boot" aria-live="polite">
-      <div class="readout">
-        <span id="status">Preparing local runtime</span>
-        <span class="pct" id="pct">0%</span>
-      </div>
-      <div class="rail"><div class="fill" id="fill"></div></div>
-    </section>
-  </main>
-
-  <footer class="chrome foot">
-    <span>private by location</span>
-    <span>your model · your machine</span>
-  </footer>
-
+    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
     :root {{
       --bg: {pal['bg']}; --fg: {pal['fg']}; --muted: {pal['muted']}; --accent: {accent};
-      --edge: {edge};
-      --grid-dot: {'rgba(18, 18, 20, 0.10)' if is_light else 'rgba(255, 255, 255, 0.09)'};
-      --star: {'rgba(18, 18, 20, 0.38)' if is_light else 'rgba(255, 255, 255, 0.42)'};
-      --star-accent: {accent}{'66' if is_light else '59'};
+      --edge: color-mix(in srgb, var(--fg) 15%, transparent);
+      --grid-dot: color-mix(in srgb, var(--fg) 9%, transparent);
+      --star: color-mix(in srgb, var(--fg) 58%, transparent);
+      --star-accent: color-mix(in srgb, var(--accent) 62%, transparent);
       --ease: cubic-bezier(.22, 1, .36, 1);
       --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
     }}
@@ -253,42 +268,50 @@ def _build_splash_html() -> str:
     }}
     @keyframes grid-drift {{ to {{ background-position: 30px 30px; }} }}
 
-    /* star glitter — three sparse twinkle layers over the static grid.
-       Non-square tiles + off-grid origins + co-prime periods (6.4 / 8.9 /
-       11.7s) composite into an asymmetric scatter: dots blink as
-       individuals, never as a uniform wave. The parent's radial mask
-       applies to the layers, so glitter fades toward the corners too. */
-    .tw {{
-      position: absolute; inset: 0;
-      animation: grid-drift 90s linear infinite, twinkle var(--tw-period) ease-in-out infinite;
-      animation-delay: 0s, var(--tw-delay);
+    .stars {{
+      position: absolute; inset: 0; z-index: 0; pointer-events: none;
+      -webkit-mask-image: radial-gradient(ellipse 92% 88% at 50% 48%, #000 28%, rgba(0, 0, 0, .92) 72%, transparent 100%);
+      mask-image: radial-gradient(ellipse 92% 88% at 50% 48%, #000 28%, rgba(0, 0, 0, .92) 72%, transparent 100%);
     }}
-    .t1 {{
-      --tw-period: 6.4s; --tw-delay: -1.2s;
-      background-image: radial-gradient(var(--star) 1.1px, transparent 1.7px);
-      background-size: 140px 170px;
-      background-position: 17px 43px;
+    .star {{
+      position: absolute;
+      left: var(--x); top: var(--y);
+      width: var(--s); height: var(--s);
+      border-radius: 50%;
+      color: var(--star);
+      background: currentColor;
+      opacity: 0;
+      animation: star-twinkle var(--duration) ease-out var(--delay) both;
     }}
-    .t2 {{
-      --tw-period: 8.9s; --tw-delay: -4.4s;
-      background-image: radial-gradient(var(--star-accent) 1.2px, transparent 1.9px);
-      background-size: 190px 130px;
-      background-position: 101px 77px;
+    .star.accent {{ color: var(--star-accent); }}
+    .star.repeat {{
+      box-shadow: 0 0 6px currentColor;
+      animation:
+        star-twinkle var(--duration) ease-out var(--delay) both,
+        star-repeat var(--cycle) linear var(--repeat-delay) infinite;
     }}
-    .t3 {{
-      --tw-period: 11.7s; --tw-delay: -7.8s;
-      background-image: radial-gradient(var(--star) 1px, transparent 1.6px);
-      background-size: 230px 260px;
-      background-position: 59px 149px;
+    .star.repeat::before,
+    .star.repeat::after {{
+      content: "";
+      position: absolute; left: 50%; top: 50%;
+      background: currentColor;
+      transform: translate(-50%, -50%);
     }}
-    /* blink hard once, flicker down, long dark wait — a twinkle, not a pulse */
-    @keyframes twinkle {{
-      0%   {{ opacity: 0; }}
-      5%   {{ opacity: .9; }}
-      12%  {{ opacity: .15; }}
-      18%  {{ opacity: .55; }}
-      28%  {{ opacity: 0; }}
-      100% {{ opacity: 0; }}
+    .star.repeat::before {{ width: calc(var(--s) * 3.4); height: 1px; }}
+    .star.repeat::after {{ width: 1px; height: calc(var(--s) * 3.4); }}
+    @keyframes star-twinkle {{
+      0%   {{ opacity: 0; transform: scale(.45); }}
+      28%  {{ opacity: .78; transform: scale(1); }}
+      48%  {{ opacity: .18; transform: scale(.72); }}
+      68%  {{ opacity: .46; transform: scale(.92); }}
+      100% {{ opacity: 0; transform: scale(.5); }}
+    }}
+    @keyframes star-repeat {{
+      0%, 100% {{ opacity: 0; transform: scale(.52); }}
+      5% {{ opacity: .88; transform: scale(1); }}
+      9% {{ opacity: .14; transform: scale(.68); }}
+      14% {{ opacity: .52; transform: scale(.92); }}
+      21% {{ opacity: 0; transform: scale(.55); }}
     }}
 
     /* corner chrome — small caps mono, appears last, never competes */
@@ -387,9 +410,40 @@ def _build_splash_html() -> str:
     @media (prefers-reduced-motion: reduce) {{
       *, *::before, *::after {{ animation: none !important; transition-duration: .01ms !important; }}
       .mark, h1, .boot, .mast, .foot {{ opacity: 1; transform: none; }}
+      .star {{ display: none; }}
     }}
   </style>
+</head>
+<body>
+  <div class="grid" aria-hidden="true"></div>
+  <div class="stars" aria-hidden="true">
+    {star_html}
+  </div>
+
+  <header class="chrome mast">
+    <span class="mast-item"><i class="dot"></i>local runtime</span>
+    <span class="mast-item dim">profile / {theme_label}</span>
+  </header>
+
+  <main class="lockup">
+    <div class="mark">{logo_html}</div>
+    <h1>accuretta</h1>
+    <section class="boot" aria-live="polite">
+      <div class="readout">
+        <span id="status">Preparing local runtime</span>
+        <span class="pct" id="pct">0%</span>
+      </div>
+      <div class="rail"><div class="fill" id="fill"></div></div>
+    </section>
+  </main>
+
+  <footer class="chrome foot">
+    <span>private by location</span>
+    <span>your model · your machine</span>
+  </footer>
+
   <script>
+    window.__splashReadyAt = performance.now();
     window.__splashStage = function (label, pct) {{
       var status = document.getElementById('status');
       var fill = document.getElementById('fill');
@@ -499,7 +553,7 @@ def main() -> int:
     # (only the whole message via the copy button). Turning it on restores normal
     # selection + Ctrl+C + right-click copy. UI chrome stays unselectable via the
     # `user-select: none` CSS on buttons, the sidebar, and code line numbers.
-    splash_shown_at = time.monotonic()
+    splash_created_at = time.monotonic()
     win = webview.create_window("Accuretta", html=_build_splash_html(),
                                 width=1440, height=920, min_size=(960, 640),
                                 text_select=True)
@@ -520,10 +574,19 @@ def main() -> int:
         _stage("Waiting for local engine", 55)
         if _wait_ready():
             _stage("Opening workspace", 100)
-            # Warm launches can finish before the opening choreography becomes
-            # legible. Guarantee a short total presentation, but never pad a
-            # genuinely slow boot beyond the final ready transition.
-            elapsed = time.monotonic() - splash_shown_at
+            # Measure from the splash document's final script, not from Python's
+            # pre-window setup. That keeps the guaranteed warm-launch interval
+            # tied to content the user could actually see.
+            try:
+                elapsed_ms = win.evaluate_js(
+                    "window.__splashReadyAt == null ? null : "
+                    "performance.now() - window.__splashReadyAt"
+                )
+                elapsed = float(elapsed_ms) / 1000.0
+                if not 0.0 <= elapsed < 3600.0:
+                    raise ValueError("invalid splash clock")
+            except Exception:
+                elapsed = time.monotonic() - splash_created_at
             time.sleep(max(0.38, 1.45 - elapsed))
             win.load_url(f"http://127.0.0.1:{PORT}")
             threading.Thread(target=_watch_bridge, args=(win,), daemon=True).start()

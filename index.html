@@ -25,7 +25,7 @@
     document.documentElement.setAttribute('data-theme', theme);
   })();
 </script>
-  <link rel="stylesheet" href="/app.css?v=50">
+  <link rel="stylesheet" href="/app.css?v=55">
 <script src="https://unpkg.com/@phosphor-icons/web"></script>
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js?v=2" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js?v=2" defer></script>
@@ -59,7 +59,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.7.5</span>
+        <span class="v" id="brand-v">v0.7.6</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -183,25 +183,28 @@
         <button class="iconbtn" id="btn-toggle-plan" title="Plan" aria-pressed="false"><i class="ph ph-list-checks"></i></button>
         <button class="iconbtn" id="btn-github-activity" title="GitHub Activity"><i class="ph ph-git-branch"></i></button>
         <button class="iconbtn" id="btn-session-desktop" title="Desktop automation for this chat only" hidden><i class="ph ph-desktop"></i></button>
-        <button class="iconbtn" id="btn-cmd-history" title="PowerShell command history"><i class="ph ph-terminal-window"></i></button>
+        <button class="iconbtn" id="btn-cmd-history" title="Host and WSL command history"><i class="ph ph-terminal-window"></i></button>
         <button class="iconbtn" id="btn-palette" title="Switch session (⌘K / Ctrl+K)"><i class="ph ph-magnifying-glass"></i></button>
         <button class="iconbtn" id="btn-theme" title="Theme"><i class="ph ph-moon"></i></button>
         <button class="iconbtn" id="btn-toggle-preview" title="Toggle preview"><i class="ph ph-browser"></i></button>
-        <button class="iconbtn mobile-only" id="btn-mobile-menu" title="Menu"><i class="ph ph-dots-three-vertical"></i></button>
+        <button class="iconbtn mobile-only" id="btn-mobile-menu" type="button" title="Menu" aria-label="Open menu" aria-haspopup="menu" aria-controls="mobile-menu" aria-expanded="false"><i class="ph ph-dots-three-vertical"></i></button>
       </div>
     </div>
 
     <div class="mobile-menu-scrim" id="mobile-menu-scrim"></div>
     <div class="mobile-menu" id="mobile-menu" role="menu">
-      <button class="mm-item" data-mm="theme"><i class="ph ph-moon"></i><span id="mm-theme-label">Dark mode</span></button>
+      <button class="mm-item" type="button" role="menuitem" data-mm="theme"><i class="ph ph-moon"></i><span id="mm-theme-label">Dark mode</span></button>
+      <button class="mm-item" type="button" role="menuitem" data-mm="target"><i class="ph ph-device-mobile"></i><span id="mm-target-label">Command target</span></button>
+      <button class="mm-item" type="button" role="menuitem" data-mm="github"><i class="ph ph-git-branch"></i>GitHub activity</button>
+      <button class="mm-item" type="button" role="menuitem" data-mm="history"><i class="ph ph-terminal-window"></i>Command history</button>
       <div class="mm-sep"></div>
-      <button class="mm-item" data-mm="chat"><i class="ph ph-chats-circle"></i>Chat</button>
-      <button class="mm-item" data-mm="sessions"><i class="ph ph-list-bullets"></i>Sessions</button>
-      <button class="mm-item" data-mm="approvals"><i class="ph ph-shield-check"></i>Approvals</button>
+      <button class="mm-item" type="button" role="menuitem" data-mm="chat"><i class="ph ph-chats-circle"></i>Chat</button>
+      <button class="mm-item" type="button" role="menuitem" data-mm="sessions"><i class="ph ph-list-bullets"></i>Sessions</button>
+      <button class="mm-item" type="button" role="menuitem" data-mm="approvals"><i class="ph ph-shield-check"></i>Approvals</button>
       <div class="mm-sep"></div>
-      <button class="mm-item" data-mm="settings"><i class="ph ph-gear-six"></i>Settings</button>
-      <button class="mm-item" data-mm="faq"><i class="ph ph-question"></i>FAQ</button>
-      <button class="mm-item" data-mm="shutdown"><i class="ph ph-power"></i>Shutdown</button>
+      <button class="mm-item" type="button" role="menuitem" data-mm="settings"><i class="ph ph-gear-six"></i>Settings</button>
+      <button class="mm-item" type="button" role="menuitem" data-mm="faq"><i class="ph ph-question"></i>FAQ</button>
+      <button class="mm-item" type="button" role="menuitem" data-mm="shutdown"><i class="ph ph-power"></i>Shutdown</button>
     </div>
 
     <div class="status-line" id="status-line"></div>
@@ -223,12 +226,27 @@
         <div class="composer">
           <div class="revealer-deck" id="revealer-deck"></div>
           <div class="composer-tools">
-            <button class="chip" id="mode-ide" data-mode="ide"><i class="ph ph-code"></i>IDE</button>
-            <button class="chip" id="mode-agent" data-mode="agent"><i class="ph ph-terminal-window"></i>Agent</button>
-            <button class="chip on" id="mode-auto" data-mode="auto"><i class="ph ph-lightning"></i>Auto</button>
+            <div class="mode-control" id="composer-mode-control">
+              <button class="mode-pill" id="composer-mode-pill" type="button" aria-haspopup="menu" aria-controls="composer-mode-menu" aria-expanded="false" aria-label="Composer mode: Auto" title="Choose how Accuretta handles the next message">
+                <i class="ph ph-lightning mode-pill-icon" id="composer-mode-icon" aria-hidden="true"></i>
+                <span class="mode-pill-label" id="composer-mode-value">Auto</span>
+                <i class="ph ph-caret-down mode-pill-caret" aria-hidden="true"></i>
+              </button>
+              <div class="mode-popover" id="composer-mode-popover">
+                <div class="mode-popover-head">
+                  <span>Mode</span>
+                  <strong id="composer-mode-popover-value">Auto</strong>
+                </div>
+                <div class="mode-menu" id="composer-mode-menu" role="menu" aria-label="Composer mode">
+                  <button type="button" class="mode-option active" role="menuitemradio" aria-checked="true" data-composer-mode="auto"><i class="ph ph-lightning" aria-hidden="true"></i><span>Auto</span><i class="ph ph-check mode-check" aria-hidden="true"></i></button>
+                  <button type="button" class="mode-option" role="menuitemradio" aria-checked="false" data-composer-mode="agent"><i class="ph ph-terminal-window" aria-hidden="true"></i><span>Agent</span><i class="ph ph-check mode-check" aria-hidden="true"></i></button>
+                  <button type="button" class="mode-option" role="menuitemradio" aria-checked="false" data-composer-mode="ide"><i class="ph ph-code" aria-hidden="true"></i><span>IDE<small class="mode-option-note">Wide layout</small></span><i class="ph ph-check mode-check" aria-hidden="true"></i></button>
+                </div>
+              </div>
+            </div>
             <button class="chip" id="btn-attach-image" title="Attach image — the vision model reads it and hands a description to the main model"><i class="ph ph-image"></i>Image</button>
             <button class="chip" id="btn-attach-file" title="Upload files from this browser into the PC workspace"><i class="ph ph-paperclip"></i>File</button>
-            <button class="chip" id="btn-perms" title="Access — approval mode for agent actions. Soft = autonomous, medium = trust writes, hard = every action asks. Windows/System32 and registry changes always require the hold-to-approve card. Click to cycle."><i class="ph ph-keyhole"></i>Access</button>
+            <button class="chip" id="btn-perms" title="Access approval mode. Raw host or WSL commands, project tests, and persistent host-session input always ask. Soft allows routine low-risk actions, medium also trusts workspace writes, and hard asks for every action. Click to cycle."><i class="ph ph-keyhole"></i>Access</button>
             <input type="file" id="file-image" accept="image/*" multiple hidden>
             <input type="file" id="file-client" multiple hidden>
             <div class="toolbar-overflow-wrap">
@@ -355,20 +373,20 @@
 
       <div id="terminal-bottom-pane">
         <div class="term-tabs-header">
-          <button class="term-tab active" data-tab="terminal"><i class="ph ph-terminal-window"></i>Terminal</button>
-          <button class="term-tab" data-tab="sandbox"><i class="ph ph-shield-check"></i>Sandbox</button>
+          <button class="term-tab active" data-tab="terminal" title="Commands executed directly on this Windows PC"><i class="ph ph-desktop"></i>Host</button>
+          <button class="term-tab" data-tab="sandbox" title="Commands executed in the accuretta-sbx WSL guest"><i class="ph ph-shield-check"></i>WSL Guest</button>
           <button class="term-tab" data-tab="backend"><i class="ph ph-cpu"></i>Backend</button>
           <button class="term-tab" data-tab="shell"><i class="ph ph-terminal"></i>Shell</button>
           <button class="term-tab" data-tab="agentlog"><i class="ph ph-activity"></i>Agent log</button>
           <span class="grow"></span>
-          <button class="iconbtn sm" id="btn-term-clear" title="Clear active console"><i class="ph ph-trash"></i></button>
+          <button class="iconbtn sm" id="btn-term-clear" title="Clear Host output" aria-label="Clear Host output"><i class="ph ph-trash"></i></button>
         </div>
         <div class="term-tabs-body">
           <div class="term-tab-pane active" id="term-pane-terminal">
             <pre class="term-pre" id="term-console-pre"><code>$ <span class="term-cursor"></span></code></pre>
           </div>
           <div class="term-tab-pane hidden" id="term-pane-sandbox">
-            <pre class="term-pre" id="sandbox-log-pre"><code>[system] Sandbox isolated guest environment logs...</code></pre>
+            <pre class="term-pre" id="sandbox-log-pre"><code>[system] accuretta-sbx WSL guest. Windows executable interop is disabled. Drives mounted under /mnt are still real host files.</code></pre>
           </div>
           <div class="term-tab-pane hidden" id="term-pane-backend">
             <div class="backend-pane" id="backend-pane">
@@ -944,14 +962,14 @@
       <span>Approvals</span>
     </div>
     <div class="form-row">
-      <span class="hint"><b>soft</b> = the agent runs autonomously (MCP browser included) &mdash; only deletions, program launches, desktop actions and protected ops still ask. <b>medium</b> = trust writes: workspace file writes/edits save without asking, everything else asks. <b>hard</b> = every action asks. in ALL modes, Windows/System32 and registry changes need the hold-to-approve card, and drive-wipe / self-harm commands are refused outright.</span>
+      <span class="hint"><b>soft</b> allows routine low-risk actions. <b>medium</b> also trusts workspace file writes and edits. <b>hard</b> asks for every action. raw host or WSL commands, project tests, persistent host-session input, deletions, program launches, desktop actions and protected operations always ask. drive wipes and bridge self-harm are refused outright.</span>
     </div>
     <div class="form-row inline">
       <label>Approval mode</label>
       <div class="seg" id="seg-approval-mode">
-        <button class="chip" data-mode="soft" type="button">soft</button>
-        <button class="chip" data-mode="medium" type="button">medium</button>
-        <button class="chip" data-mode="hard" type="button">hard</button>
+        <button class="chip" data-approval-mode="soft" type="button">soft</button>
+        <button class="chip" data-approval-mode="medium" type="button">medium</button>
+        <button class="chip" data-approval-mode="hard" type="button">hard</button>
       </div>
     </div>
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
@@ -1014,7 +1032,7 @@
       <span class="sandbox-chip" id="sandbox-chip" data-state="unknown">checking…</span>
     </div>
     <div class="form-row">
-      <span class="hint">an isolated Ubuntu guest (<code>accuretta-sbx</code>, via WSL2) for running offensive tools and unpacking untrusted files off your host — the workspace is visible inside at <code>/mnt/…</code>. optional: in a web red-team the exploits run on the target, not here, so this matters mainly when you pull loot back to analyze locally. first-time set-up with full progress lives in the <b>Setup Wizard</b>.</span>
+      <span class="hint">a separate Ubuntu WSL2 guest (<code>accuretta-sbx</code>) for offensive tools and static inspection. It reduces exposure, but it is not malware-grade containment. Windows drives under <code>/mnt/…</code> are real host files, so never execute an unknown sample here. First-time setup lives in the <b>Setup Wizard</b>.</span>
     </div>
     <div class="form-row inline" id="sandbox-actions" style="gap:8px;flex-wrap:wrap;">
       <button class="btn sm" id="btn-sandbox-setup" type="button"><i class="ph ph-cube"></i>Set up / repair</button>
@@ -1178,7 +1196,7 @@
 </aside>
 
 <!-- ====== COMMAND HISTORY DRAWER ======
-     Lists every PowerShell command the agent has run. Same drawer mechanism
+     Lists every host or WSL guest command the agent has run. Same drawer mechanism
      as Settings — scrim + slide-in panel. Populated on open by hitting
      /api/cmd-history. Each row collapses by default; click to expand
      stdout / stderr / duration / chat. -->
@@ -1231,13 +1249,13 @@
         <span class="hint">Where your .gguf files live. Leave blank to use the default.</span>
       </div>
       <div class="setup-step" id="step-sandbox">
-        <label>Sandbox <span class="hint" style="font-weight:normal;">— optional, isolated Linux guest</span></label>
+        <label>Sandbox <span class="hint" style="font-weight:normal;">(optional WSL2 guest)</span></label>
         <div class="setup-scanner-card" id="sbx-wiz-card">
           <div class="header">
             <i class="ph ph-spinner-gap pulse-icon spin" id="sbx-wiz-icon" style="font-size:18px;display:inline-block;"></i>
             <div class="title" id="sbx-wiz-title">Checking for WSL…</div>
           </div>
-          <div class="desc" id="sbx-wiz-desc">Runs offensive tools and unpacks untrusted files in an isolated Ubuntu guest (via WSL2) so nothing touches your host. Your workspace is visible inside it.</div>
+          <div class="desc" id="sbx-wiz-desc">Runs tools in a separate Ubuntu WSL2 guest. This reduces exposure, but Windows drives mounted under <code>/mnt</code> remain host files. Do not execute unknown samples.</div>
         </div>
       </div>
     </div>
@@ -1249,7 +1267,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
-  <script src="/app.js?v=2026082103"></script>
+  <script src="/app.js?v=2026082205"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {
@@ -1310,17 +1328,23 @@
         card.className = 'setup-scanner-card success';
         icon.className = 'ph ph-check-circle success-icon';
         title.textContent = 'Sandbox ready';
-        desc.innerHTML = 'Isolated guest <code>' + escSbx(st.sandbox_distro) + '</code> is provisioned. Manage it later in Settings &rarr; Sandbox.';
+        desc.innerHTML = 'WSL2 guest <code>' + escSbx(st.sandbox_distro) + '</code> is provisioned. Mounted Windows files remain host files. Manage it in Settings &rarr; Sandbox.';
       } else if (st.state === 'no_wsl') {
         icon.className = 'ph ph-warning pulse-icon';
         title.textContent = 'WSL not installed (one-time)';
         desc.innerHTML = 'The sandbox needs WSL2. In an <strong>elevated PowerShell</strong> run <code>wsl --install</code>, reboot once, then reopen this wizard — everything after is automatic. This step is optional; you can start using accuretta without it.';
+      } else if (st.state === 'needs_hardening') {
+        icon.className = 'ph ph-shield-warning';
+        title.textContent = 'WSL guest security update required';
+        desc.innerHTML = 'Commands are disabled until Windows executable interop is turned off for this guest. The update restarts only <code>' + escSbx(st.sandbox_distro) + '</code>.' +
+          '<div style="margin-top:10px;"><button class="btn-installer-download" id="sbx-wiz-btn"><i class="ph ph-shield-check"></i> Apply security update</button></div>';
+        var b = sbxEl('sbx-wiz-btn'); if (b) b.addEventListener('click', startSbx);
       } else {
         icon.className = 'ph ph-cube';
         title.textContent = (st.state === 'present_unprovisioned')
           ? 'WSL detected — sandbox needs provisioning'
           : 'WSL detected — sandbox not set up';
-        desc.innerHTML = 'One click builds an isolated Ubuntu guest and installs the toolset (~230 MB download, a few minutes). No reboot needed.' +
+        desc.innerHTML = 'One click builds a separate Ubuntu WSL2 guest and installs the toolset (~230&nbsp;MB download, a few minutes). It is not malware-grade containment.' +
           '<div style="margin-top:10px;"><button class="btn-installer-download" id="sbx-wiz-btn"><i class="ph ph-download-simple"></i> Set up sandbox</button></div>';
         var b = sbxEl('sbx-wiz-btn'); if (b) b.addEventListener('click', startSbx);
       }

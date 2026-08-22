@@ -335,6 +335,10 @@ import contextvars
 _current_chat_id: contextvars.ContextVar[str] = contextvars.ContextVar("_current_chat_id", default="")
 _current_rt_chat: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "_current_rt_chat", default=None)
+_current_tool_name: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_tool_name", default="")
+_current_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_tool_call_id", default="")
 
 # per-chat SSE emitter so tools can stream progress without plumbing emit through every call
 _chat_emitters: dict[str, callable] = {}
@@ -5367,7 +5371,7 @@ def bridge_self_threat(cmd: str) -> str | None:
 # The REFUSE set (drive wipes, fork bombs, bridge self-harm) is mode-independent.
 
 _SOFT_PROMPT_KINDS = {"delete", "registry", "launch"}
-_SOFT_COMMAND_KINDS = {"powershell", "sandbox", "session", "git"}
+_SOFT_COMMAND_KINDS = {"powershell", "sandbox", "session", "git", "test"}
 _MCP_SOFT_BLOCK = re.compile(r"delete|remove|drop|destroy|terminate|unregister", re.IGNORECASE)
 
 # git verbs that only READ the repo — the only ones soft mode may run freely.
@@ -6780,13 +6784,68 @@ def tool_delete_file(args: dict) -> dict:
         return {"error": str(e)}
 
 
-def _emit_tool_stream(name: str, text: str) -> None:
-    """If a chat turn is active, emit a tool_stream SSE event."""
-    cid = _current_chat_id.get()
+def _execution_tool_name(fallback: str) -> str:
+    return _current_tool_name.get() or _resolve_tool_name(fallback)
+
+
+def _emit_execution_event(state: str, target: str, command: str, *,
+                          cwd: str = "", chat_id: str = "", **details) -> None:
+    """Report the real command lifecycle, separately from the model tool call."""
+    cid = chat_id or _current_chat_id.get() or _get_current_chat()
+    emit = _chat_emitters.get(cid) if cid else None
+    if not emit:
+        return
+    event = {
+        "type": f"command_{state}",
+        "name": _execution_tool_name("run_powershell"),
+        "call_id": _current_tool_call_id.get(),
+        "target": target,
+        "command": command,
+        "cwd": cwd,
+    }
+    event.update({k: v for k, v in details.items() if v is not None})
+    try:
+        emit(event)
+    except Exception:
+        pass
+
+
+def _execution_not_run(message: str, target: str, command: str, *,
+                       reason: str = "blocked", cwd: str = "", **details) -> dict:
+    event_details = dict(details)
+    event_details.setdefault("reason", reason)
+    event_details.setdefault("message", message)
+    _emit_execution_event("not_executed", target, command, cwd=cwd,
+                          **event_details)
+    result = {
+        "error": message,
+        "not_executed": True,
+        "executed": False,
+        "execution_target": target,
+        "execution_state": reason,
+    }
+    result.update(details)
+    return result
+
+
+def _emit_tool_stream(name: str, text: str, chat_id: str = "", target: str = "",
+                      call_id: str = "") -> None:
+    """If a chat turn is active, emit a tool_stream SSE event.
+
+    Reader threads do not inherit ContextVars, so subprocess callers capture
+    the chat id before spawning and pass it explicitly.
+    """
+    cid = chat_id or _current_chat_id.get()
     emit = _chat_emitters.get(cid) if cid else None
     if emit:
         try:
-            emit({"type": "tool_stream", "name": name, "text": text[:240]})
+            emit({
+                "type": "tool_stream",
+                "name": _execution_tool_name(name),
+                "call_id": call_id or _current_tool_call_id.get(),
+                "target": target,
+                "text": text[:240],
+            })
         except Exception:
             pass
 
@@ -6795,7 +6854,7 @@ _cmd_history_lock = threading.Lock()
 
 
 def _append_cmd_history(entry: dict) -> None:
-    """Append a single PowerShell-call record to cmd_history.jsonl, then trim
+    """Append a started host or WSL command to cmd_history.jsonl, then trim
     the file to CMD_HISTORY_MAX lines if it's grown past that. Failures are
     swallowed — command logging must never block a tool call from returning."""
     try:
@@ -6852,23 +6911,93 @@ def _read_cmd_history(limit: int = 200, chat_id: str = "") -> list[dict]:
 # sequentially within a turn, so one live command per chat at a time.
 _running_cmds_lock = threading.Lock()
 _running_cmds: dict[str, subprocess.Popen] = {}
+_running_cmd_targets: dict[str, str] = {}
 # Procs terminated via the kill button. Windows TerminateProcess sets exit code
 # 1 (indistinguishable from a real exit 1 by returncode), so we mark the kill
 # explicitly and read it back in _run_powershell.
 _killed_procs: set = set()
 
 
+def _trusted_windows_binary(*relative_parts: str) -> str:
+    if os.name != "nt":
+        return ""
+    windows_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
+    for system_dir in ("Sysnative", "System32"):
+        candidate = os.path.abspath(os.path.join(windows_root, system_dir, *relative_parts))
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def _trusted_node_binary() -> str:
+    if os.name == "nt":
+        roots = [os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")]
+        for root in filter(None, roots):
+            candidate = os.path.abspath(os.path.join(root, "nodejs", "node.exe"))
+            if os.path.isfile(candidate):
+                return candidate
+    current = os.path.normcase(os.path.abspath(os.getcwd()))
+    workspace = os.path.normcase(os.path.abspath(str(ROOT)))
+    for raw_dir in os.environ.get("PATH", "").split(os.pathsep):
+        if not raw_dir or not os.path.isabs(raw_dir):
+            continue
+        directory = os.path.normcase(os.path.abspath(raw_dir))
+        if directory == current or directory == workspace or directory.startswith(workspace + os.sep):
+            continue
+        candidate = os.path.join(directory, "node.exe" if os.name == "nt" else "node")
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def _terminate_process_tree(proc: subprocess.Popen, target: str) -> bool:
+    if proc.poll() is not None:
+        return True
+    if target == "sandbox":
+        rc, _ = _wsl_run(["--terminate", SANDBOX_DISTRO], timeout=30)
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        return rc == 0 or proc.poll() is not None
+    if os.name == "nt":
+        taskkill = _trusted_windows_binary("taskkill.exe")
+        if taskkill:
+            try:
+                result = subprocess.run(
+                    [taskkill, "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True, text=True, timeout=30,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                if result.returncode == 0 or proc.poll() is not None:
+                    return True
+            except Exception:
+                pass
+    try:
+        proc.kill()
+        proc.wait(timeout=5)
+        return True
+    except Exception:
+        return proc.poll() is not None
+
+
 def _kill_current_command(chat_id: str) -> bool:
     """Kill the shell command currently running for this chat, if any."""
     with _running_cmds_lock:
         proc = _running_cmds.get(chat_id or "")
+        target = _running_cmd_targets.get(chat_id or "", "host")
         if proc is not None:
             _killed_procs.add(proc)
     if proc is None:
         return False
     try:
-        proc.kill()
-        return True
+        if _terminate_process_tree(proc, target):
+            return True
+        raise RuntimeError("process tree did not stop")
     except Exception:
         with _running_cmds_lock:
             _killed_procs.discard(proc)
@@ -6877,9 +7006,19 @@ def _kill_current_command(chat_id: str) -> bool:
 
 def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000) -> dict:
     t_start = time.time()
+    stream_chat_id = _current_chat_id.get() or _get_current_chat()
+    stream_tool_name = _execution_tool_name("run_powershell")
+    stream_call_id = _current_tool_call_id.get()
+    process_cwd = os.getcwd()
+    powershell_exe = _trusted_windows_binary("WindowsPowerShell", "v1.0", "powershell.exe")
+    if not powershell_exe:
+        return _execution_not_run(
+            "Trusted Windows PowerShell executable was not found in the Windows system directory.",
+            "host", cmd, reason="spawn_error", cwd=process_cwd, spawn_error=True,
+        )
     try:
         proc = subprocess.Popen(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+            [powershell_exe, "-NoProfile", "-NonInteractive", "-Command", cmd],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
@@ -6895,8 +7034,12 @@ def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000) -> di
             "stdout": "",
             "stderr": str(e),
             "spawn_error": True,
+            "target": "host",
+            "tool": stream_tool_name,
+            "call_id": stream_call_id,
         })
-        return err
+        return _execution_not_run(str(e), "host", cmd, reason="spawn_error",
+                                  cwd=process_cwd, spawn_error=True)
 
     out_lines: list[str] = []
     err_lines: list[str] = []
@@ -6905,38 +7048,36 @@ def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000) -> di
         try:
             for line in iter(pipe.readline, ""):
                 sink.append(line)
-                _emit_tool_stream(name, line.rstrip("\n\r"))
+                _emit_tool_stream(stream_tool_name, line.rstrip("\n\r"), stream_chat_id,
+                                  target="host", call_id=stream_call_id)
             pipe.close()
         except Exception:
             pass
 
     t_out = threading.Thread(target=reader, args=(proc.stdout, out_lines, "run_powershell"), daemon=True)
     t_err = threading.Thread(target=reader, args=(proc.stderr, err_lines, "run_powershell"), daemon=True)
-    t_out.start()
-    t_err.start()
 
-    # Register for the per-command kill button; always deregister on the way out.
-    _cid = _get_current_chat() or ""
+    # Register for the per-command kill button before announcing the spawn.
+    _cid = stream_chat_id or ""
     if _cid:
         with _running_cmds_lock:
             _running_cmds[_cid] = proc
+            _running_cmd_targets[_cid] = "host"
+    _emit_execution_event("spawned", "host", cmd, cwd=process_cwd,
+                          chat_id=stream_chat_id, pid=proc.pid)
+    t_out.start()
+    t_err.start()
     try:
+        timed_out = False
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            _append_cmd_history({
-                "ts": int(t_start * 1000),
-                "chat_id": _get_current_chat(),
-                "command": cmd,
-                "exit": -1,
-                "ok": False,
-                "duration_ms": int((time.time() - t_start) * 1000),
-                "stdout": "".join(out_lines)[-max_stdout:],
-                "stderr": "".join(err_lines)[-4000:],
-                "timed_out": True,
-            })
-            return {"error": f"timeout after {timeout}s"}
+            _terminate_process_tree(proc, "host")
+            timed_out = True
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
 
         t_out.join(timeout=5)
         t_err.join(timeout=5)
@@ -6952,28 +7093,44 @@ def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000) -> di
         result = {
             "ok": proc.returncode == 0,
             "exit": proc.returncode,
+            "exit_code": proc.returncode,
             "stdout": stdout,
             "stderr": stderr,
+            "executed": True,
+            "execution_target": "host",
         }
-        if killed:
+        if timed_out:
+            result["timed_out"] = True
+            result["error"] = f"timeout after {timeout}s"
+        elif killed:
             result["killed"] = True
             result["error"] = "command was killed"
+        duration_ms = int((time.time() - t_start) * 1000)
         _append_cmd_history({
             "ts": int(t_start * 1000),
-            "chat_id": _get_current_chat(),
+            "chat_id": stream_chat_id,
             "command": cmd,
             "exit": proc.returncode,
             "ok": result["ok"],
-            "duration_ms": int((time.time() - t_start) * 1000),
+            "duration_ms": duration_ms,
             "stdout": stdout,
             "stderr": stderr,
             "killed": killed,
+            "timed_out": timed_out,
+            "target": "host",
+            "tool": stream_tool_name,
+            "call_id": stream_call_id,
         })
+        _emit_execution_event("finished", "host", cmd, cwd=process_cwd,
+                              chat_id=stream_chat_id, exit_code=proc.returncode,
+                              killed=killed, timed_out=timed_out,
+                              duration_ms=duration_ms)
         return result
     finally:
         with _running_cmds_lock:
             if _cid and _running_cmds.get(_cid) is proc:
                 _running_cmds.pop(_cid, None)
+                _running_cmd_targets.pop(_cid, None)
             _killed_procs.discard(proc)
 
 
@@ -7062,45 +7219,79 @@ def _clickfix_cmd(cmd: str) -> str | None:
     return None
 
 
+_HOST_CODE_EXEC_RE = re.compile(
+    r"(?:^|[;&|]\s*)"
+    r"(?:&\s*)?"
+    r"(?:node(?:\.exe)?|python(?:3|w)?(?:\.exe)?|py(?:\.exe)?|deno|bun|"
+    r"ruby|perl|php|java|dotnet|npx|pnpm\s+(?:run|exec|test|start|install|add)|"
+    r"npm\s+(?:run|exec|test|start|install|ci|update)|"
+    r"yarn\s+(?:run|test|start|install|add)|uv\s+run|poetry\s+run|pipenv\s+run|"
+    r"pytest|tox|nox|jest|vitest|mocha|tsx|ts-node|"
+    r"cargo\s+(?:run|test|build)|go\s+(?:run|test)|dotnet\s+(?:run|test|build)|"
+    r"(?:make|msbuild|gradle|mvn)(?:\.exe)?|"
+    r"git\s+(?:checkout|switch|merge|rebase|commit|pull|push|clone|submodule)|"
+    r"cmd(?:\.exe)?\s+/c|powershell(?:\.exe)?|"
+    r"pwsh(?:\.exe)?|wsl(?:\.exe)?|bash|sh|cscript|wscript|mshta|rundll32|"
+    r"invoke-expression|iex|add-type|"
+    r"[^\s;&|]+\.(?:exe|com|ps1|bat|cmd|js|vbs|wsf|hta|jar))\b",
+    re.IGNORECASE,
+)
+
+_WSL_HOST_INTEROP_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:&\s*)?"
+    r"(?:cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|reg|regedit|"
+    r"explorer|start|schtasks|sc)(?:\.exe)?\b|"
+    r"(?:^|[\s;&|])(?:/mnt/[a-z]/[^\s;&|]*\.exe)\b",
+    re.IGNORECASE,
+)
+
+
+def _host_command_executes_code(command: str) -> bool:
+    """Conservatively identify host commands that execute code or scripts."""
+    return bool(_HOST_CODE_EXEC_RE.search(str(command or "").strip()))
+
+
 def tool_run_powershell(args: dict) -> dict:
     cmd = (args.get("command") or "").strip()
     if not cmd:
         return {"error": "empty command"}
+    process_cwd = os.getcwd()
+    _emit_execution_event("requested", "host", cmd, cwd=process_cwd)
+
+    def not_run(message: str, reason: str, **details) -> dict:
+        return _execution_not_run(message, "host", cmd, reason=reason,
+                                  cwd=process_cwd, **details)
+
     threat = bridge_self_threat(cmd)
     if threat:
-        return {
-            "error": (
+        return not_run(
+            (
                 f"refused: {threat}. Accuretta won't terminate or overwrite its own "
                 "server through a tool call — restart the bridge yourself if you "
                 "really mean to. If you're trying to kill a different python "
                 "process (flask dev server, etc.), target it by exact PID rather "
                 "than 'all python.exe' or 'whatever listens on 8787'."
             ),
-            "refused_command": cmd,
-        }
+            "self_protection", refused_command=cmd)
     catastrophic = _catastrophic_cmd(cmd)
     if catastrophic:
-        return {
-            "error": (
+        return not_run(
+            (
                 f"refused: this command {catastrophic}. Accuretta hard-blocks "
                 "whole-machine / whole-drive destruction — it never even reaches "
                 "the approval queue. If you truly intend this, run it yourself."
             ),
-            "refused_command": cmd,
-            "catastrophic": True,
-        }
+            "catastrophic", refused_command=cmd, catastrophic=True)
     clickfix = _clickfix_cmd(cmd)
     if clickfix:
-        return {
-            "error": (
+        return not_run(
+            (
                 f"refused: this command {clickfix} — the ClickFix signature "
                 "(remote content piped into an interpreter). Accuretta hard-blocks "
                 "download-and-execute pipelines; they never reach the approval "
                 "queue. If you truly intend this, run it yourself."
             ),
-            "refused_command": cmd,
-            "clickfix": True,
-        }
+            "clickfix", refused_command=cmd, clickfix=True)
     # Registry tier check runs BEFORE the generic powershell approval. Both
     # tiers now route to the hold-to-approve CRITICAL card (never auto-
     # approved in any approval_mode); system hives get the loudest wording.
@@ -7112,7 +7303,8 @@ def tool_run_powershell(args: dict) -> dict:
             details={"kind": "registry", "level": "system", "targets": reg["targets"], "critical": True},
         )
         if approval.get("decision") != "approve":
-            return {"error": f"user denied SYSTEM registry edit ({approval.get('status')})"}
+            return not_run(f"user denied SYSTEM registry edit ({approval.get('status')})",
+                           "denied")
     elif reg["level"] == "user":
         approval = request_approval(
             title="REGISTRY EDIT (user hive)",
@@ -7120,15 +7312,26 @@ def tool_run_powershell(args: dict) -> dict:
             details={"kind": "registry", "level": "user", "targets": reg["targets"], "critical": True},
         )
         if approval.get("decision") != "approve":
-            return {"error": f"user denied registry edit ({approval.get('status')})"}
-    elif needs_approval(cmd):
+            return not_run(f"user denied registry edit ({approval.get('status')})",
+                           "denied")
+    else:
+        executes_code = _host_command_executes_code(cmd)
+        red_team_context = bool(_rt_authorized_mission(_rt_context_chat()))
         approval = request_approval(
-            title="PowerShell (write/modify)",
+            title=("Host code execution" if executes_code else "Command on Windows host"),
             command=cmd,
-            details={"kind": "powershell"},
+            details={
+                "kind": "powershell",
+                "target": "host",
+                # A free-form shell is an execution boundary. Classification is
+                # useful copy, never the thing that decides whether it may run.
+                "force_prompt": True,
+                "executes_code": executes_code,
+                "red_team_context": red_team_context,
+            },
         )
         if approval.get("decision") != "approve":
-            return {"error": f"user denied command ({approval.get('status')})"}
+            return not_run(f"user denied command ({approval.get('status')})", "denied")
     return _run_powershell(cmd, timeout=int(args.get("timeout", 120)))
 
 
@@ -7697,9 +7900,17 @@ class Session:
         self._lock = threading.Lock()
 
     def start(self, cwd: Optional[str] = None) -> None:
+        shell_executable = None
+        if sys.platform == "win32":
+            shell_executable = _trusted_windows_binary("cmd.exe")
+            if not shell_executable:
+                raise RuntimeError(
+                    "Trusted Windows command processor was not found in the system directory."
+                )
         self._proc = subprocess.Popen(
             self.command,
             shell=True,
+            executable=shell_executable,
             cwd=cwd or None,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -7739,9 +7950,9 @@ class Session:
             return False
         try:
             data = text + ("\n" if enter and not text.endswith("\n") else "")
-            self._append(data if data.endswith("\n") else data + "\n")  # echo into the shared view
             self._proc.stdin.write(data)
             self._proc.stdin.flush()
+            self._append(data)
             return True
         except Exception:
             return False
@@ -7758,12 +7969,15 @@ class Session:
             text = "… [earlier output truncated — read again for more] …\n" + text[-cap:]
         return text
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return True
         try:
-            if self._proc and self._proc.poll() is None:
-                self._proc.terminate()
+            _terminate_process_tree(proc, "host")
         except Exception:
-            pass
+            return proc.poll() is not None
+        return proc.poll() is not None
 
     def info(self) -> dict:
         return {"id": self.id, "command": self.command, "alive": self.alive(),
@@ -7780,9 +7994,10 @@ class SessionManager:
         with self._lock:
             self._n += 1
             sid = f"s{self._n}"
-            s = Session(sid, command)
-            self._sessions[sid] = s
+        s = Session(sid, command)
         s.start(cwd=cwd)
+        with self._lock:
+            self._sessions[sid] = s
         return s
 
     def get(self, sid: Optional[str]) -> Optional[Session]:
@@ -7796,8 +8011,7 @@ class SessionManager:
     def stop(self, sid: str) -> bool:
         s = self.get(sid)
         if s:
-            s.stop()
-            return True
+            return s.stop()
         return False
 
     def stop_all(self) -> None:
@@ -7820,28 +8034,89 @@ def _session_wait(ms) -> None:
         time.sleep(ms / 1000.0)
 
 
+def _session_not_executed(message: str, **details) -> dict:
+    result = {
+        "error": message,
+        "not_executed": True,
+        "executed": False,
+        "execution_target": "host",
+    }
+    result.update(details)
+    return result
+
+
+def _session_workspace_cwd(requested: str = "") -> tuple[str, str]:
+    configured = [
+        normalize_path(folder)
+        for folder in (get_workspace().get("folders", []) or [])
+        if isinstance(folder, str) and folder.strip()
+    ]
+    roots = configured or [normalize_path(str(ROOT))]
+    cwd = normalize_path(requested or roots[0])
+    normalized_cwd = os.path.normcase(os.path.abspath(cwd))
+    inside = False
+    for root in roots:
+        normalized_root = os.path.normcase(os.path.abspath(root))
+        try:
+            if os.path.commonpath([normalized_cwd, normalized_root]) == normalized_root:
+                inside = True
+                break
+        except ValueError:
+            continue
+    if not inside or is_blocked_path(cwd):
+        return "", "CWD is outside configured workspace bounds."
+    if not os.path.isdir(cwd):
+        return "", f"CWD is not a directory: {cwd}"
+    return cwd, ""
+
+
 def tool_session_start(args: dict) -> dict:
     command = (args.get("command") or ("powershell" if sys.platform == "win32" else "bash")).strip()
     if not command:
-        return {"error": "empty command"}
+        return _session_not_executed("empty command")
+    cwd, cwd_error = _session_workspace_cwd(str(args.get("cwd") or ""))
+    if cwd_error:
+        return _session_not_executed(cwd_error, scope_blocked=True)
+    if sys.platform == "win32" and command.lower() in {"powershell", "powershell.exe"}:
+        powershell_exe = _trusted_windows_binary("WindowsPowerShell", "v1.0", "powershell.exe")
+        if not powershell_exe:
+            return _session_not_executed(
+                "Trusted Windows PowerShell executable was not found.", spawn_error=True)
+        command = f'"{powershell_exe}" -NoLogo -NoProfile'
     threat = bridge_self_threat(command)
     if threat:
-        return {"error": f"refused: {threat}", "refused_command": command}
+        return _session_not_executed(
+            f"refused: {threat}", refused_command=command, self_protection=True)
     catastrophic = _catastrophic_cmd(command)
     if catastrophic:
-        return {"error": f"refused: this command {catastrophic}. Run it yourself if you truly mean to.",
-                "refused_command": command, "catastrophic": True}
+        return _session_not_executed(
+            f"refused: this command {catastrophic}. Run it yourself if you truly mean to.",
+            refused_command=command, catastrophic=True)
     clickfix = _clickfix_cmd(command)
     if clickfix:
-        return {"error": f"refused: this command {clickfix} (ClickFix signature). Run it yourself if you truly mean to.",
-                "refused_command": command, "clickfix": True}
-    approval = request_approval(title="Interactive session", command=command, details={"kind": "session"})
+        return _session_not_executed(
+            f"refused: this command {clickfix} (ClickFix signature). Run it yourself if you truly mean to.",
+            refused_command=command, clickfix=True)
+    approval = request_approval(
+        title="Start persistent process on Windows host",
+        command=command,
+        details={
+            "kind": "session", "target": "host", "cwd": cwd,
+            "force_prompt": True, "executes_code": True,
+            "red_team_context": bool(_rt_authorized_mission(_rt_context_chat())),
+        },
+    )
     if approval.get("decision") != "approve":
-        return {"error": f"user denied session ({approval.get('status')})"}
-    s = _session_mgr.create(command, cwd=(args.get("cwd") or None))
+        return _session_not_executed(
+            f"user denied session ({approval.get('status')})")
+    try:
+        s = _session_mgr.create(command, cwd=cwd)
+    except Exception as e:
+        return _session_not_executed(str(e), spawn_error=True)
     _session_wait(args.get("wait_ms", 600))
     return {
         "session_id": s.id, "alive": s.alive(), "output": s.read_model(),
+        "executed": True, "execution_target": "host", "cwd": cwd,
         "note": "Interactive session started. Drive it with session_send (input=command), "
                 "poll new output with session_read, and end it with session_stop.",
     }
@@ -7851,40 +8126,55 @@ def tool_session_send(args: dict) -> dict:
     sid = args.get("session_id") or args.get("id")
     s = _session_mgr.get(sid)
     if not s:
-        return {"error": f"no such session: {sid}", "sessions": _session_mgr.list()}
+        return _session_not_executed(
+            f"no such session: {sid}", sessions=_session_mgr.list())
     if not s.alive():
-        return {"error": f"session {sid} has exited", "exit_code": s.exit_code()}
+        return _session_not_executed(
+            f"session {sid} has exited", exit_code=s.exit_code())
     text = args.get("input")
     if text is None:
         text = args.get("text", "")
     text = str(text)
     threat = bridge_self_threat(text)
     if threat:
-        return {"error": f"refused: {threat}", "refused_input": text}
+        return _session_not_executed(
+            f"refused: {threat}", refused_input=text, self_protection=True)
     catastrophic = _catastrophic_cmd(text)
     if catastrophic:
-        return {"error": f"refused: this input {catastrophic}. Run it yourself if you truly mean to.",
-                "refused_input": text, "catastrophic": True}
+        return _session_not_executed(
+            f"refused: this input {catastrophic}. Run it yourself if you truly mean to.",
+            refused_input=text, catastrophic=True)
     clickfix = _clickfix_cmd(text)
     if clickfix:
-        return {"error": f"refused: this input {clickfix} (ClickFix signature). Run it yourself if you truly mean to.",
-                "refused_input": text, "clickfix": True}
-    if needs_approval(text):
-        approval = request_approval(title="Session input (write/modify)", command=text,
-                                    details={"kind": "session", "session_id": sid})
-        if approval.get("decision") != "approve":
-            return {"error": f"user denied input ({approval.get('status')})"}
+        return _session_not_executed(
+            f"refused: this input {clickfix} (ClickFix signature). Run it yourself if you truly mean to.",
+            refused_input=text, clickfix=True)
+    approval = request_approval(
+        title="Send input to persistent Windows host process",
+        command=text,
+        details={
+            "kind": "session", "session_id": sid, "target": "host",
+            "force_prompt": True, "executes_code": True,
+            "red_team_context": bool(_rt_authorized_mission(_rt_context_chat())),
+        },
+    )
+    if approval.get("decision") != "approve":
+        return _session_not_executed(
+            f"user denied input ({approval.get('status')})")
     if not s.send(text, enter=bool(args.get("enter", True))):
-        return {"error": "failed to write to session (it may have exited)", "alive": s.alive()}
+        return _session_not_executed(
+            "failed to write to session (it may have exited)", alive=s.alive())
     _session_wait(args.get("wait_ms", 700))
-    return {"session_id": sid, "alive": s.alive(), "output": s.read_model()}
+    return {"session_id": sid, "alive": s.alive(), "output": s.read_model(),
+            "executed": True, "execution_target": "host"}
 
 
 def tool_session_read(args: dict) -> dict:
     sid = args.get("session_id") or args.get("id")
     s = _session_mgr.get(sid)
     if not s:
-        return {"error": f"no such session: {sid}", "sessions": _session_mgr.list()}
+        return _session_not_executed(
+            f"no such session: {sid}", sessions=_session_mgr.list())
     _session_wait(args.get("wait_ms", 0))
     return {"session_id": sid, "alive": s.alive(), "exit_code": s.exit_code(), "output": s.read_model()}
 
@@ -7892,8 +8182,25 @@ def tool_session_read(args: dict) -> dict:
 def tool_session_stop(args: dict) -> dict:
     sid = args.get("session_id") or args.get("id")
     if not sid:
-        return {"error": "session_id required", "sessions": _session_mgr.list()}
-    return {"session_id": sid, "stopped": _session_mgr.stop(sid)}
+        return _session_not_executed(
+            "session_id required", sessions=_session_mgr.list())
+    session = _session_mgr.get(sid)
+    if not session:
+        return _session_not_executed(
+            f"no such session: {sid}", session_id=sid,
+            sessions=_session_mgr.list())
+    stopped = _session_mgr.stop(sid)
+    alive = session.alive()
+    result = {
+        "session_id": sid,
+        "stopped": bool(stopped and not alive),
+        "alive": alive,
+        "executed": True,
+        "execution_target": "host",
+    }
+    if not result["stopped"]:
+        result["error"] = "failed to stop the persistent process tree"
+    return result
 
 
 def tool_session_list(args: dict) -> dict:
@@ -8818,11 +9125,13 @@ def _run_git(cwd: str, argv: list[str], timeout: int = 60,
     out_lines: list[str] = []
     err_lines: list[str] = []
 
+    stream_chat_id = _current_chat_id.get()
+
     def reader(pipe, sink, label):
         try:
             for line in iter(pipe.readline, ""):
                 sink.append(line)
-                _emit_tool_stream(label, line.rstrip("\n\r"))
+                _emit_tool_stream(label, line.rstrip("\n\r"), stream_chat_id)
             pipe.close()
         except Exception:
             pass
@@ -9426,6 +9735,40 @@ def _github_valid_branch_name(name: str) -> str | None:
     if _GITHUB_BRANCH_BAD.search(name):
         return "invalid branch name — no `..`, no `@{`, no leading/trailing slash or dash, no `.git`/`.lock` segments"
     return None
+
+
+def _github_worktree_metadata(raw: object) -> dict | None:
+    """Validate the private context attached to a GitHub branch session."""
+    if not isinstance(raw, dict):
+        return None
+    owner = str(raw.get("owner") or "").strip()
+    repo = str(raw.get("repo") or "").strip()
+    branch = str(raw.get("branch") or "").strip()
+    path = normalize_path(str(raw.get("path") or ""))
+    if (not _GITHUB_OWNER_RE.fullmatch(owner)
+            or not _GITHUB_REPO_RE.fullmatch(repo)
+            or _github_valid_branch_name(branch)
+            or not path
+            or not _workspace_root_for(path)
+            or not (Path(path) / ".git").exists()):
+        return None
+    return {"owner": owner, "repo": repo, "branch": branch, "path": path}
+
+
+def _github_worktree_prompt(chat: dict | None) -> str:
+    """Render a branch session's private repo context for the model."""
+    worktree = _github_worktree_metadata((chat or {}).get("github_worktree"))
+    if not worktree:
+        return ""
+    return (
+        "active GitHub worktree for this chat:\n"
+        f"- repository: {worktree['owner']}/{worktree['repo']}\n"
+        f"- expected branch: {worktree['branch']}\n"
+        f"- local path: {worktree['path']}\n"
+        "Treat this as the user's current project. For code work, inspect this path first "
+        "and keep changes inside it unless the user explicitly names another project. "
+        "Before branch-sensitive work, verify the branch with git_status."
+    )
 
 
 def _github_find_workspace_repo(repo: str) -> str | None:
@@ -17178,13 +17521,17 @@ def tool_check_syntax(args: dict) -> dict:
             return {"error": str(e)}
             
     elif ext in ('.js', '.ts', '.jsx', '.tsx'):
+        node_exe = _trusted_node_binary()
+        if not node_exe:
+            return {"error": "A trusted Node.js executable was not found outside the workspace."}
         try:
-            res = subprocess.run(['node', '--check', file_path], capture_output=True, text=True)
+            res = subprocess.run([node_exe, '--check', file_path], capture_output=True, text=True,
+                                 cwd=str(ROOT), creationflags=_NO_WINDOW, timeout=60)
             if res.returncode == 0:
                 return {"result": "Syntax OK"}
             return {"error": res.stderr.strip() or "Syntax check failed"}
-        except FileNotFoundError:
-            return {"error": "Node.js not installed or not in PATH."}
+        except subprocess.TimeoutExpired:
+            return {"error": "Node.js syntax check timed out after 60 seconds."}
     else:
         return {"error": f"Unsupported extension: {ext}"}
 
@@ -17194,56 +17541,141 @@ def tool_run_tests(args: dict) -> dict:
     cwd = normalize_path(args.get("cwd", str(ROOT)))
     if not command:
         return {"error": "test command required"}
+    _emit_execution_event("requested", "host", command, cwd=cwd)
+
+    def not_run(message: str, reason: str, **details) -> dict:
+        return _execution_not_run(message, "host", command, reason=reason,
+                                  cwd=cwd, **details)
+
     if not is_in_workspace(cwd):
-        return {"error": "CWD is outside workspace bounds."}
+        return not_run("CWD is outside workspace bounds.", "scope_blocked")
     threat = bridge_self_threat(command)
     if threat:
-        return {"error": f"refused: {threat}"}
+        return not_run(f"refused: {threat}", "self_protection")
     catastrophic = _catastrophic_cmd(command)
     if catastrophic:
-        return {"error": f"refused: this command {catastrophic}", "catastrophic": True}
-    # Tests execute repository code and can mutate files or launch subprocesses.
-    # Route them through the same approval policy as shell work: soft mode stays
-    # autonomous, while medium/hard modes honor the user's chosen gate.
+        return not_run(f"refused: this command {catastrophic}", "catastrophic",
+                       catastrophic=True)
     approval = request_approval(
-        title="Run project verification",
+        title="Run project tests on Windows host",
         command=command,
-        details={"kind": "test", "cwd": cwd},
+        details={
+            "kind": "test",
+            "cwd": cwd,
+            "target": "host",
+            "force_prompt": True,
+            "executes_code": True,
+            "red_team_context": bool(_rt_authorized_mission(_rt_context_chat())),
+        },
     )
     if approval.get("decision") != "approve":
-        return {"error": f"user denied test command ({approval.get('status')})"}
+        return not_run(f"user denied test command ({approval.get('status')})", "denied")
+
+    t_start = time.time()
+    chat_id = _current_chat_id.get() or _get_current_chat()
+    tool_name = _execution_tool_name("run_tests")
+    call_id = _current_tool_call_id.get()
     try:
-        res = subprocess.run(shlex.split(command, posix=os.name != "nt"), cwd=cwd,
-                             capture_output=True, text=True, timeout=max(
-                                 1, min(int(args.get("timeout") or 600), 3600)))
-        output = res.stdout + "\n" + res.stderr
-        
+        argv = shlex.split(command, posix=os.name != "nt")
+        proc = subprocess.Popen(
+            argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, creationflags=_NO_WINDOW,
+        )
+    except Exception as e:
+        _append_cmd_history({
+            "ts": int(t_start * 1000), "chat_id": chat_id, "command": command,
+            "cwd": cwd, "exit": -1, "ok": False, "duration_ms": 0,
+            "stdout": "", "stderr": str(e), "spawn_error": True,
+            "target": "host", "tool": tool_name, "call_id": call_id,
+        })
+        return not_run(str(e), "spawn_error", spawn_error=True)
+
+    out_lines: list[str] = []
+    err_lines: list[str] = []
+
+    def reader(pipe, sink):
+        try:
+            for line in iter(pipe.readline, ""):
+                sink.append(line)
+                _emit_tool_stream(tool_name, line.rstrip("\r\n"), chat_id,
+                                  target="host", call_id=call_id)
+            pipe.close()
+        except Exception:
+            pass
+
+    out_thread = threading.Thread(target=reader, args=(proc.stdout, out_lines), daemon=True)
+    err_thread = threading.Thread(target=reader, args=(proc.stderr, err_lines), daemon=True)
+    if chat_id:
+        with _running_cmds_lock:
+            _running_cmds[chat_id] = proc
+            _running_cmd_targets[chat_id] = "host"
+    _emit_execution_event("spawned", "host", command, cwd=cwd,
+                          chat_id=chat_id, pid=proc.pid)
+    out_thread.start()
+    err_thread.start()
+
+    timeout = max(1, min(int(args.get("timeout") or 600), 3600))
+    timed_out = False
+    try:
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_process_tree(proc, "host")
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        out_thread.join(timeout=5)
+        err_thread.join(timeout=5)
+        stdout = "".join(out_lines)
+        stderr = "".join(err_lines)
+        output = stdout + "\n" + stderr
+        with _running_cmds_lock:
+            killed = proc in _killed_procs
+        if proc.returncode is not None and proc.returncode < 0:
+            killed = True
         failures = [
-            line.strip() for line in output.splitlines() 
+            line.strip() for line in output.splitlines()
             if any(kw in line for kw in ("FAIL", "Error:", "Exception", "Traceback", "FAILED"))
         ]
-        
         summary = {
-            "passed": res.returncode == 0,
-            "returncode": res.returncode,
+            "passed": proc.returncode == 0 and not timed_out and not killed,
+            "returncode": proc.returncode,
             "failure_hints": failures[:15],
             "output_tail": output[-2000:]
         }
-        
-        if res.returncode == 0:
-            return {"result": summary}
-        return {"error": "Tests failed", "details": summary}
-        
-    except subprocess.TimeoutExpired as e:
-        def _timeout_text(value) -> str:
-            if isinstance(value, bytes):
-                return value.decode("utf-8", "replace")
-            return str(value or "")
-        return {"error": f"tests timed out after {e.timeout}s",
-                "output_tail": (_timeout_text(e.stdout) + "\n" +
-                                _timeout_text(e.stderr))[-2000:]}
-    except Exception as e:
-        return {"error": str(e)}
+        duration_ms = int((time.time() - t_start) * 1000)
+        _append_cmd_history({
+            "ts": int(t_start * 1000), "chat_id": chat_id, "command": command,
+            "cwd": cwd, "exit": proc.returncode, "ok": summary["passed"],
+            "duration_ms": duration_ms, "stdout": stdout[-16000:],
+            "stderr": stderr[-4000:], "killed": killed, "timed_out": timed_out,
+            "target": "host", "tool": tool_name, "call_id": call_id,
+        })
+        _emit_execution_event("finished", "host", command, cwd=cwd,
+                              chat_id=chat_id, exit_code=proc.returncode,
+                              killed=killed, timed_out=timed_out,
+                              duration_ms=duration_ms)
+        base = {
+            "details": summary,
+            "exit_code": proc.returncode,
+            "executed": True,
+            "execution_target": "host",
+        }
+        if timed_out:
+            return {**base, "error": f"tests timed out after {timeout}s", "timed_out": True}
+        if killed:
+            return {**base, "error": "test command was killed", "killed": True}
+        if proc.returncode == 0:
+            return {**base, "ok": True, "result": summary}
+        return {**base, "error": "Tests failed"}
+    finally:
+        with _running_cmds_lock:
+            if chat_id and _running_cmds.get(chat_id) is proc:
+                _running_cmds.pop(chat_id, None)
+                _running_cmd_targets.pop(chat_id, None)
+            _killed_procs.discard(proc)
 
 # =====================================================================
 # MCP CLIENT IMPLEMENTATION
@@ -17688,7 +18120,11 @@ TOOLS: dict[str, dict] = {
         "fn": tool_check_syntax,
     },
     "run_tests": {
-        "description": "Run a test command (e.g. pytest, npm test) and get a structured summary of failures.",
+        "description": (
+            "Run a test command (e.g. pytest, npm test) directly on the Windows host and get a "
+            "structured summary of failures. Every test command requires user approval. To run a "
+            "test inside the WSL guest instead, use sandbox_run."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -18245,7 +18681,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_delete_file,
     },
     "run_powershell": {
-        "description": "Run a PowerShell command. Read-only commands run freely; write/modify commands require approval.",
+        "description": "Request a PowerShell command on the Windows host. Every free-form host command requires user approval and its real process lifecycle is shown in the Host terminal.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -18416,7 +18852,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_remote_copy_from,
     },
     "session_start": {
-        "description": "Open a PERSISTENT interactive session — a long-lived process you drive statefully across turns (unlike run_powershell, which is one-shot and loses all state: cwd, env, connections). Use it to hold a shell you obtained (reverse/bind shell, ssh), or a REPL / DB client / debugger (python, sqlite3, gdb). `command` is the process to launch (defaults to a local shell). Returns a session_id + initial output; then use session_send / session_read / session_stop. The user can watch and type into the same session live in the Shell tab. Requires approval to start.",
+        "description": "Open a PERSISTENT process directly on the Windows host and drive it statefully across turns (unlike run_powershell, which is one-shot and loses cwd, environment, and connections). Use it for SSH, a REPL, DB client, or debugger. `command` is the process to launch (defaults to a local shell). Returns a session_id + initial output; then use session_send / session_read / session_stop. The user can watch the same process in the Shell tab. Starting it always requires approval.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -18429,7 +18865,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_session_start,
     },
     "session_send": {
-        "description": "Send a line of input to a running interactive session (from session_start) — run a command inside the held shell / type into the REPL — and return the new output. State persists between calls. Write/modify inputs may require approval.",
+        "description": "Send a line to a persistent Windows host process created by session_start and return new output. State persists between calls. Every input requires approval because shell and REPL input can execute code.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -20078,6 +20514,11 @@ def _visible_tool_names(include_exploit: bool = True, chat_id: str = "") -> set[
         # first-party worker. Every other MCP connector remains hidden.
         visible = {n for n in visible
                    if not (n.startswith("mcp_") and not n.startswith("mcp_playwright_"))}
+    # The system prompt advertises the guest whenever it is ready. Keep the
+    # actual schema in lockstep so the model never substitutes host PowerShell
+    # merely because the sandbox bundle was still lazy-hidden.
+    if "sandbox_run" in TOOLS and "sandbox_run" not in excluded:
+        visible.add("sandbox_run")
     return {n for n in visible if n in TOOLS and n not in excluded}
 
 
@@ -20286,10 +20727,11 @@ TOOL_ALIASES = {
     "remove_file": "delete_file",
     "rm_file": "delete_file",
     "powershell": "run_powershell",
-    "shell": "run_powershell",
-    "bash": "run_powershell",
-    "cmd": "run_powershell",
-    "exec": "run_powershell",
+    "shell": "sandbox_run",
+    "bash": "sandbox_run",
+    "sandbox": "sandbox_run",
+    "sandbox_shell": "sandbox_run",
+    "guest_shell": "sandbox_run",
     "search_web": "web_search",
     "google": "web_search",
     "duckduckgo": "web_search",
@@ -20576,7 +21018,7 @@ _CHAT_STATE_TOOLS = frozenset(
 # tool output are never copied into the audit log.
 _ACTION_AUDIT_LOCK = threading.Lock()
 _ACTION_AUDIT_ALWAYS = frozenset({
-    "run_powershell", "session_start", "session_send", "session_stop",
+    "run_powershell", "run_tests", "session_start", "session_send", "session_stop",
     "remote_shell", "remote_write_file", "remote_save_code_block",
     "remote_file_begin", "remote_file_append", "remote_file_commit", "remote_file_abort",
     "remote_copy_to", "remote_copy_from",
@@ -20675,7 +21117,7 @@ def _record_action_audit(name: str, args: dict, result: Any) -> None:
 def _call_write_target(call: dict) -> str:
     """Normalized write target of a parsed tool call, or "" when the call is
     not a path-mutating write (no serialization needed for those)."""
-    if call.get("name") not in _WRITE_CAPABLE_TOOLS:
+    if _resolve_tool_name(call.get("name") or "") not in _WRITE_CAPABLE_TOOLS:
         return ""
     a = call.get("arguments")
     p = a.get("path") if isinstance(a, dict) else None
@@ -20687,6 +21129,9 @@ def _call_serial_key(call: dict) -> str:
     concurrently. Path-writing tools key on their write target (normalized via
     the loop-breaker's raw path form), shared-store tools key on a constant so
     they serialize with each other; "" = no constraint (full parallelism)."""
+    canon = _resolve_tool_name(call.get("name") or "")
+    if canon in {"run_powershell", "run_tests"} or canon.startswith("sandbox_"):
+        return "local-process"
     tgt = _call_write_target(call)
     if tgt:
         # Normalize so "./x.py" and "x.py" (and case variants on Windows)
@@ -20696,7 +21141,7 @@ def _call_serial_key(call: dict) -> str:
         except Exception:
             pass
         return "write:" + tgt
-    if call.get("name") in _CHAT_STATE_TOOLS:
+    if canon in _CHAT_STATE_TOOLS:
         return "state"
     return ""
 
@@ -20824,6 +21269,17 @@ def _missing_required_tool_args(name: str, args: Any) -> list[str]:
         elif isinstance(value, (list, dict)) and not value:
             missing.append(key)
     return missing
+
+
+def _invoke_tool_with_context(name: str, args: dict, call_id: str) -> dict:
+    canon = _resolve_tool_name(name)
+    name_token = _current_tool_name.set(canon)
+    call_token = _current_tool_call_id.set(call_id)
+    try:
+        return invoke_tool(canon, args)
+    finally:
+        _current_tool_call_id.reset(call_token)
+        _current_tool_name.reset(name_token)
 
 
 def invoke_tool(name: str, args: dict) -> dict:
@@ -22246,6 +22702,11 @@ you may occasionally append exactly one of these to the absolute end of your res
             "duplicate or narrate it in your reply. When entering an unfamiliar repository, call project_map "
             "once before opening files blindly."
         )
+        parts.append(
+            "execution boundary: run_powershell, run_tests, and persistent session tools execute or interact with processes directly on the Windows host. "
+            "sandbox_run, sandbox_nmap, and sandbox_sqlmap execute in the WSL guest. Never describe a host command as a "
+            "sandbox check, and never execute a file recovered from an untrusted target."
+        )
         # CTF-tuned red-team models (e.g. RavenX-CyberAgent) narrate CTF framing
         # from training priors — "0/3 flags captured", "objective: 3 flags" —
         # even against a real target with nothing to find. Kill it: real
@@ -22294,11 +22755,13 @@ you may occasionally append exactly one of these to the absolute end of your res
                 )
         if _sandbox_ready_cached():
             parts.append(
-                "sandbox: an isolated Linux guest is available via sandbox_run(command, cwd?). "
+                "sandbox: a separate WSL2 Linux guest is available via sandbox_run(command, cwd?). "
                 "PREFER it for two things: running offensive/recon tools (nmap, sqlmap, binwalk), "
-                "and — most importantly — unpacking or analyzing UNTRUSTED files pulled back from "
-                "a target (firmware images, malware samples, archives), so a booby-trapped file "
-                "cannot compromise the host. The workspace is visible inside at /mnt/<drive>/... ; "
+                "and unpacking or statically analyzing UNTRUSTED files pulled back from a target "
+                "(firmware images, malware samples, archives). This WSL guest reduces exposure but "
+                "is NOT malware-grade containment: never execute an unknown sample, and remember "
+                "that mounted Windows files remain host files. The workspace is visible inside at "
+                "/mnt/<drive>/... ; "
                 "pass cwd as a Windows path. It has real tools installed (binwalk -e extraction "
                 "works, plus 7z/unsquashfs/mtd-utils, sqlmap, nmap, etc.) — use them, don't hand-"
                 "roll a replacement; if a tool errors, fix the invocation. Ordinary host tasks "
@@ -22338,6 +22801,14 @@ you may occasionally append exactly one of these to the absolute end of your res
         parts.append("workspace:\n" + "\n".join(f"- {f}" for f in ws))
     else:
         parts.append("workspace: none (file tools will refuse)")
+
+    try:
+        active_chat = (get_chats().get("chats", {}) or {}).get(_get_current_chat())
+        worktree_context = _github_worktree_prompt(active_chat)
+        if worktree_context:
+            parts.append(worktree_context)
+    except Exception:
+        pass
 
     # === AGENTS.md (cross-harness project instructions) ===
     # Honor a repo-root AGENTS.md in each workspace folder if present. This is the
@@ -23974,15 +24445,28 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             _round_all_refused = True
             for batch in _batches:
                 _futures: dict[int, object] = {}
+                _call_ids: dict[int, str] = {}
                 for call in batch:
-                    name = call.get("name") or ""
+                    requested_name = call.get("name") or ""
+                    name = _resolve_tool_name(requested_name)
                     args = call.get("arguments") or {}
-                    emit({"type": "tool_start", "name": name, "arguments": args})
+                    call_id = str(call.get("id") or f"tool-{uuid.uuid4().hex[:12]}")
+                    _call_ids[id(call)] = call_id
+                    emit({
+                        "type": "tool_start",
+                        "name": name,
+                        "requested_name": requested_name,
+                        "call_id": call_id,
+                        "arguments": args,
+                    })
                     _ctx = contextvars.copy_context()
                     _futures[id(call)] = _tool_executor.submit(
-                        _ctx.run, invoke_tool, name, args if isinstance(args, dict) else {})
+                        _ctx.run, _invoke_tool_with_context, name,
+                        args if isinstance(args, dict) else {}, call_id)
                 for call in batch:
-                    name = call.get("name") or ""
+                    requested_name = call.get("name") or ""
+                    name = _resolve_tool_name(requested_name)
+                    call_id = _call_ids[id(call)]
                     args = call.get("arguments") or {}
                     future = _futures[id(call)]
                     while not future.done():
@@ -24023,7 +24507,13 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         refused_names.add(_resolve_tool_name(name))
                     else:
                         _round_all_refused = False
-                    emit({"type": "tool_result", "name": name, "result": result})
+                    emit({
+                        "type": "tool_result",
+                        "name": name,
+                        "requested_name": requested_name,
+                        "call_id": call_id,
+                        "result": result,
+                    })
                     if (_rt_on
                             and _rt_close_frontend_secret_mission(_rt_chat, name)):
                         _rt_dirty = True
@@ -24131,7 +24621,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     _trunc = _tool_result_cap(name)
                     conversation.append({
                         "role": "tool",
-                        "tool_call_id": call.get("id") or name,
+                        "tool_call_id": call_id,
                         "name": name,
                         "content": compress_tool_result(name, result, _trunc),
                     })
@@ -24674,13 +25164,13 @@ def download_and_extract_llama(build_type: str):
             })
 
 
-# ---- WSL sandbox: isolated Linux guest for loot / offensive tooling ---------
+# ---- WSL guest for loot inspection and offensive tooling -------------------
 #
 # Why this exists: in a red-team run the exploits execute on the TARGET, not
 # here - the only local risk is (a) parsing untrusted loot (firmware / binaries
 # pulled back from a target) with local tools, and (b) the agent being steered
 # by target content into touching the host. This provides an opt-in,
-# kernel-isolated Ubuntu guest, `accuretta-sbx`, created via `wsl --import` so
+# separate Ubuntu WSL2 guest, `accuretta-sbx`, created via `wsl --import` so
 # it never touches the user's other distros and needs no interactive first-run
 # (imported distros default to root). The Windows workspace is visible inside
 # at /mnt/... so tools operate on the same files; we translate with wslpath.
@@ -24695,6 +25185,7 @@ def download_and_extract_llama(build_type: str):
 SANDBOX_DISTRO = "accuretta-sbx"
 SANDBOX_DIR = DATA / "sandbox"                  # holds the distro's ext4.vhdx
 SANDBOX_STATE_FILE = DATA / "sandbox_state.json"
+SANDBOX_SECURITY_PROFILE = 3
 # Ubuntu cloud rootfs (URLs verified live). `.tar.xz` - we decompress to `.tar`
 # before import because `wsl --import` does not reliably accept xz. Tried in
 # order; first reachable one wins.
@@ -24740,6 +25231,7 @@ _SBX_BINWALK_WRAPPER = (
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 SANDBOX_LOCK = threading.Lock()
+_sandbox_hardening_lock = threading.Lock()
 SANDBOX_PROGRESS = {
     "status": "idle",   # idle|downloading|extracting|importing|provisioning|done|failed
     "step": "",         # human-readable current step
@@ -24769,7 +25261,7 @@ def _sbx_log(msg: str):
 
 
 def _wsl_exe() -> str:
-    return shutil.which("wsl") or "wsl"
+    return _trusted_windows_binary("wsl.exe")
 
 
 def _wsl_run(args, timeout=60):
@@ -24778,8 +25270,11 @@ def _wsl_run(args, timeout=60):
     otherwise arrives full of NUL bytes)."""
     env = dict(os.environ)
     env["WSL_UTF8"] = "1"
+    executable = _wsl_exe()
+    if not executable:
+        return 127, "trusted wsl.exe was not found in the Windows system directory"
     try:
-        r = subprocess.run([_wsl_exe(), *args], capture_output=True, text=True,
+        r = subprocess.run([executable, *args], capture_output=True, text=True,
                            timeout=timeout, env=env, creationflags=_NO_WINDOW,
                            encoding="utf-8", errors="replace")
         return r.returncode, (r.stdout or "") + (r.stderr or "")
@@ -24791,7 +25286,23 @@ def _wsl_run(args, timeout=60):
         return 1, str(e)
 
 
-def _wsl_bash(distro, script, timeout=120):
+def _write_wsl_script(stream, script: str) -> None:
+    """Write a Bash script to WSL with Unix line endings on every host."""
+    script = str(script or "").replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        stream.reconfigure(newline="\n")
+        stream.write(script)
+    except (AttributeError, _io.UnsupportedOperation):
+        raw = getattr(stream, "buffer", None)
+        if raw is None:
+            stream.write(script)
+        else:
+            raw.write(script.encode("utf-8"))
+            raw.flush()
+
+
+def _wsl_bash(distro, script, timeout=120, *, announce=False,
+              command="", cwd=""):
     """Run a bash script as root inside `distro`, passing it over STDIN.
 
     Critical: wsl.exe performs its own $VAR substitution on command-line
@@ -24799,47 +25310,210 @@ def _wsl_bash(distro, script, timeout=120):
     passing a script via `bash -lc "<script>"` silently corrupts anything with
     shell variables — `for t in ...; do ... $t ...` yields empty `$t`, and even
     single-quoted `$t` gets stripped. Feeding the script through stdin bypasses
-    that arg mangling completely. Returns (returncode, combined_output)."""
+    that arg mangling completely. Returns (returncode, output, killed, spawned)."""
     env = dict(os.environ)
     env["WSL_UTF8"] = "1"
+    t_start = time.time()
+    stream_chat_id = _current_chat_id.get() or _get_current_chat()
+    stream_tool_name = _execution_tool_name("sandbox_run")
+    stream_call_id = _current_tool_call_id.get()
+    executable = _wsl_exe()
+    if not executable:
+        message = "trusted wsl.exe was not found in the Windows system directory"
+        if announce:
+            _emit_execution_event("not_executed", "sandbox", command or script,
+                                  cwd=cwd, reason="spawn_error", message=message)
+        return 127, message, False, False
     try:
-        p = subprocess.Popen([_wsl_exe(), "-d", distro, "-u", "root", "--", "bash", "-l"],
+        p = subprocess.Popen([
+            executable, "-d", distro, "-u", "root", "--",
+            "/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV",
+            "/bin/bash", "--noprofile", "--norc",
+        ],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              text=True, env=env, creationflags=_NO_WINDOW, encoding="utf-8", errors="replace")
-        
-        p.stdin.write(script)
+    except FileNotFoundError:
+        if announce:
+            _emit_execution_event("not_executed", "sandbox", command or script,
+                                  cwd=cwd, reason="spawn_error", message="wsl not found")
+        return 127, "wsl not found", False, False
+    except Exception as e:
+        if announce:
+            _emit_execution_event("not_executed", "sandbox", command or script,
+                                  cwd=cwd, reason="spawn_error", message=str(e))
+        return 1, str(e), False, False
+
+    output: list[str] = []
+    if announce and stream_chat_id:
+        with _running_cmds_lock:
+            _running_cmds[stream_chat_id] = p
+            _running_cmd_targets[stream_chat_id] = "sandbox"
+        _emit_execution_event("spawned", "sandbox", command or script, cwd=cwd,
+                              chat_id=stream_chat_id, pid=p.pid, distro=distro)
+    try:
+        _write_wsl_script(p.stdin, script)
         p.stdin.close()
-        
-        output = []
+
         def _reader():
             for line in iter(p.stdout.readline, ''):
                 output.append(line)
                 try:
-                    broadcast_event({"type": "sandbox:stream", "line": line.rstrip("\\r\\n")})
+                    clean = line.rstrip("\r\n")
+                    if announce and stream_chat_id:
+                        _emit_tool_stream(stream_tool_name, clean, stream_chat_id,
+                                          target="sandbox", call_id=stream_call_id)
+                    elif not stream_chat_id:
+                        broadcast_event({"type": "sandbox:stream", "line": clean})
                 except Exception:
                     pass
 
         t = threading.Thread(target=_reader, daemon=True)
         t.start()
         
+        timed_out = False
         try:
             rc = p.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            p.kill()
+            _terminate_process_tree(p, "sandbox")
+            timed_out = True
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                pass
             rc = 124
             output.append("timeout\\n")
-        
+
         t.join(timeout=1.0)
-        return rc, "".join(output)
-    except FileNotFoundError:
-        return 127, "wsl not found"
+        with _running_cmds_lock:
+            killed = p in _killed_procs
+        if p.returncode is not None and p.returncode < 0:
+            killed = True
+        if timed_out:
+            killed = False
+        combined = "".join(output)
+        duration_ms = int((time.time() - t_start) * 1000)
+        if announce:
+            _append_cmd_history({
+                "ts": int(t_start * 1000), "chat_id": stream_chat_id,
+                "command": command or script, "cwd": cwd, "exit": rc,
+                "ok": rc == 0 and not killed and not timed_out,
+                "duration_ms": duration_ms, "stdout": combined[-20000:],
+                "stderr": "", "killed": killed, "timed_out": timed_out,
+                "target": "sandbox", "distro": distro,
+                "tool": stream_tool_name, "call_id": stream_call_id,
+            })
+            _emit_execution_event("finished", "sandbox", command or script,
+                                  cwd=cwd, chat_id=stream_chat_id, exit_code=rc,
+                                  killed=killed, timed_out=timed_out,
+                                  duration_ms=duration_ms, distro=distro)
+        return rc, combined, killed, True
     except Exception as e:
-        return 1, str(e)
+        try:
+            _terminate_process_tree(p, "sandbox")
+        except Exception:
+            pass
+        if announce:
+            _emit_execution_event("finished", "sandbox", command or script,
+                                  cwd=cwd, chat_id=stream_chat_id, exit_code=1,
+                                  error=str(e), duration_ms=int((time.time() - t_start) * 1000),
+                                  distro=distro)
+        return 1, str(e), False, True
+    finally:
+        with _running_cmds_lock:
+            if stream_chat_id and _running_cmds.get(stream_chat_id) is p:
+                _running_cmds.pop(stream_chat_id, None)
+                _running_cmd_targets.pop(stream_chat_id, None)
+            _killed_procs.discard(p)
 
 
 def _wsl_in(distro, script, timeout=120):
     """Run a bash script as root inside a distro (stdin-fed, see _wsl_bash)."""
     return _wsl_bash(distro, script, timeout=timeout)
+
+
+_SANDBOX_WSL_CONF = "[interop]\nenabled=false\nappendWindowsPath=false\n"
+_SANDBOX_INTEROP_VERIFY = r"""
+set -eu
+# Some WSL releases ignore interop.enabled=false even though they honor
+# appendWindowsPath=false. Disable the guest's current binfmt handler as the
+# supported runtime fallback, then verify it actually stayed disabled.
+if [ -e /proc/sys/fs/binfmt_misc/WSLInterop ] && grep -q '^enabled' /proc/sys/fs/binfmt_misc/WSLInterop; then
+  if ! echo 0 > /proc/sys/fs/binfmt_misc/WSLInterop; then
+    echo INTEROP_HANDLER_DISABLE_FAILED
+    exit 40
+  fi
+fi
+if [ -e /proc/sys/fs/binfmt_misc/WSLInterop ] && grep -q '^enabled' /proc/sys/fs/binfmt_misc/WSLInterop; then
+  echo INTEROP_HANDLER_ENABLED
+  exit 41
+fi
+case ":$PATH:" in
+  *:/mnt/[A-Za-z]/*) echo WINDOWS_PATH_PRESENT; exit 42 ;;
+esac
+if [ -x /mnt/c/Windows/System32/cmd.exe ] && /mnt/c/Windows/System32/cmd.exe /c exit 0 >/dev/null 2>&1; then
+  echo WINDOWS_PE_LAUNCHED
+  exit 43
+fi
+echo ACCURETTA_INTEROP_DISABLED
+"""
+
+
+def _sandbox_apply_security_profile(log: bool = False) -> tuple[bool, str]:
+    """Disable Windows process interop, restart only our distro, then verify."""
+    with _sandbox_hardening_lock:
+        encoded = _b64.b64encode(_SANDBOX_WSL_CONF.encode("utf-8")).decode("ascii")
+        rc, out, _, _ = _wsl_bash(
+            SANDBOX_DISTRO,
+            f"set -eu; echo {encoded} | base64 -d > /etc/wsl.conf; chmod 644 /etc/wsl.conf",
+            timeout=60,
+        )
+        if rc != 0:
+            return False, (out or "could not write /etc/wsl.conf").strip()[-500:]
+        if log:
+            _sbx_log("Windows executable interop disabled; restarting this WSL guest.")
+        verify_error = ""
+        for attempt in range(3):
+            rc, out = _wsl_run(["--terminate", SANDBOX_DISTRO], timeout=60)
+            if rc != 0:
+                return False, (out or "could not restart WSL guest").strip()[-500:]
+            if attempt:
+                time.sleep(min(float(attempt), 2.0))
+            rc, out, _, _ = _wsl_bash(
+                SANDBOX_DISTRO, _SANDBOX_INTEROP_VERIFY, timeout=60)
+            if rc == 0 and "ACCURETTA_INTEROP_DISABLED" in out:
+                break
+            verify_error = (
+                out or f"interop verification failed with exit {rc}"
+            ).strip()[-500:]
+            if log and attempt < 2:
+                _sbx_log(
+                    f"Security verification did not settle; retrying guest restart "
+                    f"({attempt + 2}/3).")
+        else:
+            return False, verify_error or "interop verification failed"
+        state = load_json(SANDBOX_STATE_FILE, {})
+        state.update({
+            "security_profile": SANDBOX_SECURITY_PROFILE,
+            "interop_disabled": True,
+            "updated": time.time(),
+        })
+        save_json(SANDBOX_STATE_FILE, state)
+        if "_SBX_READY_CACHE" in globals():
+            _SBX_READY_CACHE.update(t=0.0, ready=False)
+        return True, ""
+
+
+def _sandbox_security_profile_active() -> tuple[bool, str]:
+    """Enforce and verify the profile after any external WSL guest restart."""
+    rc, out, _, _ = _wsl_bash(SANDBOX_DISTRO, _SANDBOX_INTEROP_VERIFY, timeout=60)
+    if rc == 0 and "ACCURETTA_INTEROP_DISABLED" in out:
+        return True, ""
+    state = load_json(SANDBOX_STATE_FILE, {})
+    state.update({"interop_disabled": False, "updated": time.time()})
+    save_json(SANDBOX_STATE_FILE, state)
+    if "_SBX_READY_CACHE" in globals():
+        _SBX_READY_CACHE.update(t=0.0, ready=False)
+    return False, (out or f"security verification exited with {rc}").strip()[-500:]
 
 
 def _wsl_distros() -> list:
@@ -24862,6 +25536,7 @@ def wsl_probe() -> dict:
         "wsl_installed": False, "wsl_version": "", "kernel": "",
         "distros": [], "sandbox_distro": SANDBOX_DISTRO,
         "sandbox_present": False, "sandbox_provisioned": False,
+        "security_profile": 0, "interop_disabled": False,
         "ready": False, "state": "no_wsl", "provision": None,
     }
     rc, out = _wsl_run(["--version"], timeout=15)
@@ -24881,12 +25556,17 @@ def wsl_probe() -> dict:
         info["sandbox_present"] = SANDBOX_DISTRO in info["distros"]
     st = load_json(SANDBOX_STATE_FILE, {})
     info["sandbox_provisioned"] = bool(st.get("provisioned")) and info["sandbox_present"]
+    info["security_profile"] = int(st.get("security_profile") or 0)
+    info["interop_disabled"] = bool(st.get("interop_disabled"))
     if not info["wsl_installed"]:
         info["state"] = "no_wsl"
     elif not info["sandbox_present"]:
         info["state"] = "no_distro"
     elif not info["sandbox_provisioned"]:
         info["state"] = "present_unprovisioned"
+    elif (info["security_profile"] < SANDBOX_SECURITY_PROFILE
+          or not info["interop_disabled"]):
+        info["state"] = "needs_hardening"
     else:
         info["state"] = "ready"
     info["ready"] = info["state"] == "ready"
@@ -24946,24 +25626,53 @@ def _sbx_stream_provision(script, timeout=1800) -> int:
     """Run a provisioning script in the guest, streaming stdout into the log."""
     env = dict(os.environ)
     env["WSL_UTF8"] = "1"
-    cmd = [_wsl_exe(), "-d", SANDBOX_DISTRO, "-u", "root", "--", "bash", "-lc", script]
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    executable = _wsl_exe()
+    if not executable:
+        _sbx_log("trusted wsl.exe was not found in the Windows system directory")
+        return 127
+    cmd = [
+        executable, "-d", SANDBOX_DISTRO, "-u", "root", "--",
+        "/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV",
+        "/bin/bash", "--noprofile", "--norc",
+    ]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, env=env, creationflags=_NO_WINDOW, bufsize=1,
                          encoding="utf-8", errors="replace")
-    t0 = time.time()
-    try:
-        for line in p.stdout:
-            _sbx_log(line.rstrip())
-            if time.time() - t0 > timeout:
-                p.kill()
-                _sbx_log("provision timed out")
-                break
-        p.wait(timeout=30)
-    finally:
+    _write_wsl_script(p.stdin, script)
+    p.stdin.close()
+
+    def _reader():
         try:
-            p.stdout.close()
-        except Exception:
-            pass
+            for line in iter(p.stdout.readline, ""):
+                _sbx_log(line.rstrip())
+        finally:
+            try:
+                p.stdout.close()
+            except Exception:
+                pass
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    timed_out = False
+    try:
+        try:
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _sbx_log(f"provision timed out after {timeout}s")
+            _wsl_run(["--terminate", SANDBOX_DISTRO], timeout=30)
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    p.kill()
+                    p.wait(timeout=5)
+                except Exception:
+                    pass
+    finally:
+        reader.join(timeout=5)
+    if timed_out:
+        return 124
     return p.returncode if p.returncode is not None else 1
 
 
@@ -24981,6 +25690,10 @@ def _sbx_provision_thread(reinstall: bool = False) -> None:
 
         os.makedirs(SANDBOX_DIR, exist_ok=True)
         have = SANDBOX_DISTRO in _wsl_distros()
+        previous_state = load_json(SANDBOX_STATE_FILE, {})
+        needs_full_provision = reinstall or not (
+            have and bool(previous_state.get("provisioned"))
+        )
 
         if have and reinstall:
             _sbx_log(f"Removing existing {SANDBOX_DISTRO} for a clean reinstall...")
@@ -24999,7 +25712,7 @@ def _sbx_provision_thread(reinstall: bool = False) -> None:
                 os.remove(tar_xz)
             except Exception:
                 pass
-            _sbx_set(status="importing", step="Creating isolated distro...", pct=0)
+            _sbx_set(status="importing", step="Creating WSL guest...", pct=0)
             _sbx_log(f"wsl --import {SANDBOX_DISTRO}")
             rc, out = _wsl_run(["--import", SANDBOX_DISTRO, str(SANDBOX_DIR),
                                 str(tar_path), "--version", "2"], timeout=600)
@@ -25015,44 +25728,55 @@ def _sbx_provision_thread(reinstall: bool = False) -> None:
         else:
             _sbx_log(f"{SANDBOX_DISTRO} already imported - provisioning only.")
 
-        _sbx_set(status="provisioning", step="Installing toolset (apt)...", pct=0)
-        save_json(SANDBOX_STATE_FILE, {"provisioned": False, "distro": SANDBOX_DISTRO,
-                                       "updated": time.time()})
-        tools = " ".join(SANDBOX_APT_TOOLS)
-        wrap_b64 = _b64.b64encode(_SBX_BINWALK_WRAPPER.encode("utf-8")).decode("ascii")
-        script = (
-            "set -e; export DEBIAN_FRONTEND=noninteractive; "
-            # A fresh Ubuntu cloud rootfs ships /etc/resolv.conf as a symlink to a
-            # systemd-resolved path that isn't running under WSL, so DNS is dead
-            # and apt fails. Drop the dangling symlink and write a static resolver
-            # for this session; once the symlink is gone WSL auto-generates a
-            # working resolv.conf on later boots.
-            "rm -f /etc/resolv.conf; "
-            "printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf; "
-            "echo '== apt-get update =='; apt-get update; "
-            f"echo '== installing: {tools} =='; "
-            # Resilient: if the batch install fails (one unavailable package used
-            # to abort the WHOLE toolset under set -e, leaving the guest bare),
-            # fall back to installing each package on its own so a single miss
-            # doesn't cost every other tool.
-            f"apt-get install -y --no-install-recommends {tools} || "
-            f"{{ echo '== batch failed; installing individually =='; "
-            f"for p in {tools}; do apt-get install -y --no-install-recommends \"$p\" "
-            f"|| echo \"WARN: $p unavailable\"; done; }}; "
-            # Drop the binwalk root-extraction wrapper ahead of /usr/bin.
-            f"echo {wrap_b64} | base64 -d > /usr/local/bin/binwalk "
-            "&& chmod +x /usr/local/bin/binwalk && echo '== binwalk wrapper installed =='; "
-            "apt-get clean; echo PROVISION_DONE"
-        )
-        _sbx_stream_provision(script, timeout=1800)
+        _sbx_set(status="provisioning", step="Applying guest security profile...", pct=0)
+        if needs_full_provision:
+            save_json(SANDBOX_STATE_FILE, {
+                "provisioned": False, "distro": SANDBOX_DISTRO,
+                "security_profile": 0, "interop_disabled": False,
+                "updated": time.time(),
+            })
+            _sbx_set(status="provisioning", step="Installing toolset (apt)...", pct=0)
+            tools = " ".join(SANDBOX_APT_TOOLS)
+            wrap_b64 = _b64.b64encode(_SBX_BINWALK_WRAPPER.encode("utf-8")).decode("ascii")
+            script = (
+                "set -e; export DEBIAN_FRONTEND=noninteractive; "
+                "rm -f /etc/resolv.conf; "
+                "printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf; "
+                "echo '== apt-get update =='; apt-get update; "
+                f"echo '== installing: {tools} =='; "
+                f"apt-get install -y --no-install-recommends {tools} || "
+                f"{{ echo '== batch failed; installing individually =='; "
+                f"for p in {tools}; do apt-get install -y --no-install-recommends \"$p\" "
+                f"|| echo \"WARN: $p unavailable\"; done; }}; "
+                f"echo {wrap_b64} | base64 -d > /usr/local/bin/binwalk "
+                "&& chmod +x /usr/local/bin/binwalk && echo '== binwalk wrapper installed =='; "
+                "apt-get clean; echo PROVISION_DONE"
+            )
+            if _sbx_stream_provision(script, timeout=1800) != 0:
+                _sbx_set(status="failed", step="Tool installation failed",
+                         error="The WSL guest tool installation failed. Review the setup log and retry.")
+                return
+        else:
+            _sbx_log("Existing toolset found; applying the current security profile only.")
 
-        rc, out = _wsl_in(SANDBOX_DISTRO, "echo ACCURETTA_SBX_OK", timeout=60)
+        hardened, hardening_error = _sandbox_apply_security_profile(log=True)
+        if not hardened:
+            _sbx_set(status="failed", step="Security profile failed", error=hardening_error)
+            return
+
+        rc, out, _, _ = _wsl_in(SANDBOX_DISTRO, "echo ACCURETTA_SBX_OK", timeout=60)
         if "ACCURETTA_SBX_OK" not in out:
             _sbx_set(status="failed", step="Verification failed",
                      error=(out or "").strip()[:400])
             return
-        save_json(SANDBOX_STATE_FILE, {"provisioned": True, "distro": SANDBOX_DISTRO,
-                                       "tools": SANDBOX_APT_TOOLS, "updated": time.time()})
+        save_json(SANDBOX_STATE_FILE, {
+            "provisioned": True,
+            "distro": SANDBOX_DISTRO,
+            "tools": SANDBOX_APT_TOOLS,
+            "security_profile": SANDBOX_SECURITY_PROFILE,
+            "interop_disabled": True,
+            "updated": time.time(),
+        })
         _sbx_set(status="done", step="Sandbox ready.", pct=100)
         _sbx_log("Sandbox ready.")
         broadcast_event({"type": "sandbox:update"})
@@ -25085,20 +25809,60 @@ def _win_to_wsl_path(p: str) -> str:
     return p
 
 
-def sandbox_run(command: str, cwd: str = "", timeout: int = 300) -> dict:
-    """Run a shell command inside the isolated accuretta-sbx guest. Windows
+def sandbox_run(command: str, cwd: str = "", timeout: int = 300,
+                request_emitted: bool = False) -> dict:
+    """Run a shell command inside the separate accuretta-sbx WSL guest. Windows
     workspace paths are visible at /mnt/... ; pass cwd as a Windows path and it
     is translated. This is the execution primitive the model-facing sandbox
     tool / auto-routing will build on."""
+    if not request_emitted:
+        _emit_execution_event("requested", "sandbox", command, cwd=cwd)
     probe = wsl_probe()
     if not probe["ready"]:
-        return {"error": f"sandbox not ready (state={probe['state']}). Set it up in Settings -> Sandbox.",
-                "state": probe["state"]}
-    wsl_cwd = _win_to_wsl_path(cwd) if cwd else ""
-    prefix = f"cd {shlex.quote(wsl_cwd)} 2>/dev/null; " if wsl_cwd else ""
-    rc, out = _wsl_bash(SANDBOX_DISTRO, prefix + command, timeout=timeout)
-    return {"exit_code": rc, "output": (out or "")[-20000:], "distro": SANDBOX_DISTRO,
-            "cwd": wsl_cwd or "~"}
+        return _execution_not_run(
+            f"WSL guest not ready (state={probe['state']}). Set it up in Settings > Sandbox.",
+            "sandbox", command, reason="guest_not_ready", cwd=cwd,
+            state=probe["state"],
+        )
+    with _sandbox_hardening_lock:
+        profile_ok, profile_error = _sandbox_security_profile_active()
+        if not profile_ok:
+            return _execution_not_run(
+                "WSL guest security verification failed. Windows executable interop may be active, so the command was not run.",
+                "sandbox", command, reason="unsafe_guest", cwd=cwd,
+                security_error=profile_error,
+            )
+        wsl_cwd = _win_to_wsl_path(cwd) if cwd else ""
+        prefix = f"cd {shlex.quote(wsl_cwd)} 2>/dev/null; " if wsl_cwd else ""
+        rc, out, killed, spawned = _wsl_bash(
+            SANDBOX_DISTRO, prefix + command, timeout=timeout, announce=True,
+            command=command, cwd=wsl_cwd or "~",
+        )
+    if not spawned:
+        return {
+            "error": (out or "WSL guest process could not start")[-2000:],
+            "not_executed": True,
+            "executed": False,
+            "execution_target": "sandbox",
+            "execution_state": "spawn_error",
+            "exit_code": rc,
+        }
+    result = {
+        "ok": rc == 0 and not killed,
+        "exit_code": rc,
+        "output": (out or "")[-20000:],
+        "distro": SANDBOX_DISTRO,
+        "cwd": wsl_cwd or "~",
+        "executed": True,
+        "execution_target": "sandbox",
+    }
+    if killed:
+        result.update(killed=True, error="sandbox command was killed")
+    elif rc == 124:
+        result.update(timed_out=True, error=f"sandbox command timed out after {timeout}s")
+    elif rc != 0:
+        result.update(error=f"sandbox command exited with code {rc}")
+    return result
 
 
 def sandbox_selftest() -> dict:
@@ -25108,7 +25872,7 @@ def sandbox_selftest() -> dict:
     if not probe["ready"]:
         return {"ok": False, "state": probe["state"],
                 "error": "sandbox not ready - set it up first."}
-    rc, out = _wsl_in(SANDBOX_DISTRO,
+    rc, out, _, _ = _wsl_in(SANDBOX_DISTRO,
                       "uname -a; echo '--- tools ---'; "
                       "for t in python3 nmap sqlmap binwalk 7z unsquashfs file xxd jq git curl gobuster ffuf nikto hydra whatweb wafw00f masscan testssl.sh enum4linux smbclient; do "
                       "printf '%-10s ' \"$t\"; (command -v $t >/dev/null && echo ok || echo MISSING); done; "
@@ -25132,7 +25896,10 @@ def _sandbox_ready_cached(ttl: float = 30.0) -> bool:
     now = time.time()
     if now - _SBX_READY_CACHE["t"] < ttl:
         return _SBX_READY_CACHE["ready"]
-    if not load_json(SANDBOX_STATE_FILE, {}).get("provisioned"):
+    state = load_json(SANDBOX_STATE_FILE, {})
+    if (not state.get("provisioned")
+            or int(state.get("security_profile") or 0) < SANDBOX_SECURITY_PROFILE
+            or not state.get("interop_disabled")):
         _SBX_READY_CACHE.update(t=now, ready=False)
         return False
     ready = bool(wsl_probe().get("ready"))
@@ -25151,59 +25918,81 @@ def _sandbox_scope_block(command: str) -> str | None:
 
 
 def tool_sandbox_run(args: dict) -> dict:
-    """Run a shell command inside the isolated accuretta-sbx Linux guest. Gated
-    the same way as run_powershell: catastrophic commands are hard-refused, and
-    write/modify commands need approval. The guest is kernel-isolated from the
-    host except the workspace, which is visible at /mnt/... — so a delete
-    targeting /mnt IS a delete of the user's real files, hence the same guards."""
+    """Run a shell command inside the separate accuretta-sbx Linux guest.
+    Every free-form command requires approval and catastrophic commands are
+    hard-refused. This is a convenience WSL guest, not a malware containment
+    boundary: mounted Windows paths remain real host files. A delete targeting
+    /mnt is a delete of the user's real files, hence the same guards."""
     command = (args.get("command") or "").strip()
     if not command:
         return {"error": "empty command"}
+    requested_cwd = str(args.get("cwd") or "")
+    _emit_execution_event("requested", "sandbox", command, cwd=requested_cwd)
+
+    def not_run(message: str, reason: str, **details) -> dict:
+        return _execution_not_run(message, "sandbox", command, reason=reason,
+                                  cwd=requested_cwd, **details)
+
+    if _WSL_HOST_INTEROP_RE.search(command):
+        return not_run(
+            (
+                "refused: this sandbox command invokes a Windows executable. "
+                "WSL interop crosses the guest boundary, so use the explicit "
+                "host PowerShell tool and its approval prompt instead."
+            ),
+            "host_interop", refused_command=command, host_interop=True)
     catastrophic = _catastrophic_cmd(command)
     if catastrophic:
-        return {
-            "error": (
+        return not_run(
+            (
                 f"refused: this command {catastrophic}. Even inside the sandbox, "
                 "/mnt/<drive> is a window into the user's real filesystem, so this "
                 "is hard-blocked. Run it yourself if you truly intend it."
             ),
-            "refused_command": command,
-            "catastrophic": True,
-        }
+            "catastrophic", refused_command=command, catastrophic=True)
     clickfix = _clickfix_cmd(command)
     if clickfix:
-        return {
-            "error": (
+        return not_run(
+            (
                 f"refused: this command {clickfix} (ClickFix signature). Even "
                 "inside the sandbox, download-and-execute pipelines are hard-"
                 "blocked. Run it yourself if you truly intend it."
             ),
-            "refused_command": command,
-            "clickfix": True,
-        }
+            "clickfix", refused_command=command, clickfix=True)
     sblk = _sandbox_scope_block(command)
     if sblk:
-        return {"error": sblk, "scope_blocked": True}
-    if needs_approval(command):
-        approval = request_approval(
-            title="Sandbox command (write/modify)",
-            command=command,
-            details={"kind": "sandbox", "distro": SANDBOX_DISTRO},
-        )
-        if approval.get("decision") != "approve":
-            return {"error": f"user denied sandbox command ({approval.get('status')})"}
-    return sandbox_run(command, cwd=(args.get("cwd") or ""), timeout=int(args.get("timeout", 300)))
+        return not_run(sblk, "scope_blocked", scope_blocked=True)
+    executes_code = _host_command_executes_code(command)
+    approval = request_approval(
+        title=("Execute code in WSL guest" if executes_code else "Command in WSL guest"),
+        command=command,
+        details={
+            "kind": "sandbox",
+            "distro": SANDBOX_DISTRO,
+            "target": "sandbox (WSL guest)",
+            "cwd": requested_cwd,
+            "force_prompt": True,
+            "executes_code": executes_code,
+            "host_mounts_exposed": True,
+            "windows_interop_disabled": True,
+        },
+    )
+    if approval.get("decision") != "approve":
+        return not_run(f"user denied WSL guest command ({approval.get('status')})", "denied")
+    return sandbox_run(
+        command, cwd=requested_cwd, timeout=int(args.get("timeout", 300)),
+        request_emitted=True,
+    )
 
 
 TOOLS["sandbox_run"] = {
     "description": (
-        "Run a shell command inside an ISOLATED Ubuntu Linux guest (kernel-isolated "
-        "from the host via WSL2), as root. Use it for anything that shouldn't touch "
-        "the host directly: offensive/recon tools, and most importantly unpacking or "
-        "analyzing UNTRUSTED files pulled back from a target (firmware, malware, "
-        "archives) so a booby-trapped file can't compromise the user's machine. The "
-        "workspace is visible at /mnt/<drive>/... ; pass `cwd` as a Windows path and "
-        "it is translated. Read-only commands run freely; write/modify need approval; "
+        "Run a shell command inside the accuretta-sbx Ubuntu WSL2 guest, as root. "
+        "Use it for offensive/recon tools and static unpacking or inspection away "
+        "from normal host processes. It is NOT malware-grade containment: never "
+        "execute an unknown sample, and mounted Windows paths are still real host "
+        "files. The workspace is visible at /mnt/<drive>/... ; pass `cwd` as a Windows path and "
+        "it is translated. Every free-form guest command requires approval; "
         "drive-wipes are refused. "
         "PREINSTALLED and working — USE THESE, do not write your own replacement for a "
         "tool that is already here: python3/pip3, nmap, sqlmap, binwalk (extraction "
@@ -25244,14 +26033,21 @@ def tool_sandbox_nmap(args: dict) -> dict:
     if ports:
         cmd += f"-p {ports} "
     cmd += shlex.quote(target)
+    _emit_execution_event("requested", "sandbox", cmd)
     approval = request_approval(
-        title="Sandbox nmap scan",
+        title="WSL guest nmap scan",
         command=cmd,
         details={"kind": "sandbox", "distro": SANDBOX_DISTRO},
     )
     if approval.get("decision") != "approve":
-        return {"error": f"user denied nmap scan ({approval.get('status')})"}
-    res = sandbox_run(cmd, timeout=int(args.get("timeout", 600)))
+        return _execution_not_run(
+            f"user denied nmap scan ({approval.get('status')})",
+            "sandbox", cmd, reason="denied")
+    res = sandbox_run(
+        cmd, timeout=int(args.get("timeout", 600)), request_emitted=True)
+    if (res.get("error") or res.get("executed") is False
+            or res.get("exit_code") not in (None, 0)):
+        return res
     out = res.get("output") or ""
     hosts = []
     try:
@@ -25278,10 +26074,12 @@ def tool_sandbox_nmap(args: dict) -> dict:
             hosts.append(entry)
     except Exception as e:
         return {"error": f"nmap output parse failed: {e}",
-                "exit_code": res.get("exit_code"), "raw": out[-4000:]}
+                "exit_code": res.get("exit_code"), "raw": out[-4000:],
+                "executed": True, "execution_target": "sandbox"}
     return {"ok": True, "target": target, "command": cmd, "hosts": hosts,
             "host_count": len(hosts),
-            "open_ports": sum(len(h["ports"]) for h in hosts)}
+            "open_ports": sum(len(h["ports"]) for h in hosts),
+            "exit_code": 0, "executed": True, "execution_target": "sandbox"}
 
 
 def tool_sandbox_sqlmap(args: dict) -> dict:
@@ -25309,14 +26107,21 @@ def tool_sandbox_sqlmap(args: dict) -> dict:
     if proxy:
         parts.append(f"--proxy={shlex.quote(proxy)}")
     cmd = " ".join(parts)
+    _emit_execution_event("requested", "sandbox", cmd)
     approval = request_approval(
-        title="Sandbox sqlmap",
+        title="WSL guest sqlmap",
         command=cmd,
         details={"kind": "sandbox", "distro": SANDBOX_DISTRO},
     )
     if approval.get("decision") != "approve":
-        return {"error": f"user denied sqlmap ({approval.get('status')})"}
-    res = sandbox_run(cmd, timeout=int(args.get("timeout", 900)))
+        return _execution_not_run(
+            f"user denied sqlmap ({approval.get('status')})",
+            "sandbox", cmd, reason="denied")
+    res = sandbox_run(
+        cmd, timeout=int(args.get("timeout", 900)), request_emitted=True)
+    if (res.get("error") or res.get("executed") is False
+            or res.get("exit_code") not in (None, 0)):
+        return res
     out = res.get("output") or ""
     injectable = ("is vulnerable" in out
                   or "sqlmap identified the following injection point" in out)
@@ -25324,7 +26129,8 @@ def tool_sandbox_sqlmap(args: dict) -> dict:
     m = re.search(r"back-end DBMS:\s*(.+)", out)
     return {"ok": True, "url": url, "injectable": injectable,
             "parameters": params, "dbms": m.group(1).strip() if m else "",
-            "exit_code": res.get("exit_code"), "raw_tail": out[-3000:]}
+            "exit_code": res.get("exit_code"), "raw_tail": out[-3000:],
+            "executed": True, "execution_target": "sandbox"}
 
 
 def tool_rt_generate_report(args: dict) -> dict:
@@ -25436,7 +26242,8 @@ TOOLS["sandbox_nmap"] = {
     "description": (
         "Run nmap INSIDE the sandbox guest and get parsed JSON (hosts, open "
         "ports, service/product/version) instead of raw text. AUTHORIZED RECON "
-        "ONLY. Scan traffic originates from the guest, not the host. timing "
+        "ONLY. The nmap process runs in the guest; traffic still exits through "
+        "the PC and WSL network. timing "
         "0-4 (default 3); ports like '22,80,443' or '1-1024' (default: nmap "
         "top 1000). Scope-enforced: refuses out-of-mission targets."
     ),
@@ -26544,7 +27351,7 @@ class Handler(BaseHTTPRequestHandler):
                 origin = (body.get("origin") or "desktop").strip().lower()
                 if origin not in ("mobile", "desktop"):
                     origin = "desktop"
-                chats["chats"][chat_id] = {
+                record = {
                     "id": chat_id,
                     "title": body.get("title") or "new session",
                     "created": int(time.time()),
@@ -26552,6 +27359,10 @@ class Handler(BaseHTTPRequestHandler):
                     "messages": [],
                     "origin": origin,
                 }
+                worktree = _github_worktree_metadata(body.get("github_worktree"))
+                if worktree:
+                    record["github_worktree"] = worktree
+                chats["chats"][chat_id] = record
                 chats["order"].insert(0, chat_id)
                 save_json(CHATS_FILE, chats)
             return self._send_json(200, chats["chats"][chat_id])
@@ -26884,7 +27695,9 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_chat(self, body: dict):
         chat_id = body.get("chat_id") or uuid.uuid4().hex[:12]
         user_text = (body.get("message") or "").strip()
-        mode = body.get("mode") or "auto"  # auto | ide | agent
+        mode = str(body.get("mode") or "auto").strip().lower()
+        if mode not in {"auto", "ide", "agent"}:
+            return self._send_json(400, {"error": "invalid chat mode"})
         images = body.get("images") or []  # list of base64 data URLs
         regenerate = bool(body.get("regenerate"))
         reasoning_effort = _normalize_reasoning_effort(body.get("reasoning_effort"))
@@ -30549,6 +31362,7 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
         # off the wire and let extract_tool_calls handle the tool_code shape.
         _gm = any(_is_gemma_model(m) for m in
                   (get_settings().get("model"), get_settings().get("model_path"), _llama.loaded_model()))
+        _text_tools = _gm or _native_tools_broken()
 
         if use_tools:
             # Owner path: same long-session memory as the web UI — token-aware
@@ -30582,7 +31396,7 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
                     traceback.print_exc()
             _set_current_chat(chat_id)
             system_prompt = build_system_prompt(include_tools=True, chat_mode="agent",
-                                                include_tool_list=not _text_tools)
+                                                include_tool_list=_text_tools)
             # Mission block + pins are NOT spliced here — run_chat_turn appends
             # them as a tail message after the history (cache-friendly; see the
             # volatile-tail block there). Only the rare-changing rolling summary
@@ -30611,7 +31425,6 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
                     out["name"] = m["name"]
             msgs.append(out)
 
-        _text_tools = _gm or _native_tools_broken()
         final = run_chat_turn(chat_id, msgs, use_tools=use_tools, emit=lambda e: None,
                               native_tools=not _text_tools)
         if not final:

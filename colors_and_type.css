@@ -874,9 +874,9 @@
 }
 
 /* ============================================================
-   APERTURE DARK THEME — the spatial edition in a dark room.
-   Deep blue-graphite (never pitch black), electric cyan accent
-   that no other theme uses. Composer geometry lives in app.css.
+   APERTURE DARK THEME: the spatial edition in a dark room.
+   Neutral charcoal surfaces use a restrained white accent.
+   Composer geometry lives in app.css.
    ============================================================ */
 [data-theme="aperture-dark"] {
   --bg:        #111111;
@@ -932,8 +932,8 @@
   --btn-shadow-hover: inset 0 1px 0 rgba(255, 255, 255, 0.09), 0 10px 24px -14px rgba(0, 0, 0, 0.68), 0 0 0 1px rgba(0, 0, 0, 0.32);
   --btn-shadow-active: inset 0 1px 2px rgba(0, 0, 0, 0.50), 0 0 0 1px rgba(0, 0, 0, 0.30);
 
-  --btn-send-gradient: linear-gradient(145deg, #67E8F9 0%, #0891B2 100%);
-  --btn-send-glow: 0 11px 24px -13px rgba(34, 211, 238, 0.55);
+  --btn-send-gradient: linear-gradient(145deg, #FFFFFF 0%, #CFCFCF 100%);
+  --btn-send-glow: 0 11px 24px -13px rgba(255, 255, 255, 0.32);
 }
 
 /* ============================================================

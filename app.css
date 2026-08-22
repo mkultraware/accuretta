@@ -2,7 +2,7 @@
    Accuretta app — layout + components on top of the design system.
    Imports: /colors_and_type.css
    ============================================================ */
-@import url("/colors_and_type.css?v=10");
+@import url("/colors_and_type.css?v=11");
 
 * {
   box-sizing: border-box;
@@ -73,6 +73,8 @@ button {
 
 /* ---- desktop flex layout ---- */
 .app {
+  position: fixed;
+  inset: 0;
   display: flex;
   flex-direction: row;
   width: 100vw;
@@ -81,6 +83,21 @@ button {
   gap: 10px;
   padding: 10px 0 10px 10px;
   background: var(--bg);
+  isolation: isolate;
+}
+
+/* A tiny static dither breaks up 8-bit color bands without changing theme
+   palettes. Keeping it above every surface also covers component gradients. */
+.app::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 2147483646;
+  pointer-events: none;
+  opacity: 0.035;
+  mix-blend-mode: soft-light;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='96' height='96' viewBox='0 0 96 96'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.82' numOctaves='3' seed='17' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.72'/%3E%3C/svg%3E");
+  background-size: 96px 96px;
 }
 
 .sidebar {
@@ -93,6 +110,7 @@ button {
 .center {
   flex: 1 1 auto;
   min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
   height: calc(100vh - 20px);
   min-height: 0;
   overflow: hidden;
@@ -2212,13 +2230,6 @@ button {
   100% { opacity: 0; }
 }
 
-  background: var(--bg-inset);
-  padding: 1px 5px;
-  border-radius: 3px;
-  font-size: 12px;
-  color: var(--fg);
-}
-
 .faq-q {
   font-family: var(--font-display);
   color: var(--fg);
@@ -2682,7 +2693,7 @@ button {
 
   min-width: 0;
   min-height: 0;
-  height: 100vh;
+  height: 100%;
 }
 
 .topbar {
@@ -5286,7 +5297,7 @@ body.remote-client .chat-scroll {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  height: 100vh;
+  height: 100%;
 }
 
 .preview-head {
@@ -5961,13 +5972,27 @@ body.remote-client .chat-scroll {
 
 .cmd-row-summary {
   display: grid;
-  grid-template-columns: auto auto 1fr auto;
+  grid-template-columns: auto auto auto 1fr auto;
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
   cursor: pointer;
   user-select: none;
 }
+
+.cmd-row-target {
+  display: inline-flex;
+  align-items: center;
+  width: max-content;
+  padding: 2px 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font: 700 9px/1.2 var(--font-mono);
+  letter-spacing: .06em;
+}
+
+.cmd-row-target.is-host { color: var(--warning); }
+.cmd-row-target.is-sandbox { color: var(--accent); }
 
 .cmd-row-exit {
   display: inline-flex;
@@ -6144,7 +6169,7 @@ body.remote-client .chat-scroll {
 
   .cmd-row-summary {
     grid-template-columns: 1fr auto;
-    grid-template-rows: auto auto;
+    grid-template-rows: auto auto auto;
     gap: 4px 8px;
     padding: 10px 12px;
   }
@@ -6155,6 +6180,11 @@ body.remote-client .chat-scroll {
     font-size: 9px;
   }
 
+  .cmd-row-target {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
   .cmd-row-exit {
     grid-column: 2;
     grid-row: 1;
@@ -6163,7 +6193,7 @@ body.remote-client .chat-scroll {
 
   .cmd-row-cmd {
     grid-column: 1 / -1;
-    grid-row: 2;
+    grid-row: 3;
     font-size: 12px;
     white-space: normal;
     word-break: break-all;
@@ -6305,30 +6335,33 @@ body.remote-client .chat-scroll {
   font-weight: 500;
 }
 
-/* Settings are grouped into a handful of remembered disclosure sections.
-   Native <details>/<summary> provides keyboard and screen-reader behavior;
-   the custom shell keeps it visually quiet enough for a dense control panel. */
+/* Settings use a flat disclosure index. Native <details>/<summary> keeps the
+   keyboard and screen-reader behavior without wrapping every category in a
+   translucent card. */
 .settings-section {
-  margin: 0 0 10px;
-  border: 1px solid var(--border);
-  border-radius: 13px;
-  background:
-    linear-gradient(155deg,
-      color-mix(in srgb, var(--bg-raised) 88%, transparent),
-      color-mix(in srgb, var(--bg-inset) 60%, transparent));
-  overflow: clip;
+  margin: 0;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
   transition: border-color var(--dur-fast) var(--ease-out),
     background-color var(--dur-fast) var(--ease-out);
 }
 
+.settings-section:first-child {
+  border-top: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+}
+
 .settings-section[open] {
   border-color: var(--border-strong);
-  background: color-mix(in srgb, var(--bg-raised) 72%, var(--bg));
+  background: color-mix(in srgb, var(--fg) 2.5%, transparent);
 }
 
 .settings-section-summary {
-  min-height: 58px;
-  padding: 10px 13px;
+  min-height: 62px;
+  padding: 11px 4px;
   display: flex;
   align-items: center;
   gap: 11px;
@@ -6343,24 +6376,25 @@ body.remote-client .chat-scroll {
 }
 
 .settings-section-summary:hover {
-  background: color-mix(in srgb, var(--fg) 3.5%, transparent);
+  background: transparent;
+  color: var(--accent);
 }
 
 .settings-section-summary:focus-visible {
-  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 70%, transparent);
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--accent) 76%, transparent);
 }
 
 .settings-section-icon {
-  width: 31px;
-  height: 31px;
-  flex: 0 0 31px;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
-  border-radius: 9px;
+  border: 0;
+  border-radius: 0;
   color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  background: transparent;
 }
 
 .settings-section-icon i {
@@ -6406,7 +6440,7 @@ body.remote-client .chat-scroll {
 }
 
 .settings-section-content {
-  padding: 0 14px 14px;
+  padding: 0 4px 16px 43px;
   border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
   animation: settings-section-in 170ms var(--ease-out) both;
 }
@@ -7132,10 +7166,8 @@ body.is-mobile {
 
 @media (max-width: 600px) {
 
-  /* JS reparents the mode chips + image button into the overflow menu on
-     mobile, so the composer toolbar row only carries the overflow trigger
-     and a spacer. Model pill is hidden on mobile (eats too much room) — pick
-     models from Settings instead. */
+  /* Image, file and access actions move into the overflow menu on phones.
+     The grouped mode control stays visible. The model picker stays in Settings. */
   .composer-tools {
     flex-wrap: nowrap !important;
     overflow: visible;
@@ -7331,15 +7363,15 @@ body.is-mobile {
     min-height: 36px;
   }
 
-  /* Send + Stop: fixed 42px circle on mobile — never flex-stretch. */
+  /* Send + Stop: fixed finger-sized circles on mobile — never flex-stretch. */
   #btn-send,
   #btn-stop {
-    flex: 0 0 42px !important;
-    width: 42px !important;
-    height: 42px !important;
-    min-width: 42px;
-    max-width: 42px;
-    min-height: 42px !important;
+    flex: 0 0 44px !important;
+    width: 44px !important;
+    height: 44px !important;
+    min-width: 44px;
+    max-width: 44px;
+    min-height: 44px !important;
     padding: 0 !important;
     border-radius: 50% !important;
     justify-content: center;
@@ -7456,13 +7488,13 @@ body.is-mobile {
   }
 
   .settings-section {
-    margin-bottom: 8px;
-    border-radius: 12px;
+    margin-bottom: 0;
+    border-radius: 0;
   }
 
   .settings-section-summary {
     min-height: 62px;
-    padding: 11px 12px;
+    padding: 11px 2px;
   }
 
   .settings-section-copy small {
@@ -7472,7 +7504,7 @@ body.is-mobile {
   }
 
   .settings-section-content {
-    padding: 0 12px 13px;
+    padding: 0 2px 14px 39px;
   }
 
   .model-health-card {
@@ -8753,7 +8785,7 @@ body,
 .composer {
   border-radius: 24px;
   padding: 14px 16px 16px;
-  background: var(--glass-bg) !important;
+  background: var(--glass-bg);
   backdrop-filter: blur(var(--glass-blur));
   -webkit-backdrop-filter: blur(var(--glass-blur));
   border: 1px solid var(--glass-border);
@@ -9044,15 +9076,28 @@ body,
 /* ---- MOBILE LAYOUT v2 MEDIA QUERY -------------------------- */
 @media (max-width: 600px) {
   #btn-theme {
-    display: inline-flex !important;
+    display: none !important;
   }
 
   #btn-mobile-menu {
-    display: none !important;
+    display: inline-flex !important;
   }
 
   #btn-palette {
     display: none !important;
+  }
+
+  .client-context-control,
+  #btn-github-activity {
+    display: none !important;
+  }
+
+  .topbar > .iconbtn,
+  .topbar .actions > .iconbtn {
+    flex: 0 0 44px;
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
   }
 
   .modal-scrim {
@@ -9090,10 +9135,6 @@ body,
     white-space: nowrap;
     max-width: 100%;
     font-size: 14px;
-  }
-
-  #mode-ide {
-    display: none !important;
   }
 
   /* Reflowed layout */
@@ -9416,7 +9457,7 @@ body,
   .mm-item {
     padding: 11px 12px;
     font-size: 13px;
-    min-height: 40px;
+    min-height: 44px;
   }
 }
 
@@ -9681,7 +9722,7 @@ body,
   }
 
   .composer {
-    background: var(--glass-bg) !important;
+    background: var(--glass-bg);
     backdrop-filter: blur(var(--glass-blur));
     -webkit-backdrop-filter: blur(var(--glass-blur));
     border-color: color-mix(in srgb, var(--border-strong) 30%, transparent);
@@ -10376,6 +10417,177 @@ body,
   gap: 8px;
 }
 
+.mode-control {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+.mode-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg-muted);
+  font: 500 11px/1 var(--font-sans);
+  cursor: pointer;
+  box-shadow: none;
+  transition: color 160ms var(--ease-out), border-color 160ms var(--ease-out),
+    background-color 160ms var(--ease-out);
+}
+
+.mode-pill-icon {
+  color: var(--accent);
+  font-size: 14px;
+}
+
+.mode-pill-caret {
+  color: var(--fg-faint);
+  font-size: 10px;
+  transition: transform 180ms var(--ease-spring);
+}
+
+.mode-pill[aria-expanded="true"] .mode-pill-caret {
+  transform: rotate(180deg);
+}
+
+.mode-pill:hover,
+.mode-pill[aria-expanded="true"] {
+  color: var(--fg);
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--border-strong));
+  background: color-mix(in srgb, var(--accent-subtle) 55%, var(--bg-inset));
+}
+
+.mode-pill:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-subtle);
+}
+
+.mode-popover {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 10px);
+  z-index: 260;
+  width: min(224px, calc(100vw - 24px));
+  padding: 11px 12px 10px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--bg-raised);
+  color: var(--fg);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(6px);
+  transform-origin: 18% 100%;
+  transition: opacity 180ms var(--ease-out), transform 240ms var(--ease-spring),
+    visibility 0s linear 240ms;
+}
+
+.mode-popover.open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateY(0);
+  transition-delay: 0s;
+}
+
+.mode-popover-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.mode-popover-head strong {
+  color: var(--accent);
+  font: 650 11px/1 var(--font-mono);
+}
+
+.mode-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 2px -4px -4px;
+}
+
+.mode-option {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg-muted);
+  font: 500 12px/1.2 var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 140ms var(--ease-out), color 140ms var(--ease-out);
+}
+
+.mode-option > i:first-child {
+  color: var(--fg-faint);
+  font-size: 14px;
+}
+
+.mode-option span {
+  flex: 1 1 auto;
+}
+
+.mode-option .mode-check {
+  color: var(--accent);
+  font-size: 13px;
+  opacity: 0;
+  transform: scale(0.6);
+  transition: opacity 140ms var(--ease-out), transform 200ms var(--ease-spring);
+}
+
+.mode-option:hover:not([aria-disabled="true"]) {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+}
+
+.mode-option.active {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--accent) 11%, transparent);
+}
+
+.mode-option.active > i:first-child {
+  color: var(--accent);
+}
+
+.mode-option.active .mode-check {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.mode-option.disabled {
+  cursor: help;
+  opacity: 0.42;
+}
+
+.mode-option-note {
+  display: block;
+  margin-top: 2px;
+  color: var(--fg-faint);
+  font: 500 9px/1.15 var(--font-sans);
+}
+
+.mode-option:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent-subtle);
+}
+
 /* Model-aware reasoning effort. Hidden entirely when the loaded model does not
    advertise thinking controls; the compact pill expands into a real slider so
    the composer stays quiet until the user asks for it. */
@@ -10654,6 +10866,11 @@ body,
   padding: 0 10px;
   height: 32px;
   flex-shrink: 0;
+}
+
+#btn-term-clear:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
 }
 .term-tab {
   display: inline-flex;
@@ -11122,7 +11339,7 @@ body,
   transform: translate(0, 0);
 }
 
-@media (max-width: 680px) {
+@media (max-width: 600px) {
   .welcome-logo-wrap {
     margin-bottom: var(--s-3);
   }
@@ -13809,7 +14026,7 @@ body,
   to { opacity: 1; transform: translateY(0); }
 }
 
-@media (max-width: 680px) {
+@media (max-width: 600px) {
   :is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-content {
     max-width: 440px;
   }
@@ -14247,12 +14464,12 @@ body,
 
 /* Overlays use cropped focus sheets. Their geometry now follows the workspace
    rather than inheriting the generic glass card treatment. */
-:is(.modal, .palette) {
+:is([data-theme="aperture"], [data-theme="aperture-dark"]) :is(.modal, .palette) {
   border-radius: 24px 4px 24px 24px;
   border-color: rgba(25, 27, 31, 0.10);
 }
 
-.drawer {
+:is([data-theme="aperture"], [data-theme="aperture-dark"]) .drawer {
   top: 10px;
   right: 10px;
   bottom: 10px;
@@ -14262,12 +14479,12 @@ body,
   box-shadow: none;
 }
 
-.drawer.open {
+:is([data-theme="aperture"], [data-theme="aperture-dark"]) .drawer.open {
   transform: none;
   will-change: auto;
 }
 
-:is(.modal, .palette)::after {
+:is([data-theme="aperture"], [data-theme="aperture-dark"]) :is(.modal, .palette)::after {
   right: 28px;
   width: 74px;
   height: 2px;
@@ -14536,7 +14753,7 @@ body,
   }
 }
 
-@media (max-width: 680px) {
+@media (max-width: 600px) {
   .app {
     gap: 0;
     padding: calc(env(safe-area-inset-top, 0px) + 10px) 0 0;
@@ -14671,7 +14888,7 @@ body,
 /* The generic collapsed-sidebar tab sat across Aperture's clipped outer
    corner. Keep the control fully inside the framed workspace and reserve its
    topbar space so the title cannot run underneath it. */
-@media (min-width: 681px) {
+@media (min-width: 601px) {
   :is([data-theme="aperture"], [data-theme="aperture-dark"]) .app.sidebar-collapsed .pull-tab-left {
     left: 20px;
     top: 20px;
@@ -14729,6 +14946,9 @@ body,
 }
 
 [data-theme] .composer {
+  --composer-bg: color-mix(in srgb, var(--bg-raised, #FBFAF6) 94%, transparent);
+  --composer-border: color-mix(in srgb, var(--fg) 11%, transparent);
+  --composer-shadow: var(--shadow-md);
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   grid-template-areas:
@@ -14740,10 +14960,10 @@ body,
   max-width: 900px;
   padding: 9px 9px 9px 18px;
   overflow: visible;
-  border: 1px solid color-mix(in srgb, var(--fg) 11%, transparent);
+  border: 1px solid var(--composer-border);
   border-radius: 21px 5px 21px 21px;
-  background: color-mix(in srgb, var(--bg-raised, #FBFAF6) 94%, transparent);
-  box-shadow: var(--shadow-pop);
+  background: var(--composer-bg);
+  box-shadow: var(--composer-shadow);
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
   will-change: auto;
@@ -14765,7 +14985,7 @@ body,
   transform: none;
   border-color: color-mix(in srgb, var(--accent) 34%, transparent) !important;
   box-shadow:
-    var(--shadow-pop),
+    var(--composer-shadow),
     0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent) !important;
 }
 
@@ -14836,7 +15056,7 @@ body,
   box-shadow: inset 0 -2px 0 var(--accent);
 }
 
-[data-theme] :is(.effort-pill, .model-pill) {
+[data-theme] :is(.mode-pill, .effort-pill, .model-pill) {
   min-height: 32px;
   border-radius: 10px 3px 10px 10px;
   background: color-mix(in srgb, var(--bg-inset, #F3F2ED) 55%, transparent);
@@ -14852,15 +15072,14 @@ body,
 }
 
 [data-theme] .composer-foot #btn-send {
-  background: color-mix(in srgb, var(--fg) 88%, transparent) !important;
-  color: var(--bg-raised, #FFFFFF);
-  box-shadow:
-    0 14px 26px -16px color-mix(in srgb, var(--fg) 72%, transparent),
-    inset 0 1px 0 color-mix(in srgb, var(--fg) 12%, transparent);
+  background: var(--btn-send-gradient) !important;
+  color: var(--accent-fg);
+  box-shadow: var(--btn-send-glow);
 }
 
 [data-theme] .composer-foot #btn-send:hover {
-  background: var(--accent) !important;
+  background: var(--btn-send-gradient) !important;
+  filter: brightness(1.07);
 }
 
 [data-theme] .composer-foot #btn-stop {
@@ -14876,11 +15095,10 @@ body,
 }
 
 /* ============================================================
-   APERTURE DARK - the spatial edition in a dark room.
-   Deep blue-graphite canvas (never pitch black), electric cyan
-   accent #E2E2E2 that no other theme uses, no right-edge
-   gradient planes (both are gone entirely). These overrides
-   land last so they beat the shared aperture geometry above.
+   APERTURE DARK: the spatial edition in a dark room.
+   Neutral charcoal surfaces and a restrained white accent keep
+   the hierarchy crisp without adding a second color system.
+   These overrides land after the shared Aperture geometry.
    ============================================================ */
 [data-theme="aperture-dark"] body {
   background: #111111;
@@ -14955,6 +15173,7 @@ body,
 [data-theme="aperture-dark"] .bubble.user {
   background: rgba(255, 255, 255, 0.07) !important;
   border-color: rgba(255, 255, 255, 0.12) !important;
+  border-right-color: var(--accent) !important;
   box-shadow: 0 18px 40px -32px rgba(0, 0, 0, 0.65) !important;
 }
 
@@ -14963,7 +15182,25 @@ body,
 }
 
 [data-theme="aperture-dark"] .avatar.user {
-  border-color: rgba(34, 211, 238, 0.55);
+  border-color: rgba(255, 255, 255, 0.42);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+[data-theme="aperture-dark"] .welcome-logo-wrap::after {
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+[data-theme="aperture-dark"] .welcome-suggestions {
+  border-color: rgba(255, 255, 255, 0.13);
+}
+
+[data-theme="aperture-dark"] .welcome-suggest-btn {
+  border-right-color: rgba(255, 255, 255, 0.10);
+}
+
+[data-theme="aperture-dark"] .welcome-suggest-btn:hover {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: linear-gradient(to bottom, rgba(255, 255, 255, 0.055), transparent);
 }
 
 [data-theme="aperture-dark"] :is(.topbar, .preview-head) {
@@ -14981,7 +15218,7 @@ body,
   box-shadow: 0 8px 20px -14px rgba(0, 0, 0, 0.55);
 }
 
-@media (max-width: 680px) {
+@media (max-width: 600px) {
   [data-theme="aperture-dark"] .app {
     background: #0A0A0A;
   }
@@ -15256,3 +15493,501 @@ pre.code-card.streaming-plain code {
   white-space: pre;
 }
 .gh-empty-hint i { color: var(--accent); font-size: 14px; flex-shrink: 0; }
+
+.command-target {
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  font: 650 8px/1 var(--font-mono);
+  letter-spacing: 0.08em;
+}
+
+.command-target.is-host {
+  color: var(--warning);
+  background: var(--warning-subtle);
+}
+
+.command-target.is-sandbox {
+  color: var(--info);
+  background: var(--info-subtle);
+}
+
+:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"], [data-theme="velvet"], [data-theme="cartograph"], [data-theme="aperture-dark"]) .composer {
+  --composer-bg: color-mix(in srgb, var(--bg-raised) 88%, transparent);
+}
+
+[data-theme="cartograph"] .composer {
+  --composer-bg:
+    radial-gradient(110% 150% at 100% 100%, rgba(255, 107, 69, 0.018), transparent 64%),
+    radial-gradient(95% 130% at 0% 0%, rgba(255, 255, 255, 0.025), transparent 58%),
+    rgba(19, 22, 24, 0.96);
+  --composer-border: rgba(255, 255, 255, 0.085);
+  --composer-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.045),
+    0 14px 42px rgba(0, 0, 0, 0.28),
+    0 2px 8px rgba(0, 0, 0, 0.18);
+}
+
+@media (max-width: 600px) {
+  [data-theme] .app {
+    width: 100%;
+    height: 100dvh;
+    gap: 0;
+    padding: calc(env(safe-area-inset-top, 0px) + 10px) 0 0;
+  }
+
+  [data-theme] .center,
+  [data-theme] .app.preview-collapsed .center,
+  [data-theme] .app.sidebar-collapsed .center {
+    flex: 1 1 auto;
+    width: 100%;
+    height: auto;
+    min-height: 0;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+
+  [data-theme] .sidebar {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100dvh;
+    border: 0;
+    border-radius: 0;
+  }
+
+  [data-theme] .drawer,
+  :is([data-theme="aperture"], [data-theme="aperture-dark"]) .drawer {
+    inset: 0 !important;
+    width: 100vw !important;
+    max-width: none !important;
+    height: 100dvh;
+    border: 0;
+    border-radius: 0;
+  }
+
+  [data-theme] .composer-wrap {
+    padding: 7px 8px calc(env(safe-area-inset-bottom, 0px) + 8px);
+  }
+
+  [data-theme] .composer {
+    width: 100%;
+    max-width: 100%;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "deck deck"
+      "tray tray"
+      "input input"
+      "tools foot";
+    gap: 4px 7px;
+    padding: 8px 8px 8px 12px;
+    border-radius: 18px 4px 18px 18px;
+  }
+
+  [data-theme] .revealer-deck {
+    width: calc(100% + 20px);
+    margin: -8px 0 8px -12px;
+    border-top-left-radius: 17px;
+    border-top-right-radius: 3px;
+  }
+
+  [data-theme] .composer-input {
+    min-height: 46px;
+    max-height: min(140px, 32dvh);
+    padding: 8px 2px;
+    font-size: 16px;
+  }
+
+  [data-theme] .composer-tools {
+    min-width: 0;
+    gap: 4px;
+    overflow: visible;
+  }
+
+  [data-theme] .composer-foot-actions {
+    gap: 6px;
+  }
+
+  [data-theme] :is(.mode-pill, .effort-pill, .model-pill) {
+    min-height: 44px;
+  }
+
+  [data-theme] .mode-pill {
+    padding-inline: 10px;
+  }
+
+  [data-theme] .mode-popover {
+    width: min(224px, calc(100vw - 16px));
+  }
+
+  [data-theme] .mode-option,
+  [data-theme] .toolbar-overflow-menu .chip {
+    min-height: 44px;
+  }
+
+  [data-theme] .toolbar-overflow {
+    width: 44px !important;
+    height: 44px !important;
+  }
+}
+
+@media (min-width: 601px) and (max-width: 820px) {
+  [data-theme] .app {
+    gap: 0;
+    padding: 7px;
+  }
+
+  [data-theme] .sidebar {
+    position: fixed;
+    z-index: 1200;
+    inset: 7px auto 7px 7px;
+    width: min(320px, calc(100vw - 14px));
+    height: calc(100dvh - 14px);
+    box-shadow: var(--shadow-lg);
+  }
+
+  [data-theme] .center,
+  [data-theme] .app.preview-collapsed .center,
+  [data-theme] .app.sidebar-collapsed .center {
+    flex: 1 1 auto;
+    width: 100%;
+    height: calc(100dvh - 14px);
+    border: 1px solid var(--glass-border, var(--border-subtle));
+    border-radius: 9px 28px 28px 28px;
+  }
+
+  [data-theme] :is(.preview, .preview-resizer, #pull-tab, .pull-tab-left, #btn-toggle-preview) {
+    display: none !important;
+  }
+
+  [data-theme] :is(.client-context-control, #btn-toggle-plan, #btn-github-activity, #btn-session-desktop) {
+    display: none !important;
+  }
+
+  [data-theme] #btn-settings-m {
+    display: inline-flex !important;
+  }
+
+  [data-theme] .topbar > .iconbtn,
+  [data-theme] .topbar .actions > .iconbtn {
+    flex: 0 0 44px;
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+  }
+
+  [data-theme] :is(.mode-pill, .effort-pill, .model-pill, .composer-tools .chip) {
+    min-height: 44px;
+  }
+
+  [data-theme] :is(.toolbar-overflow, #btn-send, #btn-stop) {
+    width: 44px !important;
+    min-width: 44px;
+    height: 44px !important;
+  }
+
+  [data-theme] .chat,
+  [data-theme] .composer-wrap,
+  [data-theme] .composer {
+    width: 100%;
+    min-width: 0;
+  }
+
+  [data-theme] .composer-wrap {
+    padding: 10px 10px 14px;
+  }
+
+  [data-theme] .composer {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "deck"
+      "tray"
+      "input"
+      "tools"
+      "foot";
+    gap: 4px;
+    padding: 8px 9px 9px 14px;
+  }
+
+  [data-theme] .composer-tools {
+    width: 100%;
+    min-width: 0;
+  }
+
+  [data-theme] .composer-foot {
+    width: auto;
+    min-width: 0;
+    justify-self: end;
+  }
+
+  [data-theme] .topbar :is(.path, .chat-title) {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+/* ============================================================
+   SHARED EDITORIAL WELCOME
+   Every palette uses the same quiet hierarchy. Theme primitives supply the
+   ink, rules, focus tint and typography, so the layout stays coherent without
+   flattening each theme into Aperture's exact material treatment.
+   ============================================================ */
+[data-theme] .welcome-screen {
+  --welcome-max-width: 860px;
+  --welcome-logo-column: 76px;
+  --welcome-rule: color-mix(in srgb, var(--fg) 13%, transparent);
+  --welcome-rule-soft: color-mix(in srgb, var(--fg) 10%, transparent);
+  --welcome-hover-field: color-mix(in srgb, var(--accent) 5%, transparent);
+  --welcome-field-a: color-mix(in srgb, var(--accent) 7%, transparent);
+  --welcome-field-b: color-mix(in srgb, var(--fg) 4%, transparent);
+  justify-content: center;
+  padding: 64px clamp(32px, 7vw, 104px);
+}
+
+[data-theme] .welcome-content {
+  display: grid;
+  grid-template-columns: var(--welcome-logo-column) minmax(0, 1fr);
+  grid-template-areas:
+    "logo title"
+    ". subtitle"
+    ". suggestions";
+  align-items: start;
+  width: min(var(--welcome-max-width), 100%);
+  max-width: var(--welcome-max-width);
+  text-align: left;
+}
+
+[data-theme] .welcome-logo-wrap {
+  grid-area: logo;
+  width: 48px;
+  height: 48px;
+  margin: 8px 0 0;
+  filter: none;
+}
+
+[data-theme] .welcome-logo-wrap::before,
+[data-theme] .welcome-logo-wrap::after {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  opacity: 1;
+  pointer-events: none;
+  -webkit-mask-image: none;
+  mask-image: none;
+  transform: none;
+  animation: none;
+}
+
+[data-theme] .welcome-logo-wrap::before {
+  inset: -8px auto auto -8px;
+  border-top: 1px solid var(--accent);
+  border-left: 1px solid var(--accent);
+}
+
+[data-theme] .welcome-logo-wrap::after {
+  inset: auto -8px -8px auto;
+  border-right: 1px solid color-mix(in srgb, var(--fg) 24%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--fg) 24%, transparent);
+}
+
+[data-theme] .welcome-title {
+  grid-area: title;
+  max-width: none;
+  margin: 0 0 14px;
+  font-family: var(--font-display, var(--font-sans));
+  font-size: clamp(48px, 6vw, 76px);
+  font-weight: 550;
+  line-height: 0.92;
+  letter-spacing: -0.06em;
+}
+
+[data-theme] .welcome-subtitle {
+  grid-area: subtitle;
+  max-width: 520px;
+  margin: 0 0 42px;
+  font-size: 16px;
+  line-height: 1.48;
+}
+
+[data-theme] .welcome-suggestions {
+  grid-area: suggestions;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  border-top: 1px solid var(--welcome-rule);
+  border-bottom: 1px solid var(--welcome-rule);
+}
+
+[data-theme] .welcome-suggest-btn {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-content: start;
+  min-height: 118px;
+  padding: 18px 20px 20px 0;
+  border: 0;
+  border-right: 1px solid var(--welcome-rule-soft);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  transform: none;
+  animation: welcome-index-enter 560ms var(--ease-fluid) both;
+}
+
+[data-theme] .welcome-suggest-btn:nth-child(2) {
+  padding-left: 20px;
+  animation-delay: 55ms;
+}
+
+[data-theme] .welcome-suggest-btn:nth-child(3) {
+  padding-left: 20px;
+  border-right: 0;
+  animation-delay: 110ms;
+}
+
+[data-theme] .welcome-suggest-btn::before {
+  grid-column: 1 / -1;
+  margin-bottom: 22px;
+  color: var(--accent);
+  font: 600 9px/1 var(--font-mono);
+  letter-spacing: 0.12em;
+}
+
+[data-theme] .welcome-suggest-btn:nth-child(1)::before { content: "01 / CREATE"; }
+[data-theme] .welcome-suggest-btn:nth-child(2)::before { content: "02 / BUILD"; }
+[data-theme] .welcome-suggest-btn:nth-child(3)::before { content: "03 / REPAIR"; }
+
+[data-theme] .welcome-suggest-icon-wrap {
+  display: none;
+}
+
+[data-theme] .welcome-suggest-text {
+  grid-column: 1;
+  transition: transform 240ms var(--ease-fluid);
+}
+
+[data-theme] .welcome-suggest-go {
+  position: static;
+  grid-column: 2;
+  grid-row: 2;
+  align-self: start;
+  opacity: 0.32;
+  transform: none;
+}
+
+[data-theme] .welcome-suggest-btn:hover {
+  border-color: var(--welcome-rule-soft);
+  background: linear-gradient(to bottom, var(--welcome-hover-field), transparent);
+  box-shadow: none;
+  transform: none;
+}
+
+[data-theme] .welcome-suggest-btn:hover .welcome-suggest-text {
+  transform: translateX(4px);
+}
+
+[data-theme] .welcome-suggest-btn:hover .welcome-suggest-go {
+  color: var(--accent);
+  opacity: 1;
+  transform: translateX(3px);
+}
+
+[data-theme] .welcome-blobs {
+  --wb-strength: 1;
+  opacity: 1;
+  background:
+    radial-gradient(circle at 15% 16%, var(--welcome-field-a), transparent 30%),
+    radial-gradient(circle at 86% 78%, var(--welcome-field-b), transparent 28%);
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+
+[data-theme] .welcome-blobs :is(.wb-blob, .wb-pillars, .wb-soften, .wb-noise) {
+  display: none;
+}
+
+@keyframes welcome-index-enter {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (max-width: 1100px) and (min-width: 601px) {
+  [data-theme] .welcome-screen {
+    padding-inline: 34px;
+  }
+
+  [data-theme] .welcome-content {
+    --welcome-logo-column: 64px;
+  }
+}
+
+@media (max-width: 600px) {
+  [data-theme] .welcome-screen {
+    justify-content: flex-start;
+    padding: 54px 24px 150px;
+  }
+
+  [data-theme] .welcome-content {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "logo"
+      "title"
+      "subtitle"
+      "suggestions";
+    max-width: 440px;
+  }
+
+  [data-theme] .welcome-logo-wrap {
+    width: 46px;
+    height: 46px;
+    margin: 0 0 28px 8px;
+  }
+
+  [data-theme] .welcome-title {
+    margin-bottom: 16px;
+    font-size: clamp(42px, 14vw, 58px);
+  }
+
+  [data-theme] .welcome-subtitle {
+    margin-bottom: 30px;
+  }
+
+  [data-theme] .welcome-suggestions {
+    grid-template-columns: 1fr;
+    border-bottom: 0;
+  }
+
+  [data-theme] .welcome-suggest-btn,
+  [data-theme] .welcome-suggest-btn:nth-child(2),
+  [data-theme] .welcome-suggest-btn:nth-child(3) {
+    min-height: 92px;
+    padding: 14px 4px;
+    border-right: 0;
+    border-bottom: 1px solid var(--welcome-rule-soft);
+  }
+
+  [data-theme] .welcome-suggest-btn::before {
+    margin-bottom: 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme] .welcome-content,
+  [data-theme] .welcome-suggest-btn {
+    animation: none;
+  }
+}

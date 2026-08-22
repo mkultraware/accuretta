@@ -104,7 +104,7 @@ Accuretta also records verification debt. A file edit adds the path to the task'
 
 ## Approvals and audit records
 
-Reads can run without stopping the conversation. File writes, shell commands, Git changes, desktop input, remote changes, and MCP calls pass through an approval card unless you have explicitly trusted that action.
+Reads can run without stopping the conversation. Raw Windows or WSL shell commands, project test commands, and persistent host-session input always require a fresh approval. File writes, Git changes, desktop input, remote changes, and MCP calls follow the selected access mode unless the operation has a stricter gate.
 
 Approved actions write a bounded record to `data/action_audit.jsonl`. It stores the tool, target, time, outcome, authorization identity, and hashes of the arguments and result. It does not copy prompts, commands, typed text, or tool output into the audit file.
 
@@ -166,7 +166,7 @@ File analysis covers:
 - YARA scans with bundled or supplied rules
 - optional Ghidra decompilation through `pyghidra`
 
-The optional WSL2 sandbox runs tools and unpacks suspicious samples inside an Ubuntu guest. The workspace can be mounted into the guest, while the Windows host stays outside that kernel.
+The optional WSL2 guest runs Linux tools inside a separate Ubuntu distro. Accuretta disables Windows executable interop and verifies that setting before each command. This is convenience isolation, not malware containment: mounted paths under `/mnt` are real Windows files, network traffic still leaves through the PC, and commands run as guest root. Never execute an unknown sample there; use a disposable virtual machine with no host mounts for hostile code.
 
 ## Persistent shells, desktop tools, and MCP
 
