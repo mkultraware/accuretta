@@ -39,6 +39,7 @@ import base64 as _b64
 import io as _io
 import ipaddress
 import hashlib
+import gzip
 import socket
 import struct
 import ssl
@@ -239,6 +240,7 @@ WORKSPACE_FILE = DATA / "workspace.json"
 SAVINGS_FILE = DATA / "savings.json"
 MODEL_RUNTIME_FILE = DATA / "model_runtime_profiles.json"
 MODEL_DATASET_FILE = DATA / "model_usage_dataset.jsonl"   # append-only, content-free turn/tool log (gitignored via data/)
+UPDATE_CHECK_FILE = DATA / "update_check.json"
 SYSTEM_CONTEXT_FILE = DATA / "ACCURETTA.md"
 MEMORIES_FILE = DATA / "memories.jsonl"
 MEMORIES_MAX_INJECT = 15          # how many to load into every system prompt
@@ -643,6 +645,163 @@ def save_json(path: Path, value: Any) -> None:
         _write_json_atomic_unlocked(path, value)
 
 
+# ---- public release checks -------------------------------------------------
+# This is intentionally anonymous. One bridge instance checks GitHub and every
+# browser connected to it reads the same cached result.
+_UPDATE_CHECK_LOCK = threading.Lock()
+_UPDATE_AUTO_TTL_S = 12 * 60 * 60
+_UPDATE_MANUAL_COOLDOWN_S = 5 * 60
+_UPDATE_ERROR_RETRY_S = 30 * 60
+_UPDATE_REPO = "mkultraware/accuretta"
+_UPDATE_API_URL = f"https://api.github.com/repos/{_UPDATE_REPO}/releases/latest"
+_UPDATE_RELEASES_URL = f"https://github.com/{_UPDATE_REPO}/releases/latest"
+
+
+def _app_version() -> str:
+    """Read the visible app version so the splash/UI remains the source."""
+    try:
+        html = (ROOT / "index.html").read_text(encoding="utf-8")
+        match = re.search(r'id=["\']brand-v["\'][^>]*>\s*v?([^<\s]+)', html)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return "0.0.0"
+
+
+def _version_key(value: str) -> tuple:
+    """Comparable SemVer-like key. Stable releases sort after prereleases."""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)(?:[-+]([^\s]+))?", str(value or ""))
+    if not match:
+        return (0, 0, 0, 0, "")
+    major, minor, patch = (int(match.group(i)) for i in range(1, 4))
+    prerelease = match.group(4) or ""
+    return (major, minor, patch, 1 if not prerelease else 0, prerelease)
+
+
+def _release_summary(body: str, name: str, tag: str) -> str:
+    """Return one short plain-text line from GitHub release notes."""
+    for raw in str(body or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "![", "<!--")):
+            continue
+        line = re.sub(r"^[-*+]\s+", "", line)
+        line = re.sub(r"\[([^]]+)]\([^)]+\)", r"\1", line)
+        line = re.sub(r"[`*_~>]", "", line).strip()
+        if line:
+            return line[:177].rstrip() + ("..." if len(line) > 177 else "")
+    clean_name = str(name or "").strip()
+    if clean_name and clean_name.lower() != str(tag or "").strip().lower():
+        return clean_name[:180]
+    return "A new Accuretta release is ready."
+
+
+def _update_response(cache: dict, *, cached: bool, now: float) -> dict:
+    current = _app_version()
+    release = cache.get("release") if isinstance(cache.get("release"), dict) else None
+    latest = (release or {}).get("version") or ""
+    return {
+        "ok": not bool(cache.get("error")),
+        "current_version": current,
+        "available": bool(release and _version_key(latest) > _version_key(current)),
+        "release": release,
+        "cached": cached,
+        "checked_at": int(cache.get("checked_at") or 0),
+        "next_check_at": int(cache.get("next_allowed_at") or 0),
+        "rate_limited": bool(cache.get("rate_limited")),
+        "error": str(cache.get("error") or ""),
+        "server_time": int(now),
+    }
+
+
+def app_update_status(manual: bool = False, now: float | None = None) -> dict:
+    """Check the latest public GitHub release with a durable rate-safe cache."""
+    now = float(time.time() if now is None else now)
+    with _UPDATE_CHECK_LOCK:
+        cache = load_json(UPDATE_CHECK_FILE, {})
+        if not isinstance(cache, dict):
+            cache = {}
+
+        next_allowed = float(cache.get("next_allowed_at") or 0)
+        if next_allowed > now:
+            return _update_response(cache, cached=True, now=now)
+
+        last_request = float(cache.get("last_request_at") or 0)
+        checked_at = float(cache.get("checked_at") or 0)
+        if manual and last_request and now - last_request < _UPDATE_MANUAL_COOLDOWN_S:
+            return _update_response(cache, cached=True, now=now)
+        if not manual and checked_at and now - checked_at < _UPDATE_AUTO_TTL_S:
+            return _update_response(cache, cached=True, now=now)
+
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"Accuretta/{_app_version()}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if cache.get("etag"):
+            headers["If-None-Match"] = str(cache["etag"])
+        request = urllib.request.Request(_UPDATE_API_URL, headers=headers)
+        cache["last_request_at"] = int(now)
+        try:
+            with urllib.request.urlopen(request, timeout=6.0) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                tag = str(payload.get("tag_name") or "").strip()
+                version_match = re.search(r"\d+\.\d+\.\d+(?:[-+][^\s]+)?", tag)
+                if not version_match:
+                    raise ValueError("latest release has no valid version tag")
+                version = version_match.group(0)
+                release_url = str(payload.get("html_url") or "")
+                expected_prefix = f"https://github.com/{_UPDATE_REPO}/releases/"
+                if not release_url.startswith(expected_prefix):
+                    release_url = _UPDATE_RELEASES_URL
+                cache.update({
+                    "checked_at": int(now),
+                    "next_allowed_at": 0,
+                    "rate_limited": False,
+                    "error": "",
+                    "etag": response.headers.get("ETag") or "",
+                    "release": {
+                        "version": version,
+                        "tag": tag,
+                        "name": str(payload.get("name") or tag)[:180],
+                        "summary": _release_summary(payload.get("body") or "", payload.get("name") or "", tag),
+                        "url": release_url,
+                        "published_at": str(payload.get("published_at") or ""),
+                    },
+                })
+        except urllib.error.HTTPError as exc:
+            if exc.code == 304 and cache.get("release"):
+                cache.update({"checked_at": int(now), "next_allowed_at": 0,
+                              "rate_limited": False, "error": ""})
+            elif exc.code == 404:
+                # A valid public repository with no published release yet.
+                cache.update({"checked_at": int(now), "next_allowed_at": 0,
+                              "rate_limited": False, "error": "", "release": None})
+            elif exc.code in (403, 429):
+                retry_after = exc.headers.get("Retry-After")
+                reset_at = exc.headers.get("X-RateLimit-Reset")
+                try:
+                    blocked_until = now + max(1, int(retry_after)) if retry_after else float(reset_at or 0)
+                except (TypeError, ValueError):
+                    blocked_until = 0
+                if blocked_until <= now:
+                    blocked_until = now + 60 * 60
+                cache.update({
+                    "next_allowed_at": int(blocked_until),
+                    "rate_limited": True,
+                    "error": "GitHub rate limit reached",
+                })
+            else:
+                cache.update({"next_allowed_at": int(now + _UPDATE_ERROR_RETRY_S),
+                              "rate_limited": False, "error": f"GitHub returned {exc.code}"})
+        except Exception as exc:
+            cache.update({"next_allowed_at": int(now + _UPDATE_ERROR_RETRY_S),
+                          "rate_limited": False, "error": str(exc)[:180]})
+
+        save_json(UPDATE_CHECK_FILE, cache)
+        return _update_response(cache, cached=False, now=now)
+
+
 # ---- lifetime savings counters --------------------------------------------
 # The "saved vs cloud" card totals every token this machine has run so users can
 # watch months of savings add up. That number must NOT live in the browser
@@ -1025,6 +1184,157 @@ def _model_runtime_profiles() -> dict:
                 advice.append("Tool errors are elevated; inspect capability health and action outcomes before changing model settings.")
         row["advice"] = advice
     return out
+
+
+def _usage_stats() -> dict:
+    """Return content-free aggregates for the local Usage stats page."""
+    settings = get_settings()
+    telemetry_enabled = bool(settings.get("passive_model_telemetry", True))
+    profiles = _model_runtime_profiles().get("models") or {}
+    models = []
+    for name, row in profiles.items():
+        if not isinstance(row, dict):
+            continue
+        turns = max(0, int(row.get("turns", 0) or 0))
+        if turns < 1:
+            continue
+        observed = row.get("observed") or _model_observed(row)
+        calls = max(0, int(row.get("tool_calls", 0) or 0))
+        completion = float(observed.get("completion_rate", 0) or 0)
+        tool_success = (1.0 - float(observed.get("tool_error_rate", 0) or 0)) if calls else None
+        reliability = completion if tool_success is None else completion * 0.65 + tool_success * 0.35
+        models.append({
+            "model": str(name)[:180],
+            "turns": turns,
+            "completed_turns": max(0, int(row.get("completed_turns", 0) or 0)),
+            "completion_rate": round(completion, 3),
+            "tool_calls": calls,
+            "tool_success": round(tool_success, 3) if tool_success is not None else None,
+            "output_tok_s": float(observed.get("output_tok_s", 0) or 0),
+            "avg_elapsed_ms": round(max(0.0, float(row.get("elapsed_s", 0) or 0)) * 1000 / turns, 1),
+            "compactions": max(0, int(observed.get("compactions", 0) or 0)),
+            "reliability": round(reliability, 3),
+            "confidence": "high" if turns >= 25 else "medium" if turns >= 8 else "warming_up",
+            "ranked": turns >= 5,
+        })
+    models.sort(key=lambda item: (item["ranked"], item["reliability"], item["turns"]), reverse=True)
+
+    chat_data = get_chats()
+    chat_titles = {}
+    repo_keys = set()
+    repo_names = set()
+    repo_sessions = 0
+    for chat_id, chat in (chat_data.get("chats") or {}).items():
+        if not isinstance(chat, dict):
+            continue
+        session = hashlib.sha256(str(chat_id).encode("utf-8")).hexdigest()[:12]
+        chat_titles[session] = str(chat.get("title") or "Untitled task")[:180]
+        worktree = chat.get("github_worktree")
+        if not isinstance(worktree, dict):
+            continue
+        owner = str(worktree.get("owner") or "").strip()
+        repo = str(worktree.get("repo") or "").strip()
+        if not repo:
+            continue
+        key = f"{owner}/{repo}" if owner else repo
+        repo_keys.add(key.casefold())
+        repo_names.add(key)
+        repo_sessions += 1
+
+    daily = {}
+    longest = None
+    dataset_turns = 0
+    dataset_input = 0
+    dataset_output = 0
+    dataset_elapsed = 0.0
+    try:
+        with open(MODEL_DATASET_FILE, "r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                day = str(item.get("day") or "")[:10]
+                prompt = max(0, int(item.get("prompt_tokens", 0) or 0))
+                output = max(0, int(item.get("output_tokens", 0) or 0))
+                elapsed = max(0.0, float(item.get("elapsed_ms", 0) or 0))
+                dataset_turns += 1
+                dataset_input += prompt
+                dataset_output += output
+                dataset_elapsed += elapsed
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+                    bucket = daily.setdefault(day, {"day": day, "turns": 0, "tokens": 0, "elapsed_ms": 0.0})
+                    bucket["turns"] += 1
+                    bucket["tokens"] += prompt + output
+                    bucket["elapsed_ms"] += elapsed
+                if longest is None or elapsed > longest["elapsed_ms"]:
+                    session = str(item.get("session") or "")[:16]
+                    longest = {
+                        "elapsed_ms": round(elapsed, 1),
+                        "model": str(item.get("model") or "Unknown model")[:180],
+                        "day": day,
+                        "title": chat_titles.get(session) or "Chat no longer available",
+                        "chat_available": session in chat_titles,
+                    }
+    except (FileNotFoundError, OSError):
+        pass
+
+    today = datetime.date.today()
+    chart_days = []
+    for offset in range(29, -1, -1):
+        day = (today - datetime.timedelta(days=offset)).isoformat()
+        bucket = daily.get(day) or {"day": day, "turns": 0, "tokens": 0, "elapsed_ms": 0.0}
+        chart_days.append({**bucket, "elapsed_ms": round(float(bucket["elapsed_ms"]), 1)})
+
+    fold = {"attempts": 0, "successful": 0, "failed": 0, "skipped": 0,
+            "folded_messages": 0, "folded_tokens": 0}
+    benign = {"tail_too_small", "no_messages", "already_compacted", "below_threshold", "busy"}
+    try:
+        with open(FOLD_EVENTS_FILE, "r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                fold["attempts"] += 1
+                if item.get("ok"):
+                    fold["successful"] += 1
+                    fold["folded_messages"] += max(0, int(item.get("folded", 0) or 0))
+                    fold["folded_tokens"] += max(0, int(item.get("folded_tokens", 0) or 0))
+                elif str(item.get("outcome") or "") in benign:
+                    fold["skipped"] += 1
+                else:
+                    fold["failed"] += 1
+    except (FileNotFoundError, OSError):
+        pass
+
+    savings = _savings_get()
+    return {
+        "generated_at": int(time.time()),
+        "telemetry_enabled": telemetry_enabled,
+        "privacy": "Local aggregate counters only. Prompts, replies, paths and tool results are not included.",
+        "models": models,
+        "daily": chart_days,
+        "totals": {
+            "turns": max(dataset_turns, max(0, int(savings.get("turns", 0) or 0))),
+            "input_tokens": max(dataset_input, max(0, int(savings.get("tok_in", 0) or 0))),
+            "output_tokens": max(dataset_output, max(0, int(savings.get("tok_out", 0) or 0))),
+            "elapsed_ms": round(dataset_elapsed, 1),
+            "since": max(0, int(savings.get("since", 0) or 0)),
+        },
+        "savings": savings,
+        "compression": fold,
+        "repos": {
+            "unique": len(repo_keys),
+            "sessions": repo_sessions,
+            "names": sorted(repo_names, key=str.casefold)[:12],
+        },
+        "longest": longest,
+    }
 
 
 def _advisor_suggest_settings(settings: dict, observed: dict) -> dict:
@@ -26319,11 +26629,13 @@ MIME = {
     ".md": "text/markdown; charset=utf-8",
     ".txt": "text/plain; charset=utf-8",
     ".ico": "image/x-icon",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
     ".webmanifest": "application/manifest+json",
 }
 
 STATIC_WHITELIST = {
-    "index.html", "app.js", "app.css", "colors_and_type.css",
+    "index.html", "app.js", "app.css", "colors_and_type.css", "signal-field.js",
     # legacy logo file kept around so older clients / cached HTML still resolve
     "logo-mark.png", "black.png",
     # new brand assets — see index.html <link rel="..."> tags
@@ -26331,6 +26643,8 @@ STATIC_WHITELIST = {
     "favicon.png", "favicon-32.png",
     "apple-touch-icon.png",
     "app-icon-192.png", "app-icon-512.png",
+    "notification.mp3",
+    "notification-error.wav",
     "manifest.webmanifest",
 }
 
@@ -26409,17 +26723,16 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _send_bytes(self, status: int, data: bytes, ctype: str, extra_headers: dict | None = None):
+        headers = dict(extra_headers or {})
+        cache_control = headers.pop("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-        self.send_header("Pragma", "no-cache")
-        if extra_headers:
-            for k, v in extra_headers.items():
-                # Cache-Control passed via extra_headers takes precedence — overwrite
-                if k.lower() == "cache-control":
-                    continue
-                self.send_header(k, v)
+        self.send_header("Cache-Control", cache_control)
+        if "no-cache" in cache_control or "no-store" in cache_control:
+            self.send_header("Pragma", "no-cache")
+        for k, v in headers.items():
+            self.send_header(k, v)
         self._set_cors()
         self.end_headers()
         try:
@@ -26456,7 +26769,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_api_get(p, parsed)
             name = p.lstrip("/")
             if name in STATIC_WHITELIST or name.startswith("accuMOTION/"):
-                return self._serve_static(name)
+                return self._serve_static(name, versioned=bool(parsed.query))
             return self._send_json(404, {"error": "not found"})
         except Exception as e:
             traceback.print_exc()
@@ -26519,13 +26832,36 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self._send_json(500, {"error": str(e)})
 
-    def _serve_static(self, name: str):
+    def _serve_static(self, name: str, *, versioned: bool = False):
         full = ROOT / name
         if not full.is_file():
             return self._send_json(404, {"error": f"missing: {name}"})
+        stat = full.stat()
+        source_etag = f'{stat.st_mtime_ns:x}-{stat.st_size:x}'
+        cache_control = ("no-cache, must-revalidate" if name == "index.html"
+                         else ("public, max-age=31536000, immutable" if versioned
+                               else "public, max-age=3600, must-revalidate"))
         data = full.read_bytes()
         ctype = MIME.get(full.suffix, "application/octet-stream")
-        self._send_bytes(200, data, ctype)
+        accepts_gzip = "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
+        compressible = full.suffix.lower() in {
+            ".html", ".js", ".css", ".json", ".svg", ".md", ".txt", ".webmanifest"
+        }
+        encoded = accepts_gzip and compressible and len(data) >= 256
+        if encoded:
+            data = gzip.compress(data, compresslevel=6)
+        etag = f'"{source_etag}{"-gz" if encoded else ""}"'
+        headers = {"Cache-Control": cache_control, "ETag": etag, "Vary": "Accept-Encoding"}
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self._set_cors()
+            self.end_headers()
+            return
+        if encoded:
+            headers["Content-Encoding"] = "gzip"
+        self._send_bytes(200, data, ctype, extra_headers=headers)
 
     # ---- API routes
 
@@ -26587,10 +26923,14 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "llama": LLAMA,
                 "vision_llama": VISION_LLAMA,
-                "llama_up": llama_ping(timeout=1.0),
+                "llama_up": llama_ready(timeout=1.0),
                 # legacy alias so older frontend builds don't break
                 "ollama": LLAMA,
             })
+        if p == "/api/app-update":
+            qs = urllib.parse.parse_qs(parsed.query)
+            manual = (qs.get("manual") or [""])[0] == "1"
+            return self._send_json(200, app_update_status(manual=manual))
         if p == "/api/llama-log":
             # Live tail of the llama.cpp backend's stdout/stderr — powers the
             # Backend terminal tab so model loads/reloads show real progress.
@@ -26668,6 +27008,8 @@ class Handler(BaseHTTPRequestHandler):
             # Lifetime token totals for the "saved vs cloud" card. Server-side so
             # it survives restarts and follows the machine, not the browser.
             return self._send_json(200, _savings_get())
+        if p == "/api/usage-stats":
+            return self._send_json(200, _usage_stats())
         if p == "/api/workspace":
             return self._send_json(200, get_workspace())
         if p == "/api/workspace/files":
@@ -27345,11 +27687,10 @@ class Handler(BaseHTTPRequestHandler):
             chat_id = body.get("id") or uuid.uuid4().hex[:12]
             chats = get_chats()
             if chat_id not in chats["chats"]:
-                # `origin` records where the session was started — "mobile" or
-                # "desktop". The chat list uses it to swap in a phone icon for
-                # mobile-born sessions so you can spot them at a glance.
+                # `origin` records where the session was started. The chat list
+                # uses it to distinguish mobile and GitHub worktree sessions.
                 origin = (body.get("origin") or "desktop").strip().lower()
-                if origin not in ("mobile", "desktop"):
+                if origin not in ("mobile", "desktop", "github"):
                     origin = "desktop"
                 record = {
                     "id": chat_id,
@@ -31210,7 +31551,8 @@ class LlamaProcess:
             return {"ok": True, "pid": p.pid, "model": model_path,
                     "ready": False, "mmproj": mmproj_path,
                     "vision_capable": bool(mmproj_path)}
-        if wait_for_llama(wait_seconds):
+        base_url = f"http://127.0.0.1:{port}"
+        if wait_for_llama(wait_seconds, base_url=base_url):
             return {"ok": True, "pid": p.pid, "model": model_path,
                     "ready": True, "mmproj": mmproj_path,
                     "vision_capable": bool(mmproj_path)}
@@ -31229,6 +31571,7 @@ _vision_llama = LlamaProcess()
 
 
 def llama_ping(timeout: float = 2.0, base_url: str = None) -> bool:
+    """Return whether a llama-server process is answering HTTP requests."""
     if base_url is None:
         base_url = LLAMA
     try:
@@ -31239,21 +31582,49 @@ def llama_ping(timeout: float = 2.0, base_url: str = None) -> bool:
         return False
 
 
+def llama_ready(timeout: float = 2.0, base_url: str = None) -> bool:
+    """Return true only after llama.cpp reports that model loading is done."""
+    if base_url is None:
+        base_url = LLAMA
+    try:
+        with urllib.request.urlopen(f"{base_url}/health", timeout=timeout) as response:
+            payload = response.read(1024)
+            if response.status != 200:
+                return False
+            if not payload:
+                return True
+            try:
+                status = str(json.loads(payload.decode("utf-8")).get("status") or "").lower()
+            except Exception:
+                return True
+            return status in {"", "ok", "ready"}
+    except urllib.error.HTTPError as exc:
+        # Older llama.cpp builds did not expose /health. Their model-list
+        # endpoint is the best readiness signal available.
+        if exc.code == 404:
+            return llama_ping(timeout=timeout, base_url=base_url)
+        return False
+    except Exception:
+        return False
 
 
-def wait_for_llama(wait_seconds: int = 30) -> bool:
+
+
+def wait_for_llama(wait_seconds: int = 30, base_url: str = None) -> bool:
     """Poll llama-server up to wait_seconds. Returns True once it's up."""
-    if llama_ping():
+    if base_url is None:
+        base_url = LLAMA
+    if llama_ready(base_url=base_url):
         return True
     t0 = time.time()
     printed = False
     while time.time() - t0 < wait_seconds:
         time.sleep(0.6)
-        if llama_ping(timeout=1.5):
+        if llama_ready(timeout=1.5, base_url=base_url):
             print(f"  llama-server up in {time.time() - t0:.1f}s")
             return True
         if not printed and time.time() - t0 > 2:
-            print(f"  waiting for llama-server at {LLAMA} ...")
+            print(f"  waiting for llama-server at {base_url} ...")
             printed = True
     return False
 
@@ -31794,40 +32165,48 @@ def main():
             pass
     threading.Thread(target=_open_browser, daemon=True).start()
 
-    # workspace file watcher — polls every 5s, emits workspace:update on changes
-    _ws_snapshot: dict[str, float] = {}  # path -> mtime
+    # Lightweight fallback watcher. os.walk uses scandir and prunes dependency,
+    # VCS and build trees before entering them, avoiding a full workspace rglob.
+    _ws_snapshot: dict[str, tuple[float, int]] = {}
+    _ws_skip_dirs = {
+        ".git", ".hg", ".svn", ".idea", ".vscode", "node_modules",
+        "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+        ".venv", "venv", ".tox", "dist", "build", ".next", ".nuxt",
+        ".cache", "coverage", "target",
+    }
+
     def _workspace_watcher():
-        import hashlib
         while True:
-            time.sleep(5)
+            time.sleep(8)
             try:
                 ws = get_workspace()
                 folders = ws.get("folders") or []
-                current: dict[str, float] = {}
+                current: dict[str, tuple[float, int]] = {}
                 changed = False
                 for f in folders:
                     p = Path(f)
                     if not p.is_dir():
                         continue
-                    for fp in p.rglob("*"):
-                        if not fp.is_file():
-                            continue
-                        # skip hidden / build noise
-                        name = fp.name.lower()
-                        if name.startswith(".") or name.endswith((".pyc", ".log")):
-                            continue
-                        try:
-                            mt = fp.stat().st_mtime
-                        except Exception:
-                            continue
-                        current[str(fp)] = mt
-                        if str(fp) not in _ws_snapshot or abs(_ws_snapshot[str(fp)] - mt) > 0.5:
-                            changed = True
+                    for dirpath, dirnames, filenames in os.walk(p):
+                        dirnames[:] = [d for d in dirnames
+                                       if not d.startswith(".") and d.lower() not in _ws_skip_dirs]
+                        for filename in filenames:
+                            name = filename.lower()
+                            if name.startswith(".") or name.endswith((".pyc", ".log")):
+                                continue
+                            fp = Path(dirpath) / filename
+                            try:
+                                stat = fp.stat()
+                            except Exception:
+                                continue
+                            key = str(fp)
+                            fingerprint = (stat.st_mtime, stat.st_size)
+                            current[key] = fingerprint
+                            if _ws_snapshot.get(key) != fingerprint:
+                                changed = True
                 # removed files
-                for k in _ws_snapshot:
-                    if k not in current:
-                        changed = True
-                        break
+                if not changed and _ws_snapshot.keys() != current.keys():
+                    changed = True
                 _ws_snapshot.clear()
                 _ws_snapshot.update(current)
                 if changed:

@@ -25,7 +25,7 @@
     document.documentElement.setAttribute('data-theme', theme);
   })();
 </script>
-  <link rel="stylesheet" href="/app.css?v=55">
+<link rel="stylesheet" href="/app.css?v=66">
 <script src="https://unpkg.com/@phosphor-icons/web"></script>
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js?v=2" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js?v=2" defer></script>
@@ -43,7 +43,6 @@
 <body>
 
 <div class="app preview-collapsed" id="app">
-
   <!-- ====== LEFT SIDEBAR (desktop) / MOBILE SESSIONS SCREEN ====== -->
   <aside class="sidebar" id="sidebar">
     <div class="brand">
@@ -59,7 +58,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.7.6</span>
+        <span class="v" id="brand-v">v0.7.7</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -139,7 +138,7 @@
           <span class="tok-total" id="tok-total" title="Total generated tokens this session">0 tok</span>
           <div class="side-socials" aria-label="Social links">
             <a class="side-social" href="https://huggingface.co/" target="_blank" rel="noopener noreferrer" title="You can download local models here" aria-label="Hugging Face">
-              <svg viewBox="0 0 120 120" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M37.5 55c-3.3 0-6-2.7-6-6s2.7-6 6-6 6 2.7 6 6-2.7 6-6 6zm45 0c-3.3 0-6-2.7-6-6s2.7-6 6-6 6 2.7 6 6-2.7 6-6 6zM60 3C28.5 3 3 28.5 3 60s25.5 57 57 57 57-25.5 57-57S91.5 3 60 3zm0 104c-25.9 0-47-21.1-47-47S34.1 13 60 13s47 21.1 47 47-21.1 47-47 47zm24.5-32.5c-2.8 4.8-8 12.5-24.5 12.5s-21.7-7.7-24.5-12.5c-1.1-1.9.4-4.2 2.6-4 6.2.6 13.1 2 21.9 2s15.7-1.4 21.9-2c2.2-.2 3.7 2.1 2.6 4z"/></svg>
+              <svg class="hf-mark" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.9 11.1c0 3.8-2.6 6.7-5.9 6.7s-5.9-2.9-5.9-6.7V8.8c0-3.2 2.3-5.6 5.9-5.6s5.9 2.4 5.9 5.6z"/><circle cx="9.6" cy="9.5" r=".75" fill="currentColor" stroke="none"/><circle cx="14.4" cy="9.5" r=".75" fill="currentColor" stroke="none"/><path d="M9.2 12.7c.8.8 1.7 1.2 2.8 1.2s2-.4 2.8-1.2"/><path d="M6.4 12.5c-1.1-.1-2.1-.8-2.7-1.8-.4-.7-1.3-.9-1.9-.4-.5.4-.6 1.1-.3 1.7 1 1.9 2.7 3.2 4.7 3.5"/><path d="M17.6 12.5c1.1-.1 2.1-.8 2.7-1.8.4-.7 1.3-.9 1.9-.4.5.4.6 1.1.3 1.7-1 1.9-2.7 3.2-4.7 3.5"/><path d="M3.2 10.4 2.7 8.9M4.7 10.6 4.6 8.8M20.8 10.4l.5-1.5M19.3 10.6l.1-1.8"/></svg>
             </a>
             <a class="side-social" href="https://x.com/NoJetsNextDoor" target="_blank" rel="noopener noreferrer" title="@NoJetsNextDoor on X" aria-label="X / Twitter">
               <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
@@ -152,6 +151,7 @@
         <div class="side-foot-actions" style="display: flex; gap: 8px; align-items: center; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-muted);">
           <button class="iconbtn" id="btn-theme-side" title="Cycle theme"><i class="ph ph-sparkle" id="btn-theme-side-icon"></i></button>
           <button class="iconbtn" id="btn-faq" title="FAQ / About"><i class="ph ph-question"></i></button>
+          <button class="iconbtn" id="btn-usage-stats" title="Usage stats"><i class="ph ph-chart-line-up"></i></button>
           <span class="grow"></span>
           <button class="iconbtn" id="btn-settings" title="Settings"><i class="ph ph-gear-six"></i></button>
           <button class="iconbtn" id="btn-shutdown-side" title="Shutdown"><i class="ph ph-power"></i></button>
@@ -159,6 +159,25 @@
       </div>
     </div>
   </aside>
+
+  <section class="app-update-card" id="app-update-card" aria-live="polite" aria-label="Accuretta update available" hidden>
+    <div class="app-update-head">
+      <span class="app-update-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3v11"></path><path d="m8 10 4 4 4-4"></path><path d="M5 16.5v2A2.5 2.5 0 0 0 7.5 21h9a2.5 2.5 0 0 0 2.5-2.5v-2"></path>
+        </svg>
+      </span>
+      <div class="app-update-title-wrap">
+        <span class="app-update-kicker">Update available</span>
+        <strong id="app-update-title">Accuretta update</strong>
+      </div>
+      <button class="app-update-dismiss" id="app-update-dismiss" type="button" title="Dismiss this version" aria-label="Dismiss this update"><i class="ph ph-x"></i></button>
+    </div>
+    <p class="app-update-summary" id="app-update-summary">A new release is ready.</p>
+    <a class="app-update-link" id="app-update-link" href="https://github.com/mkultraware/accuretta/releases/latest" target="_blank" rel="noopener noreferrer">
+      <span>View update</span><i class="ph ph-arrow-up-right" aria-hidden="true"></i>
+    </a>
+  </section>
 
   <button class="pull-tab-left" id="pull-tab-left" title="Open sidebar"><i class="ph ph-caret-right"></i></button>
 
@@ -196,6 +215,7 @@
       <button class="mm-item" type="button" role="menuitem" data-mm="theme"><i class="ph ph-moon"></i><span id="mm-theme-label">Dark mode</span></button>
       <button class="mm-item" type="button" role="menuitem" data-mm="target"><i class="ph ph-device-mobile"></i><span id="mm-target-label">Command target</span></button>
       <button class="mm-item" type="button" role="menuitem" data-mm="github"><i class="ph ph-git-branch"></i>GitHub activity</button>
+      <button class="mm-item" type="button" role="menuitem" data-mm="usage"><i class="ph ph-chart-line-up"></i>Usage stats</button>
       <button class="mm-item" type="button" role="menuitem" data-mm="history"><i class="ph ph-terminal-window"></i>Command history</button>
       <div class="mm-sep"></div>
       <button class="mm-item" type="button" role="menuitem" data-mm="chat"><i class="ph ph-chats-circle"></i>Chat</button>
@@ -223,8 +243,8 @@
       </div>
 
       <div class="composer-wrap">
+        <div class="revealer-deck" id="revealer-deck" role="status" aria-live="polite" aria-relevant="additions text"></div>
         <div class="composer">
-          <div class="revealer-deck" id="revealer-deck"></div>
           <div class="composer-tools">
             <div class="mode-control" id="composer-mode-control">
               <button class="mode-pill" id="composer-mode-pill" type="button" aria-haspopup="menu" aria-controls="composer-mode-menu" aria-expanded="false" aria-label="Composer mode: Auto" title="Choose how Accuretta handles the next message">
@@ -440,6 +460,31 @@
     <button class="mobile-tab" data-mtab="settings"><i class="ph ph-gear-six"></i><span>Settings</span></button>
   </nav>
 </div>
+
+<!-- ====== USAGE STATS PAGE ====== -->
+<section class="usage-page" id="usage-page" aria-hidden="true" aria-labelledby="usage-title">
+  <header class="usage-page-head">
+    <button class="usage-back" id="btn-close-usage" type="button" aria-label="Back to chat"><i class="ph ph-arrow-left"></i><span>Back</span></button>
+    <div>
+      <span class="usage-eyebrow">Local telemetry</span>
+      <h1 id="usage-title">Usage stats</h1>
+    </div>
+    <button class="usage-refresh" id="btn-refresh-usage" type="button" title="Refresh usage stats"><span>Refresh</span><i class="ph ph-arrow-clockwise"></i></button>
+  </header>
+  <div class="usage-page-scroll">
+    <div class="usage-shell">
+      <section class="usage-hero" aria-label="Accuretta usage mark">
+        <canvas id="usage-mark" width="696" height="360" aria-hidden="true"></canvas>
+        <p>What your local models have actually done.</p>
+        <span id="usage-range">Loading local counters…</span>
+      </section>
+      <div id="usage-content" class="usage-content" aria-live="polite">
+        <div class="usage-loading"><i class="ph ph-circle-notch"></i><span>Reading local stats</span></div>
+      </div>
+      <footer class="usage-privacy"><i class="ph ph-lock-key"></i><span id="usage-privacy">Aggregate counters stay on this machine.</span></footer>
+    </div>
+  </div>
+</section>
 
 <!-- ====== SHUTDOWN MODAL ====== -->
 <div class="modal-scrim" id="shutdown-scrim"></div>
@@ -935,7 +980,7 @@
 
     <div class="form-group">Notifications</div>
     <div class="form-row">
-      <span class="hint">a soft chime when the agent needs your approval, and when a longer task (20s+) finishes. off = silent.</span>
+      <span class="hint">plays your notification sound when the agent needs approval or when a task finishes or fails after 40 seconds. off = silent.</span>
     </div>
     <div class="form-row inline">
       <label>Sound notifications</label>
@@ -1267,7 +1312,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
-  <script src="/app.js?v=2026082205"></script>
+<script src="/app.js?v=2026082408"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {
@@ -1600,6 +1645,13 @@
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ path: modelPath })
+          }).then(function(res) {
+            return res.json().then(function(data) {
+              if (!res.ok || !data.ok || !data.ready) {
+                throw new Error(data.error || 'The model did not become ready.');
+              }
+              return data;
+            });
           });
         }
       })

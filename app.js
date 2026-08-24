@@ -73,12 +73,19 @@
   }
 
   // ---------- utilities ----------
-  // simple toast system — bottom-right, auto-dismiss. keyed toasts replace each other.
+  // Composer notification tabs. Keyed notices replace an older copy.
   const _toasts = new Map();
 
-  function showDeckToast(msg, kind, ms = 3000) {
+  function showDeckToast(msg, kind, ms = 3000, key = null, html = false) {
     const deck = $("#revealer-deck");
     if (!deck) return null;
+
+    if (key && _toasts.has(key)) {
+      const previous = _toasts.get(key);
+      clearTimeout(previous?._dismissTimer);
+      try { previous.remove(); } catch {}
+      _toasts.delete(key);
+    }
 
     const row = document.createElement("div");
     row.className = `revealer-card notifications ${kind}`;
@@ -91,11 +98,15 @@
       err: '<i class="ph ph-x-circle" style="color:var(--danger)"></i>'
     };
     const iconHtml = iconMap[kind] || iconMap.info;
+    const labelMap = { info: "Update", ok: "Done", warn: "Attention", err: "Could not complete" };
+    const cleanMsg = html ? String(msg) : esc(String(msg));
 
     row.innerHTML = `
-      <span class="notification-dot is-${kind}"></span>
       <span class="notification-icon">${iconHtml}</span>
-      <span class="notification-text">${msg}</span>
+      <div class="notification-copy">
+        <span class="notification-label">${labelMap[kind] || labelMap.info}</span>
+        <div class="notification-text">${cleanMsg}</div>
+      </div>
     `;
     // Stacked-deck entrance: start collapsed + dropped, then let the
     // transition settle it into place (transitions re-run smoothly when a
@@ -107,16 +118,18 @@
       _syncDeckStack();
     }));
 
-    setTimeout(() => {
+    row._dismissTimer = setTimeout(() => {
       row.classList.add("fade-out");
       _syncDeckStack();
       setTimeout(() => {
         row.remove();
+        if (key && _toasts.get(key) === row) _toasts.delete(key);
         _syncDeckStack();
         if (deck.children.length === 0) deck.innerHTML = "";
       }, 260);
     }, ms);
 
+    if (key) _toasts.set(key, row);
     return row;
   }
 
@@ -137,6 +150,7 @@
   }
 
   function toast(msg, kind = "info", ms = 3000, key = null, html = false) {
+    msg = String(msg ?? "");
     // Only `.toast.err` has an error style; `"error"` was passed at ~12 call
     // sites and silently rendered with the neutral accent dot. Normalize it.
     if (kind === "error") kind = "err";
@@ -148,10 +162,10 @@
       triggerComposerStatus("loaded");
     }
 
-    // Try routing to the deck first
+    // Route ordinary status messages into the narrow tab above the composer.
     const deck = $("#revealer-deck");
     if (deck) {
-      const deckRow = showDeckToast(msg, kind, ms);
+      const deckRow = showDeckToast(msg, kind, ms, key, html);
       if (deckRow) return deckRow;
     }
 
@@ -205,6 +219,88 @@
       comp.classList.add("status-error");
       setTimeout(() => comp.classList.remove("status-error"), 5000);
     }
+  }
+
+  async function requestModelLoad(modelPath) {
+    const result = await api("/api/models/load", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: modelPath }),
+    });
+    if (!result?.ok || !result?.ready) {
+      throw new Error(result?.error || "llama-server did not report the model ready");
+    }
+    return result;
+  }
+
+  const UPDATE_DISMISS_KEY = "accuretta:dismissed-update";
+  let activeUpdateVersion = "";
+  let updateCheckTimer = null;
+
+  function positionAppUpdateCard() {
+    const card = $("#app-update-card");
+    if (!card || card.hidden) return;
+    let bottom = 76;
+    if (isMobile()) {
+      bottom = 14;
+      if (app.classList.contains("m-tab-chat")) {
+        const composer = document.querySelector(".composer-wrap");
+        if (composer) {
+          bottom = Math.max(14, Math.ceil(window.innerHeight - composer.getBoundingClientRect().top + 12));
+        }
+      }
+    }
+    card.style.setProperty("--app-update-bottom", `${bottom}px`);
+  }
+
+  function hideAppUpdateCard(persist = false) {
+    const card = $("#app-update-card");
+    if (!card || card.hidden) return;
+    if (persist && activeUpdateVersion) {
+      try { localStorage.setItem(UPDATE_DISMISS_KEY, activeUpdateVersion); } catch {}
+    }
+    card.classList.add("is-leaving");
+    card.classList.remove("is-visible");
+    setTimeout(() => {
+      card.hidden = true;
+      card.classList.remove("is-leaving");
+    }, 220);
+  }
+
+  function showAppUpdateCard(status) {
+    const release = status?.release;
+    const version = String(release?.version || "").trim();
+    if (!status?.available || !version || !release?.url) return;
+    try {
+      if (localStorage.getItem(UPDATE_DISMISS_KEY) === version) return;
+    } catch {}
+
+    activeUpdateVersion = version;
+    const card = $("#app-update-card");
+    if (!card) return;
+    $("#app-update-title").textContent = `Accuretta v${version} available`;
+    $("#app-update-summary").textContent = release.summary || "A new Accuretta release is ready.";
+    $("#app-update-link").href = release.url;
+    card.hidden = false;
+    card.classList.remove("is-leaving");
+    positionAppUpdateCard();
+    requestAnimationFrame(() => card.classList.add("is-visible"));
+  }
+
+  async function checkForAppUpdate() {
+    try {
+      showAppUpdateCard(await api("/api/app-update"));
+    } catch (error) {
+      console.debug("update check skipped:", error);
+    }
+  }
+
+  function initAppUpdateCheck() {
+    $("#app-update-dismiss")?.addEventListener("click", () => hideAppUpdateCard(true));
+    window.addEventListener("resize", positionAppUpdateCard, { passive: true });
+    setTimeout(checkForAppUpdate, 1400);
+    if (updateCheckTimer) clearInterval(updateCheckTimer);
+    updateCheckTimer = setInterval(checkForAppUpdate, 12 * 60 * 60 * 1000);
   }
 
   function compactionRowFor(chatId) {
@@ -431,17 +527,18 @@
   }
 
   // ---------- notifications & audio ----------
-  // Smooth, modern chimes synthesized via Web Audio (no asset files). Soft
-  // attack + gentle exponential release through a warm lowpass = no clicks, no
-  // harsh beep. Gated by the Sound-notifications setting and debounced so a
-  // burst (rapid approvals) doesn't stutter.
   let _lastSound = 0;
+  const _activeNotificationAudio = new Set();
   function soundOn() { return state.settings ? state.settings.sound_notifications !== false : true; }
-  function playChime(notes, vol) {
-    if (!soundOn()) return;
+  function reserveSoundSlot() {
     const now = performance.now();
-    if (now - _lastSound < 1200) return;
+    if (now - _lastSound < 1200) return false;
     _lastSound = now;
+    return true;
+  }
+  function playChime(notes, vol, reserved) {
+    if (!soundOn()) return;
+    if (!reserved && !reserveSoundSlot()) return;
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
       const ctx = new AC();
@@ -470,10 +567,52 @@
       setTimeout(() => { try { ctx.close(); } catch (e) {} }, (end - t0) * 1000 + 300);
     } catch (e) {}
   }
-  // gentle rising "attention" for approvals (C5 -> G5)
-  function playApprovalSound() { playChime([{ f: 523.25, t: 0, dur: 0.28 }, { f: 783.99, t: 0.13, dur: 0.5 }], 0.15); }
-  // warm resolving triad when a long task finishes (C5 -> E5 -> G5)
-  function playCompletionSound() { playChime([{ f: 523.25, t: 0, dur: 0.22 }, { f: 659.25, t: 0.1, dur: 0.22 }, { f: 783.99, t: 0.2, dur: 0.6 }], 0.14); }
+  function playNotificationAsset({ src = "/notification.mp3?v=2026082401", rate = 1, volume = 0.72, fallbackNotes, fallbackVolume = 0.14 } = {}) {
+    if (!soundOn() || !reserveSoundSlot()) return;
+    let didFallback = false;
+    const fallback = () => {
+      if (didFallback) return;
+      didFallback = true;
+      playChime(fallbackNotes, fallbackVolume, true);
+    };
+    try {
+      const audio = new Audio(src);
+      audio.preload = "auto";
+      audio.volume = volume;
+      audio.playbackRate = rate;
+      if (rate !== 1) {
+        audio.preservesPitch = false;
+        audio.webkitPreservesPitch = false;
+      }
+      const cleanup = () => _activeNotificationAudio.delete(audio);
+      _activeNotificationAudio.add(audio);
+      audio.addEventListener("ended", cleanup, { once: true });
+      audio.addEventListener("error", () => { cleanup(); fallback(); }, { once: true });
+      const started = audio.play();
+      if (started && typeof started.catch === "function") started.catch(() => { cleanup(); fallback(); });
+    } catch (e) {
+      fallback();
+    }
+  }
+  function playApprovalSound() {
+    playNotificationAsset({
+      fallbackNotes: [{ f: 523.25, t: 0, dur: 0.28 }, { f: 783.99, t: 0.13, dur: 0.5 }],
+      fallbackVolume: 0.15,
+    });
+  }
+  function playCompletionSound() {
+    playNotificationAsset({
+      fallbackNotes: [{ f: 523.25, t: 0, dur: 0.22 }, { f: 659.25, t: 0.1, dur: 0.22 }, { f: 783.99, t: 0.2, dur: 0.6 }],
+    });
+  }
+  function playFailureSound() {
+    playNotificationAsset({
+      src: "/notification-error.wav?v=2026082401",
+      volume: 0.68,
+      fallbackNotes: [{ f: 392, t: 0, dur: 0.28 }, { f: 293.66, t: 0.14, dur: 0.55 }],
+      fallbackVolume: 0.13,
+    });
+  }
 
   function notifyApproval() {
     playApprovalSound();   // always audible (when enabled) — approvals are the point
@@ -487,12 +626,29 @@
     }
   }
 
-  // Chime only for a genuinely longer task, not every quick reply. durMs = turn length.
+  const COMPLETION_SOUND_MIN_MS = 40000;
+
+  // End-of-task notifications stay quiet for quick replies. Approval alerts
+  // remain immediate because the agent is blocked waiting for the user.
   function notifyCompletion(durMs) {
-    if ((durMs || 0) >= 20000) playCompletionSound();
+    if ((durMs || 0) < COMPLETION_SOUND_MIN_MS) return;
+    playCompletionSound();
     if (document.visibilityState !== "visible") {
       if (Notification.permission === "granted") {
         const n = new Notification("Accuretta", { body: "The agent finished.", icon: "logo-mark-dark.png" });
+        n.onclick = () => { window.focus(); n.close(); };
+      } else if (Notification.permission === "default") {
+        Notification.requestPermission();
+      }
+    }
+  }
+
+  function notifyFailure(message, durMs) {
+    if ((durMs || 0) < COMPLETION_SOUND_MIN_MS) return;
+    playFailureSound();
+    if (document.visibilityState !== "visible") {
+      if (Notification.permission === "granted") {
+        const n = new Notification("Accuretta task failed", { body: message || "The agent stopped with an error.", icon: "logo-mark-dark.png" });
         n.onclick = () => { window.focus(); n.close(); };
       } else if (Notification.permission === "default") {
         Notification.requestPermission();
@@ -727,7 +883,7 @@
         }
       }
       
-      deck.querySelectorAll(".revealer-card:not(.permissions):not(.attack-rail):not(.osint-card):not(.secret-rail)").forEach(c => c.remove());
+      deck.querySelectorAll('[data-card-type="writes"], [data-card-type="commands"], [data-card-type="mcp"]').forEach(c => c.remove());
       if (deck.children.length === 0) deck.innerHTML = "";
     }
     
@@ -2427,6 +2583,7 @@
     wireEvents();
     subscribeSSE();
     initCostWidget();
+    initAppUpdateCheck();
     loadClientContext().catch(() => {});
     setTimeout(() => checkModelAdvisor({ notify: true }).catch(() => {}), 1200);
 
@@ -2463,10 +2620,7 @@
     // will pick the new values up automatically.
     if (state.llamaRunning && modelPath) {
       try {
-        await api("/api/models/load", {
-          method: "POST", headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({ path: modelPath }),
-        });
+        await requestModelLoad(modelPath);
         await refreshModels();
       } catch (e) { console.warn("boot reload failed:", e); }
     }
@@ -2616,6 +2770,18 @@
     autoResize(ta);
   }
 
+  async function refreshContextStats(chatId = state.chatId) {
+    if (!chatId) return;
+    try {
+      const result = await api("/api/ctx-stats?chat_id=" + encodeURIComponent(chatId));
+      if (!result || typeof result.prompt_tokens !== "number" || state.chatId !== chatId) return;
+      state._lastMsgPromptTokens = result.prompt_tokens;
+      state._ctxSource = result.source || "";
+      if (Number.isFinite(result.capacity) && result.capacity > 0) state._ctxCapacity = result.capacity;
+      renderCtxGauge();
+    } catch (_) {}
+  }
+
   function selectChat(id) {
     state.chatId = id;
     const chat = state.chats.chats[id];
@@ -2744,22 +2910,13 @@
     } else if (isCompactViewport()) {
       app.classList.add("sidebar-collapsed");
     }
-    // start context-stats polling
+    // SSE carries live context updates. Fetch once on selection, then use a
+    // slow visible/streaming-only fallback in case the event stream reconnects.
     clearInterval(state._ctxPoll);
-    state._ctxPoll = setInterval(async () => {
-      try {
-        const cid = state.chatId;
-        if (!cid) return;
-        const r = await api("/api/ctx-stats?chat_id=" + encodeURIComponent(cid));
-        // Guard against a slow response landing after the user switched chats.
-        if (r && typeof r.prompt_tokens === "number" && state.chatId === cid) {
-          state._lastMsgPromptTokens = r.prompt_tokens;
-          state._ctxSource = r.source || "";
-          if (Number.isFinite(r.capacity) && r.capacity > 0) state._ctxCapacity = r.capacity;
-          renderCtxGauge();
-        }
-      } catch (_) {}
-    }, 2000);
+    refreshContextStats(id);
+    state._ctxPoll = setInterval(() => {
+      if (!document.hidden && state.streaming) refreshContextStats(state.chatId);
+    }, 15000);
   }
 
   // ---------- session-scoped desktop kill switch ----------
@@ -3002,9 +3159,10 @@
       // chat-circle. The active row also shows the colored dot bullet via
       // the `.chatrow.active::before` rule in app.css — the icon is the
       // SECONDARY signal, the dot is the primary.
+      const isGitHubChat = c.origin === "github" || !!c.github_worktree;
       const iconClass = c.origin === "mobile" ? "ph ph-device-mobile"
-        : (c.origin === "github" ? "ph ph-git-branch" : "ph ph-chat-circle");
-      if (c.origin === "github") row.classList.add("gh-branch");
+        : (isGitHubChat ? "ph ph-git-branch" : "ph ph-chat-circle");
+      if (isGitHubChat) row.classList.add("gh-branch");
       row.innerHTML = `
         <i class="${iconClass}"></i>
         <span class="t">${esc(c.title)}</span>
@@ -3390,13 +3548,18 @@
     try {
       await streamChat("", agentRow, state.abortCtl.signal, [], { regenerate: true });
     } catch (e) {
-      if (e.name !== "AbortError") toast("regenerate failed: " + e.message, "err");
+      if (e.name !== "AbortError") {
+        agentRow._notificationFailed = true;
+        agentRow._notificationError = e.message;
+        toast("regenerate failed: " + e.message, "err");
+      }
     } finally {
       state.streaming = false;
       state.abortCtl = null;
       state.liveTurn = null;
       setStreamingUI(false);
       renderRegenerateChip();
+      if (agentRow._notificationFailed) notifyFailure(agentRow._notificationError, agentRow._workStart ? Date.now() - agentRow._workStart : 0);
     }
   }
 
@@ -3657,8 +3820,14 @@
     } catch (e) {
       const b = agentRow.querySelector("#stream-bubble") || agentRow.querySelector(".bubble");
       if (b) {
-        if (e.name === "AbortError") b.innerHTML += `<div style="color: var(--fg-faint); font-size:11px; margin-top:6px;">— stopped</div>`;
-        else b.innerHTML = `<span style="color: var(--danger)">error: ${esc(e.message)}</span>`;
+        if (e.name === "AbortError") {
+          agentRow._notificationCancelled = true;
+          b.innerHTML += `<div style="color: var(--fg-faint); font-size:11px; margin-top:6px;">— stopped</div>`;
+        } else {
+          agentRow._notificationFailed = true;
+          agentRow._notificationError = e.message;
+          b.innerHTML = `<span style="color: var(--danger)">error: ${esc(e.message)}</span>`;
+        }
       }
     } finally {
       state.streaming = false;
@@ -3667,7 +3836,8 @@
       setStreamingUI(false);
       await loadChats();
       renderChatList();
-      notifyCompletion(agentRow._workStart ? Date.now() - agentRow._workStart : 0);
+      if (agentRow._notificationFailed) notifyFailure(agentRow._notificationError, agentRow._workStart ? Date.now() - agentRow._workStart : 0);
+      else if (!agentRow._notificationCancelled) notifyCompletion(agentRow._workStart ? Date.now() - agentRow._workStart : 0);
     }
   }
 
@@ -3775,8 +3945,16 @@
         reasoning_effort: state.reasoningEffort || "auto",
         client_context: currentClientHint(),
       }),
-      signal,
-    });
+       signal,
+     });
+    if (!resp.ok) {
+      let detail = "";
+      try {
+        const payload = await resp.json();
+        detail = payload && payload.error ? String(payload.error) : "";
+      } catch (e) {}
+      throw new Error(detail || `request failed (${resp.status})`);
+    }
     if (!resp.body) throw new Error("no response body");
 
     const reader = resp.body.getReader();
@@ -5521,6 +5699,10 @@
       });
       renderMessages();
     } else if (evt.type === "error") {
+      if (row) {
+        row._notificationFailed = true;
+        row._notificationError = evt.error || "The agent stopped with an error.";
+      }
       bubble.innerHTML = `<span style="color: var(--danger)">error: ${esc(evt.error)}</span>`;
     }
   }
@@ -5872,7 +6054,7 @@
     });
     let monthRow = "";
     for (const ml of months) {
-      monthRow += `<span class="gh-month" style="flex:${ml.count} 0 0">${ml.label}</span>`;
+      monthRow += `<span class="gh-month" style="grid-column:${ml.wi + 1} / span ${ml.count}">${ml.label}</span>`;
     }
     // Day labels sit at fixed rows: Mon(1), Wed(3), Fri(5) like GitHub's grid.
     const days = [
@@ -5895,7 +6077,7 @@
       }
     });
     wrap.innerHTML = `
-      <div class="gh-months">${monthRow}</div>
+      <div class="gh-months" style="--gh-week-count:${weeks.length}">${monthRow}</div>
       <div class="gh-grid">
         <div class="gh-days">${dayHtml}</div>
         <div class="gh-cells">${cells.join("")}</div>
@@ -6078,6 +6260,239 @@
     selectChat(c.id);
     const ta = $("#composer-input");
     if (ta) { ta.value = ""; autoResize(ta); }
+  }
+
+  let usageMarkFrame = 0;
+  let usageChartId = 0;
+
+  function usageCompactNumber(value) {
+    const n = Number(value) || 0;
+    if (n >= 1e9) return `${(n / 1e9).toFixed(n >= 1e10 ? 0 : 1)}B`;
+    if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1)}M`;
+    if (n >= 1e3) return `${(n / 1e3).toFixed(n >= 1e4 ? 0 : 1)}K`;
+    return n.toLocaleString();
+  }
+
+  function usageDuration(ms) {
+    const seconds = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    if (hours) return `${hours}h ${minutes}m`;
+    if (minutes) return `${minutes}m ${seconds % 60}s`;
+    return `${seconds}s`;
+  }
+
+  function usageModelName(name) {
+    return String(name || "Unknown model").replace(/\.gguf$/i, "");
+  }
+
+  function usageAreaChart(points, key, formatValue) {
+    const id = `usage-area-${++usageChartId}`;
+    const values = points.map(item => Math.max(0, Number(item[key]) || 0));
+    const max = Math.max(1, ...values);
+    const left = 18, right = 742, top = 18, bottom = 174;
+    const coords = values.map((value, index) => {
+      const x = left + (right - left) * (values.length < 2 ? 0 : index / (values.length - 1));
+      const y = bottom - (value / max) * (bottom - top);
+      return [x, y];
+    });
+    let line = "";
+    coords.forEach(([x, y], index) => {
+      if (!index) line = `M ${x.toFixed(1)} ${y.toFixed(1)}`;
+      else {
+        const [px, py] = coords[index - 1];
+        const dx = (x - px) * 0.42;
+        line += ` C ${(px + dx).toFixed(1)} ${py.toFixed(1)}, ${(x - dx).toFixed(1)} ${y.toFixed(1)}, ${x.toFixed(1)} ${y.toFixed(1)}`;
+      }
+    });
+    const area = `${line} L ${right} ${bottom} L ${left} ${bottom} Z`;
+    const labels = [0, Math.floor((points.length - 1) / 2), points.length - 1].map(index => {
+      const date = new Date(`${points[index]?.day || ""}T12:00:00`);
+      return `<text x="${coords[index]?.[0] || left}" y="210" text-anchor="${index === 0 ? "start" : index === points.length - 1 ? "end" : "middle"}">${date.toLocaleDateString(undefined, { month: "short", day: "numeric" })}</text>`;
+    }).join("");
+    const last = values[values.length - 1] || 0;
+    return `<svg class="usage-area-chart" viewBox="0 0 760 220" role="img" aria-label="30 day usage trend">
+      <defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".34"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
+      <line class="usage-chart-grid" x1="18" y1="174" x2="742" y2="174"/>
+      <line class="usage-chart-grid" x1="18" y1="96" x2="742" y2="96"/>
+      <path class="usage-chart-area" d="${area}" fill="url(#${id})"/>
+      <path class="usage-chart-line" d="${line}"/>
+      <circle class="usage-chart-point" cx="${coords.at(-1)?.[0] || right}" cy="${coords.at(-1)?.[1] || bottom}" r="4"/>
+      <text class="usage-chart-value" x="742" y="18" text-anchor="end">${esc(formatValue(last))}</text>
+      ${labels}
+    </svg>`;
+  }
+
+  function drawUsageMark(animate = true) {
+    const canvas = $("#usage-mark");
+    if (!canvas || typeof Path2D === "undefined") return;
+    cancelAnimationFrame(usageMarkFrame);
+    const ctx = canvas.getContext("2d");
+    const width = canvas.width, height = canvas.height;
+    const mainPath = new Path2D(_LOGO_SLAB_D);
+    const accentPath = new Path2D(_LOGO_PURPLE_D);
+    const scale = 1.06, ox = (width - 348 * scale) / 2, oy = 28;
+    const targets = [];
+    for (let y = 8; y <= 276; y += 9) {
+      for (let x = 8; x <= 340; x += 9) {
+        const accent = ctx.isPointInPath(accentPath, x, y);
+        if (accent || ctx.isPointInPath(mainPath, x, y)) {
+          targets.push({ x: ox + x * scale, y: oy + y * scale, accent });
+        }
+      }
+    }
+    const starts = targets.map((_, index) => {
+      const columns = 29;
+      const mixed = (index * 83) % targets.length;
+      return {
+        x: 28 + (mixed % columns) * ((width - 56) / (columns - 1)),
+        y: 28 + Math.floor(mixed / columns) * 14,
+      };
+    });
+    const style = getComputedStyle(document.documentElement);
+    const main = style.getPropertyValue("--fg").trim() || "#e9e9ed";
+    const accent = style.getPropertyValue("--accent").trim() || "#7867ff";
+    const muted = style.getPropertyValue("--border").trim() || "#34343b";
+    const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const started = performance.now();
+    const duration = 1600;
+    const paint = now => {
+      const raw = animate && !reduced ? Math.min(1, (now - started) / duration) : 1;
+      const ease = 1 - Math.pow(1 - raw, 4);
+      ctx.clearRect(0, 0, width, height);
+      targets.forEach((target, index) => {
+        const start = starts[index];
+        const local = Math.max(0, Math.min(1, (ease - (index % 17) * 0.0025) / 0.96));
+        const x = start.x + (target.x - start.x) * local;
+        const y = start.y + (target.y - start.y) * local;
+        ctx.globalAlpha = 0.18 + local * 0.82;
+        ctx.fillStyle = local < 0.7 ? muted : (target.accent ? accent : main);
+        ctx.beginPath();
+        ctx.arc(x, y, 2.45, 0, Math.PI * 2);
+        ctx.fill();
+      });
+      ctx.globalAlpha = 1;
+      if (raw < 1) usageMarkFrame = requestAnimationFrame(paint);
+    };
+    usageMarkFrame = requestAnimationFrame(paint);
+  }
+
+  function renderUsageStats(data) {
+    const content = $("#usage-content");
+    if (!content) return;
+    const totals = data.totals || {};
+    const compression = data.compression || {};
+    const repos = data.repos || {};
+    const longest = data.longest;
+    const models = Array.isArray(data.models) ? data.models : [];
+    const ranked = models.filter(model => model.ranked);
+    const best = ranked[0] || null;
+    const attention = ranked.length > 1 ? ranked[ranked.length - 1] : null;
+    const provider = CLOUD_PRICING[state.costProvider] || CLOUD_PRICING.openai;
+    const inputTokens = Number(data.savings?.tok_in ?? totals.input_tokens) || 0;
+    const outputTokens = Number(data.savings?.tok_out ?? totals.output_tokens) || 0;
+    const inputCost = inputTokens / 1e6 * provider.input;
+    const outputCost = outputTokens / 1e6 * provider.output;
+    const money = value => `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const since = totals.since ? new Date(totals.since * 1000) : null;
+    $("#usage-range").textContent = since
+      ? `Recorded since ${since.toLocaleDateString(undefined, { month: "long", year: "numeric" })}`
+      : "Local counters";
+    $("#usage-privacy").textContent = data.privacy || "Aggregate counters stay on this machine.";
+    usageChartId = 0;
+    let rankedPosition = 0;
+    const modelRows = models.slice(0, 10).map(model => {
+      const score = Math.round((Number(model.reliability) || 0) * 100);
+      const rank = model.ranked ? String(++rankedPosition).padStart(2, "0") : "--";
+      const tag = best && model.model === best.model ? '<span class="usage-model-tag best">Best observed</span>'
+        : attention && model.model === attention.model ? '<span class="usage-model-tag watch">Watch</span>' : "";
+      return `<div class="usage-model-row">
+        <span class="usage-model-rank">${rank}</span>
+        <div class="usage-model-main"><strong title="${esc(model.model)}">${esc(usageModelName(model.model))}</strong><span>${model.turns.toLocaleString()} ${model.turns === 1 ? "turn" : "turns"} · ${esc(model.confidence.replace("_", " "))} confidence</span></div>
+        <span class="usage-model-tag-slot">${tag}</span>
+        <div class="usage-model-meter"><span style="width:${score}%"></span></div>
+        <strong class="usage-model-score">${score}</strong>
+        <dl><div><dt>Finished</dt><dd>${Math.round(model.completion_rate * 100)}%</dd></div><div><dt>Tool success</dt><dd>${model.tool_success == null ? "n/a" : `${Math.round(model.tool_success * 100)}%`}</dd></div><div><dt>Output speed</dt><dd>${Number(model.output_tok_s || 0).toFixed(1)} tok/s</dd></div></dl>
+      </div>`;
+    }).join("");
+    const providerOptions = Object.entries(CLOUD_PRICING).map(([key, item]) => `<option value="${key}"${key === state.costProvider ? " selected" : ""}>${esc(item.label)}</option>`).join("");
+    content.innerHTML = `
+      <section class="usage-kpis">
+        <article><i class="ph ph-chat-centered-text"></i><span>Model turns</span><strong>${usageCompactNumber(totals.turns)}</strong><small>${usageCompactNumber(inputTokens + outputTokens)} tokens processed</small></article>
+        <article><i class="ph ph-timer"></i><span>Autonomous time</span><strong>${usageDuration(totals.elapsed_ms)}</strong><small>Across recorded model turns</small></article>
+        <article><i class="ph ph-git-branch"></i><span>Repos worked on</span><strong>${Number(repos.unique || 0).toLocaleString()}</strong><small>${Number(repos.sessions || 0).toLocaleString()} branch sessions</small></article>
+        <article><i class="ph ph-arrows-in-line-vertical"></i><span>Successful compactions</span><strong>${Number(compression.successful || 0).toLocaleString()}</strong><small>${usageCompactNumber(compression.folded_tokens)} tokens folded</small></article>
+      </section>
+
+      <section class="usage-panel usage-trend-panel">
+        <div class="usage-section-head"><div><span class="usage-eyebrow">Last 30 days</span><h2>Local model activity</h2></div><strong>${usageCompactNumber((data.daily || []).reduce((sum, day) => sum + Number(day.tokens || 0), 0))} tokens</strong></div>
+        ${usageAreaChart(data.daily || [], "tokens", usageCompactNumber)}
+      </section>
+
+      <section class="usage-two-col">
+        <article class="usage-panel usage-saving-panel">
+          <div class="usage-section-head"><div><span class="usage-eyebrow">Cloud equivalent</span><h2>Estimated savings</h2></div><select id="usage-provider" aria-label="Cloud price comparison">${providerOptions}</select></div>
+          <div class="usage-money">${money(inputCost + outputCost)}</div>
+          <div class="usage-breakdown"><div><span>Input · ${usageCompactNumber(inputTokens)}</span><strong>${money(inputCost)}</strong></div><div><span>Output · ${usageCompactNumber(outputTokens)}</span><strong>${money(outputCost)}</strong></div><div><span>Compared with</span><strong>${esc(provider.label)}</strong></div></div>
+          <p>Equivalent API list price. Electricity and hardware costs are not subtracted.</p>
+        </article>
+        <article class="usage-panel usage-longest-panel">
+          <div class="usage-section-head"><div><span class="usage-eyebrow">Longest recorded turn</span><h2>${longest ? usageDuration(longest.elapsed_ms) : "No data yet"}</h2></div><i class="ph ph-path"></i></div>
+          <strong>${esc(longest?.title || "Run a task to start measuring")}</strong>
+          <span>${longest ? `${esc(usageModelName(longest.model))} · ${esc(longest.day || "date unavailable")}` : ""}</span>
+          ${longest && !longest.chat_available ? '<small>The original chat was deleted, so its title is no longer available.</small>' : ""}
+        </article>
+      </section>
+
+      <section class="usage-panel usage-model-panel">
+        <div class="usage-section-head"><div><span class="usage-eyebrow">Observed model health</span><h2>Model performance</h2></div><span class="usage-method">Reliability = finished turns + tool success</span></div>
+        <div class="usage-model-list">${modelRows || '<div class="usage-empty">No model telemetry yet.</div>'}</div>
+        <p class="usage-footnote">Ranking starts after five observed turns. Small samples are shown but left unranked.</p>
+      </section>
+
+      <section class="usage-two-col">
+        <article class="usage-panel usage-compression-panel">
+          <div class="usage-section-head"><div><span class="usage-eyebrow">Context compression</span><h2>${usageCompactNumber(compression.folded_messages)} messages folded</h2></div><i class="ph ph-arrows-in-line-vertical"></i></div>
+          <div class="usage-breakdown"><div><span>Successful folds</span><strong>${Number(compression.successful || 0).toLocaleString()}</strong></div><div><span>Skipped safely</span><strong>${Number(compression.skipped || 0).toLocaleString()}</strong></div><div><span>Failed</span><strong>${Number(compression.failed || 0).toLocaleString()}</strong></div></div>
+        </article>
+        <article class="usage-panel usage-repos-panel">
+          <div class="usage-section-head"><div><span class="usage-eyebrow">GitHub work</span><h2>${Number(repos.unique || 0).toLocaleString()} repositories</h2></div><i class="ph ph-git-branch"></i></div>
+          <div class="usage-repo-list">${(repos.names || []).map(name => `<span><i class="ph ph-git-branch"></i>${esc(name)}</span>`).join("") || '<span class="usage-empty">No repo sessions recorded yet.</span>'}</div>
+        </article>
+      </section>`;
+    $("#usage-provider")?.addEventListener("change", event => {
+      state.costProvider = event.target.value;
+      try { localStorage.setItem("accuretta:cost-provider", state.costProvider); } catch {}
+      renderCostWidget();
+      renderUsageStats(data);
+    });
+  }
+
+  async function loadUsageStats() {
+    const content = $("#usage-content");
+    if (content) content.innerHTML = '<div class="usage-loading"><i class="ph ph-circle-notch"></i><span>Reading local stats</span></div>';
+    try {
+      renderUsageStats(await api("/api/usage-stats"));
+    } catch (error) {
+      if (content) content.innerHTML = `<div class="usage-error"><i class="ph ph-warning-circle"></i><strong>Usage stats are unavailable</strong><span>${esc(error.message || error)}</span></div>`;
+    }
+  }
+
+  function openUsageStats() {
+    const page = $("#usage-page");
+    if (!page) return;
+    page.classList.add("open");
+    page.setAttribute("aria-hidden", "false");
+    drawUsageMark(true);
+    loadUsageStats();
+  }
+
+  function closeUsageStats() {
+    const page = $("#usage-page");
+    if (!page) return;
+    cancelAnimationFrame(usageMarkFrame);
+    page.classList.remove("open");
+    page.setAttribute("aria-hidden", "true");
   }
 
   async function refreshGitHubStatus() {
@@ -7513,14 +7928,14 @@
     html += buildCommandsCardHtml(running.commands, isCollapsed("commands"), true);
     html += buildMcpCardHtml(running.mcp, isCollapsed("mcp"), true);
 
-    deck.querySelectorAll(".revealer-card:not(.permissions):not(.attack-rail):not(.osint-card):not(.secret-rail)").forEach(c => c.remove());
+    deck.querySelectorAll('[data-card-type="writes"], [data-card-type="commands"], [data-card-type="mcp"]').forEach(c => c.remove());
     if (html) {
       deck.insertAdjacentHTML("beforeend", html);
     }
 
-    deck.querySelectorAll(".revealer-card:not(.permissions)").forEach(card => {
+    deck.querySelectorAll('[data-card-type="writes"], [data-card-type="commands"], [data-card-type="mcp"]').forEach(card => {
       const head = card.querySelector(".revealer-card-head");
-      head.addEventListener("click", () => card.classList.toggle("collapsed"));
+      if (head) head.addEventListener("click", () => card.classList.toggle("collapsed"));
 
       const killBtn = card.querySelector(".revealer-card-kill");
       if (killBtn) killBtn.addEventListener("click", (e) => { e.stopPropagation(); killCurrentCommand(); });
@@ -8407,10 +8822,7 @@
     renderModelPill();
     toast(action === "undo" ? "restoring the previous model setup…" : "loading the recommended model setup…", "info", 60000, tid);
     try {
-      await api("/api/models/load", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: result.model_path }),
-      });
+      await requestModelLoad(result.model_path);
       await refreshModels();
       toast(action === "undo" ? "previous settings restored" : "recommended settings applied; the ten-turn check starts now", "ok", 5000, tid);
     } finally {
@@ -9302,10 +9714,7 @@
       renderStatus();
       renderModelPill();
       try {
-        await api("/api/models/load", {
-          method: "POST", headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({ path: payload.model_path }),
-        });
+        await requestModelLoad(payload.model_path);
         toast("model reloaded with new settings", "ok", 2500, tid);
       } catch (e) {
         toast("reload failed: " + (e.message || e), "error", 6000, tid);
@@ -9370,6 +9779,7 @@
     // style on the icon stays put.
     const sideIcon = document.getElementById("btn-theme-side-icon");
     if (sideIcon) sideIcon.className = iconClass;
+    if ($("#usage-page")?.classList.contains("open")) drawUsageMark(false);
   }
 
   function activateTerminalTab(tabId) {
@@ -10423,10 +10833,7 @@
         model: modelPath.split(/[\\/]/).pop().replace(/\.gguf$/i, ""),
       };
       await saveSettings(persistPayload);
-      await api("/api/models/load", {
-        method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ path: modelPath }),
-      });
+      await requestModelLoad(modelPath);
       await refreshModels();
       if (tuned) {
         const msg = tuned.quant_downshift
@@ -10563,9 +10970,11 @@
       state.mobileTab = "chat";
       $$(".mobile-tab").forEach(t => t.classList.toggle("active", t.dataset.mtab === "chat"));
       app.classList.add("m-tab-chat");
+      positionAppUpdateCard();
       return;
     }
     app.classList.add("m-tab-" + state.mobileTab);
+    positionAppUpdateCard();
   }
 
   // ---------- event wiring ----------
@@ -10804,9 +11213,40 @@
       .catch(() => {});
   }
 
-  function clearActiveSkill() {
-    if (!state.chatId) return;
-    fireToolCall("load_skill", { name: "", chat_id: state.chatId });
+  async function clearActiveSkill() {
+    const chatId = state.chatId;
+    const previous = state.activeSkill;
+    if (!chatId || !previous) return;
+
+    const raw = state.chats?.chats?.[chatId];
+    state.activeSkill = null;
+    if (raw) {
+      delete raw.active_skill;
+      delete raw.active_skill_budget;
+    }
+    renderSkillPill();
+    clearSkillDeckCard();
+
+    try {
+      const result = await api("/api/skills/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId })
+      });
+      if (result?.error) throw new Error(result.error);
+      toast(`Skill ${previous.name} unloaded`, "ok", 2200, "skill-unloaded");
+    } catch (error) {
+      if (state.chatId === chatId && !state.activeSkill) {
+        state.activeSkill = previous;
+        if (raw) {
+          raw.active_skill = previous.name;
+          raw.active_skill_budget = previous.budget || 0;
+        }
+        renderSkillPill();
+        skillDeckCard({ skill: previous.name, budget: previous.budget || 0 });
+      }
+      toast(`Could not unload ${previous.name}: ${error?.message || error}`, "err", 4500, "skill-unload-fail");
+    }
   }
 
   function renderSkillPill() {
@@ -10822,9 +11262,11 @@
     pill.innerHTML = `${_SKILL_ICON}<span class="skill-pill-name">skill: ${esc(s.name)}${suffix}</span>` +
       `<button class="skill-pill-x" title="Unload active skill" aria-label="Unload active skill">×</button>`;
     pill.classList.remove("hidden");
-    pill.querySelector(".skill-pill-x").addEventListener("click", (e) => {
+    pill.querySelector(".skill-pill-x").addEventListener("click", async (e) => {
       e.stopPropagation();
-      clearActiveSkill();
+      const button = e.currentTarget;
+      button.disabled = true;
+      await clearActiveSkill();
     });
   }
 
@@ -10841,12 +11283,21 @@
     const budget = evt.budget ? ` · ~${kTokens(evt.budget)} tok` : "";
     const replaced = evt.replaced ? ` · replaced ${esc(evt.replaced)}` : "";
     card.innerHTML =
-      `<span class="notification-dot is-skill"></span>` +
+      `<span class="notification-icon is-skill"><i class="ph ph-book-open-text" aria-hidden="true"></i></span>` +
       `<div class="skill-load-body">` +
-      `<div class="skill-loader" aria-hidden="true"></div>` +
-      `<span class="notification-text">skill <strong>${esc(evt.skill)}</strong>${budget}${replaced} — guiding this turn</span>` +
+      `<svg class="skill-loader" viewBox="0 0 20 20" aria-hidden="true">` +
+      `<rect x="3.25" y="3.25" width="13.5" height="13.5" rx="3"></rect>` +
+      `<path d="M6.5 10h7"></path>` +
+      `</svg>` +
+      `<span class="notification-copy"><span class="notification-label">Skill loaded</span>` +
+      `<span class="notification-text"><strong>${esc(evt.skill)}</strong>${budget}${replaced} · guiding this turn</span></span>` +
       `</div>`;
+    card.classList.add("note-pre");
     deck.appendChild(card);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      card.classList.remove("note-pre");
+      _syncDeckStack();
+    }));
     if (!state.streaming) scheduleSkillSettle(card);
     return card;
   }
@@ -10868,8 +11319,10 @@
     clearTimeout(card._settleTimer);
     card.classList.add("is-done");
     const txt = card.querySelector(".notification-text");
+    const label = card.querySelector(".notification-label");
     const name = card.dataset.skill || "skill";
-    if (txt) txt.textContent = `skill ${name} — active in this chat`;
+    if (label) label.textContent = "Skill active";
+    if (txt) txt.textContent = name;
   }
 
   function maybeSettleSkillCards() {
@@ -11097,6 +11550,12 @@
     $("#btn-github-activity")?.addEventListener("click", ghActivityOpen);
     $("#btn-close-github-activity")?.addEventListener("click", ghActivityClose);
     $("#github-activity-scrim")?.addEventListener("click", ghActivityClose);
+    $("#btn-usage-stats")?.addEventListener("click", openUsageStats);
+    $("#btn-close-usage")?.addEventListener("click", closeUsageStats);
+    $("#btn-refresh-usage")?.addEventListener("click", () => {
+      drawUsageMark(true);
+      loadUsageStats();
+    });
     $("#btn-close-cmd-history")?.addEventListener("click", closeCmdHistory);
     $("#cmd-history-scrim")?.addEventListener("click", closeCmdHistory);
     $("#btn-cmd-history-refresh")?.addEventListener("click", loadCmdHistory);
@@ -12200,6 +12659,7 @@
         return;
       }
       if (a === "github") { $("#btn-github-activity")?.click(); return; }
+      if (a === "usage") { openUsageStats(); return; }
       if (a === "history") { $("#btn-cmd-history")?.click(); return; }
       if (a === "settings") { openSettings(); return; }
       if (a === "faq") { $("#btn-faq")?.click(); return; }
@@ -12264,6 +12724,11 @@
 
     // ⌘K / Ctrl+K anywhere
     window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && $("#usage-page")?.classList.contains("open")) {
+        e.preventDefault();
+        closeUsageStats();
+        return;
+      }
       const isCmd = e.metaKey || e.ctrlKey;
       if (isCmd && (e.key === "k" || e.key === "K")) {
         e.preventDefault();

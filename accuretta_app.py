@@ -15,6 +15,9 @@ Package it into a single windowed .exe (no console) with PyInstaller:
     pip install pywebview pyinstaller
     pyinstaller --noconfirm --windowed --name Accuretta ^
         --add-data "index.html;." --add-data "app.js;." --add-data "app.css;." ^
+        --add-data "signal-field.js;." ^
+        --add-data "notification.mp3;." ^
+        --add-data "notification-error.wav;." ^
         --add-data "colors_and_type.css;." --add-data "manifest.webmanifest;." ^
         --add-data "accuMOTION;accuMOTION" --add-data "media;media" ^
         --add-data "logo-mark-light.png;." --add-data "logo-mark-dark.png;." ^
@@ -182,13 +185,39 @@ def _logo_data_uri(theme: str) -> str:
         return ""
 
 
+def _read_app_version() -> str:
+    """The release number shown in the app (index.html #brand-v). The splash
+    footer displays it, so index.html stays the single source of truth.
+    Falls back to the last shipped version if the file can't be read."""
+    try:
+        html = (bridge.ROOT / "index.html").read_text(encoding="utf-8")
+        m = re.search(r'id="brand-v">v(\d+\.\d+\.\d+)<', html)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return "0.7.7"
+
+
+def _signal_field_js() -> str:
+    """The splash-only signal-field effect, inlined into the intro. The splash is a
+    self-contained HTML string with no http origin, so it can't <script src>
+    the bridge. '' if the file is missing (splash simply runs without it)."""
+    try:
+        return (bridge.ROOT / "signal-field.js").read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
 def _build_splash_html() -> str:
     """Theme-aware boot splash — quiet, flat, typographic.
 
     Design rules: the saved theme supplies the entire palette (bg / fg /
     muted / accent) and the matching logo variant; every surface is FLAT —
     no blur, no translucency, no glow, no gradient field, no film grain.
-    The dot grid carries a small hand-balanced field of independent points.
+    The signal field (signal-field.js, inlined) replaces the old static dot
+    grid: a live dot field whose points light up with two slow travelling
+    waves, tinted by the theme's --fg / --accent.
     Staggered one-shot twinkles cover a warm launch, while eight quiet repeaters
     keep a slow boot alive without turning the background into a light show.
     window.__splashStage(label, pct) stays the live progress contract.
@@ -198,8 +227,11 @@ def _build_splash_html() -> str:
     logo = _logo_data_uri(theme)
     accent = pal["accent"]
     theme_label = re.sub(r"[^a-z0-9 -]", "", (theme or "light").replace("-", " ")).strip() or "light"
+    version = _read_app_version()
     logo_html = (f'<img src="{logo}" class="logo-img" alt="">' if logo
                  else '<span class="logo-fallback">a</span>')
+    signal_js = _signal_field_js()
+    signal_script = (f'  <script>\n{signal_js}\n  </script>\n' if signal_js else "")
     stars = (
         (7, 18, 2.1, 0.03, 0.48, "repeat", 4.1),
         (14, 72, 2.3, 0.46, 0.54, "accent repeat", 3.7),
@@ -240,7 +272,6 @@ def _build_splash_html() -> str:
     :root {{
       --bg: {pal['bg']}; --fg: {pal['fg']}; --muted: {pal['muted']}; --accent: {accent};
       --edge: color-mix(in srgb, var(--fg) 15%, transparent);
-      --grid-dot: color-mix(in srgb, var(--fg) 9%, transparent);
       --star: color-mix(in srgb, var(--fg) 58%, transparent);
       --star-accent: color-mix(in srgb, var(--accent) 62%, transparent);
       --ease: cubic-bezier(.22, 1, .36, 1);
@@ -255,18 +286,14 @@ def _build_splash_html() -> str:
       user-select: none; -webkit-font-smoothing: antialiased;
     }}
 
-    /* background pulse #1 — a fine dot grid, drifting one cell per 30s.
-       Masked to the center so the corners stay clean; the motion sits right
-       at the edge of perception and just keeps the surface from feeling dead. */
-    .grid {{
+    /* background pulse #1 — the signal field: a live dot grid whose points
+       light up with two slow travelling waves (signal-field.js, inlined).
+       Masked to the center so the corners stay clean, like the old grid. */
+    #signal-field {{
       position: absolute; inset: 0; z-index: 0; pointer-events: none;
-      background-image: radial-gradient(var(--grid-dot) 1px, transparent 1.15px);
-      background-size: 30px 30px;
       -webkit-mask-image: radial-gradient(ellipse 64% 58% at 50% 46%, #000 26%, transparent 76%);
       mask-image: radial-gradient(ellipse 64% 58% at 50% 46%, #000 26%, transparent 76%);
-      animation: grid-drift 90s linear infinite;
     }}
-    @keyframes grid-drift {{ to {{ background-position: 30px 30px; }} }}
 
     .stars {{
       position: absolute; inset: 0; z-index: 0; pointer-events: none;
@@ -415,7 +442,7 @@ def _build_splash_html() -> str:
   </style>
 </head>
 <body>
-  <div class="grid" aria-hidden="true"></div>
+  <canvas id="signal-field" aria-hidden="true"></canvas>
   <div class="stars" aria-hidden="true">
     {star_html}
   </div>
@@ -438,11 +465,11 @@ def _build_splash_html() -> str:
   </main>
 
   <footer class="chrome foot">
-    <span>private by location</span>
+    <span>version: {version}</span>
     <span>your model · your machine</span>
   </footer>
 
-  <script>
+  {signal_script}  <script>
     window.__splashReadyAt = performance.now();
     window.__splashStage = function (label, pct) {{
       var status = document.getElementById('status');
