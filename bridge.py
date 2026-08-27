@@ -86,6 +86,13 @@ except Exception:
     _pgw = None  # type: ignore
     _HAVE_PGW = False
 
+try:
+    import uiautomation as _uia  # type: ignore
+    _HAVE_UIA = sys.platform == "win32"
+except Exception:
+    _uia = None  # type: ignore
+    _HAVE_UIA = False
+
 # ---- scoped browser automation (optional) ---------------------------------
 # Playwright runs on a dedicated worker thread because its synchronous API is
 # thread-affine. Red-team browser sessions never share the generic MCP path.
@@ -219,6 +226,14 @@ _desktop_panic = threading.Event()
 # of what the agent requests. Tunable in settings.
 _desktop_action_times: list[float] = []
 _desktop_action_lock = threading.Lock()
+
+# UI Automation controls are COM objects and cannot safely cross request
+# threads. Snapshots therefore cache only serializable lookup descriptors;
+# every action resolves a fresh control inside its own COM apartment.
+_desktop_snapshot_cache: dict[str, dict] = {}
+_desktop_snapshot_lock = threading.Lock()
+_DESKTOP_SNAPSHOT_TTL_S = 180.0
+_DESKTOP_SNAPSHOT_CACHE_MAX = 12
 
 
 ROOT = Path(__file__).parent.resolve()
@@ -1683,7 +1698,9 @@ DEFAULT_SETTINGS = {
     "frequency_penalty": 0.0,
     "keep_alive": "30m",
     "theme": "light",
+    "composer_mode": "auto",      # last selected composer mode: auto | agent | ide
     "sound_notifications": True,    # smooth chimes for approvals + long-task completion
+    "keyboard_shortcuts": {},       # user-defined UI key combinations, action -> canonical chord
     "auto_approve_read": True,
     "auto_approve_write": False,    # trust writes: skip approval for in-workspace file writes/edits (registry/system/powershell still always prompt)
     "approval_mode": "",            # soft|medium|hard; empty = derive from auto_approve_write (legacy)
@@ -1707,6 +1724,7 @@ DEFAULT_SETTINGS = {
     "enable_thinking": True,        # when False, suppress <think> blocks entirely via chat_template_kwargs
     "thinking_budget": 4096,        # HARNESS-enforced cap on thinking tokens (we count + force-close; the model's template can't be trusted to honor it). -1 = unlimited
     "reasoning_capability_override": "auto",  # auto | off | budget | native_effort; escape hatch for new/odd templates
+    "reasoning_effort": "auto",    # last effort for the active model: auto | low | medium | high
     "max_tool_rounds": 120,         # how many tool-call rounds the model may run per user turn before forced stop
     "preserve_prior_thinking": False,# replay prior <think> verbatim: bloats context + re-feeds doubt on long runs, so default off
     "summarize_history": True,      # rolling-summary compaction: fold the oldest turns into a summary
@@ -1728,8 +1746,9 @@ DEFAULT_SETTINGS = {
                                     # through the small OCR/vision side-model. Leave blank for
                                     # text-only models or when you've already pruned the vision
                                     # tower from the GGUF to fit more layers in VRAM.
-    "mmproj_auto": True,            # auto-pick a sibling .mmproj.gguf (or *mmproj*.gguf) next to
-                                    # the chosen model when mmproj_path is empty.
+    "mmproj_mode": "auto",         # off | auto | manual. "off" always suppresses --mmproj,
+                                    # even when a matching projector exists beside the model.
+    "mmproj_auto": True,            # legacy mirror of mmproj_mode for older settings files.
     # llama-server tuning (all map to llama-server CLI flags). Restart required.
     "n_cpu_moe": 0,                 # --n-cpu-moe: how many MoE experts to keep on CPU. 0 = all on GPU.
                                     # The killer flag for fitting big MoE models (Qwen3 35B-A3B, GLM 4.7) on small VRAM.
@@ -1771,6 +1790,8 @@ DEFAULT_SETTINGS = {
                                     #   "dflash"/"dspark" — self-speculative (drafts from the model's own hidden states,
                                     #                  llama.cpp #21930). Qwen3/Llama-4-family wins; skipped on builds
                                     #                  without the flag.
+    "spec_strategy_source": "auto", # auto | manual. Manual choices are not overwritten by background tuning.
+    "spec_draft_model": "",         # matching DFlash/DSpark draft GGUF, required by those strategies.
     "no_warmup": False,             # --no-warmup. Saves a few seconds at startup.
     "enable_metrics": False,        # --metrics. Exposes Prometheus metrics on /metrics. Off by default.
     "llama_extra_args": "",         # Free-form extra flags appended verbatim, e.g. "--alias my-model --rope-scaling linear".
@@ -1785,10 +1806,140 @@ DEFAULT_SETTINGS = {
 }
 
 
+_SHORTCUT_ACTIONS = {
+    "approve_pending", "deny_pending", "open_settings", "open_faq",
+    "open_usage", "new_chat", "focus_composer", "stop_generation",
+}
+_SHORTCUT_MODIFIERS = {"Ctrl", "Alt", "Shift", "Meta"}
+_SHORTCUT_KEY_RE = re.compile(
+    r"^(?:Key[A-Z]|Digit[0-9]|F(?:[1-9]|1[0-2])|Arrow(?:Up|Down|Left|Right)|"
+    r"Home|End|PageUp|PageDown|Space|Slash|Backslash|BracketLeft|BracketRight|"
+    r"Semicolon|Quote|Comma|Period|Minus|Equal)$")
+
+
+def _normalized_keyboard_shortcuts(value) -> dict:
+    """Keep only small, known action/chord pairs from the settings file or API."""
+    if not isinstance(value, dict):
+        return {}
+    clean = {}
+    for action, chord in value.items():
+        if action not in _SHORTCUT_ACTIONS or not isinstance(chord, str):
+            continue
+        chord = chord.strip()
+        parts = chord.split("+") if chord else []
+        if not parts or len(parts) > 5 or len(chord) > 64:
+            continue
+        modifiers, key = parts[:-1], parts[-1]
+        if len(modifiers) != len(set(modifiers)):
+            continue
+        if any(part not in _SHORTCUT_MODIFIERS for part in modifiers):
+            continue
+        if not _SHORTCUT_KEY_RE.fullmatch(key):
+            continue
+        if not ({"Ctrl", "Alt", "Meta"} & set(modifiers)) and not re.fullmatch(r"F(?:[1-9]|1[0-2])", key):
+            continue
+        clean[action] = chord
+    return clean
+
+
+def _normalized_mmproj_mode(settings: dict, raw: dict | None = None) -> str:
+    """Resolve the explicit projector state while preserving old settings files."""
+    source = raw if isinstance(raw, dict) else settings
+    if "mmproj_mode" in source:
+        mode = str(source.get("mmproj_mode") or "").strip().lower()
+        if mode in {"off", "auto", "manual"}:
+            return mode
+    if str(source.get("mmproj_path") or settings.get("mmproj_path") or "").strip():
+        return "manual"
+    return "auto" if bool(source.get("mmproj_auto", settings.get("mmproj_auto", True))) else "off"
+
+
 def get_settings() -> dict:
     s = load_json(SETTINGS_FILE, {})
-    out = {**DEFAULT_SETTINGS, **(s if isinstance(s, dict) else {})}
+    raw = s if isinstance(s, dict) else {}
+    out = {**DEFAULT_SETTINGS, **raw}
+    out["mmproj_mode"] = _normalized_mmproj_mode(out, raw)
+    out["mmproj_auto"] = out["mmproj_mode"] == "auto"
+    composer_mode = str(out.get("composer_mode") or "auto").strip().lower()
+    out["composer_mode"] = composer_mode if composer_mode in {"auto", "agent", "ide"} else "auto"
+    reasoning_effort = str(out.get("reasoning_effort") or "auto").strip().lower()
+    out["reasoning_effort"] = reasoning_effort if reasoning_effort in {"auto", "low", "medium", "high"} else "auto"
+    out["keyboard_shortcuts"] = _normalized_keyboard_shortcuts(out.get("keyboard_shortcuts"))
     return out
+
+
+def update_settings(updates: dict) -> dict:
+    """Persist validated settings and any model-specific choices in one place."""
+    allowed = {k: v for k, v in (updates or {}).items() if k in DEFAULT_SETTINGS}
+    cur = get_settings()
+    cur.update(allowed)
+    if "keyboard_shortcuts" in allowed:
+        cur["keyboard_shortcuts"] = _normalized_keyboard_shortcuts(
+            allowed.get("keyboard_shortcuts"))
+
+    if any(k in allowed for k in ("mmproj_mode", "mmproj_auto", "mmproj_path")):
+        if "mmproj_mode" in allowed:
+            mode = str(allowed.get("mmproj_mode") or "").strip().lower()
+            if mode not in {"off", "auto", "manual"}:
+                mode = _normalized_mmproj_mode(cur)
+        elif "mmproj_auto" in allowed:
+            mode = "auto" if bool(allowed.get("mmproj_auto")) else (
+                "manual" if str(cur.get("mmproj_path") or "").strip() else "off")
+        else:
+            mode = "manual" if str(allowed.get("mmproj_path") or "").strip() else (
+                "auto" if bool(cur.get("mmproj_auto", True)) else "off")
+        cur["mmproj_mode"] = mode
+        cur["mmproj_auto"] = mode == "auto"
+        if mode == "manual":
+            projector = str(cur.get("mmproj_path") or "").strip()
+            if not projector:
+                raise ValueError("Manual projector mode requires a .gguf file path.")
+            if Path(projector).suffix.lower() != ".gguf":
+                raise ValueError("Vision projector must be a .gguf file.")
+            if not safe_exists(projector):
+                raise ValueError(f"Vision projector file does not exist: {projector}")
+
+    if "spec_strategy" in allowed:
+        strategy = str(cur.get("spec_strategy") or "").strip().lower()
+        if strategy not in {"off", "ngram-mod", "draft-mtp", "dflash", "dspark"}:
+            strategy = "ngram-mod"
+        cur["spec_strategy"] = strategy
+        cur["enable_speculative"] = strategy != "off"
+
+    if "spec_strategy_source" in allowed:
+        source = str(cur.get("spec_strategy_source") or "auto").strip().lower()
+        cur["spec_strategy_source"] = source if source in {"auto", "manual"} else "auto"
+
+    if (cur.get("spec_strategy") in {"dflash", "dspark"}
+            and any(k in allowed for k in ("spec_strategy", "spec_draft_model"))):
+        draft_model = str(cur.get("spec_draft_model") or "").strip()
+        if not draft_model:
+            raise ValueError(f"{cur['spec_strategy'].upper()} requires a matching draft-model GGUF file.")
+        if Path(draft_model).suffix.lower() != ".gguf":
+            raise ValueError("Speculative draft model must be a .gguf file.")
+        if not safe_exists(draft_model):
+            raise ValueError(f"Speculative draft model does not exist: {draft_model}")
+
+    if "composer_mode" in allowed:
+        mode = str(cur.get("composer_mode") or "auto").strip().lower()
+        cur["composer_mode"] = mode if mode in {"auto", "agent", "ide"} else "auto"
+
+    if "reasoning_effort" in allowed:
+        effort = str(cur.get("reasoning_effort") or "auto").strip().lower()
+        cur["reasoning_effort"] = effort if effort in {"auto", "low", "medium", "high"} else "auto"
+
+    save_json(SETTINGS_FILE, cur)
+    model_path = str(cur.get("model_path") or "").strip()
+    model_keys = globals().get("_MODEL_CONFIG_KEYS", ())
+    profile_update = {k: cur.get(k) for k in model_keys if k in allowed}
+    if any(k in allowed for k in ("mmproj_mode", "mmproj_auto", "mmproj_path")):
+        profile_update.update({
+            "mmproj_mode": cur["mmproj_mode"],
+            "mmproj_path": str(cur.get("mmproj_path") or "").strip(),
+        })
+    if model_path and profile_update:
+        _save_model_config(model_path, profile_update)
+    return cur
 
 
 _REMOTE_USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
@@ -2441,6 +2592,19 @@ def get_chats() -> dict:
         return _ChatSnapshot(c)
 
 
+def get_chat_index() -> dict:
+    snapshot = get_chats()
+    index: dict[str, dict] = {}
+    for chat_id in snapshot["order"]:
+        record = snapshot["chats"].get(chat_id)
+        if not isinstance(record, dict):
+            continue
+        summary = {key: value for key, value in record.items() if key != "messages"}
+        summary["_summary"] = True
+        index[chat_id] = summary
+    return {"chats": index, "order": list(snapshot["order"])}
+
+
 def _turn_journal_path(chat_id: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(chat_id or ""))[:80] or "unknown"
     return TURN_JOURNAL_DIR / f"{safe}.json"
@@ -2745,6 +2909,10 @@ def _build_continuity_state(chat: dict, activity: list[dict] | None = None,
     plan = plan if isinstance(plan, list) else (chat.get("plan") or [])
     pins = [str(x).strip()[:300] for x in (chat.get("pins") or []) if str(x).strip()]
     mission = chat.get("mission") if isinstance(chat.get("mission"), dict) else {}
+    compaction_memory = (
+        chat.get("compaction_memory")
+        if isinstance(chat.get("compaction_memory"), dict) else {}
+    )
     constraints = list(pins[-12:])
     if mission:
         for label, value in (("authorized target", mission.get("target")),
@@ -2775,9 +2943,18 @@ def _build_continuity_state(chat: dict, activity: list[dict] | None = None,
         if title and status not in ("completed", "done"):
             next_steps.append({"status": status[:32], "step": title[:320]})
     state = {
-        "version": 1,
+        "version": 2,
         "goal": str(anchor.get("original") or "")[:_TASK_ANCHOR_ORIGINAL_CHARS],
         "current_task": str(anchor.get("current") or anchor.get("original") or "")[:_TASK_ANCHOR_CURRENT_CHARS],
+        "verbatim_original_user": str(compaction_memory.get("original_user") or ""),
+        "recent_user_messages": [
+            str(item) for item in (compaction_memory.get("recent_user_messages") or [])
+            if str(item).strip()
+        ][-_COMPACTION_RECENT_USER_MESSAGES:],
+        "exact_anchors": [
+            str(item) for item in (compaction_memory.get("exact_anchors") or [])
+            if str(item).strip()
+        ][-_COMPACTION_ANCHOR_MAX:],
         "constraints": list(dict.fromkeys(constraints))[-16:],
         "completed": completed[-12:],
         "failures": failures[-8:],
@@ -2807,14 +2984,35 @@ def _refresh_continuity_state(chat: dict, activity: list[dict] | None = None,
     return state
 
 
-def _render_continuity_state(state: dict) -> str:
+def _render_continuity_state(state: dict, ctx_limit: int | None = None) -> str:
     if not isinstance(state, dict):
         return ""
+    original_chars, recent_chars, recent_count, anchor_chars = _compaction_render_limits(ctx_limit)
     lines = []
     if state.get("goal"):
         lines.append("goal: " + str(state["goal"]))
     if state.get("current_task") and state.get("current_task") != state.get("goal"):
         lines.append("current task: " + str(state["current_task"]))
+    original = str(state.get("verbatim_original_user") or "").strip()
+    if original:
+        original = _compaction_excerpt(original, original_chars)
+        chunks = [original[i:i + 620] for i in range(0, len(original), 620)]
+        for index, chunk in enumerate(chunks):
+            label = ("original user request (sensitive values redacted)"
+                     if index == 0 else "original user request (continued)")
+            lines.append(label + ": " + chunk)
+    recent_messages = list(state.get("recent_user_messages") or [])[-recent_count:]
+    for message in recent_messages:
+        text = _compaction_excerpt(str(message or "").strip(), recent_chars)
+        if not text:
+            continue
+        chunks = [text[i:i + 620] for i in range(0, len(text), 620)]
+        for index, chunk in enumerate(chunks):
+            label = "recent user instruction (verbatim)" if index == 0 else "recent user instruction (continued)"
+            lines.append(label + ": " + chunk)
+    for anchor in _render_anchor_subset(state.get("exact_anchors") or [], anchor_chars):
+        if str(anchor).strip():
+            lines.append("exact source anchor: " + str(anchor))
     for item in state.get("constraints") or []:
         lines.append("constraint: " + str(item))
     for item in state.get("completed") or []:
@@ -3033,13 +3231,242 @@ _SUMMARY_MIN_KEEP_HARD = 2     # absolute floor when recent messages are giant (
 _SUMMARY_TRIGGER_FRAC = 0.85
 _SUMMARY_KEEP_FRAC = 0.10     # aggressively fold most of the history, keeping only the recent tail raw
 _SUMMARY_MIN_OUTPUT_CHARS = 40  # summarizer output below this is degenerate (e.g. 11-char) — treat as failure
-_SUMMARY_REQUEST_CHARS = 200000  # cap the summarizer payload at the newest ~200K chars (~50K tokens) so it always fits ctx
+_SUMMARY_REQUEST_CHARS = 120000  # hard ceiling; live contexts use a smaller proportional source slice
 _SUMMARY_MAX_OUTPUT_TOKENS = 4096
+_COMPACTION_ORIGINAL_USER_CHARS = 1600
+_COMPACTION_RECENT_USER_CHARS = 900
+_COMPACTION_RECENT_USER_MESSAGES = 2
+_COMPACTION_ANCHOR_MAX = 48
+_COMPACTION_ANCHOR_CHARS = 2400
+_COMPACTION_SENSITIVE_KEY_RE = re.compile(
+    r"(?:password|passwd|pwd|secret|token|api[_-]?key|credential|authorization|"
+    r"bearer|private[_-]?key|client[_-]?secret)",
+    re.IGNORECASE,
+)
+_COMPACTION_KEY_VALUE_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9_.-]{2,48})\s*[:=]\s*([^\s,;]{1,180})"
+)
+_COMPACTION_WINDOWS_PATH_RE = re.compile(r"(?<!\w)[A-Za-z]:[\\/][^\s<>\"'|]{1,300}")
+_COMPACTION_POSIX_PATH_RE = re.compile(
+    r"(?<![\w:])/(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+"
+)
+_COMPACTION_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_COMPACTION_SHA_RE = re.compile(r"\b(?=[0-9a-fA-F]{7,40}\b)(?=[0-9a-fA-F]*[a-fA-F])(?=[0-9a-fA-F]*\d)[0-9a-fA-F]{7,40}\b")
+_COMPACTION_ISSUE_RE = re.compile(r"\b(?:PR|issue)\s*#?\d+\b", re.IGNORECASE)
 _COMPACTION_STOP_MESSAGE = (
     "Accuretta stopped this response because it could not produce a safe session summary. "
     "Your saved chat and completed actions are intact. Use Compact to try again now, "
     "wait three minutes and retry, or continue in a new session."
 )
+
+
+def _compaction_message_text(message: dict) -> str:
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = "\n".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return str(content or "").strip()
+
+
+def _compaction_excerpt(text: str, limit: int) -> str:
+    text = re.sub(
+        r"\[referenced-files\][\s\S]*?\[/referenced-files\]",
+        "",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    ).strip()
+    text = _COMPACTION_URL_RE.sub(
+        lambda match: _safe_compaction_url(match.group(0)) or "[redacted URL]",
+        text,
+    )
+    text = _COMPACTION_KEY_VALUE_RE.sub(
+        lambda match: (
+            f"{match.group(1)}=[redacted sensitive value]"
+            if _COMPACTION_SENSITIVE_KEY_RE.search(match.group(1))
+            else match.group(0)
+        ),
+        text,
+    )
+    if len(text) <= limit:
+        return text
+    marker = "\n...[exact middle omitted for context budget]...\n"
+    half = max(1, (limit - len(marker)) // 2)
+    return text[:half] + marker + text[-half:]
+
+
+def _safe_compaction_url(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(value.rstrip(".,;:)]}"))
+        host = parsed.hostname or ""
+        if not host:
+            return ""
+        port = f":{parsed.port}" if parsed.port else ""
+        return urllib.parse.urlunsplit((parsed.scheme, host + port, parsed.path, "", ""))[:320]
+    except Exception:
+        return ""
+
+
+def _extract_compaction_anchors(messages: list[dict]) -> list[str]:
+    """Collect exact high-signal identifiers without asking the model to copy them."""
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        value = str(value or "").strip().rstrip(".,;:)]}")[:320]
+        if not value or value in seen:
+            return
+        seen.add(value)
+        found.append(value)
+
+    for message in messages:
+        text = _compaction_message_text(message)
+        if message.get("tool_calls"):
+            text += "\n" + json.dumps(message.get("tool_calls"), ensure_ascii=False)
+        url_matches = list(_COMPACTION_URL_RE.finditer(text))
+        for match in _COMPACTION_KEY_VALUE_RE.finditer(text):
+            key = match.group(1)
+            if (key.lower() not in {"http", "https"}
+                    and not _COMPACTION_SENSITIVE_KEY_RE.search(key)):
+                add(match.group(0))
+        for match in _COMPACTION_WINDOWS_PATH_RE.finditer(text):
+            add(match.group(0))
+        for match in _COMPACTION_POSIX_PATH_RE.finditer(text):
+            if not any(url.start() <= match.start() < url.end() for url in url_matches):
+                add(match.group(0))
+        for match in url_matches:
+            add(_safe_compaction_url(match.group(0)))
+        for pattern in (_COMPACTION_SHA_RE, _COMPACTION_ISSUE_RE):
+            for match in pattern.finditer(text):
+                add(match.group(0))
+    return found
+
+
+def _bounded_compaction_anchors(existing: list, added: list) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for raw in list(existing or []) + list(added or []):
+        value = str(raw or "").strip()[:320]
+        if (not value or value in seen
+                or _COMPACTION_SENSITIVE_KEY_RE.search(value.split("=", 1)[0])):
+            continue
+        seen.add(value)
+        merged.append(value)
+    if len(merged) > _COMPACTION_ANCHOR_MAX:
+        merged = merged[:12] + merged[-(_COMPACTION_ANCHOR_MAX - 12):]
+    while sum(len(item) + 3 for item in merged) > _COMPACTION_ANCHOR_CHARS and len(merged) > 1:
+        # Retain the oldest original anchors and the newest working anchors.
+        merged.pop(12 if len(merged) > 12 else 0)
+    return merged
+
+
+def _build_compaction_memory(chat: dict, folded_messages: list[dict]) -> dict:
+    """Prepare exact evidence for a fold without mutating persisted chat state."""
+    prior = chat.get("compaction_memory")
+    prior = dict(prior) if isinstance(prior, dict) else {}
+    original = str(prior.get("original_user") or "").strip()
+    if not original:
+        for message in chat.get("messages", []):
+            if (message.get("role") == "user" and not message.get("invisible")
+                    and not message.get("_synthetic")):
+                original = _compaction_excerpt(
+                    _compaction_message_text(message),
+                    _COMPACTION_ORIGINAL_USER_CHARS,
+                )
+                if original:
+                    break
+
+    recent = [
+        str(item).strip()
+        for item in (prior.get("recent_user_messages") or [])
+        if str(item).strip()
+    ]
+    for message in folded_messages:
+        if (message.get("role") != "user" or message.get("invisible")
+                or message.get("_synthetic")):
+            continue
+        text = _compaction_excerpt(
+            _compaction_message_text(message),
+            _COMPACTION_RECENT_USER_CHARS,
+        )
+        if text and not _TASK_ACK_RE.fullmatch(_task_anchor_text(text)):
+            recent.append(text)
+    deduped_recent: list[str] = []
+    for text in recent:
+        if text == original or text in deduped_recent:
+            continue
+        deduped_recent.append(text)
+    recent = deduped_recent[-_COMPACTION_RECENT_USER_MESSAGES:]
+
+    anchors = _bounded_compaction_anchors(
+        prior.get("exact_anchors") or [],
+        _extract_compaction_anchors(folded_messages),
+    )
+    return {
+        "version": 1,
+        "original_user": original,
+        "recent_user_messages": recent,
+        "exact_anchors": anchors,
+        "updated": int(time.time()),
+    }
+
+
+def _compaction_render_limits(ctx_limit: int | None) -> tuple[int, int, int, int]:
+    if ctx_limit and ctx_limit <= 8192:
+        return 600, 400, 1, 800
+    if ctx_limit and ctx_limit <= 16384:
+        return 900, 600, 1, 1200
+    if ctx_limit and ctx_limit <= 32768:
+        return 1200, 700, 2, 1800
+    return 1600, 900, 2, 2400
+
+
+def _render_anchor_subset(anchors: list, char_budget: int) -> list[str]:
+    values = [str(item).strip()[:320] for item in anchors if str(item).strip()]
+    if not values:
+        return []
+    selected = values[:8] + [item for item in values[-24:] if item not in values[:8]]
+    while sum(len(item) + 3 for item in selected) > char_budget and len(selected) > 1:
+        selected.pop(8 if len(selected) > 8 else 0)
+    return selected
+
+
+def _render_compaction_memory(memory: dict, ctx_limit: int | None = None) -> str:
+    if not isinstance(memory, dict):
+        return ""
+    original_chars, recent_chars, recent_count, anchor_chars = _compaction_render_limits(ctx_limit)
+    sections: list[str] = []
+    original = str(memory.get("original_user") or "").strip()
+    if original:
+        sections.append(
+            "ORIGINAL USER INTENT (SENSITIVE VALUES REDACTED):\n"
+            + _compaction_excerpt(original, original_chars)
+        )
+    recent = [str(item).strip() for item in (memory.get("recent_user_messages") or [])
+              if str(item).strip()][-recent_count:]
+    if recent:
+        sections.append(
+            "RECENT REAL USER INSTRUCTIONS (SENSITIVE VALUES REDACTED):\n"
+            + "\n".join(f"- {_compaction_excerpt(item, recent_chars)}" for item in recent)
+        )
+    anchors = _render_anchor_subset(memory.get("exact_anchors") or [], anchor_chars)
+    if anchors:
+        sections.append(
+            "EXACT SOURCE ANCHORS (DO NOT PARAPHRASE):\n"
+            + "\n".join(f"- {item}" for item in anchors)
+        )
+    return "\n\n".join(sections)
+
+
+def _summary_request_chars(ctx_limit: int | None) -> int:
+    if not ctx_limit:
+        return _SUMMARY_REQUEST_CHARS
+    output_tokens = _summary_output_budget(ctx_limit)
+    fit_cap = max(8000, (int(ctx_limit) - output_tokens - 2048) * 2)
+    lean_target = max(12000, min(_SUMMARY_REQUEST_CHARS, int(ctx_limit * 0.75)))
+    return min(fit_cap, lean_target)
 
 
 def _summary_trigger_limit(ctx_limit: int) -> int:
@@ -3060,6 +3487,8 @@ def _summary_trigger_limit(ctx_limit: int) -> int:
 _SUMMARY_INSTR = (
     "You are compressing an earlier slice of a coding-assistant conversation into a structured state block. "
     "Merge the PRIOR SUMMARY (if any) with the NEW MESSAGES into one updated state. "
+    "The request may also contain harness-extracted VERBATIM USER INTENT and EXACT SOURCE ANCHORS. "
+    "Treat those as authoritative source evidence and copy exact identifiers without altering them. "
     "You MUST use this EXACT markdown format and preserve exact file paths, variable names, and error codes:\n\n"
     "## ACTIVE TASK:\n(Briefly state what we are trying to accomplish right now)\n"
     "## COMPLETED:\n(Bullet points of what has already worked)\n"
@@ -3131,7 +3560,8 @@ def _render_msgs_for_summary(slice_msgs: list[dict]) -> str:
 
 
 def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: str = "",
-                            notify: bool = True, ctx_limit: int | None = None) -> str | None:
+                            notify: bool = True, ctx_limit: int | None = None,
+                            compaction_memory: dict | None = None) -> str | None:
     """One non-streaming model call: merge old summary + new slice into an
     updated summary. Returns None on failure (callers treat that as 'fold did
     not happen' — distinct from an unchanged summary, which is a no-op)."""
@@ -3142,17 +3572,14 @@ def _update_rolling_summary(old_summary: str, slice_msgs: list[dict], chat_id: s
     # messages; slicing the combined string could erase established state on a
     # sufficiently deep later fold.
     prefix = f"PRIOR SUMMARY:\n{old_summary}\n\n" if old_summary else ""
+    evidence = _render_compaction_memory(compaction_memory or {}, ctx_limit=ctx_limit)
+    if evidence:
+        prefix += evidence + "\n\n"
     output_tokens = _summary_output_budget(ctx_limit)
-    request_chars = _SUMMARY_REQUEST_CHARS
-    if ctx_limit:
-        # The summarizer uses the same model slot. Scale its input to the live
-        # context instead of assuming the fixed 200K-char ceiling fits every
-        # model. Two chars/token is conservative for JSON/code-heavy history.
-        # Reserve the complete output allowance plus template/instruction room;
-        # the old fixed 2K output cap truncated Qwen summaries before their
-        # required final sections.
-        input_headroom = output_tokens + 2048
-        request_chars = min(request_chars, max(8000, (ctx_limit - input_headroom) * 2))
+    # A lean recent slice is faster to prefill and leaves the deterministic
+    # evidence above responsible for exact old identifiers and user wording.
+    # The fit cap remains conservative for dense code/JSON and small contexts.
+    request_chars = _summary_request_chars(ctx_limit)
     new_budget = max(2000, request_chars - len(prefix) - 32)
     if len(rendered) > new_budget:
         rendered = ("…(older new messages elided to fit the compaction request)…\n"
@@ -3463,9 +3890,16 @@ def _maybe_roll_summary_unlocked(chat: dict, ctx_limit: int, force: bool = False
     _notify = True
     if reason_hint == "manual":
         _summary_last_notice_by_chat[chat_id] = _now
-    new_summary = _update_rolling_summary(chat.get("rolling_summary", ""), msgs[through:cut],
-                                          chat_id=chat_id, notify=_notify,
-                                          ctx_limit=ctx_limit)
+    folded_messages = msgs[through:cut]
+    candidate_memory = _build_compaction_memory(chat, folded_messages)
+    new_summary = _update_rolling_summary(
+        chat.get("rolling_summary", ""),
+        folded_messages,
+        chat_id=chat_id,
+        notify=_notify,
+        ctx_limit=ctx_limit,
+        compaction_memory=candidate_memory,
+    )
     if new_summary is None:
         _summary_last_fail_by_chat[chat_id] = time.time()
         _summary_failure_seq_by_chat[chat_id] = (
@@ -3478,6 +3912,7 @@ def _maybe_roll_summary_unlocked(chat: dict, ctx_limit: int, force: bool = False
         _summary_last_fail_by_chat.pop(chat_id, None)
         chat["rolling_summary"] = new_summary
         chat["summary_through"] = cut
+        chat["compaction_memory"] = candidate_memory
         _refresh_continuity_state(chat)
         # Persistent fold marker for the UI: a subtle inline divider rendered at
         # this boundary in the chat ("compaction happened here — the model then
@@ -3687,8 +4122,13 @@ def _mid_turn_fold(chat_id: str, conversation: list[dict], start_len: int,
         out = _replay_wire_msg(m, replay_vision)
         if out is not None:
             rebuilt.append(out)
-    return {"conversation": rebuilt, "start_len": len(rebuilt),
-            "folded": new_through - old_through}
+    return {
+        "conversation": rebuilt,
+        "start_len": len(rebuilt),
+        "folded": new_through - old_through,
+        "continuity": dict(chat.get("continuity") or {}),
+        "compaction_memory": dict(chat.get("compaction_memory") or {}),
+    }
 
 
 def _compact_chat(chat_id: str, force: bool = True,
@@ -5805,8 +6245,28 @@ _BROWSER_INTENT_RE = re.compile(
 )
 
 
+_DESKTOP_INTENT_RE = re.compile(
+    r"\b(open|launch|start|focus|close|click|type|press|select|toggle|scroll|"
+    r"control|operate|interact|use)\b[^\n]{0,80}\b(app|application|window|"
+    r"desktop|screen|computer|notepad|calculator|explorer|browser|excel|word)\b|"
+    r"\b(app|application|window|desktop|screen|computer|notepad|calculator|"
+    r"explorer|browser|excel|word)\b[^\n]{0,80}\b(open|launch|start|focus|"
+    r"close|click|type|press|select|toggle|scroll|control|operate|interact|use)\b|"
+    r"(?:^|[.!?]\s+)(?:please\s+)?(?:open|launch|start|close)\s+\S+",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 def _user_asked_browser_interaction() -> bool:
     return bool(_BROWSER_INTENT_RE.search(_last_user_text or ""))
+
+
+def _user_asked_desktop_interaction(text: str) -> bool:
+    return bool(_DESKTOP_INTENT_RE.search(str(text or "")))
+
+
+def _is_desktop_approval_kind(kind: str) -> bool:
+    return str(kind or "").startswith(("desktop_", "desktop."))
 
 
 # Playwright MCP verbs that MUTATE page state (as opposed to reads like
@@ -5839,7 +6299,7 @@ def request_approval(title: str, command: str, details: dict | None = None, time
             and _recent_web_taint()
             and (kind in _SOFT_COMMAND_KINDS
                  or kind in _SAFE_WRITE_KINDS
-                 or (kind or "").startswith("desktop_"))):
+                 or _is_desktop_approval_kind(kind))):
         details["web_tainted"] = True
         details["force_prompt"] = True
     # The frontend may only offer "remember for this session" on kinds the
@@ -5855,7 +6315,7 @@ def request_approval(title: str, command: str, details: dict | None = None, time
             if mode != "hard" and kind in _SAFE_WRITE_KINDS:
                 return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
             if mode == "soft":
-                if kind in _SOFT_PROMPT_KINDS or (kind or "").startswith("desktop_"):
+                if kind in _SOFT_PROMPT_KINDS or _is_desktop_approval_kind(kind):
                     pass                                    # launches + desktop stay gated
                 elif (kind or "").startswith("mcp_"):
                     if not _MCP_SOFT_BLOCK.search(kind):    # playwright runs free; delete-ish MCP still prompts
@@ -9896,9 +10356,13 @@ def _github_rest_h(method: str, path: str, body: dict | None = None,
         return 0, {"message": str(e)}, {}
 
 
-def _github_graphql(query: str, token: str | None = None, timeout: int = 30) -> tuple[int, dict]:
+def _github_graphql(query: str, token: str | None = None, timeout: int = 30,
+                    variables: dict | None = None) -> tuple[int, dict]:
     """Raw GitHub GraphQL call. Returns (status, parsed_json)."""
-    payload = json.dumps({"query": query}).encode("utf-8")
+    request_body = {"query": query}
+    if variables is not None:
+        request_body["variables"] = variables
+    payload = json.dumps(request_body).encode("utf-8")
     req = urllib.request.Request(
         GITHUB_GRAPHQL_API, data=payload, method="POST", headers=_github_headers(token))
     try:
@@ -9939,10 +10403,78 @@ query AccurettaActivity {
         pushedAt
         defaultBranchRef { name }
       }
+      pageInfo { hasNextPage endCursor }
     }
   }
 }
 """
+
+_GH_REPOS_QUERY = """
+query AccurettaRepositories($first: Int!, $after: String) {
+  viewer {
+    repositories(first: $first, after: $after,
+                 orderBy: {field: PUSHED_AT, direction: DESC},
+                 ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]) {
+      nodes {
+        name
+        owner { login }
+        stargazerCount
+        pushedAt
+        defaultBranchRef { name }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
+
+def _github_repo_page(connection: object) -> tuple[list[dict], dict]:
+    """Normalize a GitHub repository connection for the browser."""
+    conn = connection if isinstance(connection, dict) else {}
+    repos = []
+    for node in conn.get("nodes", []) or []:
+        if not isinstance(node, dict):
+            continue
+        repos.append({
+            "name": node.get("name", ""),
+            "owner": ((node.get("owner") or {}) or {}).get("login", ""),
+            "stars": int(node.get("stargazerCount") or 0),
+            "pushed_at": node.get("pushedAt", ""),
+            "default_branch": ((node.get("defaultBranchRef") or {}) or {}).get("name", "main"),
+        })
+    raw_page = conn.get("pageInfo") if isinstance(conn.get("pageInfo"), dict) else {}
+    page_info = {
+        "has_next": bool(raw_page.get("hasNextPage")),
+        "cursor": str(raw_page.get("endCursor") or ""),
+    }
+    return repos, page_info
+
+
+def _github_repositories(first: int = 12, after: str = "") -> dict:
+    """Fetch one token-authorized page of recently pushed repositories."""
+    cred = _github_cred()
+    pat = cred.get("pat") or ""
+    if not pat:
+        return {"connected": False, "error": "not connected"}
+    limit = max(1, min(int(first or 12), 50))
+    status, data = _github_graphql(
+        _GH_REPOS_QUERY,
+        token=pat,
+        variables={"first": limit, "after": after or None},
+    )
+    if status != 200:
+        return {"connected": False,
+                "error": str(data.get("message") or data.get("errors") or f"HTTP {status}")}
+    errors = data.get("errors")
+    if errors:
+        first_error = errors[0] if isinstance(errors, list) and errors else errors
+        return {"connected": False, "error": str(
+            first_error.get("message") if isinstance(first_error, dict) else first_error)}
+    viewer = (data.get("data") or {}).get("viewer") or {}
+    repos, page_info = _github_repo_page(viewer.get("repositories"))
+    return {"connected": True, "repos": repos, "page_info": page_info}
+
 
 def _gh_quartile_levels(counts: list[int]) -> list[int]:
     """Map contribution counts to the 0-4 GitHub grid levels.
@@ -9980,7 +10512,7 @@ def _gh_quartile_levels(counts: list[int]) -> list[int]:
 
 
 def _github_activity() -> dict:
-    """Contribution calendar (weeks -> days) + the 3 most recently pushed repos."""
+    """Contribution calendar plus the first page of recently pushed repos."""
     cred = _github_cred()
     pat = cred.get("pat") or ""
     if not pat:
@@ -10017,17 +10549,7 @@ def _github_activity() -> dict:
         for d in w:
             d["level"] = levels[li]
             li += 1
-    repos = []
-    for n in (viewer.get("repositories") or {}).get("nodes", []) or []:
-        if not isinstance(n, dict):
-            continue
-        repos.append({
-            "name": n.get("name", ""),
-            "owner": ((n.get("owner") or {}) or {}).get("login", ""),
-            "stars": int(n.get("stargazerCount") or 0),
-            "pushed_at": n.get("pushedAt", ""),
-            "default_branch": ((n.get("defaultBranchRef") or {}) or {}).get("name", "main"),
-        })
+    repos, page_info = _github_repo_page(viewer.get("repositories"))
     return {
         "connected": True,
         "login": viewer.get("login") or cred.get("login", ""),
@@ -10035,6 +10557,7 @@ def _github_activity() -> dict:
         "total_contributions": int(cal.get("totalContributions") or 0),
         "weeks": weeks,
         "repos": repos,
+        "repos_page": page_info,
     }
 
 
@@ -10079,6 +10602,159 @@ def _github_worktree_prompt(chat: dict | None) -> str:
         "and keep changes inside it unless the user explicitly names another project. "
         "Before branch-sensitive work, verify the branch with git_status."
     )
+
+
+def _project_workspace_metadata(raw: object) -> dict | None:
+    """Validate the private context attached to a from-scratch project chat."""
+    if not isinstance(raw, dict):
+        return None
+    name = str(raw.get("name") or "").strip()
+    path = normalize_path(str(raw.get("path") or ""))
+    branch = str(raw.get("branch") or "main").strip()
+    brief = str(raw.get("brief") or "").strip()[:4000]
+    owner = str(raw.get("owner") or "").strip()
+    if (not _GITHUB_REPO_RE.fullmatch(name)
+            or name in {".", ".."}
+            or _github_valid_branch_name(branch)
+            or not path
+            or not _workspace_root_for(path)
+            or Path(path).name.lower() != name.lower()
+            or not (Path(path) / ".git").exists()
+            or (owner and not _GITHUB_OWNER_RE.fullmatch(owner))):
+        return None
+    return {
+        "name": name,
+        "path": path,
+        "branch": branch,
+        "brief": brief,
+        "published": bool(raw.get("published")),
+        "owner": owner,
+    }
+
+
+def _project_workspace_prompt(chat: dict | None) -> str:
+    """Render a new project's private workspace context for the model."""
+    project = _project_workspace_metadata((chat or {}).get("project_workspace"))
+    if not project:
+        return ""
+    lines = [
+        "active project for this chat:",
+        f"- project: {project['name']}",
+        f"- expected branch: {project['branch']}",
+        f"- local path: {project['path']}",
+        f"- GitHub publication: {'published' if project['published'] else 'local only'}",
+    ]
+    if project["brief"]:
+        lines.append(f"- initial brief: {project['brief']}")
+    lines.append(
+        "Treat this as the user's current project. Inspect this path first and keep "
+        "project files inside it unless the user explicitly says otherwise."
+    )
+    return "\n".join(lines)
+
+
+def _project_workspace_root(requested: str = "") -> str | None:
+    """Resolve a selected workspace root without accepting arbitrary subfolders."""
+    roots = [normalize_path(str(folder)) for folder in get_workspace().get("folders", []) or []
+             if str(folder or "").strip()]
+    if not roots:
+        return None
+    if not requested:
+        return roots[0]
+    wanted = normalize_path(requested)
+    return next((root for root in roots if os.path.normcase(root) == os.path.normcase(wanted)), None)
+
+
+def _github_create_project(name: str, brief: str = "", workspace_root: str = "",
+                           publish: bool = False, private: bool = True) -> dict:
+    """Create a safe local git project and optionally publish an empty GitHub repo."""
+    name = (name or "").strip()
+    if not _GITHUB_REPO_RE.fullmatch(name) or name in {".", ".."} or name.endswith("."):
+        return {"error": "invalid project name; use letters, digits, dots, underscores and hyphens (max 100 characters)"}
+    if os.name == "nt" and name.split(".", 1)[0].upper() in {
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5",
+        "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4",
+        "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    }:
+        return {"error": "that project name is reserved by Windows"}
+    root = _project_workspace_root(workspace_root)
+    if not root:
+        return {"error": "choose one of the configured workspace folders"}
+    root_path = Path(root)
+    destination = root_path / name
+    try:
+        resolved_destination = destination.resolve()
+        if os.path.normcase(str(resolved_destination.parent)) != os.path.normcase(str(root_path.resolve())):
+            return {"error": "project path escapes the selected workspace folder"}
+        if destination.exists():
+            return {"error": f"a folder named `{name}` already exists in that workspace"}
+        destination.mkdir(parents=False, exist_ok=False)
+    except Exception as exc:
+        return {"error": f"could not create the project folder: {exc}"}
+
+    initialized = _run_git(str(destination), ["init", "-b", "main"], timeout=60)
+    if not initialized.get("ok"):
+        initialized = _run_git(str(destination), ["init"], timeout=60)
+        if initialized.get("ok"):
+            initialized = _run_git(
+                str(destination), ["symbolic-ref", "HEAD", "refs/heads/main"], timeout=30)
+    if not initialized.get("ok"):
+        try:
+            shutil.rmtree(destination)
+        except Exception:
+            pass
+        detail = str(initialized.get("stderr") or initialized.get("error") or "unknown error")[:500]
+        return {"error": f"git could not initialize the project: {detail}"}
+
+    result = {
+        "ok": True,
+        "name": name,
+        "path": str(destination.resolve()),
+        "branch": "main",
+        "published": False,
+        "remote_ready": False,
+    }
+    if not publish:
+        return result
+
+    pat = _github_cred().get("pat") or ""
+    if not pat:
+        result["publish_error"] = "GitHub is not connected. The local project was still created."
+        return result
+    status, remote, _headers = _github_rest_h("POST", "/user/repos", {
+        "name": name,
+        "description": (brief or "").strip()[:350],
+        "private": bool(private),
+        "auto_init": False,
+    }, token=pat)
+    if status != 201:
+        message = str(remote.get("message") or remote.get("errors") or f"HTTP {status}")
+        if status == 403:
+            message = ("GitHub refused repository creation. Give the fine-grained token "
+                       "Administration: Read and write, then retry publishing. The local project was still created.")
+        else:
+            message = f"GitHub repository creation failed: {message}. The local project was still created."
+        result["publish_error"] = message
+        return result
+
+    owner = str(((remote.get("owner") or {}) or {}).get("login") or _github_cred().get("login") or "")
+    clone_url = str(remote.get("clone_url") or "")
+    result.update({
+        "published": True,
+        "owner": owner,
+        "repo": str(remote.get("name") or name),
+        "html_url": str(remote.get("html_url") or ""),
+    })
+    if not clone_url:
+        result["publish_error"] = "GitHub created the repository but returned no clone URL. Add the remote manually."
+        return result
+    remote_result = _run_git(str(destination), ["remote", "add", "origin", clone_url], timeout=30)
+    if not remote_result.get("ok"):
+        detail = str(remote_result.get("stderr") or remote_result.get("error") or "unknown error")[:300]
+        result["publish_error"] = f"GitHub created the repository, but wiring the local remote failed: {detail}"
+        return result
+    result["remote_ready"] = True
+    return result
 
 
 def _github_find_workspace_repo(repo: str) -> str | None:
@@ -10928,8 +11604,8 @@ def tool_web_image_search(args: dict) -> dict:
 # `desktop_auto_approve_read` is on (default), because observation can't
 # mutate the machine and constant approval prompts would be unusable.
 
-def _desktop_preflight(require_libs: bool = True) -> dict | None:
-    """Return an error dict if desktop tools can't run right now, else None."""
+def _desktop_preflight(required: tuple[str, ...] = ()) -> dict | None:
+    """Return an error when desktop control is disabled or a dependency is absent."""
     s = get_settings()
     if not s.get("desktop_enabled"):
         return {"error": "desktop automation is disabled. Enable it in Settings -> Desktop automation."}
@@ -10938,12 +11614,14 @@ def _desktop_preflight(require_libs: bool = True) -> dict | None:
     cid = _current_chat_id.get()
     if cid and cid in _chat_desktop_disabled:
         return {"error": "desktop automation is off for this chat. User must re-enable it on the session header."}
-    if require_libs and not (_HAVE_PYAUTOGUI and _HAVE_PIL):
-        missing = []
-        if not _HAVE_PYAUTOGUI:
-            missing.append("pyautogui")
-        if not _HAVE_PIL:
-            missing.append("Pillow")
+    available = {
+        "pyautogui": _HAVE_PYAUTOGUI,
+        "pillow": _HAVE_PIL,
+        "pygetwindow": _HAVE_PGW,
+        "uiautomation": _HAVE_UIA,
+    }
+    missing = [name for name in required if not available.get(name, False)]
+    if missing:
         return {
             "error": f"missing dependencies: {', '.join(missing)}. Install with: pip install {' '.join(missing)}"
         }
@@ -11013,10 +11691,15 @@ def _list_windows_raw() -> list[dict]:
             try:
                 if w.width <= 0 or w.height <= 0:
                     continue
+                hwnd = int(getattr(w, "_hWnd", 0) or 0)
+                pid = _window_process_id(hwnd)
                 out.append({
+                    "window_id": _window_id(hwnd) if hwnd else "",
                     "title": title,
                     "x": int(w.left), "y": int(w.top),
                     "w": int(w.width), "h": int(w.height),
+                    "process_id": pid,
+                    "process_path": _process_path(pid),
                     "active": bool(w.isActive),
                     "minimized": bool(getattr(w, "isMinimized", False)),
                 })
@@ -11045,13 +11728,427 @@ def _find_window(substring: str):
         return None
 
 
+def _window_id(hwnd: int) -> str:
+    return f"hwnd:{int(hwnd):x}" if hwnd else ""
+
+
+def _window_handle_from_id(value: str) -> int:
+    raw = str(value or "").strip().lower()
+    if not raw.startswith("hwnd:"):
+        return 0
+    try:
+        return int(raw[5:], 16)
+    except ValueError:
+        return 0
+
+
+def _window_process_id(hwnd: int) -> int:
+    if sys.platform != "win32" or not hwnd:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+        pid = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value)
+    except Exception:
+        return 0
+
+
+def _process_path(pid: int) -> str:
+    if sys.platform != "win32" or not pid:
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return ""
+        try:
+            size = wintypes.DWORD(32768)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return buf.value
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    return ""
+
+
+def _uia_safe(control, name: str, default=None):
+    try:
+        return getattr(control, name)
+    except Exception:
+        return default
+
+
+def _uia_pattern(control, method: str):
+    try:
+        fn = getattr(control, method, None)
+        return fn() if callable(fn) else None
+    except Exception:
+        return None
+
+
+def _uia_bounds(control) -> list[int]:
+    rect = _uia_safe(control, "BoundingRectangle")
+    if not rect:
+        return [0, 0, 0, 0]
+    try:
+        left, top = int(rect.left), int(rect.top)
+        return [left, top, max(0, int(rect.right) - left), max(0, int(rect.bottom) - top)]
+    except Exception:
+        return [0, 0, 0, 0]
+
+
+def _uia_control_record(control, path: tuple[int, ...]) -> tuple[dict, dict]:
+    role = str(_uia_safe(control, "ControlTypeName", "Control") or "Control")
+    if role.endswith("Control"):
+        role = role[:-7]
+    password = bool(_uia_safe(control, "IsPassword", False))
+    actions: list[str] = []
+    patterns: dict[str, Any] = {}
+    for action, method in (
+        ("invoke", "GetInvokePattern"),
+        ("set_value", "GetValuePattern"),
+        ("toggle", "GetTogglePattern"),
+        ("select", "GetSelectionItemPattern"),
+        ("expand_collapse", "GetExpandCollapsePattern"),
+        ("scroll", "GetScrollPattern"),
+    ):
+        pattern = _uia_pattern(control, method)
+        if pattern is not None:
+            actions.append(action)
+            patterns[action] = pattern
+    if bool(_uia_safe(control, "IsKeyboardFocusable", False)):
+        actions.append("focus")
+
+    value = None
+    if "set_value" in patterns:
+        if password:
+            value = "[redacted]"
+        else:
+            try:
+                value = str(patterns["set_value"].Value)[:2000]
+            except Exception:
+                value = None
+    if value in (None, "") and role in {"Document", "Edit", "Text"} and not password:
+        text_pattern = _uia_pattern(control, "GetTextPattern")
+        if text_pattern is not None:
+            try:
+                value = str(text_pattern.DocumentRange.GetText(2000))
+            except Exception:
+                pass
+
+    state: dict[str, Any] = {}
+    try:
+        if "toggle" in patterns:
+            state["toggle"] = int(patterns["toggle"].ToggleState)
+        if "select" in patterns:
+            state["selected"] = bool(patterns["select"].IsSelected)
+        if "expand_collapse" in patterns:
+            state["expanded"] = int(patterns["expand_collapse"].ExpandCollapseState)
+    except Exception:
+        pass
+
+    runtime_id = []
+    try:
+        runtime_id = [int(v) for v in control.GetRuntimeId()]
+    except Exception:
+        pass
+    name = str(_uia_safe(control, "Name", "") or "")[:500]
+    automation_id = str(_uia_safe(control, "AutomationId", "") or "")[:240]
+    class_name = str(_uia_safe(control, "ClassName", "") or "")[:240]
+    public = {
+        "role": role or "Control",
+        "name": name,
+        "bounds": _uia_bounds(control),
+        "enabled": bool(_uia_safe(control, "IsEnabled", True)),
+        "actions": actions,
+        "depth": len(path),
+    }
+    if automation_id:
+        public["automation_id"] = automation_id
+    if class_name:
+        public["class_name"] = class_name
+    if bool(_uia_safe(control, "HasKeyboardFocus", False)):
+        public["focused"] = True
+    if bool(_uia_safe(control, "IsOffscreen", False)):
+        public["offscreen"] = True
+    if password:
+        public["password"] = True
+    if value not in (None, ""):
+        public["value"] = value
+    if state:
+        public["state"] = state
+    descriptor = {
+        "path": list(path),
+        "runtime_id": runtime_id,
+        "fingerprint": [role, name, automation_id, class_name],
+        "public": public,
+    }
+    return public, descriptor
+
+
+def _uia_window(selector: str = ""):
+    selector = str(selector or "").strip()
+    hwnd = _window_handle_from_id(selector)
+    if not hwnd and not selector and sys.platform == "win32":
+        try:
+            import ctypes
+            hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+        except Exception:
+            hwnd = 0
+    if hwnd:
+        control = _uia.ControlFromHandle(hwnd)
+        if control:
+            return control
+
+    needle = selector.lower()
+    candidates = []
+    for control in _uia.GetRootControl().GetChildren():
+        try:
+            title = str(control.Name or "").strip()
+            handle = int(control.NativeWindowHandle or 0)
+            if not title or not handle:
+                continue
+            if needle and needle not in title.lower():
+                continue
+            candidates.append(control)
+        except Exception:
+            continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (
+        str(_uia_safe(c, "Name", "")).lower() != needle,
+        -(_uia_bounds(c)[2] * _uia_bounds(c)[3]),
+    ))
+    return candidates[0]
+
+
+def _desktop_cache_put(snapshot_id: str, entry: dict) -> None:
+    now = time.time()
+    with _desktop_snapshot_lock:
+        stale = [sid for sid, item in _desktop_snapshot_cache.items()
+                 if now - float(item.get("created") or 0) > _DESKTOP_SNAPSHOT_TTL_S]
+        for sid in stale:
+            _desktop_snapshot_cache.pop(sid, None)
+        _desktop_snapshot_cache[snapshot_id] = entry
+        while len(_desktop_snapshot_cache) > _DESKTOP_SNAPSHOT_CACHE_MAX:
+            oldest = min(_desktop_snapshot_cache,
+                         key=lambda sid: float(_desktop_snapshot_cache[sid].get("created") or 0))
+            _desktop_snapshot_cache.pop(oldest, None)
+
+
+def _desktop_cache_descriptor(ref: str) -> tuple[dict | None, dict | None, str]:
+    parts = str(ref or "").split(":", 2)
+    if len(parts) != 3 or parts[0] != "e":
+        return None, None, "invalid element reference; call desktop_snapshot again"
+    snapshot_id = parts[1]
+    with _desktop_snapshot_lock:
+        cache = _desktop_snapshot_cache.get(snapshot_id)
+        descriptor = (cache.get("elements") or {}).get(ref) if cache else None
+    if not cache or not descriptor:
+        return None, None, "unknown or expired element reference; call desktop_snapshot again"
+    if time.time() - float(cache.get("created") or 0) > _DESKTOP_SNAPSHOT_TTL_S:
+        return None, None, "element reference expired; call desktop_snapshot again"
+    chat_id = _current_chat_id.get()
+    if chat_id and cache.get("chat_id") and cache.get("chat_id") != chat_id:
+        return None, None, "element reference belongs to another chat"
+    return cache, descriptor, ""
+
+
+def _uia_descriptor_matches(control, descriptor: dict) -> bool:
+    expected_runtime = descriptor.get("runtime_id") or []
+    if expected_runtime:
+        try:
+            if [int(v) for v in control.GetRuntimeId()] == expected_runtime:
+                return True
+        except Exception:
+            pass
+    _, actual_descriptor = _uia_control_record(control, tuple(descriptor.get("path") or ()))
+    return actual_descriptor.get("fingerprint") == (descriptor.get("fingerprint") or [])
+
+
+def _uia_resolve_descriptor(cache: dict, descriptor: dict):
+    window = _uia.ControlFromHandle(int(cache.get("window_handle") or 0))
+    if not window:
+        return None
+    control = window
+    try:
+        for index in descriptor.get("path") or []:
+            children = control.GetChildren()
+            if index < 0 or index >= len(children):
+                control = None
+                break
+            control = children[index]
+        if control is not None and _uia_descriptor_matches(control, descriptor):
+            return control
+    except Exception:
+        pass
+
+    target_runtime = descriptor.get("runtime_id") or []
+    if not target_runtime:
+        return None
+    queue = [window]
+    visited = 0
+    while queue and visited < 1600:
+        control = queue.pop(0)
+        visited += 1
+        try:
+            if [int(v) for v in control.GetRuntimeId()] == target_runtime:
+                return control
+            queue.extend(control.GetChildren())
+        except Exception:
+            continue
+    return None
+
+
+def _uia_capture(selector: str = "", max_depth: int = 8,
+                 max_elements: int = 160, include_offscreen: bool = False,
+                 query: str = "") -> dict:
+    window = _uia_window(selector)
+    if not window:
+        return {"error": f"no accessible window matches '{selector}'" if selector
+                         else "no foreground window is available"}
+    hwnd = int(_uia_safe(window, "NativeWindowHandle", 0) or 0)
+    if not hwnd:
+        return {"error": "the selected window has no stable native handle"}
+    snapshot_id = uuid.uuid4().hex[:10]
+    elements: list[dict] = []
+    descriptors: dict[str, dict] = {}
+    queue: list[tuple[Any, tuple[int, ...]]] = []
+    try:
+        queue = [(child, (index,)) for index, child in enumerate(window.GetChildren())]
+    except Exception as exc:
+        return {"error": f"could not read the accessibility tree: {exc}"}
+    visited = 0
+    max_nodes = max(500, max_elements * 8)
+    query = str(query or "").strip().lower()
+    while queue and len(elements) < max_elements and visited < max_nodes:
+        control, path = queue.pop(0)
+        visited += 1
+        public, descriptor = _uia_control_record(control, path)
+        relevant = bool(
+            public.get("name") or public.get("value") or public.get("actions")
+            or public.get("focused") or public.get("role") in {"Document", "Edit", "StatusBar"}
+        )
+        if query:
+            searchable = " ".join(str(public.get(key) or "") for key in
+                                  ("role", "name", "automation_id", "class_name", "value")).lower()
+            relevant = relevant and query in searchable
+        if relevant and (include_offscreen or not public.get("offscreen")):
+            ref = f"e:{snapshot_id}:{len(elements) + 1}"
+            public["ref"] = ref
+            descriptor["public"] = dict(public)
+            descriptors[ref] = descriptor
+            elements.append(public)
+        if len(path) < max_depth:
+            try:
+                children = control.GetChildren()
+                queue.extend((child, path + (index,)) for index, child in enumerate(children))
+            except Exception:
+                pass
+
+    title = str(_uia_safe(window, "Name", "") or "")[:500]
+    pid = int(_uia_safe(window, "ProcessId", 0) or _window_process_id(hwnd))
+    window_info = {
+        "window_id": _window_id(hwnd),
+        "title": title,
+        "process_id": pid,
+        "process_path": _process_path(pid),
+        "bounds": _uia_bounds(window),
+        "framework": str(_uia_safe(window, "FrameworkId", "") or "")[:100],
+    }
+    normalized = [{k: v for k, v in item.items() if k != "ref"} for item in elements]
+    state_token = hashlib.sha256(json.dumps(normalized, sort_keys=True,
+                                            ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+    cache_entry = {
+        "created": time.time(),
+        "chat_id": _current_chat_id.get(),
+        "window_handle": hwnd,
+        "window": window_info,
+        "elements": descriptors,
+        "records": elements,
+        "state_token": state_token,
+    }
+    _desktop_cache_put(snapshot_id, cache_entry)
+    return {
+        "ok": True,
+        "mode": "accessibility",
+        "snapshot_id": snapshot_id,
+        "state_token": state_token,
+        "window": window_info,
+        "elements": elements,
+        "truncated": bool(queue),
+        "visited_nodes": visited,
+        "note": "Use element refs with desktop_invoke, desktop_set_value, or desktop_scroll. Re-snapshot after major UI changes.",
+    }
+
+
+def _uia_record_key(descriptor: dict) -> tuple:
+    runtime = tuple(descriptor.get("runtime_id") or ())
+    return ("runtime",) + runtime if runtime else ("path",) + tuple(descriptor.get("path") or ())
+
+
+def _uia_diff(before: dict, after: dict) -> dict:
+    before_map = {_uia_record_key(v): v.get("public") or {}
+                  for v in (before.get("elements") or {}).values()}
+    after_map = {_uia_record_key(v): v.get("public") or {}
+                 for v in (after.get("elements") or {}).values()}
+    added_keys = after_map.keys() - before_map.keys()
+    removed_keys = before_map.keys() - after_map.keys()
+    changed = []
+    for key in before_map.keys() & after_map.keys():
+        old = {k: v for k, v in before_map[key].items() if k != "ref"}
+        new = {k: v for k, v in after_map[key].items() if k != "ref"}
+        if old != new:
+            changed.append(after_map[key])
+    return {
+        "added_count": len(added_keys),
+        "removed_count": len(removed_keys),
+        "changed_count": len(changed),
+        "added": [after_map[k] for k in list(added_keys)[:20]],
+        "removed": [before_map[k] for k in list(removed_keys)[:20]],
+        "changed": changed[:20],
+    }
+
+
+def _vision_observation_available() -> bool:
+    try:
+        if _llama.is_vision_capable():
+            return True
+    except Exception:
+        pass
+    return _separate_vision_server_ready(timeout=0.5)
+
+
+def _separate_vision_server_ready(timeout: float = 0.8) -> bool:
+    """Return true only when the configured side vision server answers now.
+
+    A different URL is configuration, not availability. Treating it as ready
+    made image POSTs wait inside describe_image() for up to three minutes when
+    an old or dead side server address remained configured.
+    """
+    if not VISION_LLAMA or VISION_LLAMA == LLAMA:
+        return False
+    try:
+        return llama_ready(timeout=timeout, base_url=VISION_LLAMA)
+    except Exception:
+        return False
+
+
 # ---- desktop tools: read-only (observation) ---------------------------------
 
 def tool_screenshot(args: dict) -> dict:
     """Capture the screen and return a base64 PNG. Read-only."""
-    err = _desktop_preflight()
+    err = _desktop_preflight(("pyautogui", "pillow"))
     if err:
         return err
+    if not _vision_observation_available():
+        return {"error": "no working vision backend is loaded. Use desktop_snapshot for CPU-only blind control."}
     try:
         region = None
         if all(k in args for k in ("x", "y", "w", "h")):
@@ -11066,9 +12163,11 @@ def tool_describe_screen(args: dict) -> dict:
     """Take a screenshot, run it through the vision model, return the description.
     This is the agent's 'eyes' — prefer this over raw screenshots so the main
     model stays text-only and VRAM stays efficient."""
-    err = _desktop_preflight()
+    err = _desktop_preflight(("pyautogui", "pillow"))
     if err:
         return err
+    if not _vision_observation_available():
+        return {"error": "no working vision backend is loaded. Use desktop_snapshot for CPU-only blind control."}
     try:
         region = None
         if all(k in args for k in ("x", "y", "w", "h")):
@@ -11076,6 +12175,8 @@ def tool_describe_screen(args: dict) -> dict:
         hint = (args.get("hint") or "").strip()
         b64, (ow, oh) = _take_screenshot_b64(region)
         desc = describe_image(b64, hint=hint)
+        if desc.startswith("[image attached —"):
+            return {"error": desc.strip("[]")}
         return {"ok": True, "description": desc, "width": ow, "height": oh}
     except Exception as e:
         return {"error": f"describe_screen failed: {e}"}
@@ -11083,7 +12184,7 @@ def tool_describe_screen(args: dict) -> dict:
 
 def tool_list_windows(args: dict) -> dict:
     """List visible top-level windows."""
-    err = _desktop_preflight(require_libs=False)
+    err = _desktop_preflight()
     if err:
         return err
     if not _HAVE_PGW:
@@ -11091,12 +12192,33 @@ def tool_list_windows(args: dict) -> dict:
     return {"ok": True, "windows": _list_windows_raw()}
 
 
+def tool_desktop_snapshot(args: dict) -> dict:
+    """Read a window's Windows UI Automation tree without screenshots or a VLM."""
+    err = _desktop_preflight(("uiautomation",))
+    if err:
+        return err
+    selector = str(args.get("window") or "").strip()
+    try:
+        max_depth = max(1, min(20, int(args.get("max_depth") or 8)))
+        max_elements = max(20, min(800, int(args.get("max_elements") or 160)))
+    except (TypeError, ValueError):
+        return {"error": "max_depth and max_elements must be integers"}
+    try:
+        with _uia.UIAutomationInitializerInThread():
+            return _uia_capture(selector, max_depth, max_elements,
+                                bool(args.get("include_offscreen")),
+                                str(args.get("query") or ""))
+    except Exception as exc:
+        return {"error": f"accessibility snapshot failed: {exc}"}
+
+
 # ---- desktop tools: actions (gated) -----------------------------------------
 
-def _gate_action(title: str, command: str, details: dict | None = None) -> dict | None:
+def _gate_action(title: str, command: str, details: dict | None = None,
+                 required: tuple[str, ...] = ()) -> dict | None:
     """Common gate for every action tool: panic -> rate -> approval.
     Returns an error dict if the caller should abort, else None."""
-    err = _desktop_preflight()
+    err = _desktop_preflight(required)
     if err:
         return err
     rerr = _desktop_rate_check()
@@ -11127,7 +12249,7 @@ def _desktop_post_state() -> dict:
             state["cursor"] = [int(pos.x), int(pos.y)]
         except Exception:
             pass
-    state["note"] = "immediate host observation; use describe_screen when visual confirmation matters"
+    state["note"] = "immediate host observation; use desktop_snapshot for semantic verification"
     return state
 
 
@@ -11163,7 +12285,7 @@ def tool_desktop_launch_app(args: dict) -> dict:
 
 def tool_desktop_focus_window(args: dict) -> dict:
     """Bring a window to the foreground by title substring."""
-    err = _desktop_preflight(require_libs=False)
+    err = _desktop_preflight()
     if err:
         return err
     if not _HAVE_PGW:
@@ -11208,6 +12330,7 @@ def tool_desktop_click(args: dict) -> dict:
         title=f"Click at ({x}, {y})",
         command=f"{button} click x{clicks} at ({x}, {y})",
         details={"kind": "desktop.click", "x": x, "y": y, "button": button, "clicks": clicks},
+        required=("pyautogui",),
     )
     if gate_err:
         return gate_err
@@ -11230,6 +12353,7 @@ def tool_desktop_type_text(args: dict) -> dict:
         title="Type text (keyboard)",
         command=f"type: {preview}",
         details={"kind": "desktop.type", "text": text, "length": len(text)},
+        required=("pyautogui",),
     )
     if gate_err:
         return gate_err
@@ -11258,6 +12382,7 @@ def tool_desktop_press_keys(args: dict) -> dict:
         title="Press keys",
         command=f"hotkey: {'+'.join(combo)}",
         details={"kind": "desktop.keys", "combo": combo},
+        required=("pyautogui",),
     )
     if gate_err:
         return gate_err
@@ -11273,7 +12398,7 @@ def tool_desktop_press_keys(args: dict) -> dict:
 
 def tool_desktop_close_window(args: dict) -> dict:
     """Close a window by title substring. Requires approval."""
-    err = _desktop_preflight(require_libs=False)
+    err = _desktop_preflight()
     if err:
         return err
     if not _HAVE_PGW:
@@ -11296,6 +12421,162 @@ def tool_desktop_close_window(args: dict) -> dict:
         return {"ok": True, "closed": w.title}
     except Exception as e:
         return {"error": str(e)}
+
+
+def _desktop_element_action(ref: str, action_name: str, command: str,
+                            details: dict, operation) -> dict:
+    err = _desktop_preflight(("uiautomation",))
+    if err:
+        return err
+    cache, descriptor, cache_error = _desktop_cache_descriptor(ref)
+    if cache_error:
+        return {"error": cache_error}
+    public = dict(descriptor.get("public") or {})
+    details = dict(details, ref=ref, window=cache.get("window"), element=public)
+    gate_err = _gate_action(
+        title=f"{action_name} accessibility element",
+        command=command,
+        details=details,
+        required=("uiautomation",),
+    )
+    if gate_err:
+        return gate_err
+    try:
+        with _uia.UIAutomationInitializerInThread():
+            control = _uia_resolve_descriptor(cache, descriptor)
+            if control is None:
+                return {"error": "the accessibility element changed or disappeared; call desktop_snapshot again"}
+            outcome = operation(control)
+            if outcome is False:
+                return {"error": f"the application refused the semantic {action_name.lower()} action"}
+            after_result = _uia_capture(
+                str((cache.get("window") or {}).get("window_id") or ""),
+                max_depth=8,
+                max_elements=max(250, len(cache.get("records") or [])),
+            )
+    except Exception as exc:
+        return {"error": f"{action_name.lower()} failed: {exc}"}
+
+    result = {"ok": True, "action": action_name.lower(), "element": public}
+    if after_result.get("ok"):
+        with _desktop_snapshot_lock:
+            after_cache = _desktop_snapshot_cache.get(after_result["snapshot_id"], {})
+        result.update({
+            "next_snapshot_id": after_result["snapshot_id"],
+            "state_token": after_result["state_token"],
+            "window": after_result["window"],
+            "changes": _uia_diff(cache, after_cache),
+        })
+    else:
+        result["verification_error"] = after_result.get("error")
+    return result
+
+
+def tool_desktop_invoke(args: dict) -> dict:
+    ref = str(args.get("ref") or "").strip()
+    if not ref:
+        return {"error": "ref is required; call desktop_snapshot first"}
+    cache, descriptor, cache_error = _desktop_cache_descriptor(ref)
+    if cache_error:
+        return {"error": cache_error}
+    public = descriptor.get("public") or {}
+    label = public.get("name") or public.get("role") or ref
+
+    def invoke(control):
+        pattern = _uia_pattern(control, "GetInvokePattern")
+        if pattern is not None:
+            return pattern.Invoke()
+        pattern = _uia_pattern(control, "GetSelectionItemPattern")
+        if pattern is not None:
+            return pattern.Select()
+        pattern = _uia_pattern(control, "GetTogglePattern")
+        if pattern is not None:
+            return pattern.Toggle()
+        pattern = _uia_pattern(control, "GetExpandCollapsePattern")
+        if pattern is not None:
+            state = int(pattern.ExpandCollapseState)
+            if state == int(_uia.ExpandCollapseState.Expanded):
+                return pattern.Collapse()
+            if state != int(_uia.ExpandCollapseState.LeafNode):
+                return pattern.Expand()
+        if bool(_uia_safe(control, "IsKeyboardFocusable", False)):
+            return control.SetFocus()
+        raise RuntimeError("element exposes no supported semantic action")
+
+    return _desktop_element_action(
+        ref, "Invoke", f'invoke accessibility element "{label}"',
+        {"kind": "desktop.invoke"}, invoke,
+    )
+
+
+def tool_desktop_set_value(args: dict) -> dict:
+    ref = str(args.get("ref") or "").strip()
+    value = args.get("value")
+    if not ref:
+        return {"error": "ref is required; call desktop_snapshot first"}
+    if not isinstance(value, str):
+        return {"error": "value must be a string"}
+    if len(value) > 10000:
+        return {"error": "value is too long (>10000 chars); split the operation"}
+    cache, descriptor, cache_error = _desktop_cache_descriptor(ref)
+    if cache_error:
+        return {"error": cache_error}
+    public = descriptor.get("public") or {}
+    sensitive = bool(public.get("password"))
+    label = public.get("name") or public.get("role") or ref
+    preview = "[redacted password]" if sensitive else (value[:200] + ("…" if len(value) > 200 else ""))
+
+    def set_value(control):
+        pattern = _uia_pattern(control, "GetValuePattern")
+        if pattern is None:
+            raise RuntimeError("element does not support the UI Automation Value pattern")
+        return pattern.SetValue(value)
+
+    return _desktop_element_action(
+        ref, "Set value", f'set "{label}" to {preview}',
+        {"kind": "desktop.set_value", "length": len(value), "sensitive": sensitive},
+        set_value,
+    )
+
+
+def tool_desktop_scroll(args: dict) -> dict:
+    ref = str(args.get("ref") or "").strip()
+    direction = str(args.get("direction") or "down").strip().lower()
+    if not ref:
+        return {"error": "ref is required; call desktop_snapshot first"}
+    if direction not in {"up", "down", "left", "right"}:
+        return {"error": "direction must be up, down, left, or right"}
+    try:
+        amount = max(1, min(10, int(args.get("amount") or 1)))
+    except (TypeError, ValueError):
+        return {"error": "amount must be an integer from 1 to 10"}
+
+    def scroll(control):
+        pattern = _uia_pattern(control, "GetScrollPattern")
+        if pattern is None:
+            raise RuntimeError("element does not support the UI Automation Scroll pattern")
+        increment = _uia.ScrollAmount.SmallIncrement
+        decrement = _uia.ScrollAmount.SmallDecrement
+        no_amount = _uia.ScrollAmount.NoAmount
+        horizontal = no_amount
+        vertical = no_amount
+        for _ in range(amount):
+            if direction == "down":
+                vertical = increment
+            elif direction == "up":
+                vertical = decrement
+            elif direction == "right":
+                horizontal = increment
+            else:
+                horizontal = decrement
+            if pattern.Scroll(horizontal, vertical) is False:
+                return False
+        return True
+
+    return _desktop_element_action(
+        ref, "Scroll", f"scroll accessibility element {direction} x{amount}",
+        {"kind": "desktop.scroll", "direction": direction, "amount": amount}, scroll,
+    )
 
 
 # ============================================================================
@@ -17548,6 +18829,7 @@ def _capability_health(chat_id: str = "") -> dict:
 
     py_caps = {
         "desktop_automation": bool(_HAVE_PYAUTOGUI),
+        "desktop_accessibility": bool(_HAVE_UIA),
         "scoped_browser": bool(_HAVE_PLAYWRIGHT),
         "image_processing": bool(_HAVE_PIL),
         "apk_deep_metadata": bool(_HAVE_ANDROGUARD),
@@ -17575,8 +18857,10 @@ def _capability_health(chat_id: str = "") -> dict:
     unavailable = (_unavailable_runtime_tools()
                    if "_unavailable_runtime_tools" in globals() else {})
     recommendations = []
+    if settings.get("desktop_enabled") and not py_caps["desktop_accessibility"]:
+        recommendations.append("Install uiautomation for CPU-only blind desktop snapshots and semantic actions.")
     if settings.get("desktop_enabled") and not py_caps["desktop_automation"]:
-        recommendations.append("Install pyautogui to enable agentic desktop input; screenshots still need Pillow.")
+        recommendations.append("Install pyautogui only if raw mouse/keyboard fallback is needed.")
     if settings.get("analysis_tools_enabled"):
         if not py_caps["yara"]:
             recommendations.append("Install yara-python for rule-based file triage.")
@@ -17606,7 +18890,9 @@ def _capability_health(chat_id: str = "") -> dict:
         "feature_groups": {
             "ide": {"enabled": True},
             "system_agent": {"enabled": bool(settings.get("desktop_enabled")),
-                             "panic": _desktop_panic.is_set()},
+                             "panic": _desktop_panic.is_set(),
+                             "blind_control": bool(_HAVE_UIA),
+                             "vision": _vision_observation_available()},
             "blue_team_analysis": {"enabled": bool(settings.get("analysis_tools_enabled"))},
             "red_team": {"enabled": bool(settings.get("red_team_enabled")),
                          "authorized_this_chat": bool(_rt_authorized_mission(chat))},
@@ -19387,8 +20673,8 @@ TOOLS: dict[str, dict] = {
     "screenshot": {
         "description": (
             "Capture the screen (or a rectangular region) and return a base64 PNG. "
-            "Read-only. Prefer `describe_screen` over this for reasoning — describe_screen "
-            "runs the image through the vision model so the main model only sees text."
+            "Read-only and available only when a vision backend is loaded. For normal "
+            "text-only desktop work use `desktop_snapshot` instead."
         ),
         "parameters": {
             "type": "object",
@@ -19404,9 +20690,8 @@ TOOLS: dict[str, dict] = {
     "describe_screen": {
         "description": (
             "Take a screenshot and ask the local vision model to describe it. "
-            "Returns a text description including visible UI text, button labels, "
-            "window titles, and app state. Use this as the agent's 'eyes' every "
-            "time you need to observe the screen — the main model never sees pixels."
+            "Available only when a native projector or side vision server is running. "
+            "Prefer `desktop_snapshot` for ordinary controls because it needs no GPU vision."
         ),
         "parameters": {
             "type": "object",
@@ -19421,9 +20706,31 @@ TOOLS: dict[str, dict] = {
         "fn": tool_describe_screen,
     },
     "list_windows": {
-        "description": "List visible top-level windows with their title and bounding box.",
+        "description": "List visible top-level windows with stable window IDs, process metadata, and bounds.",
         "parameters": {"type": "object", "properties": {}},
         "fn": tool_list_windows,
+    },
+    "desktop_snapshot": {
+        "description": (
+            "CPU-only blind computer observation. Read a Windows UI Automation tree for "
+            "the foreground window or a window selected by title/window_id. Returns named "
+            "controls, values, roles, bounds, supported semantic actions, and temporary refs. "
+            "Use this before desktop actions when no vision projector is loaded."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "window": {"type": "string", "description": "Optional title substring or hwnd:... window_id."},
+                "max_depth": {"type": "integer", "description": "Tree depth, default 8, max 20."},
+                "max_elements": {"type": "integer", "description": "Returned controls, default 160, max 800."},
+                "include_offscreen": {"type": "boolean", "description": "Include controls marked offscreen."},
+                "query": {
+                    "type": "string",
+                    "description": "Optional case-insensitive filter across role, name, ID, class, and value.",
+                },
+            },
+        },
+        "fn": tool_desktop_snapshot,
     },
     "desktop_launch_app": {
         "description": (
@@ -19452,8 +20759,8 @@ TOOLS: dict[str, dict] = {
     },
     "desktop_click": {
         "description": (
-            "Click the mouse at screen pixel (x, y). Derive coords from "
-            "describe_screen + list_windows; never guess. Requires approval."
+            "Raw fallback: click a screen pixel. Use only with coordinates supplied by "
+            "the user or a working vision backend; never guess in blind mode. Requires approval."
         ),
         "parameters": {
             "type": "object",
@@ -19493,6 +20800,50 @@ TOOLS: dict[str, dict] = {
             "required": ["title"],
         },
         "fn": tool_desktop_close_window,
+    },
+    "desktop_invoke": {
+        "description": (
+            "Perform the safest native action supported by an accessibility element: "
+            "invoke, select, toggle, expand/collapse, or focus. Requires a fresh ref from "
+            "desktop_snapshot and user approval. Returns a verified UI-state diff."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"ref": {"type": "string"}},
+            "required": ["ref"],
+        },
+        "fn": tool_desktop_invoke,
+    },
+    "desktop_set_value": {
+        "description": (
+            "Set an accessibility text/value control directly, including Unicode, without "
+            "simulated keystrokes. Requires a fresh desktop_snapshot ref and user approval."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string"},
+                "value": {"type": "string"},
+            },
+            "required": ["ref", "value"],
+        },
+        "fn": tool_desktop_set_value,
+    },
+    "desktop_scroll": {
+        "description": (
+            "Scroll an accessibility element through its native Scroll pattern. Requires "
+            "a fresh desktop_snapshot ref and user approval; returns a verified state diff."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string"},
+                "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                "amount": {"type": "integer", "description": "Small increments, default 1, max 10."},
+            },
+            "required": ["ref", "direction"],
+        },
+        "fn": tool_desktop_scroll,
     },
     # ---- firmware analysis -------------------------------------------------
     "binwalk_scan": {
@@ -20040,9 +21391,10 @@ TOOLS: dict[str, dict] = {
 
 
 _DESKTOP_TOOL_NAMES = {
-    "screenshot", "describe_screen", "list_windows",
+    "screenshot", "describe_screen", "list_windows", "desktop_snapshot",
     "desktop_launch_app", "desktop_focus_window", "desktop_click",
     "desktop_type_text", "desktop_press_keys", "desktop_close_window",
+    "desktop_invoke", "desktop_set_value", "desktop_scroll",
 }
 
 # Tools whose results are bulky-by-design (string dumps, grep hits, disasm
@@ -20079,6 +21431,14 @@ _TOOL_RESULT_CAPS = {
     # elides the content a SECOND time (head+tail) — mangling the chunk and the
     # continuation hint, which makes models thrash ("output got truncated").
     "read_file": 32000,
+
+    # Accessibility snapshots are structured UI trees. Four kilobytes leaves
+    # only a handful of controls and makes blind navigation useless; 24K keeps
+    # a practical window view while remaining tolerable for local contexts.
+    "desktop_snapshot": 24000,
+    "desktop_invoke": 16000,
+    "desktop_set_value": 16000,
+    "desktop_scroll": 16000,
 
     "scan_secrets": 48000,
     "parse_evtx": 48000,
@@ -20460,7 +21820,7 @@ _CORE_TOOL_NAMES = {
     "check_syntax", "run_tests", "check_deps", "run_powershell", "open_program",
     # planning / memory / probe
     "update_plan", "record_finding", "list_findings", "pin_note", "unpin_note", "remember", "forget", "edit_memory",
-    "list_more_tools", "compact_history",
+    "list_more_tools", "compact_history", "save_skill",
     # web
     "web_search", "web_image_search", "web_fetch",
     # interactive sessions
@@ -20479,12 +21839,12 @@ _SMALL_CTX_CORE_TOOL_NAMES = {
     "project_map", "capability_report", "read_file", "write_file", "edit_file", "list_directory",
     "find_files", "grep_files", "check_syntax", "run_tests", "run_powershell",
     "update_plan", "record_finding", "list_findings", "pin_note", "unpin_note", "list_more_tools",
-    "compact_history", "git_status", "git_diff",
+    "compact_history", "save_skill", "git_status", "git_diff",
 }
 _TINY_CTX_CORE_TOOL_NAMES = {
     "project_map", "read_file", "write_file", "edit_file", "list_directory",
     "grep_files", "check_syntax", "run_powershell", "update_plan",
-    "list_more_tools", "compact_history",
+    "list_more_tools", "compact_history", "save_skill",
 }
 # None = dynamic (all TOOLS keys with the given prefix, resolved at call time).
 _TOOL_BUNDLES: dict[str, set[str] | None] = {
@@ -20554,7 +21914,15 @@ def _parse_skill_frontmatter(text: str) -> dict:
         if not line or line.startswith("#") or ":" not in line:
             continue
         k, v = line.split(":", 1)
-        out[k.strip().lower()] = v.strip().strip('"').strip("'")
+        value = v.strip()
+        if value.startswith('"') and value.endswith('"'):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = value[1:-1]
+        elif value.startswith("'") and value.endswith("'"):
+            value = value[1:-1]
+        out[k.strip().lower()] = value
     return out
 
 
@@ -20621,6 +21989,158 @@ def _read_skill_body(entry: dict) -> str | None:
         return None
     m = _FRONTMATTER_RE.match(text)
     return (text[m.end():].strip() if m else text.strip()) or None
+
+
+def _skill_slug(value: str) -> str:
+    """Turn a user-facing title into a safe skill name and filename stem."""
+    raw = re.sub(r"(?i)\.(?:md|markdown|mdown|mkd)$", "", str(value or "").strip())
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", raw)
+    slug = re.sub(r"[-_.]{2,}", "-", slug).strip("-._").lower()
+    return slug[:80].rstrip("-._")
+
+
+def _skill_description(value: str, body: str, name: str) -> str:
+    description = " ".join(str(value or "").split())
+    if not description:
+        for raw in body.splitlines():
+            line = re.sub(r"^[#>*+\-\d.()\s]+", "", raw).strip()
+            if line:
+                description = f"Use when the user asks to follow this procedure: {line}"
+                break
+    return (description or f"Use when the user asks to follow the {name} procedure.")[:220]
+
+
+def _skill_token_budget(body: str) -> tuple[int, str]:
+    """Count the loaded body with llama.cpp's tokenizer, with the normal fallback."""
+    exact = _llama_tokenize(body)
+    if exact is not None:
+        return max(1, int(exact)), "model_tokenizer"
+    return max(1, int(math.ceil(_approx_tokens(body)))), "conservative_estimate"
+
+
+def tool_save_skill(args: dict) -> dict:
+    """Create an Accuretta skill from pasted Markdown or a workspace .md file."""
+    supplied = args.get("content")
+    raw_source_path = str(args.get("source_path") or "").strip()
+    source_path = normalize_path(raw_source_path) if raw_source_path else ""
+    if supplied is not None and source_path:
+        return {"error": "provide either content or source_path, not both"}
+    if supplied is None and not source_path:
+        return {"error": "provide pasted Markdown in content or a .md source_path"}
+
+    source_name = ""
+    if source_path:
+        source = Path(source_path)
+        if source.suffix.lower() not in {".md", ".markdown", ".mdown", ".mkd"}:
+            return {"error": "source_path must be a Markdown file"}
+        if not is_in_workspace(source_path):
+            return {"error": "source_path is outside the configured workspace"}
+        if not source.is_file():
+            return {"error": f"Markdown source not found: {source_path}"}
+        try:
+            text = source.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            return {"error": f"could not read Markdown source: {exc}"}
+        source_name = source.stem
+    elif isinstance(supplied, str):
+        text = supplied
+    else:
+        return {"error": "content must be Markdown text"}
+
+    text = text.lstrip("\ufeff")
+    match = _FRONTMATTER_RE.match(text)
+    frontmatter = _parse_skill_frontmatter(text)
+    body = (text[match.end():] if match else text).strip()
+    if not body:
+        return {"error": "refused: the skill body is empty"}
+    if len(body) > SKILL_BODY_CAP_CHARS:
+        return {"error": (f"skill body is {len(body)} chars, over the "
+                          f"{SKILL_BODY_CAP_CHARS}-char load cap; shorten it first")}
+
+    requested_name = str(args.get("name") or frontmatter.get("name") or source_name).strip()
+    name = _skill_slug(requested_name)
+    if not name or not _SKILL_NAME_RE.fullmatch(name):
+        return {"error": "a skill name is required; use letters, numbers, dots, underscores, or hyphens"}
+    description = _skill_description(
+        str(args.get("description") or frontmatter.get("description") or ""), body, name)
+    budget, budget_source = _skill_token_budget(body)
+
+    destination = SKILLS_DIR / f"{name}.md"
+    overwrite = bool(args.get("overwrite"))
+    existed = destination.exists()
+    if existed and not overwrite:
+        return {"error": (f"skill '{name}' already exists; pass overwrite=true only if the user "
+                          "asked to replace it"),
+                "path": str(destination)}
+
+    rendered = ("---\n"
+                f"name: {json.dumps(name, ensure_ascii=False)}\n"
+                f"description: {json.dumps(description, ensure_ascii=False)}\n"
+                f"budget: {budget}\n"
+                "---\n\n"
+                f"{body}\n")
+    chat_id = _get_current_chat() or ""
+    call_id = _current_tool_call_id.get()
+    approval = request_approval(
+        title="Save skill",
+        command=f'Save Accuretta skill "{name}" to "{destination}"',
+        details={"kind": "save_skill", "path": str(destination),
+                 "bytes": len(rendered.encode("utf-8")), "budget": budget},
+    )
+    if approval.get("decision") != "approve":
+        try:
+            broadcast_event({"type": "skill:save_finished", "chat_id": chat_id,
+                             "call_id": call_id, "skill": name, "outcome": "cancelled"})
+        except Exception:
+            pass
+        return {"error": f"user denied skill save ({approval.get('status')})"}
+
+    temp_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        broadcast_event({"type": "skill:saving", "chat_id": chat_id,
+                         "call_id": call_id, "skill": name})
+    except Exception:
+        pass
+    try:
+        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        _undo_snapshot(str(destination))
+        temp_path.write_text(rendered, encoding="utf-8")
+        os.replace(temp_path, destination)
+        _SKILLS_CACHE.clear()
+        saved_entry = _scan_skills().get(name)
+        if not saved_entry or saved_entry.get("budget") != budget:
+            raise ValueError("saved file did not pass the skill catalog validation")
+        broadcast_event({"type": "skills:update", "skill": name})
+    except Exception as exc:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            broadcast_event({"type": "skill:save_finished", "chat_id": chat_id,
+                             "call_id": call_id, "skill": name, "outcome": "failed"})
+        except Exception:
+            pass
+        return {"error": f"could not save skill: {exc}"}
+
+    try:
+        broadcast_event({"type": "skill:save_finished", "chat_id": chat_id,
+                         "call_id": call_id, "skill": name,
+                         "outcome": "saved", "budget": budget})
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "skill": name,
+        "description": description,
+        "budget": budget,
+        "budget_source": budget_source,
+        "body_chars": len(body),
+        "path": str(destination),
+        "overwritten": existed,
+        "note": f"saved '{name}' and refreshed the skill catalog",
+    }
 
 
 def _set_active_skill(chat_id: str, skill_name: str | None, budget: int = 0):
@@ -20716,13 +22236,21 @@ def _unlock_bundle(chat_id: str, bundle: str) -> bool:
 def _unavailable_runtime_tools() -> dict[str, str]:
     """Strict dependency failures that would make a tool fail every call."""
     missing: dict[str, str] = {}
+    if not _HAVE_PYAUTOGUI:
+        for n in ("desktop_click", "desktop_type_text", "desktop_press_keys"):
+            missing[n] = "raw mouse/keyboard fallback requires pyautogui"
     if not _HAVE_PYAUTOGUI or not _HAVE_PIL:
-        for n in ("screenshot", "describe_screen", "desktop_click",
-                  "desktop_type_text", "desktop_press_keys", "desktop_launch_app"):
-            missing[n] = "desktop automation requires pyautogui and Pillow"
+        for n in ("screenshot", "describe_screen"):
+            missing[n] = "screen capture requires pyautogui and Pillow"
+    elif not _vision_observation_available():
+        for n in ("screenshot", "describe_screen"):
+            missing[n] = "no vision backend is loaded; use desktop_snapshot"
     if not _HAVE_PGW:
         for n in ("list_windows", "desktop_focus_window", "desktop_close_window"):
             missing[n] = "window control requires pygetwindow"
+    if not _HAVE_UIA:
+        for n in ("desktop_snapshot", "desktop_invoke", "desktop_set_value", "desktop_scroll"):
+            missing[n] = "blind semantic control requires uiautomation on Windows"
     if not _HAVE_PLAYWRIGHT:
         missing["rt_browser"] = "requires playwright and its Chromium browser"
     if not _HAVE_SQUASHFS:
@@ -20943,6 +22471,45 @@ TOOLS["load_skill"] = {
         "required": ["name"],
     },
     "fn": tool_load_skill,
+}
+
+
+TOOLS["save_skill"] = {
+    "description": (
+        "Save a reusable Accuretta skill into the app's skills/ folder from pasted Markdown "
+        "or an existing workspace Markdown file. Use this when the user says 'save this as a "
+        "skill', 'turn this into a skill', or equivalent. The tool creates valid frontmatter, "
+        "calculates budget with the active model tokenizer, and refreshes the # skill picker. "
+        "Provide exactly one of content or source_path. Never set overwrite=true unless the user "
+        "explicitly asked to replace the existing skill."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Skill name. Optional when supplied Markdown has a name or source_path has a useful filename.",
+            },
+            "description": {
+                "type": "string",
+                "description": "Short explanation of when this skill should be used. Inferred when omitted.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Pasted Markdown skill instructions, with or without existing frontmatter.",
+            },
+            "source_path": {
+                "type": "string",
+                "description": "Path to an existing Markdown file inside the configured workspace.",
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": "Replace an existing skill of the same name. Only when the user explicitly requested replacement.",
+            },
+        },
+        "required": [],
+    },
+    "fn": tool_save_skill,
 }
 
 
@@ -21269,7 +22836,8 @@ REWRITE_LOOP_LIMIT = 2  # original write + one rewrite; the next is blocked
 # same serial batch.
 _WRITE_CAPABLE_TOOLS = frozenset(
     {"write_file", "edit_file", "delete_file", "replace_ast_node",
-     "remote_write_file", "remote_save_code_block", "remote_file_begin"})
+     "remote_write_file", "remote_save_code_block", "remote_file_begin",
+     "save_skill"})
 
 
 def _verification_key(path: Any) -> str:
@@ -21296,7 +22864,7 @@ def _update_verification_debt(debt: list[dict], name: str, args: dict,
     if not ok:
         return current[-20:], False
     before = json.dumps(current, sort_keys=True, default=str)
-    if canon in _WRITE_CAPABLE_TOOLS:
+    if canon in _WRITE_CAPABLE_TOOLS and canon != "save_skill":
         path = str((result.get("path") if isinstance(result, dict) else "")
                    or (args or {}).get("path") or "").strip()
         if path:
@@ -21319,7 +22887,7 @@ def _update_verification_debt(debt: list[dict], name: str, args: dict,
 # same round), so they serialize with each other within a batch.
 _CHAT_STATE_TOOLS = frozenset(
     {"pin_note", "unpin_note", "update_plan", "remember", "forget",
-     "edit_memory", "compact_history", "load_skill"})
+     "edit_memory", "compact_history", "load_skill", "save_skill"})
 
 
 # Durable, content-minimised provenance for actions that can change files,
@@ -21600,7 +23168,7 @@ def invoke_tool(name: str, args: dict) -> dict:
         return {"error": f"unknown tool: {name}", "available": sorted(TOOLS.keys())}
     def _finish(result: dict) -> dict:
         if (canon in _DESKTOP_TOOL_NAMES
-                and canon not in ("screenshot", "describe_screen", "list_windows")
+                and canon not in ("screenshot", "describe_screen", "list_windows", "desktop_snapshot")
                 and isinstance(result, dict) and not result.get("error")
                 and result.get("ok") is not False):
             result.setdefault("post_state", _desktop_post_state())
@@ -22583,7 +24151,8 @@ def _estimate_context_tokens(chat_id: str, chat: dict | None = None) -> int:
           len(chat.get("rolling_summary", "")),
           len(chat.get("pins") or []), len(str(chat.get("mission") or "")),
           len(str(chat.get("task_anchor") or "")), len(str(chat.get("plan") or "")),
-          len(str(chat.get("activity") or "")))
+          len(str(chat.get("activity") or "")),
+          len(str(chat.get("compaction_memory") or "")))
     cached = _CTX_EST_CACHE.get(chat_id)
     if cached and cached[0] == fp:
         return cached[1]
@@ -22656,6 +24225,14 @@ def _estimate_context_tokens(chat_id: str, chat: dict | None = None) -> int:
             parts.append(f"{p.get('status', 'pending')}: {p.get('title', '')}")
     if chat.get("rolling_summary"):
         parts.append(_render_activity_tail(chat.get("activity") or []))
+        try:
+            memory_ctx = _llama_props_ctx() or int(get_settings().get("num_ctx") or 32768)
+        except Exception:
+            memory_ctx = None
+        memory_text = _render_compaction_memory(
+            chat.get("compaction_memory") or {}, ctx_limit=memory_ctx)
+        if memory_text:
+            parts.append(memory_text)
 
     joined = "\n".join(parts)
     exact = _llama_tokenize(joined)
@@ -22866,11 +24443,51 @@ def describe_image(b64: str, hint: str = "") -> str:
                 ]
             }
         ],
-        "temperature": 0.1,
-        "max_tokens": 768,
+        "stream": False,
+        # Qwen3.8 defaults to xhigh reasoning. On a bounded image-description
+        # request that can consume the whole output allowance before producing
+        # visible content. Keep this override local to the vision side-trip;
+        # the user's saved effort and the main chat request are untouched.
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "max_tokens": 1536,
+        "chat_template_kwargs": {
+            "enable_thinking": True,
+            "reasoning_effort": "low",
+        },
     }
     try:
         out = llama_post("/v1/chat/completions", payload, base=VISION_LLAMA, timeout=180)
+        if isinstance(out, dict):
+            choices = out.get("choices") or []
+            if choices:
+                text = (choices[0].get("message") or {}).get("content", "").strip()
+                if text:
+                    return text
+
+        # A reasoning model can still spend its complete allowance inside an
+        # invisible think block. Retry only this stateless vision request with
+        # Qwen3.8's documented non-thinking sampler. Conversation history and
+        # the user's normal reasoning selection never enter either request.
+        fallback_payload = {
+            **payload,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "presence_penalty": 1.5,
+            "max_tokens": 768,
+            "chat_template_kwargs": {
+                "enable_thinking": False,
+                "thinking_budget": 0,
+            },
+        }
+        out = llama_post(
+            "/v1/chat/completions", fallback_payload,
+            base=VISION_LLAMA, timeout=180,
+        )
         if isinstance(out, dict):
             choices = out.get("choices") or []
             if choices:
@@ -22920,8 +24537,8 @@ decide what to do based on what the user asked:
 (B) user is chatting, greeting, asking a question, or asking for clarification:
     → reply in normal prose. one or two sentences. do NOT invent a webpage out of "hello".
 
-(C) user explicitly asks for a file operation ("save that to disk", "read this file", "remember this"):
-    → call the appropriate tool ONCE (write_file / read_file / list_directory / remember). then confirm in one short sentence. for write_file, pull the content from the previous turn's ```html``` block — do NOT regenerate it.
+(C) user explicitly asks for a file operation ("save that to disk", "save this as a skill", "read this file", "remember this"):
+    → call the appropriate tool ONCE (write_file / save_skill / read_file / list_directory / remember). then confirm in one short sentence. use save_skill specifically for reusable skills. for write_file, pull the content from the previous turn's ```html``` block — do NOT regenerate it.
 
 formatting rules for the ```html``` fence:
 1. real characters only — real newlines, real quotes (").
@@ -22943,11 +24560,11 @@ rules:
 1. status/thinking goes in <think>...</think> tags (UI shows as status line)
 2. final answer goes OUTSIDE think tags — never end a turn with only tools or thinking
 3. workspace folders are listed below — use them, don't ask
-4. only say "saved"/"wrote" if write_file returned success THIS turn
+4. only say "saved"/"wrote" if the relevant write tool returned success THIS turn
 5. call remember(text,tags?) for new facts, edit_memory(id,text,tags) to update, and forget(id) to drop.
-6. desktop: enabled={settings.get("desktop_enabled", False)}. if disabled, tell user to enable in Settings. observe before act (describe_screen → decide → act → verify). only allowlisted apps. every action needs approval.
+6. desktop: enabled={settings.get("desktop_enabled", False)}. if disabled, tell user to enable in Settings. for ordinary apps use blind semantic control (desktop_snapshot → desktop_invoke/set_value/scroll → inspect returned diff). use screenshots only when a working vision backend is available. never guess coordinates. only allowlisted apps may be launched. every action needs approval.
 7. CHAIN TOOLS AGGRESSIVELY: when the user asks you to read a file, read it immediately after finding it. do not stop after list_directory. when asked to write, write immediately after confirming the path. complete tasks in the fewest tool calls possible. never ask the user "shall i read it?" or "would you like me to proceed?" — just do it.
-8. NEVER re-emit full file content you already generated in a previous turn. if the user asks you to save something you already built, call write_file with the content but do NOT dump the full code in the visible chat text — just confirm "saved to <path>".
+8. NEVER re-emit full file content you already generated in a previous turn. if the user asks to save it as a reusable skill, call save_skill. for an ordinary file, call write_file with the content. do NOT dump the full content in visible chat text — just confirm the saved path.
 9. proactive suggestions: if there are obvious, highly actionable next steps for the user, output up to 3 short suggestions at the end of your message in this exact format: <cascade>["Action 1", "Action 2"]</cascade>. Only do this if genuinely applicable. Keep suggestions under 5 words.
 10. editing: use edit_file for small changes (it verifies the match itself); write_file only for new files or full rewrites. after writing a file, TRUST it — you can't run it, so don't rewrite "to be safe". never rewrite the same file from scratch twice — imagined flaws aren't real flaws; fix a SPECIFIC defect with edit_file instead. when SHOWING a code change in chat (not writing it), put a unified diff in a ```diff fence (add path=<file> if known) instead of re-pasting the whole file — it renders as a proper side-by-side/inline diff.
 11. don't loop on refusals: if a tool returns "path outside workspace" or a sandbox/approval refusal, STOP — name what you tried and tell the user how to fix it (add the folder, approve). do not retry variants or fall back to powershell. when desktop automation is enabled (see desktop: notice in rule 6), workspace tools may be used system-wide — paths outside the workspace folders are then allowed unless the tool itself says otherwise; you still never touch blocked system paths (Windows/System32), and destructive actions still require approval.
@@ -23114,7 +24731,8 @@ you may occasionally append exactly one of these to the absolute end of your res
 
     try:
         active_chat = (get_chats().get("chats", {}) or {}).get(_get_current_chat())
-        worktree_context = _github_worktree_prompt(active_chat)
+        worktree_context = (_github_worktree_prompt(active_chat)
+                            or _project_workspace_prompt(active_chat))
         if worktree_context:
             parts.append(worktree_context)
     except Exception:
@@ -23404,6 +25022,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         _activity_dirty = False
         _task_state: dict = {}
         _continuity_state: dict = {}
+        _compaction_memory: dict = {}
         _findings_tail: list[dict] = []
         _verification_debt: list[dict] = []
         _verification_dirty = False
@@ -23420,6 +25039,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             _activity_tail = [dict(a) for a in (_c0.get("activity") or []) if isinstance(a, dict)][-_ACTIVITY_MAX:]
             if isinstance(_c0.get("task_anchor"), dict):
                 _task_state = dict(_c0["task_anchor"])
+            if isinstance(_c0.get("compaction_memory"), dict):
+                _compaction_memory = dict(_c0["compaction_memory"])
             _verification_debt = [dict(x) for x in (_c0.get("verification_debt") or [])
                                   if isinstance(x, dict)][-20:]
             _continuity_state = _build_continuity_state(
@@ -23608,6 +25229,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         if _fold.get("conversation") is not None:
                             conversation = _fold["conversation"]
                             _roll_active = True
+                            if isinstance(_fold.get("continuity"), dict):
+                                _continuity_state = dict(_fold["continuity"])
+                            if isinstance(_fold.get("compaction_memory"), dict):
+                                _compaction_memory = dict(_fold["compaction_memory"])
                             token_scale = _conversation_token_scale(conversation)
             except Exception:
                 traceback.print_exc()
@@ -23657,6 +25282,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         if _fold.get("conversation") is not None:
                             conversation = _fold["conversation"]
                             _roll_active = True
+                            if isinstance(_fold.get("continuity"), dict):
+                                _continuity_state = dict(_fold["continuity"])
+                            if isinstance(_fold.get("compaction_memory"), dict):
+                                _compaction_memory = dict(_fold["compaction_memory"])
                             token_scale = _conversation_token_scale(conversation)
                             trimmed = truncate_messages(conversation, ctx_limit,
                                                         reserve=effective_reserve,
@@ -23744,7 +25373,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             "=== RECENT TOOL LEDGER (harness-recorded outcomes — do not claim more "
                             "than these results prove) ===\n" + _activity_text)
                 if _continuity_state and (_roll_active or _session_long_now):
-                    _continuity_text = _render_continuity_state(_continuity_state)
+                    _continuity_text = _render_continuity_state(
+                        _continuity_state, ctx_limit=ctx_limit)
                     if _continuity_text:
                         _tail_secs.append(
                             "=== STRUCTURED CONTINUITY (harness-owned facts; authoritative over a prose "
@@ -23802,7 +25432,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 # keeps its full allowance; the clamp below still bounds it by
                 # the reserved context headroom so it can never overflow the slot.
                 try:
-                    _tb_plus = int(_reasoning_cfg.get("budget") or 0)
+                    _tb_plus = int(_reasoning_cfg.get("response_headroom") or 0)
                 except (ValueError, TypeError):
                     _tb_plus = 0
                 if use_tools and _tb_plus > 0:
@@ -24003,6 +25633,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # we count reasoning chars ourselves and force-close a runaway.
             think_chars = 0
             think_overflow = False
+            think_stop_reason = ""
             _loop_buf: list[str] = []
             _loop_hits = 0
             try:
@@ -24103,6 +25734,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             emit({"type": "thinking_end"})
                             reasoning_open = False
                             think_overflow = True
+                            think_stop_reason = "budget" if _over_budget else "loop"
                             if _in_loop and not _over_budget:
                                 print(f"[chat] reasoning loop detected at {think_chars} chars — "
                                       "forcing the answer", flush=True)
@@ -24265,16 +25897,27 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 budget_retries += 1
                 rounds += 1
                 tail = "".join(content_buf)[-2000:]
+                stop_explanation = (
+                    "You reached the reasoning safety ceiling."
+                    if think_stop_reason == "budget"
+                    else "Your reasoning entered a repetition loop."
+                )
                 conversation.append({
                     "role": "user",
                     "content": (
-                        "[automatic note] You reached your thinking budget. Stop thinking now and write "
+                        f"[automatic note] {stop_explanation} Stop thinking now and write "
                         "the COMPLETE final answer directly — full code/prose, no <think> block, no more "
                         "planning. Continue from your planning so far:\n" + tail
                     ),
                 })
-                emit({"type": "notice",
-                      "note": f"thinking budget ({_think_cap} tok) reached — writing the answer now"})
+                if think_stop_reason == "budget":
+                    approx_used = max(1, round(think_chars / CHARS_PER_TOKEN))
+                    safety_ceiling = max(1, math.ceil(_think_cap * 2.5))
+                    note = (f"reasoning safety ceiling reached at ~{approx_used:,} tokens "
+                            f"({_think_cap:,} target; ~{safety_ceiling:,} ceiling) — writing the answer now")
+                else:
+                    note = "repetitive reasoning loop stopped — writing the answer now"
+                emit({"type": "notice", "note": note})
                 if rounds < max_tool_rounds:
                     force_no_think = True
                     continue
@@ -24845,6 +26488,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         _verification_dirty = True
                     _continuity_state = _build_continuity_state(
                         {"task_anchor": _task_state, "pins": _pins_tail,
+                         "compaction_memory": _compaction_memory,
                          "mission": _rt_chat.get("mission") if _rt_chat else {},
                          "findings": _findings_tail,
                          "verification_debt": _verification_debt},
@@ -24865,6 +26509,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                                               if isinstance(x, dict)][-20:]
                             _continuity_state = _build_continuity_state(
                                 {"task_anchor": _task_state, "pins": _pins_tail,
+                                 "compaction_memory": _compaction_memory,
                                  "mission": _rt_chat.get("mission") if _rt_chat else {},
                                  "findings": _findings_tail,
                                  "verification_debt": _verification_debt},
@@ -26712,9 +28357,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, status: int, obj: Any):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        accepts_gzip = "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
+        encoded = accepts_gzip and len(body) >= 1024
+        if encoded:
+            body = gzip.compress(body, compresslevel=5)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Vary", "Accept-Encoding")
+        if encoded:
+            self.send_header("Content-Encoding", "gzip")
         self._set_cors()
         self.end_headers()
         try:
@@ -26838,7 +28490,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(404, {"error": f"missing: {name}"})
         stat = full.stat()
         source_etag = f'{stat.st_mtime_ns:x}-{stat.st_size:x}'
-        cache_control = ("no-cache, must-revalidate" if name == "index.html"
+        live_ui_asset = name in {"index.html", "app.js", "app.css", "colors_and_type.css", "signal-field.js"}
+        cache_control = ("no-cache, must-revalidate" if live_ui_asset
                          else ("public, max-age=31536000, immutable" if versioned
                                else "public, max-age=3600, must-revalidate"))
         data = full.read_bytes()
@@ -27075,7 +28728,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, {"prompt_tokens": est, "capacity": cap,
                                          "source": "tokenize" if est else "none"})
         if p == "/api/chats":
-            return self._send_json(200, get_chats())
+            qs = urllib.parse.parse_qs(parsed.query)
+            chats = get_chat_index() if qs.get("summary", [""])[0] == "1" else get_chats()
+            return self._send_json(200, chats)
         if p == "/api/approvals":
             return self._send_json(200, {"pending": list_approvals()})
         if p.startswith("/api/versions/"):
@@ -27167,12 +28822,20 @@ class Handler(BaseHTTPRequestHandler):
             })
         if p == "/api/desktop/status":
             s = get_settings()
+            vision_ready = _vision_observation_available()
+            blind_ready = bool(_HAVE_UIA)
             return self._send_json(200, {
                 "enabled": bool(s.get("desktop_enabled")),
                 "panic": _desktop_panic.is_set(),
                 "have_pyautogui": _HAVE_PYAUTOGUI,
                 "have_pil": _HAVE_PIL,
                 "have_pygetwindow": _HAVE_PGW,
+                "have_uiautomation": _HAVE_UIA,
+                "blind_control_ready": blind_ready,
+                "vision_ready": vision_ready,
+                "observation_mode": ("accessibility+vision" if blind_ready and vision_ready
+                                     else "accessibility" if blind_ready
+                                     else "vision" if vision_ready else "none"),
                 "allowlist": s.get("desktop_app_allowlist") or [],
                 "max_actions_per_minute": int(s.get("desktop_max_actions_per_minute") or 30),
             })
@@ -27346,6 +29009,14 @@ class Handler(BaseHTTPRequestHandler):
             })
         if p == "/api/github/activity":
             return self._send_json(200, _github_activity())
+        if p == "/api/github/repos":
+            qs = urllib.parse.parse_qs(parsed.query)
+            cursor = (qs.get("after", [""])[0] or "").strip()
+            try:
+                limit = int(qs.get("limit", ["12"])[0] or 12)
+            except (TypeError, ValueError):
+                limit = 12
+            return self._send_json(200, _github_repositories(limit, cursor))
         return self._send_json(404, {"error": "not found"})
 
     def _handle_api_post(self, p: str, parsed):
@@ -27398,13 +29069,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(400, {"error": bname_err})
             result = _github_branch_flow(owner, repo, branch)
             return self._send_json(200 if result.get("ok") else 400, result)
+        if p == "/api/github/project":
+            result = _github_create_project(
+                str(body.get("name") or ""),
+                str(body.get("brief") or ""),
+                str(body.get("workspace_root") or ""),
+                body.get("publish") is True,
+                body.get("private") is not False,
+            )
+            return self._send_json(200 if result.get("ok") else 400, result)
         if p == "/api/chat/note":
             result = _chat_note(str(body.get("chat_id") or ""), str(body.get("text") or ""))
             return self._send_json(200 if result.get("ok") else 400, result)
         if p == "/api/settings":
-            cur = get_settings()
-            cur.update({k: v for k, v in body.items() if k in DEFAULT_SETTINGS})
-            save_json(SETTINGS_FILE, cur)
+            try:
+                cur = update_settings(body)
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
             broadcast_event({"type": "settings:update"})
             return self._send_json(200, cur)
         if p == "/api/remote/serve/enable":
@@ -27555,6 +29236,7 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             profile = inspect_model(mp)
             suggested = auto_tune(mp, vram, profile=profile, min_ctx=min_ctx)
+            suggested = _preserve_manual_model_spec(mp, suggested)
             # Remember the tune for this model — the next /api/models/load
             # restores it without re-running the tuner.
             if mp and suggested.get("num_ctx"):
@@ -27577,6 +29259,47 @@ class Handler(BaseHTTPRequestHandler):
                 root.attributes("-topmost", True)
                 path = filedialog.askdirectory(title=title)
                 root.destroy()
+                return self._send_json(200, {"path": path or ""})
+            except Exception as e:
+                return self._send_json(200, {"path": "", "error": str(e)})
+        if p == "/api/models/browse-mmproj":
+            title = "Pick a vision projector GGUF"
+            model_path = str(body.get("model_path") or "").strip()
+            initial_dir = str(Path(model_path).parent) if model_path else ""
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                path = filedialog.askopenfilename(
+                    title=title,
+                    initialdir=initial_dir or None,
+                    filetypes=[("GGUF projector", "*.gguf"), ("All files", "*.*")],
+                )
+                root.destroy()
+                if path and Path(path).suffix.lower() != ".gguf":
+                    return self._send_json(400, {"error": "projector must be a .gguf file"})
+                return self._send_json(200, {"path": path or ""})
+            except Exception as e:
+                return self._send_json(200, {"path": "", "error": str(e)})
+        if p == "/api/models/browse-spec-draft":
+            model_path = str(body.get("model_path") or "").strip()
+            initial_dir = str(Path(model_path).parent) if model_path else ""
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                path = filedialog.askopenfilename(
+                    title="Pick a DFlash or DSpark draft GGUF",
+                    initialdir=initial_dir or None,
+                    filetypes=[("GGUF draft model", "*.gguf"), ("All files", "*.*")],
+                )
+                root.destroy()
+                if path and Path(path).suffix.lower() != ".gguf":
+                    return self._send_json(400, {"error": "draft model must be a .gguf file"})
                 return self._send_json(200, {"path": path or ""})
             except Exception as e:
                 return self._send_json(200, {"path": "", "error": str(e)})
@@ -27622,15 +29345,22 @@ class Handler(BaseHTTPRequestHandler):
             # tuned flags (or compute them on first load) BEFORE the spawn reads
             # settings, so every model gets ITS best config — not the previous
             # model's leftovers.
+            target_cfg = _models_config().get(target)
+            target_cfg = target_cfg if isinstance(target_cfg, dict) else {}
             _auto_tune_for_load(target)
 
             s = get_settings()
             if target != _llama.loaded_model():
-                # Clear the explicit projector path on model switch so we don't
-                # crash trying to load an incompatible mmproj. Auto-detect will
-                # find the correct one if it exists.
-                s["mmproj_path"] = ""
-                save_json(SETTINGS_FILE, s)
+                # Restore a projector choice remembered for this model. For a
+                # new model with no projector profile, never carry a manual
+                # path across: an incompatible projector can crash at startup.
+                if not any(k in target_cfg for k in _MODEL_PROJECTOR_KEYS):
+                    mode = _normalized_mmproj_mode(s)
+                    if mode == "manual":
+                        s["mmproj_mode"] = "off"
+                        s["mmproj_auto"] = False
+                        s["mmproj_path"] = ""
+                        save_json(SETTINGS_FILE, s)
                 
             # Big models load slowly from a cold disk (a 24 GB GGUF on an HDD
             # takes 5-8 min before llama-server answers). The flat 120s wait
@@ -27678,10 +29408,29 @@ class Handler(BaseHTTPRequestHandler):
                 # default to the currently loaded / configured model
                 target = _llama.loaded_model() or (get_settings().get("model_path") or "")
             mmproj = find_mmproj_for(target) if target else ""
+            reason = ""
+            if not mmproj:
+                if not target or not safe_exists(target):
+                    reason = "the selected chat model file is missing"
+                else:
+                    nearby = []
+                    mp = Path(target)
+                    for folder in (mp.parent, mp.parent.parent):
+                        try:
+                            nearby.extend(p.name for p in folder.glob("*.gguf")
+                                          if _is_mmproj_name(p.name))
+                        except Exception:
+                            pass
+                    reason = (
+                        "projector candidates were found, but their names are too ambiguous to pair safely; choose the file manually"
+                        if nearby else
+                        "no projector-named .gguf file was found beside the selected model"
+                    )
             return self._send_json(200, {
                 "ok": True,
                 "model_path": target,
                 "mmproj_path": mmproj,
+                "reason": reason,
             })
         if p == "/api/chats":
             chat_id = body.get("id") or uuid.uuid4().hex[:12]
@@ -27690,7 +29439,7 @@ class Handler(BaseHTTPRequestHandler):
                 # `origin` records where the session was started. The chat list
                 # uses it to distinguish mobile and GitHub worktree sessions.
                 origin = (body.get("origin") or "desktop").strip().lower()
-                if origin not in ("mobile", "desktop", "github"):
+                if origin not in ("mobile", "desktop", "github", "project"):
                     origin = "desktop"
                 record = {
                     "id": chat_id,
@@ -27703,6 +29452,9 @@ class Handler(BaseHTTPRequestHandler):
                 worktree = _github_worktree_metadata(body.get("github_worktree"))
                 if worktree:
                     record["github_worktree"] = worktree
+                project = _project_workspace_metadata(body.get("project_workspace"))
+                if project:
+                    record["project_workspace"] = project
                 chats["chats"][chat_id] = record
                 chats["order"].insert(0, chat_id)
                 save_json(CHATS_FILE, chats)
@@ -27714,6 +29466,17 @@ class Handler(BaseHTTPRequestHandler):
                 chats["chats"][cid]["title"] = (body.get("title") or "").strip() or chats["chats"][cid]["title"]
                 save_json(CHATS_FILE, chats)
                 return self._send_json(200, chats["chats"][cid])
+            return self._send_json(404, {"error": "not found"})
+        if p.startswith("/api/chats/") and p.endswith("/mode"):
+            cid = p.split("/")[3]
+            mode = str(body.get("mode") or "").strip().lower()
+            if mode not in {"auto", "agent", "ide"}:
+                return self._send_json(400, {"error": "invalid chat mode"})
+            chats = get_chats()
+            if cid in chats["chats"]:
+                chats["chats"][cid]["last_mode"] = mode
+                save_json(CHATS_FILE, chats)
+                return self._send_json(200, {"ok": True, "mode": mode})
             return self._send_json(404, {"error": "not found"})
         if p == "/api/approvals/decide":
             ok = decide_approval(body.get("id") or "", body.get("decision") or "deny",
@@ -28072,14 +29835,20 @@ class Handler(BaseHTTPRequestHandler):
         # inlining "[vision server failed: …]" into the prompt, which made
         # the chat model hallucinate excuses about a "broken llama-server."
         vision_native = bool(images) and _llama.is_vision_capable()
-        ocr_available = (VISION_LLAMA and VISION_LLAMA != LLAMA)
+        ocr_available = _separate_vision_server_ready()
         if images and not vision_native and not ocr_available:
             loaded = _llama.loaded_model() or "(none)"
             loaded_name = loaded.split("\\")[-1].split("/")[-1] if loaded != "(none)" else loaded
+            side_configured = bool(VISION_LLAMA and VISION_LLAMA != LLAMA)
+            side_note = (
+                " A separate vision server is configured but is not answering."
+                if side_configured else
+                " No separate vision server is configured."
+            )
             return self._send_json(400, {"error":
                 f"This model can't see images. The loaded model "
-                f"'{loaded_name}' has no vision projector (mmproj), and no "
-                f"separate vision server is configured.\n\n"
+                f"'{loaded_name}' has no active vision projector (mmproj)."
+                f"{side_note}\n\n"
                 f"Fix: load a vision-capable GGUF (one with a sibling "
                 f"mmproj-*.gguf, e.g. Qwen2.5-VL, LLaVA, MiniCPM-V) and "
                 f"point Settings → 'Vision projector (mmproj)' at the "
@@ -28142,6 +29911,13 @@ class Handler(BaseHTTPRequestHandler):
             _update_task_anchor(chat, user_text)
         chat["updated"] = int(time.time())
         save_json(CHATS_FILE, chats)
+
+        # Explicit requests to operate a desktop app should expose the semantic
+        # tools immediately. Requiring a small local model to discover and load
+        # the bundle first wastes a round and often sends it toward PowerShell.
+        if (get_settings().get("desktop_enabled")
+                and _user_asked_desktop_interaction(user_text)):
+            _unlock_bundle(chat_id, "desktop")
 
         # IDE mode keeps tools available — the user often asks "save that" or
         # "read this file" mid-design session. The IDE prompt below is what
@@ -29055,16 +30831,27 @@ def _resolve_reasoning_request(effort, capability: dict, settings: dict,
     native_effort = None
     if level != "auto":
         enabled = True
-        budget = _reasoning_budget_for_effort(level, ctx_limit)
+        effort_headroom = _reasoning_budget_for_effort(level, ctx_limit)
         if capability.get("mode") == "native_effort":
             native_effort = (capability.get("native_effort_map") or {}).get(level, level)
+            # Native-effort models decide how long Low/Medium/Deep should reason.
+            # Keep enough response room for that thinking, but do not also send
+            # a numeric target or trip the numeric runaway ceiling against it.
+            budget = -1
+            response_headroom = effort_headroom
+        else:
+            budget = effort_headroom
+            response_headroom = max(0, budget)
     else:
         budget = legacy_budget
+        response_headroom = max(0, budget)
     if not enabled:
         budget = 0
+        response_headroom = 0
     return {
         "effort": level, "enabled": bool(enabled), "budget": int(budget),
         "native_effort": native_effort,
+        "response_headroom": int(response_headroom),
     }
 
 
@@ -29481,17 +31268,24 @@ def _free_vram_gb_for_tune() -> float:
 
 def _resolve_mmproj_for_tune(model_path: str, s: dict) -> str:
     """The mmproj (if any) a load of `model_path` would boot with, so
-    auto_tune can reserve its VRAM. Mirrors the spawn path: explicit setting
-    wins; otherwise sibling auto-detect when mmproj_auto is on."""
+    auto_tune can reserve its VRAM. Mirrors the spawn path exactly."""
+    mode = _normalized_mmproj_mode(s or {})
+    if mode == "off":
+        return ""
     mp = ((s or {}).get("mmproj_path") or "").strip()
-    if mp and safe_exists(mp):
-        return mp
-    if bool((s or {}).get("mmproj_auto", True)):
+    if mode == "manual":
+        return mp if mp and safe_exists(mp) else ""
+    if mode == "auto":
         try:
             return find_mmproj_for(model_path) or ""
         except Exception:
             return ""
     return ""
+
+
+def _runtime_spec_strategy(spec_strategy: str, mmproj_path: str) -> str:
+    """Keep the chosen decoder loaded alongside native multimodal support."""
+    return str(spec_strategy or "off").strip().lower()
 
 
 def _probe_ram_bandwidth_gbps() -> float:
@@ -30517,6 +32311,26 @@ def _parse_llama_port() -> int:
     return int(m.group(1)) if m else 8080
 
 
+def _gguf_model_identities(path: str | Path) -> set[str]:
+    """Return normalized model identities from GGUF metadata, including mmproj files."""
+    try:
+        meta = read_gguf_metadata(str(path))
+        keys = meta.get("keys") if isinstance(meta, dict) else {}
+        if not isinstance(keys, dict):
+            return set()
+        values = []
+        for key, value in keys.items():
+            lower = str(key).lower()
+            if (lower in {"general.name", "general.basename"}
+                    or (lower.startswith("general.base_model.") and lower.endswith(".name"))):
+                if isinstance(value, str) and value.strip():
+                    values.append(value)
+        return {re.sub(r"[^a-z0-9]+", "", value.lower()) for value in values
+                if len(re.sub(r"[^a-z0-9]+", "", value.lower())) >= 5}
+    except Exception:
+        return set()
+
+
 def find_mmproj_for(model_path: str) -> str:
     """Look for a vision projector .gguf sitting next to the chosen model.
     Heuristic: scan the model's directory (and one level up) for files whose
@@ -30548,6 +32362,15 @@ def find_mmproj_for(model_path: str) -> str:
             continue
     if not candidates:
         return ""
+    # Generic upstream names such as mmproj-F16.gguf carry the real pairing in
+    # GGUF metadata. Prefer an exact metadata identity match before filename
+    # heuristics; this is both safer and more useful in a crowded flat folder.
+    model_ids = _gguf_model_identities(mp)
+    if model_ids:
+        metadata_matches = [p for p in candidates if model_ids & _gguf_model_identities(p)]
+        if metadata_matches:
+            metadata_matches.sort(key=lambda p: (p.parent != mp.parent, len(p.name)))
+            return str(metadata_matches[0].resolve())
     # Prefer same-directory matches; then prefer names that share a token
     # with the model file (e.g. "qwen2.5-vl-7b" shows up in both).
     model_stem = mp.stem.lower()
@@ -30768,12 +32591,25 @@ def _watchdog_self_heal(attempt: int) -> None:
 # Remembered per GGUF path so switching models restores each model's own best
 # config instead of inheriting the previous model's leftovers.
 _MODEL_TUNE_KEYS = ("num_ctx", "n_cpu_moe", "kv_cache_type", "kv_cache_type_v", "num_gpu",
-                    "num_batch", "n_ubatch", "num_thread", "spec_strategy")
+                    "num_batch", "n_ubatch", "num_thread", "spec_strategy", "spec_strategy_source")
+_MODEL_PROJECTOR_KEYS = ("mmproj_mode", "mmproj_path")
+_MODEL_PREFERENCE_KEYS = ("reasoning_effort", "spec_draft_model")
+_MODEL_CONFIG_KEYS = _MODEL_TUNE_KEYS + _MODEL_PROJECTOR_KEYS + _MODEL_PREFERENCE_KEYS
 
 
 def _models_config() -> dict:
     cfg = load_json(MODELS_CONFIG_FILE, {})
     return cfg if isinstance(cfg, dict) else {}
+
+
+def _preserve_manual_model_spec(model_path: str, suggested: dict) -> dict:
+    """Keep background tuning from replacing a user's decoder choice."""
+    out = dict(suggested or {})
+    saved = _models_config().get(model_path)
+    if isinstance(saved, dict) and saved.get("spec_strategy_source") == "manual":
+        out.pop("spec_strategy", None)
+        out["spec_strategy_source"] = "manual"
+    return out
 
 
 def _apply_model_config(model_path: str) -> bool:
@@ -30813,9 +32649,13 @@ def _apply_model_config(model_path: str) -> bool:
     if not isinstance(cfg, dict):
         return False
     s = get_settings()
-    for k in _MODEL_TUNE_KEYS:
+    for k in _MODEL_CONFIG_KEYS:
         if k in cfg:
             s[k] = cfg[k]
+    s["mmproj_mode"] = _normalized_mmproj_mode(s)
+    s["mmproj_auto"] = s["mmproj_mode"] == "auto"
+    if "spec_strategy" in cfg:
+        s["enable_speculative"] = str(s.get("spec_strategy") or "off") != "off"
     save_json(SETTINGS_FILE, s)
     return True
 
@@ -30834,7 +32674,7 @@ def _save_model_config(model_path: str, flags: dict) -> None:
         ent = allc.get(model_path)
         if not isinstance(ent, dict):
             ent = {}
-        for k in _MODEL_TUNE_KEYS:
+        for k in _MODEL_CONFIG_KEYS:
             if k in flags:
                 ent[k] = flags[k]
         ent["tuned_at"] = int(time.time())
@@ -30864,6 +32704,7 @@ def _auto_tune_for_load(model_path: str) -> bool:
         suggested = auto_tune(model_path, vram, profile=profile)
         if not suggested.get("num_ctx"):
             return False
+        suggested["spec_strategy_source"] = "auto"
         s = get_settings()
         for k in _MODEL_TUNE_KEYS:
             if k in suggested:
@@ -31295,22 +33136,20 @@ class LlamaProcess:
         enable_metrics = bool(s.get("enable_metrics", False))
         extra_args_raw = (s.get("llama_extra_args") or "").strip()
 
-        # Vision projector resolution. Explicit setting wins; otherwise (when
-        # mmproj_auto is on, the default) we look for a sibling mmproj.gguf
-        # next to the model. Empty string means "text-only model" — chat
-        # handler will fall back to the side-vision describe_image() path.
-        mmproj_path = mmproj_override if mmproj_override is not None else (s.get("mmproj_path") or "").strip()
-        if mmproj_path and not safe_exists(mmproj_path):
-            print(f"[llama] WARN mmproj_path set but missing: {mmproj_path} — ignoring")
-            mmproj_path = ""
-        if not mmproj_path and bool(s.get("mmproj_auto", True)):
-            try:
-                guess = find_mmproj_for(model_path)
-            except Exception:
-                guess = ""
-            if guess:
-                print(f"[llama] auto-detected vision projector: {guess}")
-                mmproj_path = guess
+        # Projector mode is explicit. In particular, "off" must never fall
+        # through to auto-detection; that was the old unload regression.
+        if mmproj_override is not None:
+            mmproj_path = mmproj_override if safe_exists(mmproj_override) else ""
+        else:
+            mode = _normalized_mmproj_mode(s)
+            configured_mmproj = str(s.get("mmproj_path") or "").strip()
+            mmproj_path = _resolve_mmproj_for_tune(model_path, s)
+            if mode == "manual" and configured_mmproj and not mmproj_path:
+                print(f"[llama] WARN manual mmproj_path is missing: {configured_mmproj}")
+            elif mode == "auto" and mmproj_path:
+                print(f"[llama] auto-detected vision projector: {mmproj_path}")
+        spec_strategy = _runtime_spec_strategy(spec_strategy, mmproj_path)
+        spec_draft_model = str(s.get("spec_draft_model") or "").strip()
 
         # Stop any existing instance first.
         with self._lock:
@@ -31450,21 +33289,18 @@ class LlamaProcess:
                     "--spec-draft-n-max", str(spec_n_max),
                 ]
         elif spec_strategy in ("dflash", "dspark"):
-            # Self-speculative decoding (llama.cpp #21930): the model drafts
-            # from its OWN hidden states — no separate draft model, no MTP
-            # heads required. Big wins on Qwen3/Llama-4-family models; other
-            # architectures may not support or benefit. Fail-closed on builds
-            # without the flag (unknown --spec-type hard-exits the server).
-            if caps.get(spec_strategy):
+            # DFlash and DSpark use a separate draft network trained for the
+            # exact target model. A CLI flag without that sidecar is invalid.
+            if caps.get(spec_strategy) and spec_draft_model and safe_exists(spec_draft_model):
                 # CLI type names are prefixed draft- (draft-dflash / draft-dspark)
                 # even though the settings value is the short form.
-                cmd += ["--spec-type",
+                cmd += ["--spec-draft-model", spec_draft_model, "--spec-type",
                         {"dflash": "draft-dflash", "dspark": "draft-dspark"}.get(
                             spec_strategy, spec_strategy)]
-                print(f"[llama] speculative decoding: {spec_strategy} (self-speculative)",
+                print(f"[llama] speculative decoding: {spec_strategy} ({os.path.basename(spec_draft_model)})",
                       file=sys.stderr)
             else:
-                print(f"[llama] this build lacks --spec-type {spec_strategy} — spec_strategy→off",
+                print(f"[llama] {spec_strategy} needs a supported build and matching draft GGUF — spec_strategy→off",
                       file=sys.stderr)
         # "off" emits nothing — no speculative decoding.
         # Auto-YaRN: running ctx past the model's trained context without rope
@@ -31632,9 +33468,17 @@ def wait_for_llama(wait_seconds: int = 30, base_url: str = None) -> bool:
 def _start_vision_fallback_if_needed(s: dict) -> None:
     global VISION_LLAMA
     v_model = (s.get("vision_model") or "").strip()
-    if not v_model or not safe_exists(v_model):
-        return
     if os.environ.get("VISION_LLAMA_HOST"):
+        return
+    # Clear any in-process side server address when fallback vision is removed
+    # or the main model now has native vision. Otherwise a stale URL makes the
+    # next image turn block before the main chat request is even created.
+    if _llama.is_vision_capable() or not v_model or not safe_exists(v_model):
+        try:
+            _vision_llama.stop_permanent()
+        except Exception:
+            pass
+        VISION_LLAMA = LLAMA
         return
     
     main_port = _parse_llama_port()
@@ -31726,6 +33570,9 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
         _enforce_chat_retention(chat)
         chat["updated"] = int(time.time())
         save_json(CHATS_FILE, chats)
+        if (use_tools and get_settings().get("desktop_enabled")
+                and _user_asked_desktop_interaction(user_text)):
+            _unlock_bundle(chat_id, "desktop")
 
         replay_from = 0
         # Gemma over discord gets the same text-tools routing as the web UI:

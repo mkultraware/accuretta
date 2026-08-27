@@ -31,6 +31,7 @@
     activeSkill: null,       // { name, budget, body_chars } of the chat's active skill
     compactingChats: new Set(),
     compactionRows: new Map(),
+    skillSaveRows: new Map(),
     mobileTab: "chat",
     pendingImages: [],  // [{ dataUrl, name }]
     pendingFiles: [],   // browser File objects uploaded on send
@@ -58,6 +59,18 @@
     reasoningEffort: "auto",
   };
 
+  const SHORTCUT_ACTIONS = Object.freeze({
+    approve_pending: { label: "Approve newest request", detail: "ordinary approvals only", icon: "ph-check-circle" },
+    deny_pending: { label: "Deny newest request", detail: "closes the latest gate", icon: "ph-x-circle" },
+    open_settings: { label: "Open settings", detail: "opens the settings drawer", icon: "ph-gear-six" },
+    open_faq: { label: "Open FAQ", detail: "opens the field guide", icon: "ph-question" },
+    open_usage: { label: "Open usage stats", detail: "shows local counters", icon: "ph-chart-line-up" },
+    new_chat: { label: "New chat", detail: "creates a fresh session", icon: "ph-plus-circle" },
+    focus_composer: { label: "Focus composer", detail: "puts the cursor in the prompt", icon: "ph-cursor-text" },
+    stop_generation: { label: "Stop generation", detail: "stops the current reply", icon: "ph-stop-circle" },
+  });
+  let shortcutRecording = null;
+
   const app = $("#app");
   const isMobile = () => window.matchMedia("(max-width: 600px)").matches;
   const isCompactViewport = () => window.matchMedia("(max-width: 820px)").matches;
@@ -70,7 +83,25 @@
       app.classList.add("sidebar-collapsed", "preview-collapsed");
     }
     wasCompactViewport = compact;
+    syncSidebarToggle();
   }
+
+  function syncSidebarToggle() {
+    const button = $("#btn-toggle-sidebar-m");
+    const icon = button?.querySelector("i");
+    if (!button || !icon) return;
+    const mobile = isMobile();
+    const collapsed = app.classList.contains("sidebar-collapsed");
+    const label = mobile ? "Sessions" : (collapsed ? "Open sidebar" : "Collapse sidebar");
+    icon.className = `ph ${mobile || !collapsed ? "ph-list" : "ph-caret-right"}`;
+    button.title = label;
+    button.setAttribute("aria-label", label);
+  }
+
+  new MutationObserver(syncSidebarToggle).observe(app, {
+    attributes: true,
+    attributeFilter: ["class"],
+  });
 
   // ---------- utilities ----------
   // Composer notification tabs. Keyed notices replace an older copy.
@@ -377,7 +408,7 @@
       row.setAttribute("role", "status");
       row.setAttribute("aria-live", "polite");
       const dots = Array.from({ length: 9 }, () => "<span></span>").join("");
-      row.innerHTML = `<span class="compaction-dot-matrix" aria-hidden="true">${dots}</span><span class="compaction-inline-label">Compacting..</span>`;
+      row.innerHTML = `<span class="compaction-dot-matrix" aria-hidden="true">${dots}</span><span class="compaction-inline-label shimmer">Compacting..</span>`;
 
       const liveRow = state.liveTurn?.chatId === chatId
         && state.liveTurn.row?.parentNode === inner
@@ -431,9 +462,121 @@
     row.classList.remove("is-working");
     row.classList.add(outcome === "failed" ? "is-failed" : "is-done");
     const label = row.querySelector(".compaction-inline-label");
-    if (label) label.textContent = outcome === "failed" ? "Compaction failed" : "Compacted";
+    if (label) {
+      label.classList.remove("shimmer");
+      label.textContent = outcome === "failed" ? "Compaction failed" : "Compacted";
+    }
     row._removeTimer = setTimeout(
       () => removeCompactionRow(chatId, row), outcome === "failed" ? 3600 : 900);
+  }
+
+  const SKILL_SAVE_MIN_FEEDBACK_MS = 650;
+
+  function skillSaveRowKey(chatId, callId = "") {
+    return `${chatId}:${callId || "pending"}`;
+  }
+
+  function skillSaveRowFor(chatId, callId = "") {
+    if (callId) {
+      const key = skillSaveRowKey(chatId, callId);
+      const exact = state.skillSaveRows.get(key);
+      if (exact?.isConnected) return exact;
+      state.skillSaveRows.delete(key);
+      return null;
+    }
+    const rows = Array.from(state.skillSaveRows.values())
+      .filter(row => row?.isConnected && row.dataset.chatId === chatId);
+    return rows[rows.length - 1] || null;
+  }
+
+  function removeSkillSaveRow(chatId, row) {
+    if (!row) return;
+    clearTimeout(row._safetyTimer);
+    clearTimeout(row._finishTimer);
+    clearTimeout(row._removeTimer);
+    row.classList.add("is-leaving");
+    row._removeTimer = setTimeout(() => {
+      const key = row._skillSaveKey || skillSaveRowKey(chatId, row.dataset.callId || "");
+      if (state.skillSaveRows.get(key) === row) state.skillSaveRows.delete(key);
+      try { row.remove(); } catch {}
+    }, 260);
+  }
+
+  function ensureSkillSaveRow(chatId, skill, callId = "") {
+    if (!chatId || chatId !== state.chatId) return null;
+    const inner = $("#chat-inner");
+    if (!inner) return null;
+    const labelText = `Saving skill${skill ? ` · ${skill}` : ""}..`;
+    let row = skillSaveRowFor(chatId, callId);
+    if (!row) {
+      const follow = isNearBottom();
+      row = document.createElement("div");
+      row.dataset.chatId = chatId;
+      row.dataset.callId = callId;
+      row._skillSaveKey = skillSaveRowKey(chatId, callId);
+      row._startedAt = Date.now();
+      row.setAttribute("role", "status");
+      row.setAttribute("aria-live", "polite");
+      const dots = Array.from({ length: 9 }, () => "<span></span>").join("");
+      row.innerHTML = `<span class="compaction-dot-matrix" aria-hidden="true">${dots}</span>` +
+        `<span class="compaction-inline-label shimmer">${esc(labelText)}</span>`;
+
+      const liveRow = state.liveTurn?.chatId === chatId
+        && state.liveTurn.row?.parentNode === inner
+        ? state.liveTurn.row
+        : Array.from(inner.querySelectorAll(".bubble-row"))
+            .find(candidate => candidate.querySelector(".bubble-meta.streaming"));
+      if (liveRow) inner.insertBefore(row, liveRow);
+      else inner.appendChild(row);
+      state.skillSaveRows.set(row._skillSaveKey, row);
+      if (follow) requestAnimationFrame(() => scrollToBottom(true));
+    }
+
+    if (skill) row.dataset.skill = skill;
+    clearTimeout(row._removeTimer);
+    row.className = "compaction-inline-row skill-save-inline-row is-working";
+    const label = row.querySelector(".compaction-inline-label");
+    if (label && !row._finishPending) {
+      label.textContent = labelText;
+      label.classList.add("shimmer");
+    }
+    clearTimeout(row._safetyTimer);
+    row._safetyTimer = setTimeout(() => removeSkillSaveRow(chatId, row), 310000);
+    return row;
+  }
+
+  function finishSkillSaveRow(chatId, outcome = "saved", skill = "", callId = "") {
+    const row = skillSaveRowFor(chatId, callId);
+    if (!row) return;
+    if (row._finishPending) return;
+    row._finishPending = true;
+    if (skill) row.dataset.skill = skill;
+    clearTimeout(row._safetyTimer);
+    const label = row.querySelector(".compaction-inline-label");
+    const savedSkill = skill || row.dataset.skill || "";
+    const suffix = savedSkill ? ` · ${savedSkill}` : "";
+    const finalLabel = outcome === "failed"
+      ? `Skill save failed${suffix}`
+      : outcome === "cancelled" ? `Skill save cancelled${suffix}` : `Skill saved${suffix}`;
+    if (label) label.textContent = finalLabel;
+
+    const settle = () => {
+      row.classList.remove("is-working");
+      row.classList.add(outcome === "failed" ? "is-failed" : "is-done");
+      if (label) {
+        label.classList.remove("shimmer");
+        label.textContent = finalLabel;
+      }
+      row._removeTimer = setTimeout(
+        () => removeSkillSaveRow(chatId, row), outcome === "failed" ? 3600 : 1100);
+    };
+
+    const elapsed = Date.now() - (row._startedAt || Date.now());
+    const remaining = outcome === "saved"
+      ? Math.max(0, SKILL_SAVE_MIN_FEEDBACK_MS - elapsed)
+      : 0;
+    if (remaining) row._finishTimer = setTimeout(settle, remaining);
+    else settle();
   }
 
   function hideToast(key) {
@@ -887,24 +1030,41 @@
       if (deck.children.length === 0) deck.innerHTML = "";
     }
     
-    // Render finalized cards inside the stack
+    const group = stack.querySelector(".tool-group.activity-group");
+    if (!group) {
+      stack.remove();
+      return;
+    }
+
+    group.classList.remove("live-activity");
+    group.classList.add("done-pill", "collapsed");
+    group.querySelector(".activity-overflow")?.remove();
+    group.querySelectorAll(".tool-line.activity-older").forEach(line => line.classList.remove("activity-older"));
+    group.querySelectorAll(".tool-line.running").forEach(line => {
+      line.classList.remove("running");
+      line.classList.add("err");
+      line.querySelector(".tool-line-label")?.classList.remove("shimmer");
+      if (!line.querySelector(".tl-time")) {
+        line.insertAdjacentHTML("beforeend", '<span class="tl-time">stopped</span>');
+      }
+    });
+
+    // Keep the compact event trail, then add the richer command/file cards for
+    // users who expand the finished work and want the details.
     const activities = row._activities || { writes: [], commands: [], mcp: [] };
     let html = "";
-    
-    // Render collapsed in history
     html += buildWritesCardHtml(activities.writes, true);
     html += buildCommandsCardHtml(activities.commands, true);
     html += buildMcpCardHtml(activities.mcp, true);
-    
     if (html) {
-      stack.innerHTML = `<div class="tool-group done-pill">${html}</div>`;
-      
-      // Wire collapse toggles for the history cards
-      stack.querySelectorAll(".revealer-card").forEach(card => {
+      const body = group.querySelector(".tool-group-body");
+      const details = document.createElement("div");
+      details.className = "tool-detail-cards";
+      details.innerHTML = html;
+      body?.appendChild(details);
+      details.querySelectorAll(".revealer-card").forEach(card => {
         const head = card.querySelector(".revealer-card-head");
-        head.addEventListener("click", () => card.classList.toggle("collapsed"));
-        
-        // Wire preview-file button
+        head?.addEventListener("click", () => card.classList.toggle("collapsed"));
         card.querySelectorAll(".btn-preview-file").forEach(btn => {
           btn.addEventListener("click", (e) => {
             e.stopPropagation();
@@ -917,15 +1077,132 @@
           });
         });
       });
-      
-      // Move stack after the bubble in the bubble-col.
-      const col = bubble.parentNode;
-      if (col && bubble.nextSibling !== stack) {
-        col.insertBefore(stack, bubble.nextSibling);
-      }
-    } else {
-      stack.remove();
     }
+
+    updateToolGroupHead(stack);
+    const col = bubble.parentNode;
+    if (col && bubble.nextSibling !== stack) col.insertBefore(stack, bubble.nextSibling);
+  }
+
+  function wireToolGroupToggle(group) {
+    const head = group?.querySelector(".tool-group-head");
+    if (!head || head.dataset.wired === "true") return;
+    head.dataset.wired = "true";
+    const toggle = () => {
+      group.classList.toggle("collapsed");
+      head.setAttribute("aria-expanded", String(!group.classList.contains("collapsed")));
+    };
+    head.addEventListener("click", toggle);
+    head.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      toggle();
+    });
+  }
+
+  function ensureToolActivityGroup(stack) {
+    if (!stack) return null;
+    let group = stack.querySelector(".tool-group.activity-group");
+    if (group) return group;
+    group = document.createElement("div");
+    group.className = "tool-group activity-group live-activity";
+    group.innerHTML = `
+      <div class="tool-group-head" role="button" tabindex="0" aria-expanded="true">
+        <span class="tool-group-icon spinning">${WRENCH_SVG}</span>
+        <span class="tool-group-activity">Working…</span>
+        <span class="tool-group-summary" hidden></span>
+        <span class="tool-group-chips" hidden></span>
+        <i class="ph ph-caret-down chevron" aria-hidden="true"></i>
+      </div>
+      <div class="tool-group-body" role="status" aria-live="polite"></div>`;
+    stack.appendChild(group);
+    wireToolGroupToggle(group);
+    return group;
+  }
+
+  function syncLiveActivityRows(group) {
+    if (!group) return;
+    const body = group.querySelector(".tool-group-body");
+    if (!body) return;
+    const rows = [...body.children].filter(el => el.classList.contains("tool-line"));
+    const hiddenCount = Math.max(0, rows.length - 3);
+    rows.forEach((line, index) => line.classList.toggle("activity-older", index < hiddenCount));
+    let overflow = body.querySelector(".activity-overflow");
+    if (hiddenCount === 0) {
+      overflow?.remove();
+      return;
+    }
+    if (!overflow) {
+      overflow = document.createElement("div");
+      overflow.className = "activity-overflow";
+      body.prepend(overflow);
+    }
+    overflow.textContent = `${hiddenCount} earlier action${hiddenCount === 1 ? "" : "s"}`;
+  }
+
+  function startToolActivity(stack, toolCards, evt) {
+    const group = ensureToolActivityGroup(stack);
+    const body = group?.querySelector(".tool-group-body");
+    if (!group || !body) return null;
+    const key = String(evt.call_id || `activity-${(stack._activitySeq = (stack._activitySeq || 0) + 1)}`);
+    const existing = toolCards.get(key);
+    if (existing) return existing;
+    const label = toolLabel(evt.name, evt.arguments);
+    const line = document.createElement("div");
+    line.className = "tool-line running";
+    line.dataset.name = evt.name || "tool";
+    line.dataset.callId = String(evt.call_id || "");
+    line.dataset.path = String(evt.arguments?.path || "");
+    line.dataset.t0 = String(Date.now());
+    line.innerHTML = `${toolIconHtml(evt.name, "run") || WRENCH_SVG}<span class="tool-line-label shimmer">${esc(label)}</span>`;
+    body.appendChild(line);
+    toolCards.set(key, line);
+    const activity = group.querySelector(".tool-group-activity");
+    if (activity) activity.textContent = label;
+    syncLiveActivityRows(group);
+    return line;
+  }
+
+  function findToolActivity(stack, toolCards, evt) {
+    const callId = String(evt.call_id || "");
+    if (callId && toolCards.has(callId)) return toolCards.get(callId);
+    return [...(stack?.querySelectorAll(".tool-line.running") || [])]
+      .find(line => !evt.name || line.dataset.name === evt.name) || null;
+  }
+
+  function setToolActivityLabel(stack, toolCards, evt, label) {
+    const line = findToolActivity(stack, toolCards, evt);
+    const text = line?.querySelector(".tool-line-label");
+    if (text && label) text.textContent = label;
+  }
+
+  function finishToolActivity(stack, toolCards, evt) {
+    const line = findToolActivity(stack, toolCards, evt);
+    if (!line) return null;
+    const isErr = toolResultFailed(evt.result);
+    line.classList.remove("running");
+    line.classList.add(isErr ? "err" : "done");
+    const label = line.querySelector(".tool-line-label");
+    if (label) {
+      label.classList.remove("shimmer");
+      label.textContent = toolResultLabel(evt.name, evt.result);
+    }
+    if (isErr) {
+      const detail = toolFailureDetail(evt.result);
+      if (detail) {
+        line.title = detail;
+        line.setAttribute("aria-label", `${label?.textContent || "Tool unavailable"}. Details: ${detail}`);
+      }
+    }
+    const elapsed = line.dataset.t0 ? Date.now() - Number(line.dataset.t0) : 0;
+    if (elapsed > 0) {
+      const duration = elapsed < 1000 ? `${elapsed}ms` : `${(elapsed / 1000).toFixed(1)}s`;
+      line.insertAdjacentHTML("beforeend", `<span class="tl-time">${duration}</span>`);
+    }
+    const callId = String(evt.call_id || "");
+    if (callId) toolCards.delete(callId);
+    syncLiveActivityRows(line.closest(".tool-group"));
+    return line;
   }
 
   function updateToolGroupHead(stack) {
@@ -942,13 +1219,21 @@
       icon?.classList.add("spinning");
       // Activity stays as set by the tool_start label (the most recent one).
       // Don't overwrite mid-run.
-      activity.hidden = false;
-      summary.hidden = true;
+      if (activity) activity.hidden = false;
+      if (summary) summary.hidden = true;
+      group.classList.remove("done-pill");
+    } else if (group.classList.contains("live-activity")) {
+      icon?.classList.remove("spinning");
+      if (activity) {
+        activity.hidden = false;
+        activity.textContent = "Reviewing results…";
+      }
+      if (summary) summary.hidden = true;
       group.classList.remove("done-pill");
     } else {
       icon?.classList.remove("spinning");
-      activity.hidden = true;
-      summary.hidden = false;
+      if (activity) activity.hidden = true;
+      if (summary) summary.hidden = false;
       group.classList.add("done-pill");
       // Count commands separately from other tools so the summary reads as
       // "X tools · Y commands" — the user's exact ask.
@@ -979,7 +1264,7 @@
       }
       if (err > 0) {
         if (html) html += `<span class="dot-sep"></span>`;
-        html += `<span class="summary-item err-item"><i class="ph ph-warning"></i> ${err} failed</span>`;
+        html += `<span class="summary-item err-item"><i class="ph ph-info"></i> ${err} issue${err === 1 ? "" : "s"}</span>`;
         group.classList.add("has-err");
       } else {
         group.classList.remove("has-err");
@@ -1007,10 +1292,21 @@
     switch (name) {
       case "list_directory": return `Looking in ${shortPath(args.path) || "folder"}…`;
       case "read_file":      return `Reading ${shortPath(args.path)}…`;
+      case "read_skeleton":  return `Reading the structure of ${shortPath(args.path)}…`;
+      case "project_map":    return `Mapping ${shortPath(args.path) || "project"}…`;
+      case "find_files":     return `Searching ${shortPath(args.path) || "files"}${args.pattern ? ` for ${String(args.pattern).slice(0, 48)}` : ""}…`;
+      case "grep_files":     return `Searching ${shortPath(args.path) || "files"}${args.pattern ? ` for ${String(args.pattern).slice(0, 48)}` : ""}…`;
       case "write_file":     return `Writing ${shortPath(args.path)}…`;
       case "edit_file":      return `Editing ${shortPath(args.path)}…`;
       case "delete_file":    return `Deleting ${shortPath(args.path)}…`;
       case "run_powershell": return `Running on host…`;
+      case "run_tests":      return `Running project tests…`;
+      case "check_syntax":   return `Checking ${shortPath(args.path)}…`;
+      case "git_status":     return `Checking repository status…`;
+      case "git_log":        return `Reading repository history…`;
+      case "git_diff":       return `Reviewing repository changes…`;
+      case "update_plan":    return `Updating the task plan…`;
+      case "capability_report": return `Checking available capabilities…`;
       case "sandbox_run":    return `Running in WSL guest…`;
       case "remote_shell":   return `Running on Mac…`;
       case "remote_write_file": return `Writing ${shortPath(args.path)} on Mac…`;
@@ -1022,6 +1318,8 @@
       case "remote_copy_from": return `Copying ${shortPath(args.source)} from Mac…`;
       case "open_program":   return `Opening ${args.name || args.path || "program"}…`;
       case "web_fetch":      return `Fetching ${args.url || "the web"}…`;
+      case "web_search":     return `Searching the web${args.query ? ` for ${String(args.query).slice(0, 56)}` : ""}…`;
+      case "web_image_search": return `Searching for images${args.query ? ` of ${String(args.query).slice(0, 48)}` : ""}…`;
       case "network_snapshot": return `Scanning network…`;
       case "scan_apk":         return `Scanning APK${args.path ? " " + shortPath(args.path) : ""}…`;
       case "decompile_apk":    return `Decompiling APK${args.path ? " " + shortPath(args.path) : ""}…`;
@@ -1033,16 +1331,26 @@
   }
   function toolResultLabel(name, res) {
     res = res || {};
-    if (res.error) return `${name}: ${String(res.error).slice(0, 120)}`;
+    if (toolResultFailed(res)) return toolFailureLabel(name);
     switch (name) {
       case "list_directory": {
         const n = (res.entries || []).length;
         return `Found ${n} item${n === 1 ? "" : "s"}${res.path ? " in " + shortPath(res.path) : ""}`;
       }
       case "read_file":      return `Read ${shortPath(res.path)}${res.bytes != null ? ` (${res.bytes} bytes)` : ""}`;
+      case "read_skeleton":  return `Read the structure of ${shortPath(res.path)}`;
+      case "project_map":    return `Mapped the project`;
+      case "find_files":     return `Found ${Number(res.count || 0)} matching file${Number(res.count || 0) === 1 ? "" : "s"}`;
+      case "grep_files":     return `Found ${Number(res.match_count || 0)} match${Number(res.match_count || 0) === 1 ? "" : "es"} in ${Number(res.files_scanned || 0)} file${Number(res.files_scanned || 0) === 1 ? "" : "s"}`;
       case "write_file":     return `Wrote ${shortPath(res.path)}`;
       case "edit_file":      return `Edited ${shortPath(res.path)} · ${res.edits_applied || 0} change${(res.edits_applied || 0) === 1 ? "" : "s"}`;
       case "delete_file":    return `Deleted ${shortPath(res.path)}`;
+      case "check_syntax":   return res.ok === false ? "Syntax check failed" : "Syntax check passed";
+      case "git_status":     return `Checked repository status`;
+      case "git_log":        return `Read repository history`;
+      case "git_diff":       return `Reviewed repository changes`;
+      case "update_plan":    return `Updated the task plan`;
+      case "capability_report": return `Checked available capabilities`;
       case "remote_shell":   return `Mac command completed`;
       case "remote_write_file":
       case "remote_save_code_block": return `Wrote ${shortPath(res.path)} on Mac${res.bytes != null ? ` (${res.bytes} bytes)` : ""}`;
@@ -1067,6 +1375,8 @@
       }
       case "open_program":   return `Opened ${res.name || ""}`;
       case "web_fetch":      return `Fetched ${shortPath(res.url)}`;
+      case "web_search":     return `Found ${(res.results || []).length} web result${(res.results || []).length === 1 ? "" : "s"}`;
+      case "web_image_search": return `Found ${(res.results || []).length} image${(res.results || []).length === 1 ? "" : "s"}`;
       case "network_snapshot": {
         const t = res.tcp_count || 0;
         const u = res.udp_count || 0;
@@ -1105,6 +1415,37 @@
       }
       default:               return `${name} complete`;
     }
+  }
+
+  function toolFailureLabel(name) {
+    if (name && name.startsWith("mcp_")) {
+      const match = name.match(/^mcp_[^_]+_(.+)$/);
+      const tool = (match ? match[1] : name.slice(4)).replaceAll("_", " ");
+      return `${tool || "Connected tool"} unavailable`;
+    }
+    switch (name) {
+      case "web_fetch": return "Web fetch unavailable";
+      case "web_search": return "Web search unavailable";
+      case "web_image_search": return "Image search unavailable";
+      case "run_powershell":
+      case "sandbox_run":
+      case "remote_shell": return "Command did not complete";
+      case "run_tests": return "Tests did not complete";
+      case "read_file":
+      case "read_skeleton": return "File could not be read";
+      case "write_file":
+      case "edit_file":
+      case "delete_file": return "File action did not complete";
+      default: return "Tool unavailable";
+    }
+  }
+
+  function toolFailureDetail(res) {
+    res = res || {};
+    const raw = res.error ?? res.message ?? res.stderr ?? res.output ?? res.details;
+    if (raw == null) return "";
+    if (typeof raw === "string") return raw.slice(0, 600);
+    try { return JSON.stringify(raw).slice(0, 600); } catch { return String(raw).slice(0, 600); }
   }
 
   // ---------- lightweight syntax highlighter ----------
@@ -2568,7 +2909,7 @@
 
     // pick or create current chat
     if (state.chats.order.length) {
-      selectChat(state.chats.order[0]);
+      await selectChat(state.chats.order[0]);
     } else {
       await newChat();
     }
@@ -2641,6 +2982,11 @@
   async function loadSettings() {
     state.settings = await api("/api/settings");
     if (state.settings) {
+      const savedMode = String(state.settings.composer_mode || "auto").toLowerCase();
+      state.mode = ["auto", "agent", "ide"].includes(savedMode) ? savedMode : "auto";
+      const savedEffort = String(state.settings.reasoning_effort || "auto").toLowerCase();
+      state.reasoningEffort = ["auto", "low", "medium", "high"].includes(savedEffort)
+        ? savedEffort : "auto";
       const storedTheme = state.settings.theme || "light";
       const theme = normalizeTheme(storedTheme);
       state.settings.theme = theme;
@@ -2673,11 +3019,40 @@
     renderStatus();
     renderModelPill();
   }
+
+  let preferenceSaveChain = Promise.resolve();
+  function persistUiPreference(update) {
+    Object.assign(state.settings, update);
+    preferenceSaveChain = preferenceSaveChain
+      .catch(() => {})
+      .then(async () => {
+        const saved = await api("/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(update),
+        });
+        Object.assign(state.settings, saved || {});
+      })
+      .catch(error => {
+        toast("could not save preference: " + (error.message || error), "error", 5000);
+      });
+    return preferenceSaveChain;
+  }
   async function loadWorkspace() {
     state.workspace = await api("/api/workspace");
   }
-  async function loadChats() {
-    state.chats = await api("/api/chats");
+  async function loadChats({ preserveLoaded = true } = {}) {
+    const incoming = await api("/api/chats?summary=1");
+    if (preserveLoaded && state.chats?.chats) {
+      for (const id of incoming.order || []) {
+        const loaded = state.chats.chats[id];
+        if (Array.isArray(loaded?.messages) && incoming.chats?.[id]) {
+          incoming.chats[id].messages = loaded.messages;
+          incoming.chats[id]._summary = false;
+        }
+      }
+    }
+    state.chats = incoming;
   }
   async function loadModels() {
     try {
@@ -2764,7 +3139,7 @@
       body: JSON.stringify({ title: "new session", origin }),
     });
     await loadChats();
-    selectChat(c.id);
+    await selectChat(c.id);
     const ta = $("#composer-input");
     ta.value = "";
     autoResize(ta);
@@ -2782,9 +3157,20 @@
     } catch (_) {}
   }
 
-  function selectChat(id) {
+  async function selectChat(id) {
     state.chatId = id;
-    const chat = state.chats.chats[id];
+    let chat = state.chats.chats[id];
+    if (!chat || chat._summary || !Array.isArray(chat.messages)) {
+      try {
+        chat = await api(`/api/chats/${encodeURIComponent(id)}`);
+      } catch (error) {
+        if (state.chatId === id) toast("could not load session: " + (error.message || error), "error");
+        return;
+      }
+      if (state.chatId !== id) return;
+      chat._summary = false;
+      state.chats.chats[id] = chat;
+    }
     state.activeSkill = null;
     if (chat && chat.active_skill) {
       state.activeSkill = { name: chat.active_skill, budget: chat.active_skill_budget || 0, body_chars: 0 };
@@ -3160,9 +3546,12 @@
       // the `.chatrow.active::before` rule in app.css — the icon is the
       // SECONDARY signal, the dot is the primary.
       const isGitHubChat = c.origin === "github" || !!c.github_worktree;
+      const isProjectChat = c.origin === "project" || !!c.project_workspace;
       const iconClass = c.origin === "mobile" ? "ph ph-device-mobile"
-        : (isGitHubChat ? "ph ph-git-branch" : "ph ph-chat-circle");
+        : (isGitHubChat ? "ph ph-git-branch"
+          : (isProjectChat ? "ph ph-folder-simple" : "ph ph-chat-circle"));
       if (isGitHubChat) row.classList.add("gh-branch");
+      if (isProjectChat) row.classList.add("project-session");
       row.innerHTML = `
         <i class="${iconClass}"></i>
         <span class="t">${esc(c.title)}</span>
@@ -3389,7 +3778,7 @@
         ${thoughtChip}
         <div class="bubble ${m.role === "user" ? "user" : "agent"}">${renderMarkdown(visible)}</div>
         ${cascadeChips}
-        <div class="bubble-meta"${tokTip}>${m.role === "user" ? "you" : (state.settings.model || "agent")} · ${relTime(m.t)}</div>
+        <div class="bubble-meta"${tokTip}>${m.role === "user" ? `you · ${relTime(m.t)}` : relTime(m.t)}</div>
       </div>`;
     const savedThinkContent = row.querySelector(".think-content");
     if (savedThinkContent) savedThinkContent._fullText = thinkingText;
@@ -3534,7 +3923,7 @@
         </div>
         <div class="tool-stack" id="tool-stack"></div>
         <div class="bubble agent hidden" id="stream-bubble"></div>
-        <div class="bubble-meta streaming">${esc(state.settings.model)} · streaming<span class="typing"><span></span><span></span><span></span></span></div>
+        <div class="bubble-meta streaming">streaming<span class="typing"><span></span><span></span><span></span></span></div>
       </div>`;
     $("#chat-inner").appendChild(agentRow);
     scrollToBottom(true);
@@ -3799,7 +4188,7 @@
         </div>
         <div class="tool-stack" id="tool-stack"></div>
         <div class="bubble agent hidden" id="stream-bubble"></div>
-        <div class="bubble-meta streaming">${esc(state.settings.model)} · streaming<span class="typing"><span></span><span></span><span></span></span></div>
+        <div class="bubble-meta streaming">streaming<span class="typing"><span></span><span></span><span></span></span></div>
       </div>`;
     $("#chat-inner").appendChild(agentRow);
     scrollToBottom(true);
@@ -3818,6 +4207,10 @@
     try {
       await streamChat(withMentionRefs(text), agentRow, state.abortCtl.signal, images, opts);
     } catch (e) {
+      if (e.beforeStream && images.length) {
+        state.pendingImages = [...images, ...state.pendingImages];
+        renderImageTray();
+      }
       const b = agentRow.querySelector("#stream-bubble") || agentRow.querySelector(".bubble");
       if (b) {
         if (e.name === "AbortError") {
@@ -3830,11 +4223,17 @@
         }
       }
     } finally {
+      const finishedChatId = state.liveTurn?.chatId || state.chatId;
       state.streaming = false;
       state.abortCtl = null;
       state.liveTurn = null;   // turn committed; partial no longer needs restoring
       setStreamingUI(false);
       await loadChats();
+      const finishedChat = state.chats.chats[finishedChatId];
+      if (finishedChat) {
+        delete finishedChat.messages;
+        finishedChat._summary = true;
+      }
       renderChatList();
       if (agentRow._notificationFailed) notifyFailure(agentRow._notificationError, agentRow._workStart ? Date.now() - agentRow._workStart : 0);
       else if (!agentRow._notificationCancelled) notifyCompletion(agentRow._workStart ? Date.now() - agentRow._workStart : 0);
@@ -3896,22 +4295,9 @@
     let buf = "";
     const toolCards = new Map();
 
-    // heartbeat: if no delta arrives, rotate through varied status lines
-    // so the user sees the model is alive (not frozen). Mix of plain progress
-    // and dry one-liners. Never repeats until the pool is exhausted.
-    const idlePool = [
-      "still working", "thinking it through", "crunching tokens",
-      "wrangling the model", "hitting the monitor with a hammer",
-      "politely asking the weights", "re-reading the prompt",
-      "weighing options", "arguing with itself", "lining up the next move",
-      "checking its own math", "rehearsing the reply", "taking the scenic route",
-      "compiling thoughts", "sharpening the pencil", "consulting the rubber duck",
-      "shaking the dice", "yelling at the GPU",
-    ];
-    let pool = idlePool.slice();
-    let currentIdle = "still working";
+    // A quiet heartbeat proves the stream is alive without inventing claims
+    // about what the model is doing internally.
     let lastActivity = Date.now();
-    let lastRotate = 0;
     const started = lastActivity;
     const markActivity = () => { lastActivity = Date.now(); };
     const heartbeat = setInterval(() => {
@@ -3922,13 +4308,8 @@
       const idle = Math.floor((Date.now() - lastActivity) / 1000);
       const total = Math.floor((Date.now() - started) / 1000);
       if (idle < 3) return;
-      
-      if (Date.now() - lastRotate > 6000) {
-        if (!pool.length) pool = idlePool.slice();
-        currentIdle = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
-        lastRotate = Date.now();
-      }
-      span.innerHTML = `${currentIdle}… <span style="opacity: 0.6; margin-left: 4px;">${total}s</span>`;
+      const phase = line.dataset.phase === "writing" ? "Still writing response" : "Still thinking";
+      span.textContent = `${phase} · ${total}s`;
     }, 250);
 
      const resp = await fetch("/api/chat", {
@@ -3953,7 +4334,9 @@
         const payload = await resp.json();
         detail = payload && payload.error ? String(payload.error) : "";
       } catch (e) {}
-      throw new Error(detail || `request failed (${resp.status})`);
+      const error = new Error(detail || `request failed (${resp.status})`);
+      error.beforeStream = true;
+      throw error;
     }
     if (!resp.body) throw new Error("no response body");
 
@@ -4063,8 +4446,6 @@
             msg = `No response — Max reply tokens is set very low (${state.settings.num_predict}). Try raising it in Settings.`;
           } else if (state.settings.num_predict === 0) {
             msg = "No response — Max reply tokens is set to 0. Try raising it in Settings.";
-          } else if ((images && images.length > 0) && (state.settings.spec_strategy === "draft-mtp" || state.settings.enable_speculative)) {
-            msg = "No response — Speculative Decoding often crashes when processing images. Try disabling it in Settings.";
           }
           bubble.innerHTML =
             `<i class="quiet-icon ph ph-info"></i>` +
@@ -4297,6 +4678,8 @@
     
     if (running) {
       if (!container._thinkStart) container._thinkStart = Date.now();
+      if (!container._phaseStart) container._phaseStart = Date.now();
+      container.dataset.phase = label === "Writing response" ? "writing" : "thinking";
       // Re-entering activity (a new thinking phase, or a tool starting after
       // some answer text already showed): clear the finished look so the label
       // shimmers again instead of sitting frozen on "Thought for Xs".
@@ -4306,13 +4689,16 @@
       if (icon) icon.className = "ph ph-brain think-check-icon";
       return;
     }
-    // Done. Freeze the elapsed ONCE — it used to be recomputed on every content
-    // delta, so "Thought for Xs" visibly climbed while the answer streamed.
+    // Close the current phase and retain accumulated time if reasoning resumes
+    // after a tool result.
     container.classList.add("done");
     if (span) span.classList.remove("shimmer");
-    if (container._thinkStart && !container._thinkEnd) container._thinkEnd = Date.now();
-    const end = container._thinkEnd || Date.now();
-    const elapsed = container._thinkStart ? Math.max(1, Math.round((end - container._thinkStart) / 1000)) : 0;
+    if (container._phaseStart) {
+      container._thinkElapsed = (container._thinkElapsed || 0) + (Date.now() - container._phaseStart);
+      container._phaseStart = 0;
+    }
+    delete container.dataset.phase;
+    const elapsed = container._thinkElapsed ? Math.max(1, Math.round(container._thinkElapsed / 1000)) : 0;
     const fmt = elapsed >= 60
       ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
       : `${elapsed}s`;
@@ -5165,7 +5551,7 @@
           const meta = ctx.row.querySelector(".bubble-meta.streaming");
           if (meta) {
             const dots = meta.querySelector(".typing");
-            meta.innerHTML = `${esc(state.settings.model)} · ${liveTps} tok/s · streaming`;
+            meta.innerHTML = `${liveTps} tok/s · streaming`;
             if (dots) meta.appendChild(dots);
             else {
               const d = document.createElement("span");
@@ -5208,6 +5594,7 @@
         item.command = evt.command || item.command;
       }
       appendAgentLog(`${target === "sandbox" ? "WSL GUEST" : "HOST"} command requested: ${evt.command || ""}`);
+      setToolActivityLabel(toolStack, toolCards, evt, "Waiting for command approval…");
       updateRevealerDeck(row);
     } else if (evt.type === "command_spawned") {
       const target = executionTarget(evt);
@@ -5224,6 +5611,8 @@
         : `[HOST · ${evt.name === "run_tests" ? "project tests" : "Windows PowerShell"}]`;
       appendExecutionText(target, `\n${heading}\n$ ${evt.command || ""}\n`, false, true);
       appendAgentLog(`${target === "sandbox" ? "WSL GUEST" : "HOST"} command started: ${evt.command || ""}`);
+      setToolActivityLabel(toolStack, toolCards, evt,
+        target === "sandbox" ? "Running in WSL guest…" : "Running on host…");
       updateRevealerDeck(row);
     } else if (evt.type === "command_finished") {
       const target = executionTarget(evt);
@@ -5260,12 +5649,18 @@
       secretRailToolStart(row, evt.name, evt.arguments);
       attackRailToolStart(row, evt.name, evt.arguments);
       osintCardToolStart(row, evt.name, evt.arguments);
+      if (evt.name === "save_skill") {
+        const chatId = state.liveTurn?.chatId || state.chatId;
+        const skill = typeof evt.arguments?.name === "string" ? evt.arguments.name.trim() : "";
+        ensureSkillSaveRow(chatId, skill, String(evt.call_id || ""));
+      }
       // Mark the content boundary: everything streamed before this tool call is
       // interim narration (rendered dimmed), everything after is the live answer.
       if (row) row._answerBufBase = ctx.getBuf().length;
       if (evt.name === "session_start") {
         surfaceShell(evt.arguments?.session_id || evt.arguments?.id || "");
       }
+      startToolActivity(toolStack, toolCards, evt);
       if (!["run_powershell", "run_tests", "sandbox_run", "sandbox_nmap", "sandbox_sqlmap"].includes(evt.name)) {
         const lbl = toolLabel(evt.name, evt.arguments);
         appendAgentLog(`Tool started: ${evt.name} -> ${lbl}`);
@@ -5308,11 +5703,9 @@
         updateRevealerDeck(row);
       }
       
-      // Update the think line to show what the agent is actually doing
-      if (row) {
-        const label = toolLabel(evt.name, evt.arguments);
-        updateThinkLine(row, true, label);
-      }
+      // Keep the turn visibly alive. The concrete action sits in the trail;
+      // this header remains the honest overall state until the answer starts.
+      if (row) updateThinkLine(row, true, "Working…");
       // Estimate tokens for the tool call itself — the model generated
       // the tool name + JSON arguments, which aren't in content deltas.
       const argsLen = evt.arguments ? JSON.stringify(evt.arguments).length : 0;
@@ -5327,17 +5720,10 @@
       } else if (streamTarget === "sandbox") {
         appendSandboxText((evt.text || "") + "\n", false, false);
       }
-      const running = Array.from(toolStack.querySelectorAll(".tool-line.running")).filter(c => c.dataset.name === evt.name);
-      // FIFO pairing: with parallel same-name calls, the Nth result belongs to
-      // the Nth started pill (backend emits start/result in call order).
-      const doneCount = Array.from(toolStack.querySelectorAll(".tool-line.done, .tool-line.err")).filter(c => c.dataset.name === evt.name).length;
-      const card = running[doneCount] || running[0];
-      if (card) {
-        const span = card.querySelector("span");
-        if (span) span.textContent = (evt.text || "").slice(-120);
-      }
     } else if (evt.type === "heartbeat") {
-      // while a long tool runs, the backend sends heartbeats — keep the shimmer alive
+      // The active activity row already proves a long tool is alive. Keep the
+      // overall header stable instead of repeating the same tool in two places.
+      if (row?.querySelector(".tool-line.running")) return;
       const line = row && row.querySelector(".think-line");
       if (line && !line.classList.contains("done")) {
         const span = line.querySelector("span");
@@ -5346,9 +5732,21 @@
         }
       }
     } else if (evt.type === "tool_result") {
+      const completedActivity = finishToolActivity(toolStack, toolCards, evt);
       secretRailToolResult(row, evt.name, evt.result);
       attackRailToolResult(row, evt.name, evt.result);
       osintCardToolResult(row, evt.name, evt.result);
+      if (evt.name === "save_skill") {
+        const chatId = state.liveTurn?.chatId || state.chatId;
+        const failed = toolResultFailed(evt.result);
+        const denied = failed && /denied|cancelled/i.test(String(evt.result?.error || ""));
+        finishSkillSaveRow(
+          chatId,
+          denied ? "cancelled" : failed ? "failed" : "saved",
+          String(evt.result?.skill || ""),
+          String(evt.call_id || ""),
+        );
+      }
       if (evt.name === "web_image_search" && evt.result && evt.result.results) {
         evt.result.results.forEach(r => {
           if (r.image && r.url) {
@@ -5389,19 +5787,8 @@
         }
         updateRevealerDeck(row);
       }
-      const running = Array.from(toolStack.querySelectorAll(".tool-line.running")).filter(c => c.dataset.name === evt.name);
-      const doneCount = Array.from(toolStack.querySelectorAll(".tool-line.done, .tool-line.err")).filter(c => c.dataset.name === evt.name).length;
-      const card = running[doneCount] || running[0];
-      if (card) {
-        const isErr = toolResultFailed(evt.result);
-        card.classList.remove("running");
-        card.classList.add(isErr ? "err" : "done");
-        const customIcon = toolIconHtml(evt.name, isErr ? "err" : "done");
-        const iconHtml = customIcon || `<i class="ph ${isErr ? "ph-x-circle" : "ph-check"}"></i>`;
-        const label = toolResultLabel(evt.name, evt.result);
-        const _ms = card.dataset.t0 ? Date.now() - Number(card.dataset.t0) : 0;
-        const _t = _ms > 0 ? (_ms < 1000 ? `${_ms}ms` : `${(_ms / 1000).toFixed(1)}s`) : "";
-        card.innerHTML = `${iconHtml}<span>${esc(label)}</span>${_t ? `<span class="tl-time">${_t}</span>` : ""}`;
+      if (completedActivity) {
+        const isErr = completedActivity.classList.contains("err");
         if (!isErr && (evt.name === "edit_file" || evt.name === "write_file")) {
           if (evt.result && evt.result.path) {
             state.touchedFiles.add(evt.result.path);
@@ -5412,7 +5799,7 @@
           if (added > 0 || deleted > 0) {
             const filename = folderLeafName(evt.result.path || "");
             const msg = `<span style="color:#00ff88;font-weight:600;">+${added}</span>, <span style="color:#ff3b30;font-weight:600;">-${deleted}</span> <span style="opacity:0.4;margin:0 4px;">|</span> <span style="font-weight:500;">${esc(filename)}</span>`;
-            toast(msg, "ok", 4000, null, true);
+            toast(msg, "ok", 4000, "file-change", true);
           }
           // On mobile: inject a preview card for .html files written by the agent
           const filePath = (evt.result && evt.result.path) || "";
@@ -5443,7 +5830,7 @@
           // Also append the full chip list inside the body for when the user
           // expands the group — useful when many sources came back.
           const chips = renderWebSearchChips(evt.result && evt.result.results);
-          if (chips) card.insertAdjacentHTML("afterend", chips);
+          if (chips) completedActivity.insertAdjacentHTML("afterend", chips);
         }
         // network_snapshot: rich bar-chart card. Mount it OUTSIDE the
         // tool-group so it stays visible even when the group is collapsed
@@ -5457,7 +5844,7 @@
             if (group && group.parentElement) {
               group.insertAdjacentHTML("afterend", chart);
             } else {
-              card.insertAdjacentHTML("afterend", chart);
+              completedActivity.insertAdjacentHTML("afterend", chart);
             }
           }
         }
@@ -5521,7 +5908,7 @@
       renderStatus(tps, "idle");
       const meta = bubble.parentElement.querySelector(".bubble-meta");
       if (meta) {
-        meta.textContent = `${state.settings.model} · ${tok} tok · ${tps} tok/s`;
+        meta.textContent = `${tok} tok · ${tps} tok/s`;
         if (state.streaming && meta.classList.contains("streaming")) {
           const dots = document.createElement("span");
           dots.className = "typing";
@@ -5958,6 +6345,38 @@
   }
 
   // ---------- GitHub Activity ----------
+  let ghRepos = [];
+  let ghRepoCursor = "";
+  let ghRepoHasNext = false;
+  let ghRepoLoading = false;
+
+  function ghRepoSkeletonMarkup(count = 3, extraClass = "") {
+    return Array.from({ length: count }, () => `
+      <div class="gh-repo-card gh-repo-skeleton ${extraClass}" aria-hidden="true">
+        <div class="gh-repo-info">
+          <span class="gh-skeleton gh-skeleton-name"></span>
+          <span class="gh-skeleton gh-skeleton-star"></span>
+        </div>
+        <span class="gh-skeleton gh-skeleton-button"></span>
+      </div>`).join("");
+  }
+
+  function ghActivitySkeletonMarkup() {
+    const cells = Array.from({ length: 126 }, () => `<i class="gh-skeleton gh-skeleton-cell"></i>`).join("");
+    return `
+      <div class="gh-activity-skeleton" aria-label="Loading GitHub activity" aria-busy="true">
+        <div class="gh-graph-wrap gh-graph-skeleton">
+          <span class="gh-skeleton gh-skeleton-title"></span>
+          <div class="gh-skeleton-grid">${cells}</div>
+        </div>
+        <div class="gh-repos-titlebar">
+          <span class="gh-skeleton gh-skeleton-heading"></span>
+          <span class="gh-skeleton gh-skeleton-new"></span>
+        </div>
+        <div class="gh-repos">${ghRepoSkeletonMarkup(3)}</div>
+      </div>`;
+  }
+
   function ghActivityOpen() {
     const scrim = $("#github-activity-scrim"), modal = $("#github-activity-modal");
     if (!scrim || !modal) return;
@@ -5978,7 +6397,7 @@
   async function loadGitHubActivity() {
     const body = $("#gh-activity-body");
     if (!body) return;
-    body.innerHTML = `<div class="gh-loading"><i class="ph ph-circle-notch gh-spin"></i><span>fetching contributions…</span></div>`;
+    body.innerHTML = ghActivitySkeletonMarkup();
     let data;
     try {
       data = await api("/api/github/activity");
@@ -6020,10 +6439,18 @@
         ${total === 0 || nonzeroDays < 7 ? `
         <div class="gh-empty-hint"><i class="ph ph-git-commit"></i><span>no counted contributions yet — GitHub only counts commits that reach the <b>default branch</b> (or a merged PR) and are authored by an email <b>verified on your account</b>. unmerged branch work, forks, and unrecognized author emails don't count — add your commit email at github.com/settings/emails and the dots will light up.</span></div>` : ""}
       </div>
-      <div class="gh-repos-head">Recent repositories</div>
+      <div class="gh-repos-titlebar">
+        <div class="gh-repos-head">Recent repositories</div>
+        <button class="btn sm gh-new-project" id="gh-new-project"><i class="ph ph-plus"></i>New project</button>
+      </div>
       <div class="gh-repos" id="gh-repos"></div>`;
     renderGhGraph(data.weeks || []);
-    renderGhRepos(data.repos || []);
+    ghRepos = Array.isArray(data.repos) ? data.repos : [];
+    ghRepoCursor = String((data.repos_page && data.repos_page.cursor) || "");
+    ghRepoHasNext = !!(data.repos_page && data.repos_page.has_next);
+    renderGhRepos();
+    const newProjectBtn = $("#gh-new-project");
+    if (newProjectBtn) newProjectBtn.addEventListener("click", openNewProjectModal);
   }
 
   function ghMonthName(iso) {
@@ -6102,24 +6529,233 @@
     }, 1500);
   }
 
-  function renderGhRepos(repos) {
+  function renderGhRepos() {
     const wrap = document.getElementById("gh-repos");
     if (!wrap) return;
-    if (!repos.length) {
-      wrap.innerHTML = `<span class="hint">no repositories yet.</span>`;
-      return;
-    }
-    wrap.innerHTML = repos.map(r => `
+    const cards = ghRepos.length ? ghRepos.map(r => `
       <div class="gh-repo-card">
         <div class="gh-repo-info">
           <span class="gh-repo-name" title="${esc(r.name)}">${esc(r.name)}</span>
           <span class="gh-repo-stars" title="stargazers"><i class="ph ph-star"></i>${Number(r.stars || 0).toLocaleString()}</span>
         </div>
         <button class="btn sm accent" data-gh-work="${esc(r.name)}" data-gh-owner="${esc(r.owner || "")}" title="Create a new branch on GitHub and check it out in the workspace"><i class="ph ph-git-branch"></i>Work on this repo</button>
-      </div>`).join("");
+      </div>`).join("") : `<div class="gh-repo-empty"><i class="ph ph-folder-simple"></i><span>No repositories available to this token yet.</span></div>`;
+    const more = ghRepoHasNext ? `
+      <div class="gh-load-more-wrap">
+        <button class="btn sm" id="gh-load-more" ${ghRepoLoading ? "disabled" : ""}>Load more</button>
+      </div>` : "";
+    wrap.innerHTML = cards + more;
     wrap.querySelectorAll("[data-gh-work]").forEach(btn => {
       btn.addEventListener("click", () => workOnRepo(btn.dataset.ghOwner, btn.dataset.ghWork, btn));
     });
+    const loadMore = document.getElementById("gh-load-more");
+    if (loadMore) loadMore.addEventListener("click", loadMoreGhRepos);
+  }
+
+  async function loadMoreGhRepos() {
+    if (ghRepoLoading || !ghRepoHasNext) return;
+    ghRepoLoading = true;
+    const wrap = document.getElementById("gh-repos");
+    const controls = wrap && wrap.querySelector(".gh-load-more-wrap");
+    if (controls) controls.outerHTML = `<div class="gh-more-skeletons" aria-label="Loading more repositories" aria-busy="true">${ghRepoSkeletonMarkup(3)}</div>`;
+    try {
+      const data = await api(`/api/github/repos?limit=12&after=${encodeURIComponent(ghRepoCursor)}`);
+      if (!data || !data.connected) throw new Error((data && data.error) || "GitHub could not load more repositories");
+      const seen = new Set(ghRepos.map(r => `${r.owner}/${r.name}`.toLowerCase()));
+      for (const repo of data.repos || []) {
+        const key = `${repo.owner}/${repo.name}`.toLowerCase();
+        if (!seen.has(key)) { seen.add(key); ghRepos.push(repo); }
+      }
+      ghRepoCursor = String((data.page_info && data.page_info.cursor) || "");
+      ghRepoHasNext = !!(data.page_info && data.page_info.has_next);
+    } catch (e) {
+      toast("could not load more repositories: " + (e.message || e), "err", 4200);
+    } finally {
+      ghRepoLoading = false;
+      renderGhRepos();
+    }
+  }
+
+  function openNewProjectModal() {
+    const roots = ((state.workspace && state.workspace.folders) || []).filter(Boolean);
+    const scrim = document.createElement("div");
+    scrim.className = "modal-scrim gh-project-scrim";
+    const modal = document.createElement("aside");
+    modal.className = "modal gh-project-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-labelledby", "gh-project-title");
+    const rootOptions = roots.map(root => `<option value="${esc(root)}">${esc(root)}</option>`).join("");
+    modal.innerHTML = `
+      <div class="modal-head">
+        <i class="ph ph-folder-simple-plus"></i>
+        <h3 id="gh-project-title">New project</h3>
+        <button class="iconbtn" data-project-cancel aria-label="Cancel"><i class="ph ph-x"></i></button>
+      </div>
+      <form class="modal-body gh-project-form" id="gh-project-form">
+        <div class="gh-project-fields">
+          <label class="gh-project-field">
+            <span>Project name</span>
+            <input class="prompt-modal-input" id="gh-project-name" required maxlength="100" placeholder="my-new-project" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="gh-project-field">
+            <span>What should the model build? <small>optional</small></span>
+            <textarea class="prompt-modal-input gh-project-brief" id="gh-project-brief" rows="4" maxlength="4000" placeholder="A small dashboard that…"></textarea>
+            <small class="gh-project-help">The new project session starts with this brief.</small>
+          </label>
+          <label class="gh-project-field">
+            <span>Save in</span>
+            <select class="prompt-modal-input" id="gh-project-root" ${roots.length ? "" : "disabled"}>${rootOptions || `<option>No workspace folder configured</option>`}</select>
+          </label>
+          <div class="gh-project-publish-row">
+            <label class="gh-project-check"><input type="checkbox" id="gh-project-publish" checked><span>Publish an empty repository to GitHub</span></label>
+            <select class="prompt-modal-input gh-project-visibility" id="gh-project-visibility" aria-label="Repository visibility">
+              <option value="private">Private</option>
+              <option value="public">Public</option>
+            </select>
+          </div>
+          <div class="gh-project-permission"><i class="ph ph-info"></i><span>Publishing needs <b>Administration: Read and write</b> on the fine-grained token. Local creation still works without it.</span></div>
+          <div class="prompt-modal-err" id="gh-project-error"></div>
+          <div class="confirm-actions">
+            <button class="btn" type="button" data-project-cancel>Cancel</button>
+            <button class="btn accent" type="submit" ${roots.length ? "" : "disabled"}><i class="ph ph-plus"></i>Create project</button>
+          </div>
+        </div>
+        <div class="gh-project-progress" hidden aria-live="polite" aria-busy="true">
+          <div class="gh-project-progress-icon"><span class="gh-skeleton gh-skeleton-project-square"></span></div>
+          <strong>Creating project</strong>
+          <span class="gh-project-progress-copy">Preparing the folder and Git repository…</span>
+          <div class="gh-project-progress-lines">
+            <span class="gh-skeleton"></span><span class="gh-skeleton"></span><span class="gh-skeleton"></span>
+          </div>
+        </div>
+      </form>`;
+    document.body.appendChild(scrim);
+    document.body.appendChild(modal);
+    requestAnimationFrame(() => { scrim.classList.add("open"); modal.classList.add("open"); });
+
+    const form = modal.querySelector("#gh-project-form");
+    const nameInput = modal.querySelector("#gh-project-name");
+    const briefInput = modal.querySelector("#gh-project-brief");
+    const rootInput = modal.querySelector("#gh-project-root");
+    const publishInput = modal.querySelector("#gh-project-publish");
+    const visibilityInput = modal.querySelector("#gh-project-visibility");
+    const errorEl = modal.querySelector("#gh-project-error");
+    let busy = false;
+    let closed = false;
+    let createdProject = null;
+
+    const finish = () => {
+      if (closed || busy) return;
+      closed = true;
+      document.removeEventListener("keydown", onKey);
+      scrim.classList.remove("open");
+      modal.classList.remove("open");
+      setTimeout(() => { scrim.remove(); modal.remove(); }, 220);
+    };
+    const onKey = (event) => {
+      if (event.key === "Escape" && !busy) { event.preventDefault(); finish(); }
+    };
+    const syncPublish = () => {
+      visibilityInput.disabled = !publishInput.checked;
+      visibilityInput.closest(".gh-project-publish-row").classList.toggle("is-local", !publishInput.checked);
+    };
+    publishInput.addEventListener("change", syncPublish);
+    syncPublish();
+    document.addEventListener("keydown", onKey);
+    scrim.addEventListener("click", finish);
+    modal.querySelectorAll("[data-project-cancel]").forEach(button => button.addEventListener("click", finish));
+    setTimeout(() => nameInput && nameInput.focus(), 120);
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (busy) return;
+      const name = (nameInput.value || "").trim();
+      if (!/^[A-Za-z0-9_.-]{1,100}$/.test(name) || name === "." || name === ".." || name.endsWith(".")) {
+        errorEl.textContent = "Use letters, digits, dots, underscores and hyphens. Maximum 100 characters.";
+        errorEl.style.display = "block";
+        nameInput.focus();
+        return;
+      }
+      busy = true;
+      errorEl.style.display = "none";
+      modal.querySelector(".gh-project-fields").hidden = true;
+      modal.querySelector(".gh-project-progress").hidden = false;
+      try {
+        const result = await api("/api/github/project", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name,
+            brief: briefInput.value.trim(),
+            workspace_root: rootInput.value,
+            publish: publishInput.checked,
+            private: visibilityInput.value !== "public",
+          }),
+        });
+        if (!result || !result.ok) throw new Error((result && result.error) || "project creation failed");
+        createdProject = result;
+        busy = false;
+        finish();
+        ghActivityClose();
+        await openProjectSession(result, briefInput.value.trim());
+        if (result.publish_error) {
+          toast(result.publish_error, "warn", 6500);
+        } else {
+          toast(result.published ? `Project ${name} created and published.` : `Local project ${name} created.`, "ok", 3800);
+        }
+      } catch (error) {
+        if (closed && createdProject) {
+          toast(`Project created at ${createdProject.path}, but its session could not open: ${error.message || error}`, "err", 6500);
+          return;
+        }
+        busy = false;
+        modal.querySelector(".gh-project-progress").hidden = true;
+        modal.querySelector(".gh-project-fields").hidden = false;
+        errorEl.textContent = error.message || String(error);
+        errorEl.style.display = "block";
+        nameInput.focus();
+      }
+    });
+  }
+
+  async function openProjectSession(project, brief) {
+    const c = await api("/api/chats", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: project.name,
+        origin: "project",
+        project_workspace: {
+          name: project.name,
+          path: project.path,
+          branch: project.branch || "main",
+          brief,
+          published: !!project.published,
+          owner: project.owner || "",
+        },
+      }),
+    });
+    if (!c || !c.id) throw new Error("could not create the project session");
+    const publication = project.published
+      ? (project.remote_ready
+          ? `Published ${project.owner || "GitHub"}/${project.repo || project.name} and connected it as origin.`
+          : `Published ${project.owner || "GitHub"}/${project.repo || project.name}; the local origin still needs to be connected.`)
+      : "Created as a local Git repository.";
+    await api("/api/chat/note", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: c.id, text: `Created project \`${project.name}\` at ${project.path}. ${publication}` }),
+    }).catch(() => {});
+    await loadChats();
+    await selectChat(c.id);
+    const ta = $("#composer-input");
+    if (brief && state.settings.model) {
+      await send({ prompt: brief });
+    } else if (ta) {
+      ta.value = brief || "";
+      autoResize(ta);
+    }
   }
 
   // Promised input dialog — the branch-name prompt for "Work on this repo".
@@ -6208,7 +6844,11 @@
     });
     if (!name) return;
     const oldHtml = btn ? btn.innerHTML : "";
-    if (btn) { btn.disabled = true; btn.innerHTML = `<i class="ph ph-circle-notch gh-spin"></i> creating…`; }
+    if (btn) {
+      btn.disabled = true;
+      btn.classList.add("gh-action-loading");
+      btn.innerHTML = `<span class="gh-skeleton gh-action-skeleton" aria-label="Creating branch"></span>`;
+    }
     try {
       const r = await api("/api/github/branch", {
         method: "POST",
@@ -6224,7 +6864,7 @@
     } catch (e) {
       toast("branch creation failed: " + (e.message || e), "err", 4500);
     } finally {
-      if (btn) { btn.disabled = false; btn.innerHTML = oldHtml; }
+      if (btn) { btn.disabled = false; btn.classList.remove("gh-action-loading"); btn.innerHTML = oldHtml; }
     }
   }
 
@@ -6432,9 +7072,9 @@
       <section class="usage-two-col">
         <article class="usage-panel usage-saving-panel">
           <div class="usage-section-head"><div><span class="usage-eyebrow">Cloud equivalent</span><h2>Estimated savings</h2></div><select id="usage-provider" aria-label="Cloud price comparison">${providerOptions}</select></div>
-          <div class="usage-money">${money(inputCost + outputCost)}</div>
+          <div class="usage-money">${money(inputCost + outputCost)}<sup aria-hidden="true">*</sup></div>
           <div class="usage-breakdown"><div><span>Input · ${usageCompactNumber(inputTokens)}</span><strong>${money(inputCost)}</strong></div><div><span>Output · ${usageCompactNumber(outputTokens)}</span><strong>${money(outputCost)}</strong></div><div><span>Compared with</span><strong>${esc(provider.label)}</strong></div></div>
-          <p>Equivalent API list price. Electricity and hardware costs are not subtracted.</p>
+          <p class="usage-rate-note"><span aria-hidden="true">*</span> ${esc(API_RATE_NOTE)}</p>
         </article>
         <article class="usage-panel usage-longest-panel">
           <div class="usage-section-head"><div><span class="usage-eyebrow">Longest recorded turn</span><h2>${longest ? usageDuration(longest.elapsed_ms) : "No data yet"}</h2></div><i class="ph ph-path"></i></div>
@@ -6481,6 +7121,7 @@
   function openUsageStats() {
     const page = $("#usage-page");
     if (!page) return;
+    closeFaq();
     page.classList.add("open");
     page.setAttribute("aria-hidden", "false");
     drawUsageMark(true);
@@ -6491,6 +7132,57 @@
     const page = $("#usage-page");
     if (!page) return;
     cancelAnimationFrame(usageMarkFrame);
+    page.classList.remove("open");
+    page.setAttribute("aria-hidden", "true");
+  }
+
+  function filterFaq(query = "") {
+    const normalized = String(query).trim().toLowerCase();
+    let visibleItems = 0;
+    $$("#faq-page .faq-item").forEach(item => {
+      const visible = !normalized || item.textContent.toLowerCase().includes(normalized);
+      item.hidden = !visible;
+      if (visible) visibleItems += 1;
+    });
+    $$("#faq-page [data-faq-section]").forEach(section => {
+      section.hidden = !section.querySelector(".faq-item:not([hidden])");
+    });
+    const empty = $("#faq-empty");
+    if (empty) empty.hidden = visibleItems !== 0;
+    const note = $("#faq-results-note");
+    if (note) note.textContent = normalized
+      ? `${visibleItems} ${visibleItems === 1 ? "answer" : "answers"} found`
+      : "";
+  }
+
+  function syncFaqNav() {
+    const scroller = $(".faq-page-scroll");
+    if (!scroller) return;
+    const sections = [...$$("#faq-page [data-faq-section]:not([hidden])")];
+    if (!sections.length) return;
+    const top = scroller.getBoundingClientRect().top + 110;
+    let active = sections[0];
+    for (const section of sections) {
+      if (section.getBoundingClientRect().top <= top) active = section;
+    }
+    $$("#faq-page [data-faq-nav]").forEach(link => {
+      link.classList.toggle("active", link.dataset.faqNav === active.id);
+    });
+  }
+
+  function openFaq() {
+    const page = $("#faq-page");
+    if (!page) return;
+    closeUsageStats();
+    closeSettings();
+    page.classList.add("open");
+    page.setAttribute("aria-hidden", "false");
+    requestAnimationFrame(syncFaqNav);
+  }
+
+  function closeFaq() {
+    const page = $("#faq-page");
+    if (!page) return;
     page.classList.remove("open");
     page.setAttribute("aria-hidden", "true");
   }
@@ -6526,7 +7218,8 @@
     const secs = row._workStart ? Math.max(1, Math.round((Date.now() - row._workStart) / 1000)) : 0;
     if (title && secs > 0) {
       const fmt = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
-      title.textContent = `Worked for ${fmt}`;
+      const actions = group.querySelectorAll(".tool-line").length;
+      title.textContent = `Worked for ${fmt}${actions ? ` · ${actions} action${actions === 1 ? "" : "s"}` : ""}`;
       title.classList.remove("shimmer");
     }
     think.classList.add("has-worklog");
@@ -8075,6 +8768,25 @@
           <span class="permission-item-text">${bl.length} candidate bucket${bl.length === 1 ? "" : "s"}: <code>${esc(sample)}</code></span>
         </div>` : ""}
       `;
+    } else if (kind && (kind.startsWith("desktop.") || kind.startsWith("desktop_"))) {
+      const element = details.element || {};
+      const windowInfo = details.window || {};
+      const target = element.name || element.role || details.title || "desktop control";
+      html += `
+        <div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-desktop"></i></span>
+          <span class="permission-item-text">${esc(kind.replace(/^desktop[._]/, "").replaceAll("_", " "))}: <code>${esc(target)}</code></span>
+          <span class="permission-item-badge">DESKTOP</span>
+        </div>
+        ${windowInfo.title ? `<div class="permission-item">
+          <span class="permission-item-icon check"><i class="ph ph-app-window"></i></span>
+          <span class="permission-item-text">Window: <code>${esc(windowInfo.title)}</code></span>
+        </div>` : ""}
+        ${details.sensitive ? `<div class="permission-item">
+          <span class="permission-item-icon warning"><i class="ph ph-password"></i></span>
+          <span class="permission-item-text">Sensitive field value is hidden from this approval card.</span>
+        </div>` : ""}
+      `;
     } else if (kind && kind.startsWith("mcp_")) {
       const m = kind.match(/^mcp_([^_]+)_(.+)$/);
       const server = m ? m[1] : "MCP";
@@ -8106,6 +8818,39 @@
     return html;
   }
 
+  function reflectApprovalInLiveTurn(approval, decision = "pending") {
+    const row = state.liveTurn?.row;
+    if (!row || !approval) return;
+    const details = approval.details || {};
+    const kind = String(details.kind || "");
+    const path = String(details.path || "");
+    const candidates = [...row.querySelectorAll(".tool-line.running")].reverse();
+    const line = candidates.find(item => (!kind || item.dataset.name === kind)
+      && (!path || !item.dataset.path || item.dataset.path === path)) || candidates[0];
+    const label = line?.querySelector(".tool-line-label");
+    if (label) {
+      if (decision === "pending") {
+        const action = kind === "edit_file" ? `Edit ${shortPath(path)}`
+          : kind === "write_file" ? `Write ${shortPath(path)}`
+            : (approval.title || "requested action");
+        label.textContent = `Waiting for approval · ${action}`;
+      } else if (decision === "deny") {
+        label.classList.remove("shimmer");
+        label.textContent = `Approval denied · ${approval.title || "action"}`;
+      } else if (kind) {
+        label.textContent = toolLabel(kind, details);
+      }
+    }
+
+    const writes = row._activities?.writes || [];
+    const write = [...writes].reverse().find(item => (!path || item.path === path)
+      && (item.status === "running" || item.status === "requested"));
+    if (write) {
+      write.status = decision === "pending" ? "requested" : decision === "deny" ? "err" : "running";
+      updateRevealerDeck(row);
+    }
+  }
+
   function renderApprovals() {
     const deck = $("#revealer-deck");
     if (!deck) return;
@@ -8117,9 +8862,16 @@
       return;
     }
     
-    for (const a of state.approvals.values()) {
+    const approvals = [...state.approvals.values()];
+    const newestIndex = approvals.length - 1;
+    approvals.forEach((a, index) => {
       const card = document.createElement("div");
-      card.className = "revealer-card permissions collapsed";
+      const depth = newestIndex - index;
+      card.className = "revealer-card permissions collapsed " + (
+        depth === 0 ? "approval-front"
+          : depth === 1 ? "approval-depth-1"
+            : depth === 2 ? "approval-depth-2" : "approval-depth-hidden"
+      );
       card.dataset.cardType = "permissions";
       card.dataset.approvalId = a.id;
       
@@ -8131,6 +8883,7 @@
           <span class="revealer-card-title">${esc(a.title || "Review requested action")}</span>
           <span class="revealer-card-stats">Review and confirm the actions the agent will take.</span>
           <span class="grow"></span>
+          ${depth === 0 && approvals.length > 1 ? `<span class="approval-stack-count">${approvals.length} pending</span>` : ""}
           <div class="perm-head-actions">
             <button class="perm-quick perm-quick-deny" data-act="deny" type="button" title="Deny">Deny</button>
             ${a.details && a.details.critical ? `` : `<button class="perm-quick perm-quick-approve" data-act="approve" type="button" title="Approve">Approve</button>`}
@@ -8210,7 +8963,7 @@
       }));
 
       deck.appendChild(card);
-    }
+    });
   }
 
   async function decideApproval(id, decision, always) {
@@ -8244,15 +8997,28 @@
       try { evt = JSON.parse(e.data); } catch { return; }
       if (evt.type === "approval:new") {
         state.approvals.set(evt.approval.id, evt.approval);
+        reflectApprovalInLiveTurn(evt.approval, "pending");
         renderApprovals();
         notifyApproval();
       } else if (evt.type === "approval:decided") {
+        const approval = state.approvals.get(evt.id);
+        reflectApprovalInLiveTurn(approval, evt.decision || "deny");
         state.approvals.delete(evt.id);
         renderApprovals();
       } else if (evt.type === "settings:update") {
         loadSettings().then(renderStatus).then(renderModelPill);
       } else if (evt.type === "workspace:update") {
         loadWorkspace().then(renderWorkspace);
+      } else if (evt.type === "skills:update") {
+        loadSkills(true);
+      } else if (evt.type === "skill:saving") {
+        const chatId = evt.chat_id || state.chatId;
+        ensureSkillSaveRow(chatId, evt.skill || "", evt.call_id || "");
+        appendAgentLog(`Saving skill: ${evt.skill || "unnamed"}.`);
+      } else if (evt.type === "skill:save_finished") {
+        const chatId = evt.chat_id || state.chatId;
+        finishSkillSaveRow(chatId, evt.outcome || "saved", evt.skill || "", evt.call_id || "");
+        appendAgentLog(`Skill save ${evt.outcome || "finished"}: ${evt.skill || "unnamed"}.`);
       } else if (evt.type === "chat:rename") {
         const c = state.chats && state.chats.chats && state.chats.chats[evt.chat_id];
         if (c) {
@@ -8450,52 +9216,7 @@
   }
 
   // ---------- settings drawer ----------
-  const SETTINGS_SECTION_STATE_KEY = "accuretta:settings-sections:v1";
-  const SETTINGS_SECTIONS = [
-    {
-      id: "model",
-      title: "Model & performance",
-      subtitle: "Models, memory, speed and health",
-      icon: "ph-cpu",
-      headings: ["Model", "Auto-tune", "Model Health", "Advanced llama-server"],
-      open: true,
-    },
-    {
-      id: "generation",
-      title: "Generation",
-      subtitle: "Sampling and reasoning behavior",
-      icon: "ph-sliders-horizontal",
-      headings: ["Sampling", "Reasoning"],
-    },
-    {
-      id: "interface",
-      title: "Interface",
-      subtitle: "Preview, appearance and notifications",
-      icon: "ph-layout",
-      headings: ["Preview", "Appearance", "Notifications"],
-    },
-    {
-      id: "agent",
-      title: "Agent & safety",
-      subtitle: "Context, approvals, desktop control and memory",
-      icon: "ph-shield-check",
-      headings: ["Machine context", "Approvals", "Desktop automation", "Long-term memory"],
-    },
-    {
-      id: "security",
-      title: "Security lab",
-      subtitle: "Red team, analysis and WSL guest execution",
-      icon: "ph-crosshair",
-      headings: ["Red team tools", "Red team stealth", "Analysis tools", "Sandbox"],
-    },
-    {
-      id: "connections",
-      title: "Connections",
-      subtitle: "Remote access and integrations",
-      icon: "ph-plugs-connected",
-      headings: ["Tailscale remote access", "Discord remote bridge"],
-    },
-  ];
+  const SETTINGS_SECTION_STATE_KEY = "accuretta:settings-panels:v2";
 
   function settingsGroupTitle(el) {
     const label = el.querySelector(":scope > span:not(.grow):not(.hint)");
@@ -8525,6 +9246,57 @@
     try { localStorage.setItem(SETTINGS_SECTION_STATE_KEY, JSON.stringify(next)); } catch (_) {}
   }
 
+  function settingsSectionId(title) {
+    return String(title || "settings")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "settings";
+  }
+
+  const SETTINGS_SECTION_ICONS = Object.freeze({
+    model: "ph-cpu",
+    "auto-tune": "ph-magic-wand",
+    "model-health": "ph-heartbeat",
+    "advanced-llama-server": "ph-terminal-window",
+    sampling: "ph-sliders-horizontal",
+    reasoning: "ph-brain",
+    preview: "ph-browser",
+    appearance: "ph-palette",
+    notifications: "ph-bell",
+    "keyboard-shortcuts": "ph-keyboard",
+    "machine-context": "ph-desktop",
+    approvals: "ph-shield-check",
+    "red-team-tools": "ph-crosshair",
+    "red-team-stealth": "ph-eye-slash",
+    "analysis-tools": "ph-magnifying-glass",
+    sandbox: "ph-cube",
+    "tailscale-remote-access": "ph-device-mobile",
+    "discord-remote-bridge": "ph-discord-logo",
+    "github-integration": "ph-github-logo",
+    "desktop-automation": "ph-mouse",
+    "long-term-memory": "ph-database"
+  });
+
+  function moveSettingsHeadingMeta(heading, content) {
+    const label = heading.querySelector(":scope > span:not(.grow):not(.hint)");
+    if (!label) {
+      const note = heading.querySelector(":scope > .hint");
+      if (note) {
+        note.classList.add("settings-section-note");
+        content.appendChild(note);
+      }
+      return;
+    }
+    const extras = Array.from(heading.children).filter(
+      child => child !== label && !child.classList.contains("grow")
+    );
+    if (!extras.length) return;
+    const actions = document.createElement("div");
+    actions.className = "settings-section-actions";
+    extras.forEach(child => actions.appendChild(child));
+    content.appendChild(actions);
+  }
+
   function initSettingsSections() {
     const body = $("#settings-body");
     if (!body || body.dataset.sectionsReady === "1") return;
@@ -8545,35 +9317,19 @@
 
     const saved = readSettingsSectionState();
     const fragment = document.createDocumentFragment();
-    const claimed = new Set();
-    const definitions = SETTINGS_SECTIONS.map(def => ({ ...def }));
-    const known = new Set(definitions.flatMap(def => def.headings));
-    const extras = chunks.filter(chunk => !known.has(chunk.title));
-    if (extras.length) {
-      definitions.push({
-        id: "other", title: "Other", subtitle: "Additional settings",
-        icon: "ph-dots-three-outline", headings: extras.map(x => x.title),
-      });
-    }
-
-    definitions.forEach(def => {
-      const owned = chunks.filter(chunk => def.headings.includes(chunk.title));
-      if (!owned.length) return;
+    chunks.forEach(chunk => {
+      const sectionId = settingsSectionId(chunk.title);
       const section = document.createElement("details");
       section.className = "settings-section";
-      section.dataset.settingsSection = def.id;
-      section.open = Object.prototype.hasOwnProperty.call(saved, def.id)
-        ? !!saved[def.id]
-        : !!def.open;
+      section.dataset.settingsSection = sectionId;
+      section.open = !!saved[sectionId];
 
       const summary = document.createElement("summary");
       summary.className = "settings-section-summary";
+      const icon = SETTINGS_SECTION_ICONS[sectionId] || "ph-gear";
       summary.innerHTML = `
-        <span class="settings-section-icon"><i class="ph ${def.icon}"></i></span>
-        <span class="settings-section-copy">
-          <strong>${esc(def.title)}</strong>
-          <small>${esc(def.subtitle)}</small>
-        </span>
+        <span class="settings-section-icon" aria-hidden="true"><i class="ph ${icon}"></i></span>
+        <strong class="settings-section-title">${esc(chunk.title)}</strong>
         <i class="ph ph-caret-down settings-section-chevron" aria-hidden="true"></i>`;
       summary.addEventListener("keydown", (event) => {
         if (event.key !== "Enter" && event.key !== " ") return;
@@ -8584,20 +9340,24 @@
 
       const content = document.createElement("div");
       content.className = "settings-section-content";
-      owned.forEach(chunk => {
-        chunk.nodes[0].classList.add("settings-subhead");
-        chunk.nodes.forEach(node => content.appendChild(node));
-        claimed.add(chunk);
-      });
+      moveSettingsHeadingMeta(chunk.nodes[0], content);
+      chunk.nodes.slice(1).forEach(node => content.appendChild(node));
       section.appendChild(content);
-      section.addEventListener("toggle", rememberSettingsSections);
+      section.addEventListener("toggle", () => {
+        if (section.open) {
+          body.querySelectorAll("details.settings-section[open]").forEach(other => {
+            if (other !== section) other.open = false;
+          });
+        }
+        rememberSettingsSections();
+      });
       fragment.appendChild(section);
     });
 
     body.replaceChildren(fragment);
     if (saveRow) {
       saveRow.classList.add("settings-savebar");
-      body.appendChild(saveRow);
+      body.after(saveRow);
     }
   }
 
@@ -8955,6 +9715,159 @@
     await health;
   }
 
+  function shortcutLabel(chord) {
+    if (!chord) return "Not set";
+    const names = {
+      Ctrl: "Ctrl", Alt: "Alt", Shift: "Shift", Meta: "⌘",
+      Space: "Space", Slash: "/", Backslash: "\\", BracketLeft: "[",
+      BracketRight: "]", Semicolon: ";", Quote: "'", Comma: ",",
+      Period: ".", Minus: "-", Equal: "=",
+    };
+    return chord.split("+").map(part => {
+      if (names[part]) return names[part];
+      if (/^Key[A-Z]$/.test(part)) return part.slice(3);
+      if (/^Digit[0-9]$/.test(part)) return part.slice(5);
+      return part.replace(/^Arrow/, "");
+    }).join(" + ");
+  }
+
+  function shortcutChordFromEvent(event) {
+    const modifierCodes = new Set([
+      "ControlLeft", "ControlRight", "AltLeft", "AltRight",
+      "ShiftLeft", "ShiftRight", "MetaLeft", "MetaRight",
+    ]);
+    if (!event.code || modifierCodes.has(event.code)) return "";
+    const parts = [];
+    if (event.ctrlKey) parts.push("Ctrl");
+    if (event.altKey) parts.push("Alt");
+    if (event.shiftKey) parts.push("Shift");
+    if (event.metaKey) parts.push("Meta");
+    parts.push(event.code);
+    return parts.join("+");
+  }
+
+  function renderShortcutSettings() {
+    const list = $("#shortcut-list");
+    if (!list) return;
+    const bindings = state.settings?.keyboard_shortcuts || {};
+    list.innerHTML = Object.entries(SHORTCUT_ACTIONS).map(([action, meta]) => {
+      const chord = bindings[action] || "";
+      const recording = shortcutRecording === action;
+      return `<div class="shortcut-row">
+        <span class="shortcut-icon"><i class="ph ${meta.icon}"></i></span>
+        <span class="shortcut-copy"><strong>${esc(meta.label)}</strong><small>${esc(meta.detail)}</small></span>
+        <button class="shortcut-capture${recording ? " recording" : ""}" type="button" data-shortcut-action="${action}" aria-label="Set shortcut for ${esc(meta.label)}">
+          <kbd>${recording ? "Press keys…" : esc(shortcutLabel(chord))}</kbd>
+        </button>
+      </div>`;
+    }).join("");
+    list.querySelectorAll("[data-shortcut-action]").forEach(button => {
+      button.addEventListener("click", () => {
+        shortcutRecording = button.dataset.shortcutAction;
+        renderShortcutSettings();
+      });
+    });
+  }
+
+  function finishShortcutRecording(chord) {
+    const action = shortcutRecording;
+    if (!action) return;
+    const next = { ...(state.settings?.keyboard_shortcuts || {}) };
+    if (!chord) {
+      delete next[action];
+    } else {
+      const conflict = Object.entries(next).find(([other, value]) => other !== action && value === chord);
+      if (conflict) {
+        shortcutRecording = null;
+        renderShortcutSettings();
+        toast(`that combination is already used by ${SHORTCUT_ACTIONS[conflict[0]]?.label || "another action"}`, "warn", 3500);
+        return;
+      }
+      next[action] = chord;
+    }
+    shortcutRecording = null;
+    state.settings.keyboard_shortcuts = next;
+    renderShortcutSettings();
+    persistUiPreference({ keyboard_shortcuts: next });
+  }
+
+  async function runShortcutAction(action) {
+    if (action === "approve_pending" || action === "deny_pending") {
+      const approval = [...state.approvals.values()].at(-1);
+      if (!approval) {
+        toast("there is no pending approval", "info", 1800);
+        return;
+      }
+      if (action === "approve_pending" && approval.details?.critical) {
+        toast("protected actions still require hold-to-approve", "warn", 3200);
+        return;
+      }
+      decideApproval(approval.id, action === "approve_pending" ? "approve" : "deny", false);
+      return;
+    }
+    if (action === "open_settings") {
+      closeFaq();
+      closeUsageStats();
+      openSettings();
+    } else if (action === "open_faq") {
+      openFaq();
+    } else if (action === "open_usage") {
+      closeFaq();
+      openUsageStats();
+    } else if (action === "new_chat") {
+      closeFaq();
+      closeUsageStats();
+      await newChat();
+    } else if (action === "focus_composer") {
+      closeFaq();
+      closeUsageStats();
+      closeSettings();
+      $("#composer-input")?.focus();
+    } else if (action === "stop_generation") {
+      if (state.streaming) stopStreaming();
+      else toast("nothing is generating", "info", 1500);
+    }
+  }
+
+  function handleShortcutKeydown(event) {
+    if (shortcutRecording) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (event.key === "Escape") {
+        shortcutRecording = null;
+        renderShortcutSettings();
+        return;
+      }
+      if (event.key === "Backspace" || event.key === "Delete") {
+        finishShortcutRecording("");
+        return;
+      }
+      const chord = shortcutChordFromEvent(event);
+      if (!chord) return;
+      const guarded = event.ctrlKey || event.altKey || event.metaKey || /^F(?:[1-9]|1[0-2])$/.test(event.code);
+      if (!guarded) {
+        toast("use Ctrl, Alt, Command, or a function key in shortcuts", "warn", 3000);
+        return;
+      }
+      if (chord === "Ctrl+KeyK" || chord === "Meta+KeyK") {
+        toast("that combination is reserved for the session switcher", "warn", 3000);
+        return;
+      }
+      finishShortcutRecording(chord);
+      return;
+    }
+
+    if (event.repeat) return;
+    const chord = shortcutChordFromEvent(event);
+    if (!chord) return;
+    const match = Object.entries(state.settings?.keyboard_shortcuts || {})
+      .find(([, value]) => value === chord);
+    if (!match) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    runShortcutAction(match[0]);
+  }
+
   // ---------- Sandbox (WSL) ----------
   // Status + management live here (not the composer, by design). The guided
   // first-run experience is in the Setup Wizard; this mirrors its state and
@@ -9100,7 +10013,11 @@
     }
     if (sug.kv_cache_type) update.kv_cache_type = String(sug.kv_cache_type);
     if (sug.kv_cache_type_v != null) update.kv_cache_type_v = String(sug.kv_cache_type_v);
-    if (sug.spec_strategy) update.spec_strategy = String(sug.spec_strategy);
+    const manualSpec = state.settings?.spec_strategy_source === "manual";
+    if (sug.spec_strategy && !manualSpec) {
+      update.spec_strategy = String(sug.spec_strategy);
+      update.spec_strategy_source = "auto";
+    }
     if (sug.flash_attn != null) update.flash_attn = !!sug.flash_attn;
     // Keep the legacy flag in sync with the strategy pick, same convention as
     // collectAndSaveSettings — otherwise a stale enable_speculative=false
@@ -9438,6 +10355,34 @@
       toast("clear failed: " + (e.message || e), "error");
     }
   }
+
+  function normalizedMmprojMode(settings = {}) {
+    const mode = String(settings.mmproj_mode || "").trim().toLowerCase();
+    if (["off", "auto", "manual"].includes(mode)) return mode;
+    if (String(settings.mmproj_path || "").trim()) return "manual";
+    return settings.mmproj_auto === false ? "off" : "auto";
+  }
+
+  function syncMmprojModeUi() {
+    const modeSel = $("#set-mmproj-mode");
+    const input = $("#set-mmproj");
+    const hint = $("#set-mmproj-hint");
+    const mode = modeSel?.value || "off";
+    if (input) input.disabled = mode !== "manual";
+    if (!hint) return;
+    if (mode === "off") {
+      hint.textContent = state.visionCapable
+        ? "native vision is currently active; save settings to unload it."
+        : "projector off. no mmproj will load, even if one is beside the model.";
+    } else if (mode === "auto") {
+      hint.textContent = "the app will choose a matching projector beside this model when it reloads.";
+    } else if (input?.value.trim()) {
+      hint.textContent = "manual projector selected. save settings to load it.";
+    } else {
+      hint.textContent = "choose or paste a projector .gguf path, then save settings.";
+    }
+  }
+
   function populateSettingsForm() {
     const s = state.settings;
     const fill = (id, v) => { const el = $(id); if (el) el.value = v ?? ""; };
@@ -9488,21 +10433,13 @@
         visionSel.appendChild(o);
       }
     }
-    // mmproj path field — text input + auto-detect/clear buttons. Hint reflects
-    // current vision capability so the user knows whether the loaded model
-    // already speaks images or is falling back to the side-OCR path.
+    // Projector state is explicit: off must remain off across reloads rather
+    // than falling through to sibling auto-detection.
+    const mmMode = $("#set-mmproj-mode");
+    if (mmMode) mmMode.value = normalizedMmprojMode(s);
     const mmInp = $("#set-mmproj");
     if (mmInp) mmInp.value = s.mmproj_path || "";
-    const mmHint = $("#set-mmproj-hint");
-    if (mmHint) {
-      if (state.visionCapable) {
-        mmHint.innerHTML = `<span style="color:var(--mint-3);">native vision active</span> — chat model is reading images directly.`;
-      } else if (s.mmproj_path) {
-        mmHint.textContent = "projector configured — restart the model for it to take effect.";
-      } else {
-        mmHint.innerHTML = `leave blank to auto-detect a sibling <code>mmproj-*.gguf</code>. requires a model relaunch.`;
-      }
-    }
+    syncMmprojModeUi();
 
     fill("#set-ctx", s.num_ctx);
     fill("#set-gpu", s.num_gpu);
@@ -9544,6 +10481,8 @@
     $("#sw-metrics")?.classList.toggle("on", !!s.enable_metrics);
     const xa = $("#set-extra-args");
     if (xa) xa.value = s.llama_extra_args || "";
+    const draftModel = $("#set-spec-draft-model");
+    if (draftModel) draftModel.value = s.spec_draft_model || "";
     fill("#set-temp", s.temperature);
     fill("#set-topp", s.top_p);
     fill("#set-topk", s.top_k ?? 40);
@@ -9553,6 +10492,7 @@
     fill("#set-frequency", s.frequency_penalty ?? 0);
     $("#sw-thinking")?.classList.toggle("on", s.enable_thinking !== false);
     fill("#set-think-budget", s.thinking_budget ?? 2048);
+    syncThinkingBudgetControl();
     const reasoningCap = $("#set-reasoning-capability");
     if (reasoningCap) reasoningCap.value = s.reasoning_capability_override || "auto";
     const themeSel = $("#set-theme");
@@ -9588,6 +10528,7 @@
     refreshGitHubStatus();
     // memories panel
     loadMemories();
+    renderShortcutSettings();
   }
 
   async function refreshDesktopStatus() {
@@ -9596,13 +10537,12 @@
       const badge = $("#desktop-deps-badge");
       if (badge) {
         const missing = [];
-        if (!r.have_pyautogui) missing.push("pyautogui");
-        if (!r.have_pil) missing.push("Pillow");
+        if (!r.have_uiautomation) missing.push("uiautomation");
         if (!r.have_pygetwindow) missing.push("pygetwindow");
-        badge.textContent = missing.length
-          ? `missing: pip install ${missing.join(" ")}`
-          : "all libs installed";
-        badge.style.color = missing.length ? "var(--danger)" : "var(--mint-3)";
+        badge.textContent = r.blind_control_ready
+          ? `blind control ready · ${r.vision_ready ? "vision active" : "vision optional"}`
+          : `blind control unavailable${missing.length ? ` · pip install ${missing.join(" ")}` : ""}`;
+        badge.style.color = r.blind_control_ready ? "var(--mint-3)" : "var(--danger)";
       }
       const ps = $("#desktop-panic-state");
       if (ps) {
@@ -9613,17 +10553,18 @@
   }
   // settings whose changes require relaunching llama-server (load-time flags)
   const LOAD_TIME_KEYS = [
-    "num_ctx", "num_gpu", "num_batch", "num_thread", "kv_cache_type", "kv_cache_type_v", "model_path",
+    "num_ctx", "num_gpu", "num_batch", "num_thread", "kv_cache_type", "kv_cache_type_v", "model_path", "vision_model",
     "n_cpu_moe", "n_ubatch", "n_parallel", "flash_attn",
-    "spec_strategy", "no_warmup", "enable_metrics", "llama_extra_args",
+    "spec_strategy", "spec_draft_model", "no_warmup", "enable_metrics", "llama_extra_args",
     // mmproj_path changes how the server is launched (--mmproj <path>) so it
     // also requires a relaunch to take effect.
-    "mmproj_path",
+    "mmproj_mode", "mmproj_auto", "mmproj_path",
   ];
 
   async function collectAndSaveSettings() {
     const n = (id) => Number($(id).value);
     const modelPath = $("#set-model").value || "";
+    const mmprojMode = $("#set-mmproj-mode")?.value || "off";
     const payload = {
       model_path: modelPath,
       model: modelPath ? modelPath.split(/[\\/]/).pop().replace(/\.gguf$/i, "") : "",
@@ -9647,11 +10588,15 @@
       // so anything still reading the old field (older bridge instances, the
       // launch-time legacy-honoring rule) stays in sync with the user's pick.
       spec_strategy: ($("#set-spec-strategy")?.value || "ngram-mod"),
+      spec_strategy_source: "manual",
+      spec_draft_model: ($("#set-spec-draft-model")?.value || "").trim(),
       enable_speculative: ($("#set-spec-strategy")?.value || "ngram-mod") !== "off",
       no_warmup: !!$("#sw-nowarmup")?.classList.contains("on"),
       enable_metrics: !!$("#sw-metrics")?.classList.contains("on"),
       llama_extra_args: ($("#set-extra-args")?.value || "").trim(),
-      mmproj_path: ($("#set-mmproj")?.value || "").trim(),
+      mmproj_mode: mmprojMode,
+      mmproj_auto: mmprojMode === "auto",
+      mmproj_path: mmprojMode === "manual" ? ($("#set-mmproj")?.value || "").trim() : "",
       vram_tier_gb: Math.max(0, Number($("#set-vram-tier")?.value || 0)),
       temperature: n("#set-temp"),
       top_p: n("#set-topp"),
@@ -10137,6 +11082,7 @@
     "deepseek":  { label: "DeepSeek",  input:  1.74, output:   3.48 },  // V4 Pro (standard)
     "mistral":   { label: "Mistral",   input:  2.00, output:   5.00 },  // Magistral Medium
   };
+  const API_RATE_NOTE = "Based on published API list rates. Hardware and electricity costs are excluded.";
 
   function calcCost(provider) {
     const p = CLOUD_PRICING[provider];
@@ -10296,8 +11242,12 @@
         </div>
         <div style="flex:1;display:flex;flex-direction:column;justify-content:center;gap:2px;">
           <span style="color:${cMuted};font-size:13px;font-weight:500;letter-spacing:0.18em;text-transform:uppercase;">saved by going local</span>
-          <span style="color:${cSuccess};font-size:82px;font-weight:500;letter-spacing:-0.035em;line-height:1.05;">${savedStr}</span>
+          <div style="display:flex;align-items:flex-start;gap:6px;">
+            <span style="color:${cSuccess};font-size:82px;font-weight:500;letter-spacing:-0.035em;line-height:1.05;">${savedStr}</span>
+            <span style="color:${cSuccess};font-size:26px;line-height:1.25;">*</span>
+          </div>
           <span style="color:${cSubtle};font-size:17px;margin-top:8px;">vs running the same prompts on ${esc(providerLabel)}${sinceStr ? ` · since ${esc(sinceStr)}` : ""}</span>
+          <span style="color:${cFaint};font-size:11px;margin-top:8px;line-height:1.4;">* ${esc(API_RATE_NOTE)}</span>
         </div>
         <div style="display:flex;border-top:1px solid ${cBorder};padding-top:18px;margin-bottom:20px;">
           <div style="flex:1;"><div style="color:${cFg};font-size:19px;font-weight:500;">${tokens}</div><div style="color:${cMuted};font-size:12px;">tokens run</div></div>
@@ -10535,7 +11485,7 @@
     ide: { label: "IDE", icon: "ph-code" },
   };
 
-  function setComposerMode(mode, { announce = false } = {}) {
+  function setComposerMode(mode, { announce = false, persist = false } = {}) {
     mode = String(mode || "auto").toLowerCase();
     if (!Object.prototype.hasOwnProperty.call(COMPOSER_MODES, mode)) mode = "auto";
     if (mode === "ide" && isCompactViewport()) {
@@ -10558,6 +11508,18 @@
     if (popoverValue) popoverValue.textContent = meta.label;
     if (icon) icon.className = `ph ${meta.icon} mode-pill-icon`;
     if (pill) pill.setAttribute("aria-label", `Composer mode: ${meta.label}`);
+    if (persist) {
+      persistUiPreference({ composer_mode: mode });
+      const chat = state.chats?.chats?.[state.chatId];
+      if (chat) chat.last_mode = mode;
+      if (state.chatId) {
+        api(`/api/chats/${encodeURIComponent(state.chatId)}/mode`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode }),
+        }).catch(error => console.warn("chat mode could not be saved:", error));
+      }
+    }
   }
 
   function renderComposerMode() {
@@ -10613,7 +11575,7 @@
         focusOption(option);
         return;
       }
-      setComposerMode(option.dataset.composerMode, { announce: true });
+      setComposerMode(option.dataset.composerMode, { announce: true, persist: true });
       close();
       pill.focus({ preventScroll: true });
     });
@@ -10668,6 +11630,25 @@
     } catch (_) { return {}; }
   }
 
+  function syncThinkingBudgetControl() {
+    const row = $("#thinking-budget-row");
+    const input = $("#set-think-budget");
+    const hint = $("#thinking-budget-hint");
+    if (!row || !input || !hint) return;
+    const cap = state.reasoningCapability || {};
+    const nativeOverride = cap.mode === "native_effort" && state.reasoningEffort !== "auto";
+    input.disabled = nativeOverride;
+    row.classList.toggle("is-overridden", nativeOverride);
+    if (nativeOverride) {
+      const level = REASONING_EFFORT_LABELS[REASONING_EFFORT_LEVELS.indexOf(state.reasoningEffort)] || "Native effort";
+      hint.textContent = `${level} uses this model's native effort control. Your saved numeric budget remains available for Default effort and budget-controlled models.`;
+    } else if (cap.mode === "native_effort") {
+      hint.textContent = "Default effort uses this saved target. Choosing Low, Medium, or Deep gives control to the model's native effort setting.";
+    } else {
+      hint.textContent = "Used for Default effort and models that expose a numeric reasoning budget.";
+    }
+  }
+
   function setReasoningEffort(level, persist = true) {
     level = String(level || "auto").toLowerCase();
     if (!REASONING_EFFORT_LEVELS.includes(level)) level = "auto";
@@ -10679,6 +11660,7 @@
         saved[key] = level;
         try { localStorage.setItem(REASONING_EFFORT_KEY, JSON.stringify(saved)); } catch (_) {}
       }
+      persistUiPreference({ reasoning_effort: level });
     }
     const idx = REASONING_EFFORT_LEVELS.indexOf(level);
     const label = REASONING_EFFORT_LABELS[idx];
@@ -10700,6 +11682,7 @@
       requestAnimationFrame(() => control.classList.add("is-changing"));
       setTimeout(() => control.classList.remove("is-changing"), 260);
     }
+    syncThinkingBudgetControl();
   }
 
   function renderReasoningEffort() {
@@ -10712,13 +11695,17 @@
       control.classList.add("hidden");
       $("#reasoning-effort-popover")?.classList.remove("open");
       $("#reasoning-effort-pill")?.setAttribute("aria-expanded", "false");
+      syncThinkingBudgetControl();
       return;
     }
     const wasHidden = control.classList.contains("hidden");
     control.classList.remove("hidden");
     control.dataset.mode = cap.mode || "budget";
     const saved = readReasoningEffortMap();
-    setReasoningEffort(saved[reasoningModelKey()] || "auto", false);
+    const durable = String(state.settings.reasoning_effort || "").toLowerCase();
+    const restored = REASONING_EFFORT_LEVELS.includes(durable)
+      ? durable : (saved[reasoningModelKey()] || "auto");
+    setReasoningEffort(restored, false);
     const pill = $("#reasoning-effort-pill");
     if (pill) pill.title = cap.description || "Reasoning effort for the next message";
     if (wasHidden) {
@@ -10834,6 +11821,7 @@
       };
       await saveSettings(persistPayload);
       await requestModelLoad(modelPath);
+      await loadSettings();
       await refreshModels();
       if (tuned) {
         const msg = tuned.quant_downshift
@@ -11275,11 +12263,16 @@
     if (!deck) return null;
     // One live skill card at a time: a re-load (replaced skill) swaps the old.
     const old = deck.querySelector(".revealer-card.skill-load");
-    if (old && !old._settled) old.remove();
+    if (old) {
+      clearTimeout(old._settleTimer);
+      clearTimeout(old._compactTimer);
+      old.remove();
+    }
     const card = document.createElement("div");
     card.className = "revealer-card notifications skill-load";
     card.dataset.cardType = "notifications";
     card.dataset.skill = evt.skill || "";
+    card.title = `Skill loaded: ${evt.skill || "active skill"}`;
     const budget = evt.budget ? ` · ~${kTokens(evt.budget)} tok` : "";
     const replaced = evt.replaced ? ` · replaced ${esc(evt.replaced)}` : "";
     card.innerHTML =
@@ -11298,6 +12291,7 @@
       card.classList.remove("note-pre");
       _syncDeckStack();
     }));
+    scheduleSkillCompact(card);
     if (!state.streaming) scheduleSkillSettle(card);
     return card;
   }
@@ -11309,6 +12303,19 @@
       if (state.streaming) { scheduleSkillSettle(card); return; }
       settleSkillCard(card);
     }, 2500);
+  }
+
+  const SKILL_COMPACT_DELAY_MS = 6000;
+
+  function scheduleSkillCompact(card) {
+    if (!card || card.classList.contains("is-compact")) return;
+    clearTimeout(card._compactTimer);
+    card._compactTimer = setTimeout(() => {
+      if (!card.isConnected) return;
+      card.classList.add("is-compact");
+      card.title = `Skill active: ${card.dataset.skill || "active skill"}`;
+      _syncDeckStack();
+    }, SKILL_COMPACT_DELAY_MS);
   }
 
   // Turn ended (or the skill loaded outside a turn): stop the loader, dim the
@@ -11338,6 +12345,8 @@
     if (!deck) return;
     deck.querySelectorAll(".revealer-card.skill-load").forEach(c => {
       settleSkillCard(c);
+      clearTimeout(c._settleTimer);
+      clearTimeout(c._compactTimer);
       c.classList.add("fade-out");
       setTimeout(() => { c.remove(); if (deck.children.length === 0) deck.innerHTML = ""; }, 220);
     });
@@ -11560,11 +12569,19 @@
     $("#cmd-history-scrim")?.addEventListener("click", closeCmdHistory);
     $("#btn-cmd-history-refresh")?.addEventListener("click", loadCmdHistory);
     $("#btn-cmd-history-clear")?.addEventListener("click", clearCmdHistory);
-    const openFaq = () => { $("#faq-scrim").classList.add("open"); $("#faq-modal").classList.add("open"); };
-    const closeFaq = () => { $("#faq-scrim").classList.remove("open"); $("#faq-modal").classList.remove("open"); };
     $("#btn-faq")?.addEventListener("click", openFaq);
     $("#btn-close-faq")?.addEventListener("click", closeFaq);
-    $("#faq-scrim")?.addEventListener("click", closeFaq);
+    $("#faq-search")?.addEventListener("input", event => {
+      filterFaq(event.currentTarget.value);
+      syncFaqNav();
+    });
+    $(".faq-page-scroll")?.addEventListener("scroll", syncFaqNav, { passive: true });
+    $$("#faq-page [data-faq-nav]").forEach(link => link.addEventListener("click", event => {
+      event.preventDefault();
+      const target = document.getElementById(link.dataset.faqNav);
+      target?.scrollIntoView({ behavior: "smooth", block: "start" });
+      $$("#faq-page [data-faq-nav]").forEach(item => item.classList.toggle("active", item === link));
+    }));
     
     const openShutdown = () => { $("#shutdown-scrim")?.classList.add("open"); $("#shutdown-modal")?.classList.add("open"); };
     const closeShutdown = () => { $("#shutdown-scrim")?.classList.remove("open"); $("#shutdown-modal")?.classList.remove("open"); };
@@ -11657,7 +12674,20 @@
       }
     });
 
-    $("#btn-save-settings").addEventListener("click", collectAndSaveSettings);
+    $("#btn-save-settings").addEventListener("click", async () => {
+      try {
+        await collectAndSaveSettings();
+      } catch (error) {
+        toast("settings were not saved: " + (error.message || error), "error", 7000);
+      }
+    });
+    $("#btn-reset-shortcuts")?.addEventListener("click", () => {
+      shortcutRecording = null;
+      state.settings.keyboard_shortcuts = {};
+      renderShortcutSettings();
+      persistUiPreference({ keyboard_shortcuts: {} });
+      toast("keyboard shortcuts cleared", "ok", 1800);
+    });
     $("#set-theme")?.addEventListener("change", e => {
       const next = e.target.value;
       applyTheme(next);
@@ -11864,8 +12894,49 @@
         toast("scan failed: " + (e.message || e), "error");
       } finally { btn.disabled = false; }
     });
-    // mmproj auto-detect — asks the bridge to look for a sibling vision
-    // projector next to whichever model is currently selected/loaded.
+    $("#set-mmproj-mode")?.addEventListener("change", syncMmprojModeUi);
+    $("#btn-spec-draft-browse")?.addEventListener("click", async () => {
+      const btn = $("#btn-spec-draft-browse");
+      const modelPath = ($("#set-model")?.value || state.loadedModel || state.settings?.model_path || "").trim();
+      btn.disabled = true;
+      try {
+        const r = await api("/api/models/browse-spec-draft", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ model_path: modelPath }),
+        });
+        if (!r.path) return;
+        $("#set-spec-draft-model").value = r.path;
+        toast("draft model selected; save settings to load it", "ok", 3500);
+      } catch (e) {
+        toast("draft-model picker failed: " + (e.message || e), "error");
+      } finally { btn.disabled = false; }
+    });
+    $("#set-mmproj")?.addEventListener("input", (e) => {
+      if (e.currentTarget.value.trim()) {
+        const mode = $("#set-mmproj-mode");
+        if (mode) mode.value = "manual";
+      }
+      syncMmprojModeUi();
+    });
+    $("#btn-mmproj-browse")?.addEventListener("click", async () => {
+      const btn = $("#btn-mmproj-browse");
+      const modelPath = ($("#set-model")?.value || state.loadedModel || state.settings?.model_path || "").trim();
+      btn.disabled = true;
+      try {
+        const r = await api("/api/models/browse-mmproj", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ model_path: modelPath }),
+        });
+        if (!r.path) return;
+        $("#set-mmproj").value = r.path;
+        $("#set-mmproj-mode").value = "manual";
+        syncMmprojModeUi();
+        toast("projector selected; save settings to load it", "ok", 3500);
+      } catch (e) {
+        toast("projector picker failed: " + (e.message || e), "error");
+      } finally { btn.disabled = false; }
+    });
+    // Find a plausible sibling and pin the result as an explicit manual path.
     $("#btn-mmproj-detect")?.addEventListener("click", async () => {
       const btn = $("#btn-mmproj-detect");
       const inp = $("#set-mmproj");
@@ -11880,9 +12951,12 @@
         });
         if (r.mmproj_path) {
           if (inp) inp.value = r.mmproj_path;
-          toast("found vision projector — save & relaunch to apply", "ok", 4000);
+          const mode = $("#set-mmproj-mode");
+          if (mode) mode.value = "manual";
+          syncMmprojModeUi();
+          toast("found and selected a vision projector; save settings to load it", "ok", 4000);
         } else {
-          toast("no mmproj-*.gguf next to this model", "warn", 4000);
+          toast(r.reason || "no matching mmproj found beside this model", "warn", 5000);
         }
       } catch (e) {
         toast("probe failed: " + (e.message || e), "error");
@@ -11891,7 +12965,10 @@
     $("#btn-mmproj-clear")?.addEventListener("click", () => {
       const inp = $("#set-mmproj");
       if (inp) inp.value = "";
-      toast("vision projector cleared — chat model will be text-only after relaunch", "ok", 3500);
+      const mode = $("#set-mmproj-mode");
+      if (mode) mode.value = "off";
+      syncMmprojModeUi();
+      toast("projector set to off; save settings to unload it", "ok", 3500);
     });
     $("#btn-browse-models-dir")?.addEventListener("click", async () => {
       const btn = $("#btn-browse-models-dir");
@@ -12535,8 +13612,6 @@
         app.classList.toggle("sidebar-collapsed");
       }
     });
-    $("#pull-tab-left").addEventListener("click", () => app.classList.remove("sidebar-collapsed"));
-
     // workspace add
     $("#btn-ws-add-toggle").addEventListener("click", () => {
       $("#ws-add").classList.toggle("hidden");
@@ -12722,11 +13797,25 @@
     }
     $("#palette-scrim")?.addEventListener("click", closePalette);
 
-    // ⌘K / Ctrl+K anywhere
+    document.addEventListener("keydown", handleShortcutKeydown, true);
+
+    // built-in navigation shortcuts
     window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && $("#faq-page")?.classList.contains("open")) {
+        e.preventDefault();
+        closeFaq();
+        return;
+      }
       if (e.key === "Escape" && $("#usage-page")?.classList.contains("open")) {
         e.preventDefault();
         closeUsageStats();
+        return;
+      }
+      if (e.key === "/" && $("#faq-page")?.classList.contains("open")
+          && !e.ctrlKey && !e.metaKey && !e.altKey
+          && !e.target.closest("input, textarea, select, [contenteditable='true']")) {
+        e.preventDefault();
+        $("#faq-search")?.focus();
         return;
       }
       const isCmd = e.metaKey || e.ctrlKey;
@@ -12960,15 +14049,26 @@
       const content = container.querySelector(".think-content");
       if (!content) return;
 
+      // A completed work turn expands to the observed activity trail. Keep raw
+      // scratchpad text out of this path: it is model-dependent and often noisy.
+      if (container.classList.contains("has-worklog")) {
+        const group = container.closest(".bubble-col")?.querySelector(".tool-group");
+        const willOpen = !!group?.classList.contains("work-hidden");
+        if (group) {
+          group.classList.toggle("work-hidden", !willOpen);
+          group.classList.toggle("collapsed", !willOpen);
+        }
+        content.classList.add("hidden");
+        content.textContent = "";
+        const caret = thinkHeader.querySelector(".think-caret");
+        if (caret) caret.className = `ph ph-caret-${willOpen ? "down" : "right"} think-caret`;
+        return;
+      }
+
       const willOpen = content.classList.contains("hidden");
       if (willOpen) content.textContent = content._fullText || "";
       const isHidden = content.classList.toggle("hidden");
       if (isHidden) content.textContent = "";
-      // Finalized "Worked for Xs" block: the same caret also folds the tool group.
-      if (container.classList.contains("has-worklog")) {
-        const grp = container.closest(".bubble-col")?.querySelector(".tool-group");
-        if (grp) grp.classList.toggle("work-hidden", isHidden);
-      }
       const caret = thinkHeader.querySelector(".think-caret");
       if (caret) {
         if (isHidden) {

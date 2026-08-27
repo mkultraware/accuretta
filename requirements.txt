@@ -16,6 +16,7 @@ pillow>=10.0.0            # Image manipulation and fallback OCR / screenshots
 # ------------------------------------------------------------------------------
 pyautogui>=0.9.54         # Lets the agent take screenshots and drive the mouse/keyboard
 pygetwindow>=0.0.9        # Window enumeration and targeting support for screenshots
+uiautomation>=2.0.20      # CPU-only Windows accessibility tree and semantic control actions
 playwright>=1.48.0        # Scope-enforced Chromium sessions for authorized Red Team browser work
 
 # ------------------------------------------------------------------------------

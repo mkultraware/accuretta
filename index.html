@@ -25,7 +25,7 @@
     document.documentElement.setAttribute('data-theme', theme);
   })();
 </script>
-<link rel="stylesheet" href="/app.css?v=66">
+<link rel="stylesheet" href="/app.css?v=70">
 <script src="https://unpkg.com/@phosphor-icons/web"></script>
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js?v=2" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js?v=2" defer></script>
@@ -58,7 +58,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.7.7</span>
+        <span class="v" id="brand-v">v0.7.8</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -179,12 +179,10 @@
     </a>
   </section>
 
-  <button class="pull-tab-left" id="pull-tab-left" title="Open sidebar"><i class="ph ph-caret-right"></i></button>
-
   <!-- ====== CENTER ====== -->
   <div class="center">
     <div class="topbar">
-      <button class="iconbtn" id="btn-toggle-sidebar-m" title="Sidebar"><i class="ph ph-list"></i></button>
+      <button class="iconbtn" id="btn-toggle-sidebar-m" title="Collapse sidebar" aria-label="Collapse sidebar"><i class="ph ph-list"></i></button>
       <button class="iconbtn mobile-only" id="btn-settings-m" title="Settings"><i class="ph ph-gear-six"></i></button>
       <div class="path">
         <i class="ph ph-chat-circle-dots"></i>
@@ -590,83 +588,193 @@
   </div>
 </aside>
 
-<!-- ====== FAQ MODAL ====== -->
-<div class="modal-scrim" id="faq-scrim"></div>
-<aside class="modal" id="faq-modal" aria-hidden="true">
-  <div class="modal-head">
-    <i class="ph ph-sparkle"></i>
-    <h3>About Accuretta</h3>
-    <button class="iconbtn" id="btn-close-faq"><i class="ph ph-x"></i></button>
+<!-- ====== FAQ PAGE ====== -->
+<section class="faq-page" id="faq-page" aria-hidden="true" aria-labelledby="faq-title">
+  <header class="faq-page-head">
+    <button class="faq-back" id="btn-close-faq" type="button" aria-label="Back to chat"><i class="ph ph-arrow-left"></i><span>Back</span></button>
+    <div>
+      <span class="faq-eyebrow">Local model field guide</span>
+      <h1 id="faq-title">FAQ</h1>
+    </div>
+    <a class="faq-author" href="https://x.com/NoJetsNextDoor" target="_blank" rel="noopener noreferrer" aria-label="Follow NoJetsNextDoor on X">
+      <span>@NoJetsNextDoor</span><i class="ph ph-arrow-up-right"></i>
+    </a>
+  </header>
+
+  <div class="faq-page-scroll">
+    <div class="faq-shell">
+      <aside class="faq-rail" aria-label="FAQ sections">
+        <div class="faq-rail-mark" aria-hidden="true">
+          <span class="faq-rail-orbit orbit-a"></span>
+          <span class="faq-rail-orbit orbit-b"></span>
+          <span class="faq-rail-core">A</span>
+        </div>
+        <span class="faq-rail-label">Browse the manual</span>
+        <nav>
+          <a href="#faq-essentials" data-faq-nav="faq-essentials"><span>01</span>Essentials</a>
+          <a href="#faq-models" data-faq-nav="faq-models"><span>02</span>Models &amp; images</a>
+          <a href="#faq-memory" data-faq-nav="faq-memory"><span>03</span>Memory</a>
+          <a href="#faq-safety" data-faq-nav="faq-safety"><span>04</span>Safety &amp; privacy</a>
+          <a href="#faq-workflow" data-faq-nav="faq-workflow"><span>05</span>Workflow</a>
+          <a href="#faq-trouble" data-faq-nav="faq-trouble"><span>06</span>Troubleshooting</a>
+        </nav>
+        <p>Written for the current build. No mythology, no cloud required.</p>
+      </aside>
+
+      <main class="faq-document">
+        <section class="faq-intro">
+          <div>
+            <span class="faq-eyebrow">Accuretta / manual 01</span>
+            <h2>Your model.<br>Your machine.</h2>
+            <p>Short answers about running local models, approvals, memory, tools, and the parts that can still bite.</p>
+          </div>
+          <label class="faq-search">
+            <i class="ph ph-magnifying-glass" aria-hidden="true"></i>
+            <input id="faq-search" type="search" placeholder="Search the field guide" autocomplete="off" spellcheck="false">
+            <kbd>/</kbd>
+          </label>
+        </section>
+
+        <div class="faq-results-note" id="faq-results-note" aria-live="polite"></div>
+
+        <section class="faq-group" id="faq-essentials" data-faq-section>
+          <header><span>01</span><div><h3>Essentials</h3><p>What the app is and how a session behaves.</p></div></header>
+          <div class="faq-list">
+            <details class="faq-item" open>
+              <summary><span>What is Accuretta?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Accuretta is a local-first interface and tool harness for models served by <code>llama.cpp</code>. The core app runs on your computer at <code>localhost:8787</code>. It does not require an Accuretta account or a cloud model.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>What are Auto, Agent, and IDE modes?</span><i class="ph ph-plus"></i></summary>
+              <div><p><strong>Auto</strong> chooses a suitable route from your request. <strong>Agent</strong> lets the model use enabled tools for files, commands, research, and other work. <strong>IDE</strong> is aimed at building and previewing web interfaces. Your access mode still controls which actions need approval.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Where are chats and settings stored?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Accuretta keeps its working data under the local <code>data</code> directory, including chats, settings, summaries, memories, and local usage counters. Deleting a chat removes that chat from the app, while aggregate usage totals may remain.</p></div>
+            </details>
+          </div>
+        </section>
+
+        <section class="faq-group" id="faq-models" data-faq-section>
+          <header><span>02</span><div><h3>Models &amp; images</h3><p>The model supplies the brain. The harness supplies the hands.</p></div></header>
+          <div class="faq-list">
+            <details class="faq-item">
+              <summary><span>Can any GGUF model use tools?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Tool quality depends on the model and its chat template. Models that emit standard tool calls use the native path. Some models use text-shaped function calls, which Accuretta can parse through its compatibility path. A model can still be too small, badly quantized, or poorly trained for reliable agent work.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Can a text-only model understand an attached image?</span><i class="ph ph-plus"></i></summary>
+              <div><p>No. Image display and model vision are separate abilities. The chat can show an attachment, but the model needs compatible vision support and a loaded projector to inspect its pixels. Printing text such as <code>&lt;preview&gt;</code> or running a Python script does not magically create vision.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>What does the vision projector setting do?</span><i class="ph ph-plus"></i></summary>
+              <div><p>A matching <code>mmproj</code> file connects a supported multimodal model to image input. <strong>Off</strong> keeps the model text-only, <strong>Auto</strong> looks for a compatible projector beside the model, and <strong>Manual</strong> uses the exact projector you choose. A mismatched projector can fail or produce nonsense.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>How do I fit a large MoE model into limited VRAM?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Use Settings → Auto-tune and set a realistic VRAM budget. Accuretta reads the model metadata and proposes context size, GPU layers, cache precision, batching, and CPU expert offload. Treat the estimate as a strong starting point, then verify real speed and memory use on your machine.</p></div>
+            </details>
+          </div>
+        </section>
+
+        <section class="faq-group" id="faq-memory" data-faq-section>
+          <header><span>03</span><div><h3>Memory</h3><p>How long sessions stay useful without eating the whole context window.</p></div></header>
+          <div class="faq-list">
+            <details class="faq-item">
+              <summary><span>What does the context ring show?</span><i class="ph ph-plus"></i></summary>
+              <div><p>It estimates how much of the loaded model's context window the current prompt uses. The ring is a safety gauge, not a perfect tokenizer reading, so it intentionally leans conservative.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>What happens when a chat becomes too long?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Accuretta compacts older completed turns into a structured rolling summary. The current system keeps the original request, recent user instructions, and exact identifiers such as paths, URLs, issue IDs, and hashes as separate continuity evidence. The full chat remains stored; the model receives the compacted working version.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Does compaction make the model smarter?</span><i class="ph ph-plus"></i></summary>
+              <div><p>It gives the same model a cleaner memory. That improves recall in long sessions and reduces the amount of old text sent during compaction. It does not change the model weights, increase the physical context limit, or rescue a weak model from poor reasoning.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>What is long-term memory?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Long-term memories are small durable notes saved across chats, such as a preference, command, or project fact. Review and remove them in Settings. They are useful context, not sacred scripture, so delete stale or incorrect entries.</p></div>
+            </details>
+          </div>
+        </section>
+
+        <section class="faq-group" id="faq-safety" data-faq-section>
+          <header><span>04</span><div><h3>Safety &amp; privacy</h3><p>Local-first still requires a steering wheel and brakes.</p></div></header>
+          <div class="faq-list">
+            <details class="faq-item">
+              <summary><span>What do Soft, Medium, and Hard approval modes mean?</span><i class="ph ph-plus"></i></summary>
+              <div><p><strong>Soft</strong> allows routine low-risk actions. <strong>Medium</strong> also trusts normal writes inside the workspace. <strong>Hard</strong> asks for every action. Raw commands, tests, deletions, program launches, desktop control, and protected operations keep stricter gates. Some destructive actions are refused outright.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Can keyboard shortcuts approve protected actions?</span><i class="ph ph-plus"></i></summary>
+              <div><p>No. A shortcut may approve the newest ordinary request, but protected actions still require the hold-to-approve control. This prevents an accidental keypress from changing sensitive parts of the system.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Does anything leave my computer?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Core chat inference and local counters stay on this machine. Data can leave when you deliberately use web tools, allow external preview resources, connect GitHub, enable Discord, pair a remote machine, or ask an agent to contact an online service. Those features are optional and should be treated as network access.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Are usage stats telemetry?</span><i class="ph ph-plus"></i></summary>
+              <div><p>They are local aggregate counters used by the Usage Stats page. Accuretta records performance totals and model health without storing prompt or reply content in the model comparison dataset. The page does not require sending those counters to a remote analytics service.</p></div>
+            </details>
+          </div>
+        </section>
+
+        <section class="faq-group" id="faq-workflow" data-faq-section>
+          <header><span>05</span><div><h3>Workflow</h3><p>Small conveniences that prevent repetitive finger gymnastics.</p></div></header>
+          <div class="faq-list">
+            <details class="faq-item">
+              <summary><span>Can I bind my own keyboard shortcuts?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Yes. Open Settings → Keyboard shortcuts, choose an action, and press the combination you want. Shortcuts can approve or deny the newest request, open pages, create a chat, focus the composer, or stop generation. Use Delete or Backspace while recording to clear a binding.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>What keyboard controls are built in?</span><i class="ph ph-plus"></i></summary>
+              <div><p><code>Enter</code> sends from the composer, <code>Shift+Enter</code> adds a line, and <code>Ctrl+K</code> or <code>⌘K</code> opens the session switcher. <code>Escape</code> closes full pages and overlays. Custom shortcuts are added in Settings.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Does the composer keep drafts?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Yes. Draft text is saved per chat in browser storage and restored when you return. Sending the message clears that chat's draft.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Can I use Accuretta from another device?</span><i class="ph ph-plus"></i></summary>
+              <div><p>The local server can be reached from your LAN using the inference computer's address. Tailscale support can provide private remote access across your tailnet. Secure browser features may require the HTTPS address created by Tailscale Serve.</p></div>
+            </details>
+          </div>
+        </section>
+
+        <section class="faq-group" id="faq-trouble" data-faq-section>
+          <header><span>06</span><div><h3>Troubleshooting</h3><p>Common failures, translated from machine grunting.</p></div></header>
+          <div class="faq-list">
+            <details class="faq-item">
+              <summary><span>Why did the model produce no visible answer?</span><i class="ph ph-plus"></i></summary>
+              <div><p>A reasoning model can spend its reply budget thinking and run out before it reaches the answer. Raise the reply or thinking budget, use a lower effort, or choose a model that follows the expected reasoning template more reliably.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Why is the first turn after compaction slower?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Compaction changes the prompt prefix, so the server may need to rebuild its fast attention cache for the new condensed history. Later turns can reuse that prefix again. The pause is real, but it buys room for the session to continue.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Why did a tool fail even though the chat still works?</span><i class="ph ph-plus"></i></summary>
+              <div><p>A tool can fail because of permissions, a missing program, network trouble, invalid arguments, or a rejected approval. That usually means the individual action failed, not that Accuretta itself crashed. Read the short error, fix the cause, and retry only that action.</p></div>
+            </details>
+          </div>
+        </section>
+
+        <div class="faq-empty" id="faq-empty" hidden>
+          <i class="ph ph-binoculars"></i>
+          <strong>No matching answers</strong>
+          <span>Try fewer words. The manual is useful, but it cannot read minds yet.</span>
+        </div>
+
+        <footer class="faq-footer">
+          <span>Still stuck?</span>
+          <a href="https://x.com/NoJetsNextDoor" target="_blank" rel="noopener noreferrer">Ask @NoJetsNextDoor <i class="ph ph-arrow-up-right"></i></a>
+        </footer>
+      </main>
+    </div>
   </div>
-  <div class="modal-body">
-    <div class="faq-q">what is accuretta?</div>
-    <p>a local-first LLM wrapper. it runs entirely on your machine — no cloud API, no telemetry, no account. the model lives in <code>llama.cpp</code>, the bridge is a small python server, the UI is served on <code>localhost:8787</code> and is reachable from any device on your LAN at <code>http://&lt;your-ip&gt;:8787</code>.</p>
-
-    <div class="faq-q">what are the modes?</div>
-    <p><b>IDE</b> — model replies with one HTML document and the right pane renders it live, saving every version. good for building landing pages, mocks, dashboards.<br>
-    <b>Agent</b> — model calls tools to list files, read, write, run powershell. every write/run asks for your approval first.<br>
-    <b>Auto</b> — bridge picks IDE vs. Agent based on what you asked.</p>
-
-    <div class="faq-q">how do tools work with a gemma model?</div>
-    <p>gemma emits a python-style function call — <code>name(arg=value)</code> inside a <code>```tool_code```</code> fence — instead of the JSON tool_call that <code>llama.cpp</code>'s native parser understands. so accuretta runs gemma in <b>text-tools</b> mode: the tools are still listed in the prompt, but accuretta parses the <code>tool_code</code> call out of the reply and executes it itself, rather than handing the tool schema to llama-server (which would silently no-op and let the model narrate a fake <i>"saved to…"</i>). tools work, just via a different path. models that emit standard JSON tool calls — <b>Qwen</b>, <b>GLM</b>, <b>Llama</b>, <b>GPT-OSS</b> — still use the faster native path.</p>
-
-    <div class="faq-q">what is netscan inference device?</div>
-    <p>a one-click prompt under the <svg class="faq-svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="8" cy="6" r="2" fill="currentColor"/><circle cx="16" cy="12" r="2" fill="currentColor"/><circle cx="10" cy="18" r="2" fill="currentColor"/></svg> button that asks the model to scan <i>this</i> machine's active TCP/UDP connections, listening ports, and recent DNS cache, then flag anything weird (unknown processes phoning home, suspicious remote IPs, etc.). a chart card renders inline showing connection counts, top processes, and top remote endpoints — favicons fetched from DuckDuckGo. all data is gathered locally via PowerShell — nothing leaves your machine.</p>
-
-    <div class="faq-q">what are the security assessment buttons?</div>
-    <p>under <b>Build options → Red team</b> there are four modes. <b>Passive OSINT</b> queries public search, registry, DNS, certificate-transparency and archive providers without connecting directly to the target. <b>Target Recon</b> adds scoped TLS, HTTP and port checks. <b>Frontend Secrets</b> performs a read-only audit of frontend bundles, lazy chunks, and source maps while suppressing placeholders and public client identifiers. Confirmed values are shown exactly for reporting and are never submitted to their provider for validation. <b>Red Team</b> runs the full non-destructive assessment: reconnaissance, finding validation, exploitation, evidence capture and reporting. Active modes require you to confirm ownership or written permission before they run. <i>Use active modes only against systems you own or are contracted to test.</i></p>
-
-    <div class="faq-q">does it render markdown?</div>
-    <p>yes — pipe tables, ATX headings (<code>#</code>…<code>######</code>), ordered/unordered lists, horizontal rules, inline <code>**bold**</code>/<code>*italic*</code>/<code>`code`</code>, and fenced code blocks all render properly in chat bubbles.</p>
-
-    <div class="faq-q">can i preview an existing HTML file from the workspace?</div>
-    <p>yes. add a folder in the Workspace panel, expand it, and click the <svg class="faq-svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> lightning bolt next to any <code>.html</code> file. the page loads into the right pane with its real CSS, JS, and images intact. the bridge serves files through <code>/api/wsfs/&lt;token&gt;/&lt;rel&gt;</code> with strict path-traversal hardening — the resolved path is checked against the workspace root via <code>os.path.commonpath</code> on every request, so the iframe (and any script in it) can never reach a file outside that folder. symlinks, <code>..</code> escapes, absolute paths, and ignored files (<code>.accurettaignore</code>) are all rejected. external CDN scripts still load normally — turn off "Allow web resources" in Settings to lock that down too.</p>
-
-    <div class="faq-q">can i syntax-check a python file?</div>
-    <p>yes — click the <svg class="faq-svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg> checkmark next to any <code>.py</code> file in the workspace tree. the bridge runs <code>compile(code, name, "exec")</code> on it, which builds the AST and validates structure without executing a single line — no imports run, no side effects, no risk. you get a green banner if it parses, or a red one with line + column + message and the offending line highlighted. <i>doesn't catch import errors, type errors, or runtime errors</i> — that would need to actually run the code, which is intentionally out of scope.</p>
-
-    <div class="faq-q">why do i get "no response" when uploading an image?</div>
-    <p>this happens if you have a native vision projector loaded (<b>Vision projector</b> in Settings) while also having <b>Speculative decoding</b> enabled (e.g., using the <b>draft-mtp</b> strategy). <code>llama-server</code>'s speculative decoding feature currently breaks when processing multimodal vision inputs — the prediction worker crashes silently and ends the generation instantly. the fix: turn off speculative decoding in Settings when using vision models.</p>
-
-    <div class="faq-q">how do i fit a 35B MoE model on a 12 GB GPU?</div>
-    <p>the one-click path: open Settings, pick the model, pick your <b>VRAM budget</b> under <b>Auto-tune</b> (it tries to detect your GPU automatically), click <b>Suggest values for current model</b>. the suggester reads the GGUF header directly — actual layer count, expert count, GQA config — so the math is exact, not eyeballed. it fills in context, GPU layers, KV cache quantization, batch size, and <code>--n-cpu-moe</code> (the killer flag that keeps N expert tensors on system RAM so the rest fits in VRAM). it also disables speculative decoding for MoE models because public benchmarks show it's net-negative there. save and the model reloads.</p>
-    <p>if the suggester sees that the model needs more than half its layers offloaded, it shows a <b>quant downshift</b> banner pointing at a smaller quant from the same repo — usually a 3-5x throughput win. the willbnu/Qwen3-16G repo is a good reference: their 27-30B-A3B at Q3_K_S runs all-GPU on a 16 GB card at 80-130 tok/s, vs. Q4_K_M with offload at 30-50 tok/s. same model, same card.</p>
-    <p>everything is overrideable in the <b>Advanced llama-server</b> section right below the suggester. anything the UI doesn't surface goes in the <b>Extra flags</b> field, e.g. <code>--alias my-model --rope-scaling linear</code>.</p>
-
-    <div class="faq-q">what is ACCURETTA.md?</div>
-    <p>a scan of your machine (OS, known folders, drives) written to <code>data/ACCURETTA.md</code> on first boot. it's injected into every chat so the model knows where your Desktop, Documents, Screenshots live. edit it freely — it's re-read each turn. rescan from Settings.</p>
-
-    <div class="faq-q">why tokens and not streaming text?</div>
-    <p>the model itself decides when to speak. small local models often spend their whole reply budget inside <code>&lt;think&gt;</code> tags and never produce a visible answer. bump <b>Max reply tokens</b> in Settings if that happens, or switch to a different model.</p>
-
-    <div class="faq-q">how is my data stored?</div>
-    <p>everything lives in <code>./data</code>: chat history, workspace, settings, versions, system context. nothing leaves the machine unless you explicitly allow it.</p>
-
-    <div class="faq-q">how does memory work in accuretta?</div>
-    <p>every local model gets three layers of memory:</p>
-    <p><b>working memory</b> — the live context window for this turn. shown as the ring gauge in the sidebar. when it fills up, the bridge silently drops the oldest non-system messages so you never have to start a new chat. hover any assistant bubble's meta line to see how many tokens that reply used.</p>
-    <p><b>short-term memory</b> — the model's prior <code>&lt;think&gt;</code> reasoning, kept alive between turns inside the same chat. most local chat templates (Qwen, DeepSeek, GLM…) discard prior thinking by default; accuretta rewraps it as a "short-term memory" entry so the model's own train of thought survives. shown inline as a small italic block with a notepad icon. toggle with <i>preserve_prior_thinking</i> in <code>data/settings.json</code>.</p>
-    <p><b>long-term memory</b> — durable lessons the model saves across sessions via the <code>remember</code> tool: a working command, a file layout, a user preference. manage them in Settings → Long-term memory.</p>
-
-    <div class="faq-q">what does the working-memory ring show?</div>
-    <p>how full the current session's prompt is relative to <code>num_ctx</code>. the count is conservative (≈3 chars per token) so it errs on the safe side. once it hits the outer ring, the bridge silently drops the oldest non-system messages to stay under budget — you don't need to start a new session.</p>
-
-    <div class="faq-q">what is kv cache quant?</div>
-    <p>controls the precision of the model's memory cache. <code>q4_0</code> uses half the VRAM of <code>q8_0</code> with barely noticeable quality loss — ideal for 16GB cards. <code>f16</code> is best quality but uses full VRAM.</p>
-
-    <div class="faq-q">does the composer save drafts?</div>
-    <p>yes — whatever you type is saved to browser storage per chat. if you refresh the page or switch chats, your draft is restored when you come back. it is cleared when you hit send.</p>
-
-    <div class="faq-q">keyboard shortcuts?</div>
-    <p><code>⌘⏎</code> / <code>Ctrl⏎</code> send · <code>Shift⏎</code> newline · <code>Ctrl+K</code> / <code>⌘K</code> session switcher · click the model pill (bottom-right of composer) to swap models.</p>
-
-    <div class="faq-q">on mobile / iPad?</div>
-    <p>the UI adapts: composer chips collapse into the <svg class="faq-svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="8" cy="6" r="2" fill="currentColor"/><circle cx="16" cy="12" r="2" fill="currentColor"/><circle cx="10" cy="18" r="2" fill="currentColor"/></svg> button, send/stop fill the bottom row, and tap targets follow the iOS 44px minimum. <b>swipe left or right</b> on the sidebar to dismiss it back to the chat. the preview pane is hidden on mobile — open the page on a desktop browser to use IDE mode.</p>
-
-    <div class="faq-q">can i use a different browser?</div>
-    <p>yes. <code>start.bat firefox</code> launches in Firefox, <code>start.bat chrome</code> / <code>edge</code> / <code>brave</code> / <code>opera</code> / <code>vivaldi</code> all work. <code>start.bat none</code> skips auto-launch entirely. the value can also be set as an <code>ACCURETTA_BROWSER</code> environment variable.</p>
-  </div>
-</aside>
+</section>
 
 <!-- ====== GITHUB ACTIVITY MODAL ====== -->
 <div class="modal-scrim" id="github-activity-scrim"></div>
@@ -729,12 +837,18 @@
 
     <div class="form-row">
       <label>Vision projector · mmproj <i class="ph ph-info" title="Path to the vision projector .gguf for the chat model. When set, llama-server boots with --mmproj and the model sees attached images natively (no round-trip through the small vision model)."></i></label>
+      <select id="set-mmproj-mode">
+        <option value="off">off · text-only, lowest VRAM use</option>
+        <option value="auto">automatic · match a projector beside the model</option>
+        <option value="manual">manual · use the path below</option>
+      </select>
       <div style="display:flex;gap:6px;">
-        <input type="text" id="set-mmproj" placeholder="auto-detect from sibling .gguf, or paste a full path" style="flex:1;">
+        <input type="text" id="set-mmproj" placeholder="full path to a projector .gguf" style="flex:1;">
+        <button class="btn sm" id="btn-mmproj-browse" title="Choose a projector file"><i class="ph ph-folder-open"></i></button>
         <button class="btn sm" id="btn-mmproj-detect" title="Look for an mmproj-*.gguf next to the chat model"><i class="ph ph-magnifying-glass"></i></button>
-        <button class="btn sm" id="btn-mmproj-clear" title="Clear (disable native vision)"><i class="ph ph-x"></i></button>
+        <button class="btn sm" id="btn-mmproj-clear" title="Set projector mode to off"><i class="ph ph-x"></i></button>
       </div>
-      <span class="hint" id="set-mmproj-hint">leave blank to auto-detect a sibling <code>mmproj-*.gguf</code>. requires a model relaunch.</span>
+      <span class="hint" id="set-mmproj-hint">off guarantees that no projector is loaded. changing this requires a model relaunch.</span>
     </div>
 
     <div class="form-row">
@@ -874,10 +988,15 @@
         <option value="off">off · no speculative decoding</option>
         <option value="ngram-mod">ngram-mod · works on any model (default)</option>
         <option value="draft-mtp">draft-mtp · uses the model's MTP heads (Qwen 3.5/3.6, DeepSeek V3/R1) · ~1.85x decode</option>
-        <option value="dflash">dflash · self-speculative from the model's own hidden states (newer builds)</option>
-        <option value="dspark">dspark · self-speculative variant (newer builds)</option>
+        <option value="dflash">dflash · requires a matching DFlash draft GGUF</option>
+        <option value="dspark">dspark · requires a matching DSpark draft GGUF</option>
       </select>
-      <span class="hint">draft-mtp needs a llama.cpp build from <b>2026-05-16</b> or later (PR #22673); dflash/dspark need an even newer build. Picking one the model doesn't support makes llama-server fail at startup.</span>
+      <span class="hint">manual choices stay fixed during background auto-tuning. a loaded projector can coexist with speculative decoding.</span>
+      <div style="display:flex;gap:6px;">
+        <input type="text" id="set-spec-draft-model" placeholder="DFlash / DSpark draft .gguf path" style="flex:1;">
+        <button class="btn sm" id="btn-spec-draft-browse" title="Choose a matching speculative draft model"><i class="ph ph-folder-open"></i></button>
+      </div>
+      <span class="hint">only needed for DFlash or DSpark. Draft MTP uses heads already stored in the main model.</span>
     </div>
     <div class="form-row inline">
       <label>Skip warmup <i class="ph ph-info" title="--no-warmup. Saves a few seconds at startup. First reply may be slightly slower."></i></label>
@@ -929,9 +1048,10 @@
       <label>Enable thinking</label>
       <div class="sw" id="sw-thinking"></div>
     </div>
-    <div class="form-row">
-      <label>Thinking budget (tokens) <i class="ph ph-info" title="Cap how many tokens the model can spend in its <think> phase before being forced to answer. 0 = no thinking. -1 = unlimited."></i></label>
+    <div class="form-row" id="thinking-budget-row">
+      <label>Thinking budget (tokens) <i class="ph ph-info" title="Default target for budget-controlled reasoning. Native Low, Medium, and Deep effort levels take priority when the model supports them. 0 = no thinking. -1 = unlimited."></i></label>
       <input type="number" id="set-think-budget" step="128" min="-1">
+      <span class="hint" id="thinking-budget-hint">Used for Default effort and models that expose a numeric reasoning budget.</span>
     </div>
     <div class="form-row">
       <label>Effort control detection <i class="ph ph-info" title="Auto reads the live/GGUF chat template and learns from actual reasoning output. Use an override only when a new model supports adjustable thinking but does not advertise it clearly."></i></label>
@@ -985,6 +1105,15 @@
     <div class="form-row inline">
       <label>Sound notifications</label>
       <div class="sw" id="sw-sound-notifications"></div>
+    </div>
+
+    <div class="form-group">Keyboard shortcuts</div>
+    <div class="form-row">
+      <span class="hint">pick an action, then press a key combination. approval shortcuts only act on the newest request, and protected actions still require hold-to-approve.</span>
+    </div>
+    <div class="form-row shortcut-settings-row">
+      <div class="shortcut-list" id="shortcut-list"></div>
+      <button class="btn sm shortcut-reset" id="btn-reset-shortcuts" type="button"><i class="ph ph-arrow-counter-clockwise"></i>Clear all</button>
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
@@ -1195,7 +1324,7 @@
       <span id="desktop-deps-badge" class="hint" style="font-size:10px;"></span>
     </div>
     <div class="form-row">
-      <span class="hint">lets the agent see and drive your screen (screenshot, launch apps, click, type). every action needs your approval. only apps you list below can be launched. use the panic button to stop everything instantly.</span>
+      <span class="hint">blind control uses Windows accessibility data, so ordinary apps work without an mmproj or GPU vision. screenshots are an optional fallback. every action needs your approval; use the panic button to stop everything instantly.</span>
     </div>
     <div class="form-row inline">
       <label>Enable desktop automation</label>
@@ -1312,7 +1441,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
-<script src="/app.js?v=2026082408"></script>
+<script src="/app.js?v=2026082701"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {

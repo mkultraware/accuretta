@@ -172,7 +172,7 @@ The optional WSL2 guest runs Linux tools inside a separate Ubuntu distro. Accure
 
 One-shot commands are useful until the task needs state. Session tools keep SSH, a Python REPL, a debugger, a database client, or another terminal process alive across model turns. The Shell tab is shared, so you can watch the same process and type into it yourself.
 
-Optional desktop tools can capture the screen, list and focus windows, click, type, and press keys. They remain approval-gated and depend on Pillow, pyautogui, and the host desktop session.
+Optional desktop tools use Windows UI Automation to inspect ordinary applications as structured controls and operate them without a vision projector. `uiautomation` powers the CPU-only accessibility path; Pillow and pyautogui are needed only for screenshot and raw mouse/keyboard fallbacks. Actions remain approval-gated and require an interactive host desktop session.
 
 Accuretta includes a dependency-free MCP stdio client. Add servers to `bridge_mcp_config.json`, restart the bridge, and their tools appear alongside the built-in tools. MCP calls require approval by default.
 
@@ -207,6 +207,8 @@ budget: 2000
 
 Type `#` in the composer to pick one (the built-in picker also lists them). A skill loads into the current chat, one skill per chat, and loading another one replaces it. The model reads the procedure until you unload it with the × button next to the skill pill. Bodies over 16,000 characters refuse to load. `skills/` is per-machine user content, so it is gitignored; the format above is all a new user needs.
 
+You can also ask the agent to “save this as a skill” and paste Markdown or point it at a workspace `.md` file. Accuretta writes the finished file into `skills/`, adds or repairs the frontmatter, and calculates `budget` with the active model's tokenizer. If the model server is unavailable, it uses the same conservative token estimate as the rest of the app. Existing skills are never replaced unless you explicitly ask for that.
+
 ## Context, recovery, and model health
 
 Long chats use rolling compaction. Older turns are folded into a structured summary while recent messages and tool results stay live. Manual compaction remains available, and failed automatic compaction stops cleanly instead of repeatedly chewing on the same old messages.
@@ -227,6 +229,8 @@ The tuner reads the GGUF header for layer count, attention layout, expert counts
 - memory reserves for the operating system, graphics desktop, and vision projector
 
 Each GGUF keeps its own saved configuration. A failed launch can fall back to a safer setup without overwriting the last known working values. A watchdog can restart llama-server after an unexpected crash and stops retrying when repeated failures point to a bad configuration.
+
+Speculative-decoding and vision-projector choices are also remembered per model. Projector mode is explicit: `off` guarantees a text-only launch, `automatic` looks for a matching nearby mmproj, and `manual` uses the selected file path. The Settings picker can select a projector without typing its path.
 
 Bigger context costs memory and prompt-processing time. The tuner aims for a configuration that fits the detected hardware; it cannot make an oversized model fast.
 
