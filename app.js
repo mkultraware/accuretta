@@ -17,7 +17,7 @@
     settings: {},
     workspace: { folders: [] },
     models: [],
-    mode: "auto",          // auto | ide | agent
+    mode: "agent",         // agent | ide
     view: "preview",       // preview | code
     versions: [],
     activeVersion: null,   // vid
@@ -35,6 +35,10 @@
     mobileTab: "chat",
     pendingImages: [],  // [{ dataUrl, name }]
     pendingFiles: [],   // browser File objects uploaded on send
+    messageQueues: new Map(), // chat id -> queued composer snapshots
+    queueDispatching: false,
+    queueEditId: null,
+    queueDrainTimer: null,
     clientContext: null,
     remoteAccess: null,
     executionTarget: localStorage.getItem("accuretta:execution-target") || "host",
@@ -601,6 +605,40 @@
     }
   }
 
+  function initChatJumpButton() {
+    const scroller = $("#chat-scroll");
+    const button = $("#chat-jump-bottom");
+    if (!scroller || !button) return;
+
+    let updateFrame = 0;
+    const update = () => {
+      if (updateFrame) return;
+      updateFrame = requestAnimationFrame(() => {
+        updateFrame = 0;
+        const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+        const visible = distance > 140;
+        button.classList.toggle("is-visible", visible);
+        button.setAttribute("aria-hidden", visible ? "false" : "true");
+        button.tabIndex = visible ? 0 : -1;
+      });
+    };
+
+    scroller.addEventListener("scroll", update, { passive: true });
+    button.addEventListener("click", () => {
+      scroller.scrollTo({
+        top: scroller.scrollHeight,
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+      });
+    });
+
+    if ("ResizeObserver" in window) {
+      scroller._jumpButtonObserver?.disconnect();
+      scroller._jumpButtonObserver = new ResizeObserver(update);
+      scroller._jumpButtonObserver.observe($("#chat-inner"));
+    }
+    update();
+  }
+
   function relTime(t) {
     const d = Math.floor(Date.now() / 1000) - (t || 0);
     if (d < 60) return "just now";
@@ -710,7 +748,7 @@
       setTimeout(() => { try { ctx.close(); } catch (e) {} }, (end - t0) * 1000 + 300);
     } catch (e) {}
   }
-  function playNotificationAsset({ src = "/notification.mp3?v=2026082401", rate = 1, volume = 0.72, fallbackNotes, fallbackVolume = 0.14 } = {}) {
+  function playNotificationAsset({ src = "/assets/audio/notification.mp3?v=2026082401", rate = 1, volume = 0.72, fallbackNotes, fallbackVolume = 0.14 } = {}) {
     if (!soundOn() || !reserveSoundSlot()) return;
     let didFallback = false;
     const fallback = () => {
@@ -750,7 +788,7 @@
   }
   function playFailureSound() {
     playNotificationAsset({
-      src: "/notification-error.wav?v=2026082401",
+      src: "/assets/audio/notification-error.wav?v=2026082401",
       volume: 0.68,
       fallbackNotes: [{ f: 392, t: 0, dur: 0.28 }, { f: 293.66, t: 0.14, dur: 0.55 }],
       fallbackVolume: 0.13,
@@ -761,7 +799,7 @@
     playApprovalSound();   // always audible (when enabled) — approvals are the point
     if (document.visibilityState !== "visible") {
       if (Notification.permission === "granted") {
-        const n = new Notification("Accuretta needs approval", { body: "The agent is waiting for your permission.", icon: "logo-mark-dark.png" });
+        const n = new Notification("Accuretta needs approval", { body: "The agent is waiting for your permission.", icon: "/assets/brand/logo-mark-dark.png" });
         n.onclick = () => { window.focus(); n.close(); };
       } else if (Notification.permission === "default") {
         Notification.requestPermission();
@@ -778,7 +816,7 @@
     playCompletionSound();
     if (document.visibilityState !== "visible") {
       if (Notification.permission === "granted") {
-        const n = new Notification("Accuretta", { body: "The agent finished.", icon: "logo-mark-dark.png" });
+        const n = new Notification("Accuretta", { body: "The agent finished.", icon: "/assets/brand/logo-mark-dark.png" });
         n.onclick = () => { window.focus(); n.close(); };
       } else if (Notification.permission === "default") {
         Notification.requestPermission();
@@ -791,7 +829,7 @@
     playFailureSound();
     if (document.visibilityState !== "visible") {
       if (Notification.permission === "granted") {
-        const n = new Notification("Accuretta task failed", { body: message || "The agent stopped with an error.", icon: "logo-mark-dark.png" });
+        const n = new Notification("Accuretta task failed", { body: message || "The agent stopped with an error.", icon: "/assets/brand/logo-mark-dark.png" });
         n.onclick = () => { window.focus(); n.close(); };
       } else if (Notification.permission === "default") {
         Notification.requestPermission();
@@ -836,6 +874,90 @@
     yara_scan:       { run: "yara_scanning",      err: "yara_failed" },
     binary_inspect:  { run: "chip_inspecting",    err: "chip_failed" },
   };
+
+  const APPROVAL_SVG = {
+    shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4.5 6v5.4c0 4.5 2.8 7.9 7.5 9.6 4.7-1.7 7.5-5.1 7.5-9.6V6z"/><path d="m9 12 2 2 4-4"/></svg>',
+    git: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7" cy="5" r="2"/><circle cx="17" cy="19" r="2"/><path d="M7 7v5a7 7 0 0 0 7 7h1M17 5v7"/><path d="m14 9 3 3 3-3"/></svg>',
+    git_push: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="18" r="2"/><path d="M6 16V9a4 4 0 0 1 4-4h3M14 18h4V7"/><path d="m14 11 4-4 4 4"/></svg>',
+    git_pull: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="2"/><path d="M6 8v7a4 4 0 0 0 4 4h3M18 5v12"/><path d="m14 13 4 4 4-4"/></svg>',
+    git_commit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h5m8 0h5"/><circle cx="12" cy="12" r="4"/></svg>',
+    git_merge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="18" cy="5" r="2"/><circle cx="12" cy="19" r="2"/><path d="M6 7v2a6 6 0 0 0 6 6v2M18 7v2a6 6 0 0 1-6 6"/></svg>',
+    git_branch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="18" cy="7" r="2"/><circle cx="6" cy="19" r="2"/><path d="M6 7v10M8 13h3a7 7 0 0 0 7-4"/></svg>',
+    git_reset: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8V4m0 0h4M5 5a9 9 0 1 1-1.5 9"/><circle cx="12" cy="12" r="2"/></svg>',
+    git_add: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h9l5 5v11H5z"/><path d="M14 4v5h5M9 14h6M12 11v6"/></svg>',
+    git_restore: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4h8l4 4v12H7zM15 4v4h4"/><path d="M10 12H7m0 0 2-2m-2 2 2 2M8 12a5 5 0 0 1 8 4"/></svg>',
+    git_init: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><path d="M6 7v10M13 8h8M17 4v8"/></svg>',
+    git_clone: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><path d="M6 7v10M16 4v12m-4-4 4 4 4-4"/></svg>',
+    test: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 3h6M10 3v5l-5 9a2.7 2.7 0 0 0 2.4 4h9.2a2.7 2.7 0 0 0 2.4-4l-5-9V3"/><path d="M7.8 15h8.4"/></svg>',
+    launch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8h18"/><path d="m10 11 5 3-5 3z"/></svg>',
+    registry: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
+    copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/><path d="m12 14 2-2 2 2m-2-2v5"/></svg>',
+    desktop_click: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 3 13 9-6 1.5L9 19z"/><path d="m13 14 4 6"/></svg>',
+    desktop_type: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 10h.01M11 10h.01M15 10h.01M18 10h.01M7 14h.01M10 14h7"/></svg>',
+    desktop: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
+    archive: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16v13H4zM3 3h18v4H3z"/><path d="M9 11h6M12 11v5m-2-2 2 2 2-2"/></svg>',
+    event_log: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 4h6l1 2h3v15H5V6h3z"/><path d="M8 11h8M8 15h8M8 18h5"/></svg>',
+    persistence: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m16 16 5 5M11 7v4l3 2"/></svg>',
+    mcp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v5M16 3v5M6 8h12v3a6 6 0 0 1-6 6v4"/></svg>',
+    skill: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h11a3 3 0 0 1 3 3v13H7a3 3 0 0 1-3-3z"/><path d="M7 16h11M15 3v6l-2-1-2 1V3"/></svg>',
+  };
+
+  function approvalIconSvg(approval) {
+    const details = approval?.details || {};
+    const kind = String(details.kind || "").toLowerCase();
+    if (kind === "git") {
+      const verb = String(details.argv?.[0] || "").toLowerCase();
+      const gitKey = ({
+        push: "git_push", pull: "git_pull", fetch: "git_pull",
+        commit: "git_commit", merge: "git_merge", branch: "git_branch",
+        checkout: "git_branch", switch: "git_branch", reset: "git_reset",
+        revert: "git_reset", add: "git_add", restore: "git_restore",
+        init: "git_init", clone: "git_clone",
+      })[verb];
+      return APPROVAL_SVG[gitKey] || APPROVAL_SVG.git;
+    }
+    if (kind.startsWith("desktop.")) {
+      const action = kind.slice("desktop.".length);
+      if (action === "click") return APPROVAL_SVG.desktop_click;
+      if (action === "type" || action === "keys") return APPROVAL_SVG.desktop_type;
+      return APPROVAL_SVG.desktop;
+    }
+    if (kind.startsWith("desktop_")) {
+      if (kind.includes("click")) return APPROVAL_SVG.desktop_click;
+      if (kind.includes("type") || kind.includes("keys")) return APPROVAL_SVG.desktop_type;
+      return APPROVAL_SVG.desktop;
+    }
+    if (kind.startsWith("mcp_")) return APPROVAL_SVG.mcp;
+
+    const icon = ({
+      write_file: TOOL_SVG.writing_file,
+      edit_file: TOOL_SVG.editing_file,
+      replace_ast_node: TOOL_SVG.editing_file,
+      delete: TOOL_SVG.deleted,
+      powershell: TOOL_SVG.running_command,
+      run_powershell: TOOL_SVG.running_command,
+      command: TOOL_SVG.running_command,
+      session: TOOL_SVG.running_command,
+      sandbox: TOOL_SVG.running_command,
+      remote_shell: TOOL_SVG.running_command,
+      test: APPROVAL_SVG.test,
+      launch: APPROVAL_SVG.launch,
+      registry: APPROVAL_SVG.registry,
+      remote_file_write: TOOL_SVG.writing_file,
+      remote_file_copy: APPROVAL_SVG.copy,
+      network_snapshot: TOOL_SVG.globe,
+      event_log: APPROVAL_SVG.event_log,
+      persistence_hunt: APPROVAL_SVG.persistence,
+      extract_archive: APPROVAL_SVG.archive,
+      extract_squashfs: APPROVAL_SVG.archive,
+      carve_file: TOOL_SVG.writing_file,
+      decompile_apk: TOOL_SVG.chip_inspecting,
+      save_skill: APPROVAL_SVG.skill,
+      recon_s3: TOOL_SVG.globe,
+    })[kind];
+    return icon || APPROVAL_SVG.shield;
+  }
+
   function renderWebSearchChips(results) {
     if (!results || !results.length) return "";
     const max = 4;
@@ -1042,7 +1164,7 @@
     group.querySelectorAll(".tool-line.activity-older").forEach(line => line.classList.remove("activity-older"));
     group.querySelectorAll(".tool-line.running").forEach(line => {
       line.classList.remove("running");
-      line.classList.add("err");
+      line.classList.add(row._stopRequested ? "stopped" : "err");
       line.querySelector(".tool-line-label")?.classList.remove("shimmer");
       if (!line.querySelector(".tl-time")) {
         line.insertAdjacentHTML("beforeend", '<span class="tl-time">stopped</span>');
@@ -2982,8 +3104,8 @@
   async function loadSettings() {
     state.settings = await api("/api/settings");
     if (state.settings) {
-      const savedMode = String(state.settings.composer_mode || "auto").toLowerCase();
-      state.mode = ["auto", "agent", "ide"].includes(savedMode) ? savedMode : "auto";
+      const savedMode = String(state.settings.composer_mode || "agent").toLowerCase();
+      state.mode = savedMode === "ide" ? "ide" : "agent";
       const savedEffort = String(state.settings.reasoning_effort || "auto").toLowerCase();
       state.reasoningEffort = ["auto", "low", "medium", "high"].includes(savedEffort)
         ? savedEffort : "auto";
@@ -3219,7 +3341,7 @@
     $("#chat-title").textContent = chat ? chat.title : "new session";
     // Restore the last-used mode for this chat so the toolbar feels sticky.
     // IDE is unavailable in compact layouts because the preview pane is hidden.
-    if (chat && chat.last_mode && ["auto", "ide", "agent"].includes(chat.last_mode)) {
+    if (chat && chat.last_mode) {
       setComposerMode(chat.last_mode);
     } else if (isMobile() && state.mode === "ide") {
       setComposerMode("agent");
@@ -3290,6 +3412,9 @@
     const ta = $("#composer-input");
     ta.value = localStorage.getItem("accuretta:draft:" + id) || "";
     autoResize(ta);
+    state.queueEditId = null;
+    renderMessageQueue();
+    if (!state.streaming) scheduleMessageQueueDrain(id);
     if (isMobile()) {
       state.mobileTab = "chat";
       applyMobileTab();
@@ -3418,6 +3543,8 @@
     if (!ok) return;
     await fetch(`/api/chats/${id}`, { method: "DELETE" });
     localStorage.removeItem("accuretta:draft:" + id);
+    state.messageQueues.delete(id);
+    if (state.queueEditId) state.queueEditId = null;
     await loadChats();
     if (state.chatId === id) {
       if (state.chats.order.length) selectChat(state.chats.order[0]);
@@ -3733,6 +3860,7 @@
     let thoughtChip = "";
     let thinkingText = "";
     let cascadeChips = "";
+    let stoppedMarker = "";
     if (m.role === "assistant") {
       const { thinking, content } = splitThinking(visible);
       thinkingText = thinking;
@@ -3742,7 +3870,10 @@
       // real answer hides inside the collapsible chip (older saved chats hit
       // this routinely). Render the think text AS the visible answer — the
       // chip above stays as the collapsible copy of the same content.
-      if (!content.trim() && thinking &&
+      if (m._stopped) {
+        visible = content;
+        stoppedMarker = stoppedTurnMarkup();
+      } else if (!content.trim() && thinking &&
           THINK_CLOSE_RE.test((m.content || "").replace(/\s+$/, "").slice(-200))) {
         visible = "> The model closed its reply inside its **thinking block**. Full text follows.\n\n" + thinking;
       } else if (!content.trim() && thinking) {
@@ -3755,8 +3886,8 @@
           <div class="think-container done">
             <div class="think-header" style="cursor: pointer;">
               <i class="ph ph-caret-right think-caret"></i>
-              <i class="ph ph-check-circle think-check-icon done"></i>
-              <span class="think-title">Thought for a moment</span>
+              <i class="ph ${m._stopped ? "ph-stop-circle" : "ph-check-circle"} think-check-icon done"></i>
+              <span class="think-title">${m._stopped ? "Stopped" : "Thought for a moment"}</span>
             </div>
             <div class="think-content hidden"></div>
           </div>`;
@@ -3776,8 +3907,9 @@
       ${avatar}
       <div class="bubble-col">
         ${thoughtChip}
-        <div class="bubble ${m.role === "user" ? "user" : "agent"}">${renderMarkdown(visible)}</div>
+        <div class="bubble ${m.role === "user" ? "user" : "agent"}${m._stopped && !visible.trim() ? " hidden" : ""}">${renderMarkdown(visible)}</div>
         ${cascadeChips}
+        ${stoppedMarker}
         <div class="bubble-meta"${tokTip}>${m.role === "user" ? `you · ${relTime(m.t)}` : relTime(m.t)}</div>
       </div>`;
     const savedThinkContent = row.querySelector(".think-content");
@@ -3937,7 +4069,9 @@
     try {
       await streamChat("", agentRow, state.abortCtl.signal, [], { regenerate: true });
     } catch (e) {
-      if (e.name !== "AbortError") {
+      if (e.name === "AbortError") {
+        renderStoppedTurn(agentRow);
+      } else {
         agentRow._notificationFailed = true;
         agentRow._notificationError = e.message;
         toast("regenerate failed: " + e.message, "err");
@@ -3946,9 +4080,10 @@
       state.streaming = false;
       state.abortCtl = null;
       state.liveTurn = null;
-      setStreamingUI(false);
+      setStreamingUI(false, agentRow._notificationCancelled ? "stopped" : agentRow._notificationFailed ? "failed" : "completed");
       renderRegenerateChip();
       if (agentRow._notificationFailed) notifyFailure(agentRow._notificationError, agentRow._workStart ? Date.now() - agentRow._workStart : 0);
+      scheduleMessageQueueDrain(state.chatId);
     }
   }
 
@@ -4069,6 +4204,193 @@
     renderImageTray();
   }
 
+  function messageQueue(chatId = state.chatId, create = false) {
+    if (!chatId) return [];
+    if (!state.messageQueues.has(chatId) && create) state.messageQueues.set(chatId, []);
+    return state.messageQueues.get(chatId) || [];
+  }
+
+  function queuedMessageId() {
+    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+    return `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function queuedMessageMeta(item) {
+    const parts = [];
+    const mode = String(item.mode || "auto");
+    parts.push(mode === "ide" ? "IDE" : mode === "agent" ? "Agent" : "Auto");
+    if (item.reasoningEffort && item.reasoningEffort !== "auto") {
+      parts.push(item.reasoningEffort === "high"
+        ? "Deep"
+        : item.reasoningEffort[0].toUpperCase() + item.reasoningEffort.slice(1));
+    }
+    if (item.images?.length) parts.push(`${item.images.length} image${item.images.length === 1 ? "" : "s"}`);
+    if (item.files?.length) parts.push(`${item.files.length} file${item.files.length === 1 ? "" : "s"}`);
+    return parts;
+  }
+
+  function renderMessageQueue() {
+    const host = $("#message-queue");
+    if (!host) return;
+    const queue = messageQueue();
+    host.classList.toggle("hidden", !queue.length);
+    if (!queue.length) {
+      host.innerHTML = "";
+      state.queueEditId = null;
+      return;
+    }
+    host.innerHTML = `
+      <div class="message-queue-head">
+        <span><i class="ph ph-stack"></i>Next up</span>
+        <small>${queue.length} queued</small>
+      </div>
+      <div class="message-queue-list">
+        ${queue.map((item, index) => {
+          const editing = state.queueEditId === item.id;
+          const fallback = item.images?.length || item.files?.length ? "Attachments only" : "Empty message";
+          return `<article class="queued-message${editing ? " is-editing" : ""}" data-queue-id="${esc(item.id)}">
+            <span class="queued-message-index">${index + 1}</span>
+            <div class="queued-message-body">
+              ${editing
+                ? `<textarea class="queued-message-editor" rows="2" aria-label="Edit queued message">${esc(item.text || "")}</textarea>`
+                : `<div class="queued-message-text" title="${esc(item.text || fallback)}">${esc(item.text || fallback)}</div>`}
+              <div class="queued-message-meta">${queuedMessageMeta(item).map(part => `<span>${esc(part)}</span>`).join("")}</div>
+            </div>
+            <div class="queued-message-actions">
+              ${editing
+                ? `<button type="button" data-queue-act="save" title="Save"><i class="ph ph-check"></i></button><button type="button" data-queue-act="cancel" title="Cancel"><i class="ph ph-x"></i></button>`
+                : `<button type="button" data-queue-act="up" title="Move up"${index === 0 ? " disabled" : ""}><i class="ph ph-caret-up"></i></button><button type="button" data-queue-act="down" title="Move down"${index === queue.length - 1 ? " disabled" : ""}><i class="ph ph-caret-down"></i></button><button type="button" data-queue-act="edit" title="Edit"><i class="ph ph-pencil-simple"></i></button><button type="button" data-queue-act="remove" title="Remove"><i class="ph ph-trash"></i></button>`}
+            </div>
+          </article>`;
+        }).join("")}
+      </div>`;
+
+    host.querySelectorAll("[data-queue-act]").forEach(button => {
+      button.addEventListener("click", () => {
+        const row = button.closest(".queued-message");
+        const id = row?.dataset.queueId;
+        const index = queue.findIndex(item => item.id === id);
+        if (index < 0) return;
+        const action = button.dataset.queueAct;
+        if (action === "remove") {
+          queue.splice(index, 1);
+          if (state.queueEditId === id) state.queueEditId = null;
+        } else if (action === "up" && index > 0) {
+          [queue[index - 1], queue[index]] = [queue[index], queue[index - 1]];
+        } else if (action === "down" && index < queue.length - 1) {
+          [queue[index + 1], queue[index]] = [queue[index], queue[index + 1]];
+        } else if (action === "edit") {
+          state.queueEditId = id;
+        } else if (action === "cancel") {
+          state.queueEditId = null;
+        } else if (action === "save") {
+          const nextText = row.querySelector(".queued-message-editor")?.value.trim() || "";
+          if (!nextText && !queue[index].images?.length && !queue[index].files?.length) {
+            queue.splice(index, 1);
+          } else {
+            queue[index].text = nextText;
+          }
+          state.queueEditId = null;
+        }
+        renderMessageQueue();
+        if (action === "edit") {
+          const editor = host.querySelector(`[data-queue-id="${CSS.escape(id)}"] .queued-message-editor`);
+          editor?.focus();
+          editor?.setSelectionRange(editor.value.length, editor.value.length);
+        } else if (!state.streaming && !state.queueDispatching) {
+          scheduleMessageQueueDrain(state.chatId);
+        }
+      });
+    });
+  }
+
+  async function enqueueMessage(opts = {}) {
+    const fromComposer = opts.prompt === undefined;
+    const ta = $("#composer-input");
+    const chatId = state.chatId;
+    const text = fromComposer ? ta.value.trim() : String(opts.prompt || "").trim();
+    const images = Array.isArray(opts.images) ? opts.images.slice() : (fromComposer ? state.pendingImages.slice() : []);
+    const files = Array.isArray(opts.files) ? opts.files.slice() : (fromComposer ? state.pendingFiles.slice() : []);
+    if (!text && !images.length && !files.length) return false;
+    if (!chatId) return false;
+    if (!state.settings.model) {
+      toast("Pick a model in Settings first.", "warn", 3200, "no-model");
+      openSettings();
+      return false;
+    }
+
+    if (fromComposer) {
+      ta.value = "";
+      autoResize(ta);
+      hideMentionMenu();
+      localStorage.removeItem("accuretta:draft:" + chatId);
+      state.pendingImages = [];
+      state.pendingFiles = [];
+      renderImageTray();
+    }
+
+    if (text && /\breview this ui\b/i.test(text) && !images.length && state.currentHtml) {
+      const canvas = await captureIframePng();
+      if (canvas) images.push({ dataUrl: canvas.toDataURL("image/png"), name: `ui-${Date.now()}.png` });
+    }
+
+    const item = {
+      id: queuedMessageId(),
+      chatId,
+      text,
+      images,
+      files,
+      mode: opts.mode || state.mode,
+      reasoningEffort: opts.reasoningEffort || state.reasoningEffort || "auto",
+      clientContext: opts.clientContext || currentClientHint(),
+      invisible: !!opts.invisible,
+      mission: opts.mission || null,
+      createdAt: Date.now(),
+    };
+    messageQueue(chatId, true).push(item);
+    if (state.chatId === chatId) renderMessageQueue();
+    appendAgentLog("Message added to queue.");
+    if (state.chatId === chatId && !state.streaming && !state.queueDispatching) scheduleMessageQueueDrain(chatId);
+    return true;
+  }
+
+  function scheduleMessageQueueDrain(chatId = state.chatId) {
+    clearTimeout(state.queueDrainTimer);
+    state.queueDrainTimer = setTimeout(() => drainMessageQueue(chatId), 80);
+  }
+
+  async function drainMessageQueue(chatId = state.chatId) {
+    if (!chatId || state.chatId !== chatId || state.streaming || state.queueDispatching || state.queueEditId) return;
+    const queue = messageQueue(chatId);
+    if (!queue.length) return;
+    const item = queue.shift();
+    state.queueEditId = null;
+    state.queueDispatching = true;
+    renderMessageQueue();
+    let accepted = false;
+    try {
+      accepted = await send({
+        prompt: item.text,
+        images: item.images,
+        files: item.files,
+        mode: item.mode,
+        reasoningEffort: item.reasoningEffort,
+        clientContext: item.clientContext,
+        invisible: item.invisible,
+        mission: item.mission,
+        fromQueue: true,
+      }) !== false;
+    } finally {
+      state.queueDispatching = false;
+      if (!accepted) {
+        queue.unshift(item);
+        renderMessageQueue();
+      } else if (queue.length) {
+        scheduleMessageQueueDrain(chatId);
+      }
+    }
+  }
+
   async function uploadClientFiles(files) {
     const uploaded = [];
     for (const file of files) {
@@ -4088,33 +4410,69 @@
   }
 
   // ---------- send / stream ----------
+  function stoppedTurnMarkup() {
+    return `<div class="turn-stopped" role="status">` +
+      `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><rect x="8.5" y="8.5" width="7" height="7" rx="1.25"/></svg>` +
+      `<strong>Stopped</strong><small>Turn ended before completion</small>` +
+    `</div>`;
+  }
+
+  function renderStoppedTurn(row) {
+    if (!row) return;
+    row._notificationCancelled = true;
+    row.classList.add("was-stopped");
+    const col = row.querySelector(".bubble-col");
+    const bubble = row.querySelector("#stream-bubble") || row.querySelector(".bubble.agent");
+    if (!col || !bubble) return;
+    const hasVisibleReply = !bubble.classList.contains("hidden") && !!bubble.textContent.trim();
+    if (!hasVisibleReply) {
+      bubble.innerHTML = "";
+      bubble.classList.add("hidden");
+    }
+    col.querySelector(".turn-stopped")?.remove();
+    const marker = document.createElement("div");
+    marker.innerHTML = stoppedTurnMarkup();
+    const meta = col.querySelector(".bubble-meta");
+    col.insertBefore(marker.firstElementChild, meta || null);
+
+    const think = row.querySelector(".think-container");
+    const title = think?.querySelector(".think-title");
+    const icon = think?.querySelector(".think-check-icon");
+    const seconds = row._workStart ? Math.max(1, Math.round((Date.now() - row._workStart) / 1000)) : 0;
+    if (title) title.textContent = seconds ? `Stopped after ${seconds}s` : "Stopped";
+    if (icon) icon.className = "ph ph-stop-circle think-check-icon done";
+  }
+
   async function send(opts = {}) {
-    if (state.streaming) return;
+    if (state.streaming || (state.queueDispatching && !opts.fromQueue)) {
+      if (opts.fromQueue) return false;
+      return enqueueMessage(opts);
+    }
     const ta = $("#composer-input");
-    let text = opts.prompt !== undefined ? opts.prompt.trim() : ta.value.trim();
+    const fromComposer = opts.prompt === undefined;
+    let text = fromComposer ? ta.value.trim() : String(opts.prompt || "").trim();
+    const images = Array.isArray(opts.images) ? opts.images.slice() : (fromComposer ? state.pendingImages.slice() : []);
+    const files = Array.isArray(opts.files) ? opts.files.slice() : (fromComposer ? state.pendingFiles.slice() : []);
 
     // "review this UI" → auto-capture the preview iframe and attach as an image
     // so the vision model actually sees it. Skip if the user already attached
     // something or the phrase is trivially present in an unrelated way.
-    if (text && /\breview this ui\b/i.test(text) && !state.pendingImages.length && state.currentHtml) {
+    if (text && /\breview this ui\b/i.test(text) && !images.length && state.currentHtml) {
       const canvas = await captureIframePng();
       if (canvas) {
         const dataUrl = canvas.toDataURL("image/png");
-        state.pendingImages.push({ dataUrl, name: `ui-${Date.now()}.png` });
-        renderImageTray();
+        images.push({ dataUrl, name: `ui-${Date.now()}.png` });
       }
     }
 
-    const images = state.pendingImages.slice();
-    const files = state.pendingFiles.slice();
-    if (!text && !images.length && !files.length) return;
+    if (!text && !images.length && !files.length) return false;
     // A new request starts fresh: drop any prior turn's plan panel. The model
     // re-emits update_plan if this task is multi-step.
     renderPlanPanel([]);
     if (!state.settings.model) {
       toast("Pick a model in Settings first.", "warn", 3200, "no-model");
       openSettings();
-      return;
+      return false;
     }
     let uploadedFiles = [];
     if (files.length) {
@@ -4125,7 +4483,7 @@
       } catch (e) {
         hideToast("client-upload");
         toast(`File upload failed: ${e.message || e}`, "err", 4500);
-        return;
+        return false;
       }
       const fileBlock = [
         "[Files uploaded from the active browser client into the inference PC workspace]",
@@ -4133,15 +4491,15 @@
       ].join("\n");
       text = text ? `${text}\n\n${fileBlock}` : fileBlock;
     }
-    if (opts.prompt === undefined) {
+    if (fromComposer) {
       ta.value = "";
       autoResize(ta);
       hideMentionMenu();
+      if (state.chatId) localStorage.removeItem("accuretta:draft:" + state.chatId);
+      state.pendingImages = [];
+      state.pendingFiles = [];
+      renderImageTray();
     }
-    if (state.chatId) localStorage.removeItem("accuretta:draft:" + state.chatId);
-    state.pendingImages = [];
-    state.pendingFiles = [];
-    renderImageTray();
 
     // show the image count in the user bubble so they know what got sent.
     // Plain text label — no emoji (rendered inline in stored content, where an
@@ -4207,15 +4565,14 @@
     try {
       await streamChat(withMentionRefs(text), agentRow, state.abortCtl.signal, images, opts);
     } catch (e) {
-      if (e.beforeStream && images.length) {
+      if (e.beforeStream && images.length && fromComposer) {
         state.pendingImages = [...images, ...state.pendingImages];
         renderImageTray();
       }
       const b = agentRow.querySelector("#stream-bubble") || agentRow.querySelector(".bubble");
       if (b) {
         if (e.name === "AbortError") {
-          agentRow._notificationCancelled = true;
-          b.innerHTML += `<div style="color: var(--fg-faint); font-size:11px; margin-top:6px;">— stopped</div>`;
+          renderStoppedTurn(agentRow);
         } else {
           agentRow._notificationFailed = true;
           agentRow._notificationError = e.message;
@@ -4227,7 +4584,7 @@
       state.streaming = false;
       state.abortCtl = null;
       state.liveTurn = null;   // turn committed; partial no longer needs restoring
-      setStreamingUI(false);
+      setStreamingUI(false, agentRow._notificationCancelled ? "stopped" : agentRow._notificationFailed ? "failed" : "completed");
       await loadChats();
       const finishedChat = state.chats.chats[finishedChatId];
       if (finishedChat) {
@@ -4237,23 +4594,32 @@
       renderChatList();
       if (agentRow._notificationFailed) notifyFailure(agentRow._notificationError, agentRow._workStart ? Date.now() - agentRow._workStart : 0);
       else if (!agentRow._notificationCancelled) notifyCompletion(agentRow._workStart ? Date.now() - agentRow._workStart : 0);
+      scheduleMessageQueueDrain(state.chatId);
     }
+    return true;
   }
 
-  function setStreamingUI(on) {
-    $("#btn-send").classList.toggle("hidden", on);
+  function setStreamingUI(on, outcome = "completed") {
+    const sendButton = $("#btn-send");
+    sendButton.classList.remove("hidden");
+    sendButton.classList.toggle("queue-mode", on);
+    sendButton.title = on ? "Add message to queue" : "Send (⌘⏎)";
+    sendButton.setAttribute("aria-label", on ? "Add message to queue" : "Send message");
+    const sendIcon = sendButton.querySelector("i");
+    if (sendIcon) sendIcon.className = on ? "ph ph-plus" : "ph-bold ph-arrow-up";
     $("#btn-stop").classList.toggle("hidden", !on);
     $("#composer-input").disabled = false; // always allow typing next message
     const comp = document.querySelector(".composer");
     if (comp) comp.classList.toggle("status-thinking", on);
     renderStatus(0, on ? "streaming" : "idle");
-    appendAgentLog(on ? "Agent streaming started." : "Agent streaming completed.");
+    appendAgentLog(on ? "Agent streaming started." : `Agent streaming ${outcome}.`);
   }
 
   function stopStreaming() {
     // tell the bridge to force-close the llama-server socket first — otherwise
     // generation keeps running server-side until it hits its own limit.
     const cid = state.chatId;
+    if (state.liveTurn?.row) state.liveTurn.row._stopRequested = true;
     if (cid) {
       try {
         fetch("/api/cancel", {
@@ -4318,13 +4684,13 @@
       body: JSON.stringify({
         chat_id: state.chatId,
         message: text,
-        mode: state.mode,
+        mode: opts?.mode || state.mode,
         images: (images || []).map(x => x.dataUrl),
         regenerate,
         invisible: !!(opts && opts.invisible),
         mission: (opts && opts.mission) || undefined,
-        reasoning_effort: state.reasoningEffort || "auto",
-        client_context: currentClientHint(),
+        reasoning_effort: opts?.reasoningEffort || state.reasoningEffort || "auto",
+        client_context: opts?.clientContext || currentClientHint(),
       }),
        signal,
      });
@@ -4388,14 +4754,13 @@
         osintCardFinalize(agentRow);
         secretRailFinalize(agentRow);
         attackRailFinalize(agentRow);
-        maybeSettleSkillCards();
         const revealerDeck = document.querySelector("#revealer-deck");
         if (revealerDeck) delete revealerDeck.dataset.rtEngagement;
       }
       // safety net: if the model ran tools or thought for a while but ended
       // without a visible answer, surface what we have so the user isn't
       // staring at nothing. Promote the tail of thinking if it's substantive.
-      if (bubble && bubble.classList.contains("hidden")) {
+      if (!agentRow?._stopRequested && !signal?.aborted && bubble && bubble.classList.contains("hidden")) {
         const { thinking, content } = splitThinking(buf);
         const cascadeRes = splitCascade(content);
         const hasCascade = cascadeRes.cascade && cascadeRes.cascade.length > 0;
@@ -6086,6 +6451,10 @@
       });
       renderMessages();
     } else if (evt.type === "error") {
+      if (row?._stopRequested) {
+        renderStoppedTurn(row);
+        return;
+      }
       if (row) {
         row._notificationFailed = true;
         row._notificationError = evt.error || "The agent stopped with an error.";
@@ -8879,7 +9248,7 @@
       
       card.innerHTML = `
         <div class="revealer-card-head">
-          <span class="revealer-card-icon"><i class="ph ph-shield-check"></i></span>
+          <span class="revealer-card-icon">${approvalIconSvg(a)}</span>
           <span class="revealer-card-title">${esc(a.title || "Review requested action")}</span>
           <span class="revealer-card-stats">Review and confirm the actions the agent will take.</span>
           <span class="grow"></span>
@@ -9080,7 +9449,6 @@
         if (chatId === state.chatId) {
           state.activeSkill = { name: evt.skill, budget: evt.budget || 0, body_chars: evt.body_chars || 0 };
           renderSkillPill();
-          skillDeckCard(evt);
         }
         appendAgentLog(`Skill loaded: ${evt.skill}${evt.replaced ? ` (replaced ${evt.replaced})` : ""}.`);
       } else if (evt.type === "skill:cleared") {
@@ -9092,7 +9460,6 @@
         if (chatId === state.chatId) {
           state.activeSkill = null;
           renderSkillPill();
-          clearSkillDeckCard();
         }
         appendAgentLog("Active skill cleared.");
       } else if (evt.type === "summary_fold_failed") {
@@ -11288,7 +11655,7 @@
     // mid-render async image load). Falls back to the accent square on failure.
     let logoDataUrl = "";
     try {
-      const blob = await (await fetch("/logo-mark-light.png")).blob();
+      const blob = await (await fetch("/assets/brand/logo-mark-light.png")).blob();
       logoDataUrl = await new Promise((res, rej) => {
         const fr = new FileReader();
         fr.onload = () => res(fr.result);
@@ -11480,14 +11847,14 @@
   }
 
   const COMPOSER_MODES = {
-    auto: { label: "Auto", icon: "ph-lightning" },
     agent: { label: "Agent", icon: "ph-terminal-window" },
     ide: { label: "IDE", icon: "ph-code" },
   };
 
   function setComposerMode(mode, { announce = false, persist = false } = {}) {
-    mode = String(mode || "auto").toLowerCase();
-    if (!Object.prototype.hasOwnProperty.call(COMPOSER_MODES, mode)) mode = "auto";
+    mode = String(mode || "agent").toLowerCase();
+    if (mode === "auto") mode = "agent";
+    if (!Object.prototype.hasOwnProperty.call(COMPOSER_MODES, mode)) mode = "agent";
     if (mode === "ide" && isCompactViewport()) {
       if (announce) toast("IDE mode needs a wider window for the preview pane.", "info", 2600);
       mode = "agent";
@@ -12213,7 +12580,6 @@
       delete raw.active_skill_budget;
     }
     renderSkillPill();
-    clearSkillDeckCard();
 
     try {
       const result = await api("/api/skills/clear", {
@@ -12231,7 +12597,6 @@
           raw.active_skill_budget = previous.budget || 0;
         }
         renderSkillPill();
-        skillDeckCard({ skill: previous.name, budget: previous.budget || 0 });
       }
       toast(`Could not unload ${previous.name}: ${error?.message || error}`, "err", 4500, "skill-unload-fail");
     }
@@ -12255,100 +12620,6 @@
       const button = e.currentTarget;
       button.disabled = true;
       await clearActiveSkill();
-    });
-  }
-
-  function skillDeckCard(evt) {
-    const deck = $("#revealer-deck");
-    if (!deck) return null;
-    // One live skill card at a time: a re-load (replaced skill) swaps the old.
-    const old = deck.querySelector(".revealer-card.skill-load");
-    if (old) {
-      clearTimeout(old._settleTimer);
-      clearTimeout(old._compactTimer);
-      old.remove();
-    }
-    const card = document.createElement("div");
-    card.className = "revealer-card notifications skill-load";
-    card.dataset.cardType = "notifications";
-    card.dataset.skill = evt.skill || "";
-    card.title = `Skill loaded: ${evt.skill || "active skill"}`;
-    const budget = evt.budget ? ` · ~${kTokens(evt.budget)} tok` : "";
-    const replaced = evt.replaced ? ` · replaced ${esc(evt.replaced)}` : "";
-    card.innerHTML =
-      `<span class="notification-icon is-skill"><i class="ph ph-book-open-text" aria-hidden="true"></i></span>` +
-      `<div class="skill-load-body">` +
-      `<svg class="skill-loader" viewBox="0 0 20 20" aria-hidden="true">` +
-      `<rect x="3.25" y="3.25" width="13.5" height="13.5" rx="3"></rect>` +
-      `<path d="M6.5 10h7"></path>` +
-      `</svg>` +
-      `<span class="notification-copy"><span class="notification-label">Skill loaded</span>` +
-      `<span class="notification-text"><strong>${esc(evt.skill)}</strong>${budget}${replaced} · guiding this turn</span></span>` +
-      `</div>`;
-    card.classList.add("note-pre");
-    deck.appendChild(card);
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      card.classList.remove("note-pre");
-      _syncDeckStack();
-    }));
-    scheduleSkillCompact(card);
-    if (!state.streaming) scheduleSkillSettle(card);
-    return card;
-  }
-
-  function scheduleSkillSettle(card) {
-    if (!card || card._settled) return;
-    clearTimeout(card._settleTimer);
-    card._settleTimer = setTimeout(() => {
-      if (state.streaming) { scheduleSkillSettle(card); return; }
-      settleSkillCard(card);
-    }, 2500);
-  }
-
-  const SKILL_COMPACT_DELAY_MS = 6000;
-
-  function scheduleSkillCompact(card) {
-    if (!card || card.classList.contains("is-compact")) return;
-    clearTimeout(card._compactTimer);
-    card._compactTimer = setTimeout(() => {
-      if (!card.isConnected) return;
-      card.classList.add("is-compact");
-      card.title = `Skill active: ${card.dataset.skill || "active skill"}`;
-      _syncDeckStack();
-    }, SKILL_COMPACT_DELAY_MS);
-  }
-
-  // Turn ended (or the skill loaded outside a turn): stop the loader, dim the
-  // card to a settled "active" state. It persists until cleared/replaced.
-  function settleSkillCard(card) {
-    if (!card || card._settled) return;
-    card._settled = true;
-    clearTimeout(card._settleTimer);
-    card.classList.add("is-done");
-    const txt = card.querySelector(".notification-text");
-    const label = card.querySelector(".notification-label");
-    const name = card.dataset.skill || "skill";
-    if (label) label.textContent = "Skill active";
-    if (txt) txt.textContent = name;
-  }
-
-  function maybeSettleSkillCards() {
-    const deck = $("#revealer-deck");
-    if (!deck) return;
-    deck.querySelectorAll(".revealer-card.skill-load:not(.is-done)").forEach(c => {
-      if (!state.streaming) { settleSkillCard(c); }
-    });
-  }
-
-  function clearSkillDeckCard() {
-    const deck = $("#revealer-deck");
-    if (!deck) return;
-    deck.querySelectorAll(".revealer-card.skill-load").forEach(c => {
-      settleSkillCard(c);
-      clearTimeout(c._settleTimer);
-      clearTimeout(c._compactTimer);
-      c.classList.add("fade-out");
-      setTimeout(() => { c.remove(); if (deck.children.length === 0) deck.innerHTML = ""; }, 220);
     });
   }
 
@@ -12513,6 +12784,7 @@
   }
 
   function wireEvents() {
+    initChatJumpButton();
     $("#btn-new-chat").addEventListener("click", newChat);
     // Manual compaction: fold older turns into the session summary now. The
     // auto-summarizer only fires near the context limit (0.85) — this lets the

@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">Accuretta social preview</title>
+  <desc id="desc">Editorial light and dark Accuretta artwork with an oversized wordmark and restrained dot field.</desc>
+  <defs>
+    <pattern id="dot-field" width="16" height="16" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.15" fill="#f3f0e8"/>
+    </pattern>
+    <radialGradient id="dot-fade">
+      <stop offset="0" stop-color="white"/>
+      <stop offset="0.62" stop-color="white" stop-opacity="0.72"/>
+      <stop offset="1" stop-color="black" stop-opacity="0"/>
+    </radialGradient>
+    <mask id="dot-mask">
+      <ellipse cx="1040" cy="256" rx="300" ry="260" fill="url(#dot-fade)"/>
+    </mask>
+    <clipPath id="light-side"><rect width="848" height="630"/></clipPath>
+    <clipPath id="dark-side"><rect x="848" width="352" height="630"/></clipPath>
+  </defs>
+
+  <rect width="1200" height="630" fill="#f3f0e8"/>
+  <rect x="848" width="352" height="630" fill="#111315"/>
+  <rect x="848" width="2" height="630" fill="#ff5a32"/>
+  <rect x="760" y="0" width="440" height="520" fill="url(#dot-field)" opacity="0.17" mask="url(#dot-mask)"/>
+
+  <g font-family="Cascadia Mono, Consolas, monospace" font-size="12" font-weight="600" letter-spacing="2.4">
+    <rect x="62" y="58" width="13" height="13" fill="#ff5a32"/>
+    <text x="89" y="69" fill="#111315">LOCAL-FIRST AI</text>
+    <text x="1138" y="69" fill="#f3f0e8" text-anchor="end">01 / 01</text>
+  </g>
+
+  <g font-family="Bahnschrift SemiBold Condensed, Bahnschrift Condensed, Arial Narrow, sans-serif" font-size="162" font-weight="700" letter-spacing="1">
+    <text x="54" y="338" fill="#111315" clip-path="url(#light-side)">ACCURETTA</text>
+    <text x="54" y="338" fill="#f3f0e8" clip-path="url(#dark-side)">ACCURETTA</text>
+  </g>
+
+  <g font-family="Cascadia Mono, Consolas, monospace">
+    <text x="64" y="400" fill="#111315" font-size="18" font-weight="600" letter-spacing="4.1">YOUR MODEL. YOUR MACHINE.</text>
+    <text x="64" y="550" fill="#555652" font-size="13" letter-spacing="1.45">TURN A LOCAL MODEL INTO AN AGENT THAT CAN ACT.</text>
+    <text x="64" y="585" fill="#111315" font-size="11" font-weight="600" letter-spacing="1.55">GITHUB.COM/MKULTRAWARE/ACCURETTA</text>
+  </g>
+
+  <g transform="translate(1010 443)">
+    <path d="M0 79 48-9c4-8 10-12 19-12h24c6 0 8 4 5 9L47 77c-4 8-10 12-19 12H7c-8 0-11-4-7-10Z" fill="#f3f0e8"/>
+    <path d="m68 79 24-44c4-8 10-12 18-12h8c8 0 14 4 18 12l24 44c4 7 1 10-6 10H74c-7 0-10-3-6-10Z" fill="#ff5a32"/>
+  </g>
+
+  <path d="M900 390h250" stroke="#ff5a32" stroke-width="1.5"/>
+  <circle cx="900" cy="390" r="4" fill="#ff5a32"/>
+  <circle cx="1150" cy="390" r="4" fill="#111315" stroke="#ff5a32" stroke-width="1.5"/>
+</svg>

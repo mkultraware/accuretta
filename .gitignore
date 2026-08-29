@@ -5,7 +5,7 @@
 # ============================================================
 
 # runtime user data — all of it is per-machine and often sensitive
-data/
+data/*
 !data/.gitkeep
 
 # python
@@ -78,7 +78,6 @@ github_stats.db
 # Local release and design work that is not part of the app.
 promo_video/
 AUDIT_AND_ROADMAP.md
-media/holographic_bg.jpg
 
 # internal test suite — not shipped to users
 tests/

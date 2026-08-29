@@ -1,9 +1,9 @@
 <div align="center">
 
 <picture>
-  <source srcset="logo-mark-dark.png" media="(prefers-color-scheme: dark)">
-  <source srcset="logo-mark-light.png" media="(prefers-color-scheme: light)">
-  <img src="logo-mark-light.png" alt="Accuretta logo" width="130" />
+  <source srcset="assets/brand/logo-mark-dark.png" media="(prefers-color-scheme: dark)">
+  <source srcset="assets/brand/logo-mark-light.png" media="(prefers-color-scheme: light)">
+  <img src="assets/brand/logo-mark-light.png" alt="Accuretta logo" width="130" />
 </picture>
 
 # Accuretta
@@ -18,7 +18,7 @@
 </div>
 
 <p align="center">
-  <img src="media/Aperture.png" alt="Accuretta using the Aperture theme, with sessions and workspace files on the left, local model status and chat in the center, and preview plus terminal tools on the right." width="1100" />
+  <img src="assets/docs/interface-aperture.png" alt="Accuretta using the Aperture theme, with sessions and workspace files on the left, local model status and chat in the center, and preview plus terminal tools on the right." width="1100" />
 </p>
 
 Accuretta is a desktop workspace for local models running through [llama.cpp](https://github.com/ggml-org/llama.cpp). It puts chat history, file tools, persistent shells, live HTML previews, approvals, remote computers, and security tools in one interface.
@@ -85,7 +85,7 @@ Download one GGUF model from Hugging Face. A `Q4_K_M` quant of a 7B to 35B model
 ### 6. Finish the setup wizard
 
 <p align="center">
-  <img src="media/setup_process.png" alt="The Accuretta setup wizard scanning system hardware, offering a llama.cpp download matched to the detected GPU, and listing detected GGUF models." width="820" />
+  <img src="assets/docs/setup-wizard.png" alt="The Accuretta setup wizard scanning system hardware, offering a llama.cpp download matched to the detected GPU, and listing detected GGUF models." width="820" />
 </p>
 
 The wizard detects the GPU, finds models, offers an appropriate llama.cpp build, and tunes the selected model before starting it. Sessions, settings, workspace pointers, memories, model profiles, and preview versions are stored under `data/`.
@@ -97,7 +97,7 @@ The model can work inside a selected workspace instead of pasting every result i
 IDE mode expects one HTML document and renders it in the right pane while the model writes. Each result becomes a saved preview version, so an earlier page is one click away.
 
 <p align="center">
-  <img src="media/accuretta-demo-loop.gif" alt="Accuretta building and rendering a web page beside the chat." width="900" />
+  <img src="assets/docs/build-preview-demo.gif" alt="Accuretta building and rendering a web page beside the chat." width="900" />
 </p>
 
 Accuretta also records verification debt. A file edit adds the path to the task's structured state. A successful syntax check or project test clears it. Context compaction and restarts preserve that record, so an untested edit cannot quietly become “finished” because the model lost the earlier messages.
@@ -271,8 +271,14 @@ accuretta/
   app.css                layout and component styles
   colors_and_type.css    theme tokens
   requirements.txt       optional Python packages
+  assets/
+    audio/               notification sounds
+    brand/               light and dark logo marks
+    docs/                README screenshots and demos
+    icons/               desktop, browser, and install icons
+    reactions/           optional response stickers
+    social/              repository social-preview artwork and source
   data/                  runtime state, created on first run
-  media/                 README images and demo media
 ```
 
 ## Status

@@ -11,11 +11,11 @@
 <meta name="theme-color" content="#0e0a30" media="(prefers-color-scheme: dark)">
 <!-- favicon: the dark-slab mark on transparent. Looks correct on the white
      browser-tab strip every modern browser uses. -->
-<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
-<link rel="icon" type="image/png" sizes="64x64" href="/favicon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/assets/icons/favicon-32.png">
+<link rel="icon" type="image/png" sizes="64x64" href="/assets/icons/favicon.png">
 <!-- iOS home-screen: dark navy background baked in so iOS doesn't paint a
      ugly grey square behind a transparent icon. Sized 180x180 (Apple spec). -->
-<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="apple-touch-icon" href="/assets/icons/apple-touch-icon.png">
 <!-- PWA manifest — picks up app-icon-192 + app-icon-512 from the same dir. -->
 <link rel="manifest" href="/manifest.webmanifest">
 <script>
@@ -31,7 +31,7 @@
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js?v=2" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js?v=2" defer></script>
 <style>
-  img[src^="/accuMOTION/"] {
+  img[src^="/assets/reactions/"] {
     height: 44px !important;
     width: auto !important;
     vertical-align: middle;
@@ -58,7 +58,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.7.8</span>
+        <span class="v" id="brand-v">v0.7.9</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -240,24 +240,29 @@
         </div>
       </div>
 
+      <button class="chat-jump-bottom" id="chat-jump-bottom" type="button" aria-label="Jump to latest message" aria-hidden="true" title="Jump to latest message" tabindex="-1">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 4.5v13M6.5 12.5 12 18l5.5-5.5"></path>
+        </svg>
+      </button>
+
       <div class="composer-wrap">
         <div class="revealer-deck" id="revealer-deck" role="status" aria-live="polite" aria-relevant="additions text"></div>
         <div class="composer">
           <div class="composer-tools">
             <div class="mode-control" id="composer-mode-control">
-              <button class="mode-pill" id="composer-mode-pill" type="button" aria-haspopup="menu" aria-controls="composer-mode-menu" aria-expanded="false" aria-label="Composer mode: Auto" title="Choose how Accuretta handles the next message">
-                <i class="ph ph-lightning mode-pill-icon" id="composer-mode-icon" aria-hidden="true"></i>
-                <span class="mode-pill-label" id="composer-mode-value">Auto</span>
+              <button class="mode-pill" id="composer-mode-pill" type="button" aria-haspopup="menu" aria-controls="composer-mode-menu" aria-expanded="false" aria-label="Composer mode: Agent" title="Choose how Accuretta handles the next message">
+                <i class="ph ph-terminal-window mode-pill-icon" id="composer-mode-icon" aria-hidden="true"></i>
+                <span class="mode-pill-label" id="composer-mode-value">Agent</span>
                 <i class="ph ph-caret-down mode-pill-caret" aria-hidden="true"></i>
               </button>
               <div class="mode-popover" id="composer-mode-popover">
                 <div class="mode-popover-head">
                   <span>Mode</span>
-                  <strong id="composer-mode-popover-value">Auto</strong>
+                  <strong id="composer-mode-popover-value">Agent</strong>
                 </div>
                 <div class="mode-menu" id="composer-mode-menu" role="menu" aria-label="Composer mode">
-                  <button type="button" class="mode-option active" role="menuitemradio" aria-checked="true" data-composer-mode="auto"><i class="ph ph-lightning" aria-hidden="true"></i><span>Auto</span><i class="ph ph-check mode-check" aria-hidden="true"></i></button>
-                  <button type="button" class="mode-option" role="menuitemradio" aria-checked="false" data-composer-mode="agent"><i class="ph ph-terminal-window" aria-hidden="true"></i><span>Agent</span><i class="ph ph-check mode-check" aria-hidden="true"></i></button>
+                  <button type="button" class="mode-option active" role="menuitemradio" aria-checked="true" data-composer-mode="agent"><i class="ph ph-terminal-window" aria-hidden="true"></i><span>Agent</span><i class="ph ph-check mode-check" aria-hidden="true"></i></button>
                   <button type="button" class="mode-option" role="menuitemradio" aria-checked="false" data-composer-mode="ide"><i class="ph ph-code" aria-hidden="true"></i><span>IDE<small class="mode-option-note">Wide layout</small></span><i class="ph ph-check mode-check" aria-hidden="true"></i></button>
                 </div>
               </div>
@@ -290,6 +295,7 @@
             <span class="composer-spacer"></span>
           </div>
           <div class="image-tray hidden" id="image-tray"></div>
+          <section class="message-queue hidden" id="message-queue" aria-label="Queued messages" aria-live="polite"></section>
           <div class="composer-input-wrap">
             <div class="composer-mirror" id="composer-mirror" aria-hidden="true"></div>
             <textarea class="composer-input" id="composer-input" rows="2" placeholder="ask, build, or instruct…" spellcheck="false" autocomplete="off"></textarea>
@@ -605,9 +611,18 @@
     <div class="faq-shell">
       <aside class="faq-rail" aria-label="FAQ sections">
         <div class="faq-rail-mark" aria-hidden="true">
-          <span class="faq-rail-orbit orbit-a"></span>
-          <span class="faq-rail-orbit orbit-b"></span>
-          <span class="faq-rail-core">A</span>
+          <svg class="faq-dot-mark" viewBox="0 0 348 282">
+            <defs>
+              <pattern id="faq-dot-slab" width="22" height="22" patternUnits="userSpaceOnUse">
+                <circle class="faq-dot-slab" cx="6" cy="6" r="4.6"></circle>
+              </pattern>
+              <pattern id="faq-dot-accent" width="22" height="22" patternUnits="userSpaceOnUse" patternTransform="translate(2 2)">
+                <circle class="faq-dot-accent" cx="6" cy="6" r="4.6"></circle>
+              </pattern>
+            </defs>
+            <path fill="url(#faq-dot-slab)" d="M164 6 L226 6 Q240 6 233.7 18.5 L111.3 261.5 Q105 274 91 274 L24 274 Q10 274 16.5 261.6 L143.5 18.4 Q150 6 164 6 Z"></path>
+            <path fill="url(#faq-dot-accent)" d="M225 135 L260 135 Q272 135 277.2 145.8 L332.8 261.2 Q338 272 326 272 L269 272 Q257 272 253.3 260.6 L216.7 146.4 Q213 135 225 135 Z"></path>
+          </svg>
         </div>
         <span class="faq-rail-label">Browse the manual</span>
         <nav>
@@ -673,6 +688,10 @@
             <details class="faq-item">
               <summary><span>How do I fit a large MoE model into limited VRAM?</span><i class="ph ph-plus"></i></summary>
               <div><p>Use Settings → Auto-tune and set a realistic VRAM budget. Accuretta reads the model metadata and proposes context size, GPU layers, cache precision, batching, and CPU expert offload. Treat the estimate as a strong starting point, then verify real speed and memory use on your machine.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>What happens beyond a model's native context limit?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Accuretta can enable YaRN scaling when the configured context exceeds the limit recorded in the model. This can provide more working space, but it does not retrain the model. Recall, precision, and attention to early details may gradually degrade, and the amount varies by model. Treat extended context as useful extra room rather than guaranteed native-quality memory.</p></div>
             </details>
           </div>
         </section>
@@ -1667,7 +1686,11 @@
           var percent = document.getElementById('download-progress-percent');
           var speed = document.getElementById('download-progress-speed');
 
-          if (status.status === 'downloading') {
+          if (status.status === 'resolving') {
+            if (fill) fill.style.width = '3%';
+            if (percent) percent.textContent = 'Finding the newest complete release…';
+            if (speed) speed.textContent = 'Checking official llama.cpp packages';
+          } else if (status.status === 'downloading') {
             var pct = 0;
             if (status.bytes_total > 0) {
               pct = Math.round((status.bytes_written / status.bytes_total) * 100);

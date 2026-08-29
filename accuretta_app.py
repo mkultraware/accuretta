@@ -16,13 +16,9 @@ Package it into a single windowed .exe (no console) with PyInstaller:
     pyinstaller --noconfirm --windowed --name Accuretta ^
         --add-data "index.html;." --add-data "app.js;." --add-data "app.css;." ^
         --add-data "signal-field.js;." ^
-        --add-data "notification.mp3;." ^
-        --add-data "notification-error.wav;." ^
+        --add-data "assets;assets" ^
         --add-data "colors_and_type.css;." --add-data "manifest.webmanifest;." ^
-        --add-data "accuMOTION;accuMOTION" --add-data "media;media" ^
-        --add-data "logo-mark-light.png;." --add-data "logo-mark-dark.png;." ^
-        --add-data "favicon.png;." --add-data "app-icon-512.png;." ^
-        --icon accuretta.ico accuretta_app.py
+        --icon assets/icons/accuretta.ico accuretta_app.py
 
 Note: the bridge serves its static files relative to its own directory. When
 frozen by PyInstaller (onefile), those live under sys._MEIPASS, so the bridge's
@@ -37,6 +33,7 @@ import socket
 import sys
 import threading
 import time
+from pathlib import Path
 
 # App mode: hide the llama-server console (bridge reads this), and do not let the
 # bridge auto-open a browser -- the webview window IS the UI.
@@ -176,8 +173,8 @@ def _splash_palette(theme: str) -> dict:
 
 def _logo_data_uri(theme: str) -> str:
     """Base64-embed the theme-appropriate logo. The splash renders before the
-    bridge serves files, so an http path (/logo-mark-*.png) can't load here."""
-    fname = "logo-mark-light.png" if theme in _LIGHT_THEMES else "logo-mark-dark.png"
+    bridge serves files, so an HTTP asset path cannot load here."""
+    fname = Path("assets/brand") / ("logo-mark-light.png" if theme in _LIGHT_THEMES else "logo-mark-dark.png")
     try:
         raw = (bridge.ROOT / fname).read_bytes()
         return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
@@ -196,7 +193,7 @@ def _read_app_version() -> str:
             return m.group(1)
     except Exception:
         pass
-    return "0.7.8"
+    return "0.7.9"
 
 
 def _signal_field_js() -> str:
@@ -523,12 +520,12 @@ def _watch_bridge(win) -> None:
 
 
 def _set_app_icon() -> None:
-    """Windows: replace the inherited python icon with accuretta.ico on the live
+    """Windows: replace the inherited Python icon with Accuretta's icon on the live
     window (titlebar + taskbar). Packaged builds get this from PyInstaller
     --icon; this covers running from source via pythonw."""
     if sys.platform != "win32":
         return
-    ico = os.path.abspath("accuretta.ico")
+    ico = os.path.abspath(os.path.join("assets", "icons", "accuretta.ico"))
     if not os.path.exists(ico):
         return
     try:
@@ -620,7 +617,7 @@ def main() -> int:
         else:
             win.load_html(_FAILED_HTML)
 
-    # Swap the python icon for accuretta.ico once the window exists.
+    # Swap the Python icon for Accuretta's icon once the window exists.
     threading.Thread(target=_set_app_icon, daemon=True).start()
 
     # gui='edgechromium' forces WebView2 on Windows for identical Chromium rendering.

@@ -457,44 +457,20 @@ button {
   background: var(--bg-raised);
 }
 
-.faq-rail-core {
-  position: relative;
-  z-index: 2;
-  width: 27px;
-  height: 27px;
-  display: grid;
-  place-items: center;
-  border: 1px solid var(--accent);
-  border-radius: 50%;
-  color: var(--accent);
-  background: var(--bg);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 800;
+.faq-dot-mark {
+  width: 47px;
+  height: auto;
+  overflow: visible;
+  filter: drop-shadow(0 4px 8px color-mix(in srgb, var(--accent) 14%, transparent));
 }
 
-.faq-rail-orbit {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  border: 1px dotted color-mix(in srgb, var(--accent) 56%, transparent);
-  border-radius: 50%;
-  transform: translate(-50%, -50%);
-  animation: faq-orbit 14s linear infinite;
+.faq-dot-slab {
+  fill: color-mix(in srgb, var(--fg) 82%, transparent);
 }
-.faq-rail-orbit::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  top: -2px;
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: var(--accent);
+
+.faq-dot-accent {
+  fill: var(--accent);
 }
-.faq-rail-orbit.orbit-a { width: 48px; height: 48px; }
-.faq-rail-orbit.orbit-b { width: 62px; height: 30px; animation-direction: reverse; animation-duration: 10s; }
-@keyframes faq-orbit { to { transform: translate(-50%, -50%) rotate(360deg); } }
 
 .faq-rail-label { color: var(--muted); font-family: var(--font-mono); font-size: 10px; letter-spacing: .09em; text-transform: uppercase; }
 .faq-rail nav { display: grid; margin-top: 13px; }
@@ -617,7 +593,6 @@ button {
 
 @media (prefers-reduced-motion: reduce) {
   .faq-page { transition-duration: .01ms; }
-  .faq-rail-orbit,
   .faq-item > div { animation: none; }
   .faq-rail nav a,
   .faq-item summary > i { transition: none; }
@@ -2932,71 +2907,6 @@ button {
 
 /* ---- skills: user-curated procedures ---- */
 
-/* The l16 "drawer" loader: draws a little frame in the accent color while the
-   loaded skill is guiding the current turn. Settles (stops + dims) on
-   turn end / skill cleared, like the compaction dots. */
-.skill-loader {
-  width: 60px;
-  height: 16px;
-  display: grid;
-  flex: 0 0 auto;
-}
-
-.skill-loader:before,
-.skill-loader:after {
-  content: "";
-  grid-area: 1/1;
-  --c: no-repeat linear-gradient(var(--accent) 0 0);
-  background: var(--c), var(--c), var(--c);
-  animation: skill-l16-1 1.5s infinite linear, skill-l16-2 1.5s infinite linear;
-  transform: scale(var(--s, 1)) translate(3px, -3px);
-}
-
-.skill-loader:after {
-  --s: -1;
-}
-
-@keyframes skill-l16-1 {
-  0%,
-  3%    { background-size: 0    4px, 4px 0  , 0    4px; }
-  16.67%{ background-size: 100% 4px, 4px 0  , 0    4px; }
-  33.33%{ background-size: 100% 4px, 4px 100%, 0    4px; }
-  46%,
-  54%   { background-size: 100% 4px, 4px 100%, 100% 4px; }
-  66.67%{ background-size: 0    4px, 4px 100%, 100% 4px; }
-  83.33%{ background-size: 0    4px, 4px 0  , 100% 4px; }
-  96%,
-  100%  { background-size: 0    4px, 4px 0  , 0    4px; }
-}
-
-@keyframes skill-l16-2 {
-  0%,
-  49.9% { background-position: 0 0, 100% 0, 100% 100%; }
-  50%,
-  100%  { background-position: 100% 0, 100% 100%, 0 100%; }
-}
-
-.revealer-card.skill-load .skill-load-body {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-
-.revealer-card.skill-load .notification-text {
-  white-space: normal;
-}
-
-.revealer-card.skill-load.is-done .skill-loader:before,
-.revealer-card.skill-load.is-done .skill-loader:after {
-  animation: none;
-  opacity: 0.45;
-}
-
-.revealer-card.skill-load.is-done .notification-text {
-  opacity: 0.75;
-}
-
 .notification-dot.is-skill {
   background: var(--accent);
 }
@@ -3055,14 +2965,6 @@ button {
 
 .skill-pill-x:hover {
   color: var(--danger);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .skill-loader:before,
-  .skill-loader:after {
-    animation: none;
-    opacity: 0.5;
-  }
 }
 
 @keyframes compaction-dot-pulse {
@@ -3321,6 +3223,7 @@ button {
 }
 
 .chat-scroll {
+  grid-area: 1 / 1;
   position: relative;
   overflow-y: auto;
   overflow-x: hidden;
@@ -3330,6 +3233,82 @@ button {
   padding: 24px 0 16px;
   display: flex;
   flex-direction: column;
+}
+
+.chat > .composer-wrap {
+  grid-area: 2 / 1;
+}
+
+.chat-jump-bottom {
+  grid-area: 1 / 1;
+  align-self: end;
+  justify-self: center;
+  z-index: 6;
+  width: 46px;
+  height: 46px;
+  margin-bottom: 14px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: var(--fg);
+  background: color-mix(in srgb, var(--bg-raised) 94%, var(--accent) 6%);
+  border: 1px solid color-mix(in srgb, var(--fg) 18%, var(--border));
+  border-radius: 50%;
+  box-shadow: var(--shadow-md);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(8px) scale(0.92);
+  transition:
+    opacity 160ms ease,
+    transform 200ms cubic-bezier(.2, .8, .2, 1),
+    color 160ms ease,
+    background-color 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.chat-jump-bottom.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
+}
+
+.chat-jump-bottom svg {
+  width: 25px;
+  height: 25px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.25;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.chat-jump-bottom:hover,
+.chat-jump-bottom:focus-visible {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--bg-raised) 86%, var(--accent) 14%);
+  border-color: color-mix(in srgb, var(--accent) 58%, var(--border));
+  box-shadow: var(--shadow-lg);
+  outline: none;
+}
+
+.chat-jump-bottom:active {
+  transform: translateY(1px) scale(0.96);
+}
+
+@media (max-width: 600px) {
+  .chat-jump-bottom {
+    width: 42px;
+    height: 42px;
+    margin-bottom: 10px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-jump-bottom {
+    transition: none;
+  }
 }
 
 .chat-inner {
@@ -3854,6 +3833,45 @@ body.remote-client .chat-scroll {
 .bubble.quiet .quiet-text {
   flex: 1;
   min-width: 0;
+}
+
+.turn-stopped {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 6px;
+  width: fit-content;
+  margin-top: 5px;
+  padding: 5px 9px 5px 6px;
+  color: var(--fg-muted);
+  background: color-mix(in srgb, var(--bg-inset) 78%, transparent);
+  border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+  border-radius: 999px;
+  font-family: var(--font-sans);
+  line-height: 1;
+}
+
+.turn-stopped svg {
+  width: 15px;
+  height: 15px;
+  color: var(--fg-faint);
+  flex: 0 0 15px;
+}
+
+.turn-stopped strong {
+  color: var(--fg-muted);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.turn-stopped small {
+  color: var(--fg-faint);
+  font-size: 10px;
+}
+
+.turn-stopped small::before {
+  content: "·";
+  margin-right: 6px;
 }
 
 .bubble p {
@@ -4733,9 +4751,8 @@ body.remote-client .chat-scroll {
   color: var(--accent);
 }
 
-/* Dialect-parse warning — a system notice, deliberately styled apart from
-   model prose (smaller, muted, warning-tinted, left accent bar + icon) so it
-   never reads as something the model said. */
+/* Dialect-parse warning — a muted system notice that stays visually distinct
+   from model prose without overpowering the reply. */
 .dialect-warn {
   display: flex;
   align-items: flex-start;
@@ -4746,8 +4763,8 @@ body.remote-client .chat-scroll {
   font-size: 12px;
   line-height: 1.5;
   color: var(--fg-muted);
-  background: var(--warning-subtle);
-  border-left: 3px solid var(--warning);
+  background: color-mix(in srgb, var(--warning-subtle) 72%, transparent);
+  border: 0;
   border-radius: 6px;
   box-sizing: border-box;
   max-width: 100%;
@@ -4758,12 +4775,12 @@ body.remote-client .chat-scroll {
 }
 .dialect-warn i {
   font-size: 14px;
-  color: var(--warning);
+  color: color-mix(in srgb, var(--warning) 82%, var(--fg-muted));
   flex-shrink: 0;
   margin-top: 1px;
 }
 .dialect-warn strong {
-  color: var(--warning);
+  color: color-mix(in srgb, var(--warning) 82%, var(--fg-muted));
   font-weight: 600;
 }
 
@@ -5183,6 +5200,12 @@ body.remote-client .chat-scroll {
   background: var(--fg-faint);
   box-shadow: none;
 }
+.tool-group-body .tool-line.stopped::before {
+  background: transparent;
+  border: 1.5px solid var(--fg-faint);
+  box-sizing: border-box;
+  box-shadow: none;
+}
 .tool-group-body .tool-line > span {
   font-size: 12px;
   color: var(--fg-muted);
@@ -5193,6 +5216,7 @@ body.remote-client .chat-scroll {
 }
 .tool-group-body .tool-line.running > span { color: var(--fg); }
 .tool-group-body .tool-line.err > span { color: var(--fg-muted); }
+.tool-group-body .tool-line.stopped > span { color: var(--fg-faint); }
 .tool-group-body .tool-line .tl-time {
   flex: 0 0 auto;
   margin-left: 6px;
@@ -11102,6 +11126,205 @@ body,
   gap: 8px;
 }
 
+.message-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 7px;
+  border: 1px solid color-mix(in srgb, var(--fg) 9%, transparent);
+  border-radius: 12px 4px 12px 12px;
+  background: color-mix(in srgb, var(--bg-inset) 58%, transparent);
+}
+
+.message-queue.hidden {
+  display: none;
+}
+
+.message-queue-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 3px;
+  color: var(--fg-muted);
+  font-family: var(--font-sans);
+}
+
+.message-queue-head > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.message-queue-head i {
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.message-queue-head small {
+  color: var(--fg-faint);
+  font-size: 9.5px;
+}
+
+.message-queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 174px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.queued-message {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 5px 5px 5px 4px;
+  border: 1px solid transparent;
+  border-radius: 9px 3px 9px 9px;
+  background: color-mix(in srgb, var(--bg-raised) 72%, transparent);
+  transition: border-color var(--dur-fast) var(--ease-out), background-color var(--dur-fast) var(--ease-out);
+}
+
+.queued-message:hover,
+.queued-message.is-editing {
+  border-color: color-mix(in srgb, var(--fg) 10%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 92%, transparent);
+}
+
+.queued-message-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 7px 2px 7px 7px;
+  color: var(--accent);
+  background: var(--accent-subtle);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+}
+
+.queued-message-body {
+  min-width: 0;
+}
+
+.queued-message-text {
+  overflow: hidden;
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queued-message-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 2px;
+}
+
+.queued-message-meta span {
+  color: var(--fg-faint);
+  font-family: var(--font-sans);
+  font-size: 9px;
+}
+
+.queued-message-meta span + span::before {
+  content: "·";
+  margin-right: 5px;
+}
+
+.queued-message-actions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  opacity: 0.45;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+
+.queued-message:hover .queued-message-actions,
+.queued-message.is-editing .queued-message-actions,
+.queued-message-actions:focus-within {
+  opacity: 1;
+}
+
+.queued-message-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 25px;
+  height: 25px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px 2px 7px 7px;
+  color: var(--fg-faint);
+  background: transparent;
+  cursor: pointer;
+}
+
+.queued-message-actions button:hover:not(:disabled) {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+}
+
+.queued-message-actions button[data-queue-act="remove"]:hover {
+  color: var(--danger);
+}
+
+.queued-message-actions button:disabled {
+  opacity: 0.22;
+  cursor: default;
+}
+
+.queued-message-editor {
+  width: 100%;
+  min-height: 42px;
+  max-height: 110px;
+  resize: vertical;
+  padding: 6px 7px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-radius: 8px 2px 8px 8px;
+  outline: none;
+  color: var(--fg);
+  background: var(--bg-inset);
+  font: 11.5px/1.4 var(--font-sans);
+}
+
+.queued-message-editor:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-subtle);
+}
+
+@media (max-width: 600px) {
+  .message-queue-list {
+    max-height: 150px;
+  }
+
+  .queued-message {
+    grid-template-columns: 22px minmax(0, 1fr) auto;
+    gap: 5px;
+  }
+
+  .queued-message-actions {
+    opacity: 1;
+  }
+
+  .queued-message-actions button {
+    width: 28px;
+    height: 28px;
+  }
+}
+
 .mode-control {
   position: relative;
   display: inline-flex;
@@ -11885,8 +12108,8 @@ body,
    the A picks up each theme's accent color automatically. */
 .welcome-logo-accent {
   background-color: var(--accent);
-  -webkit-mask: url(/logo-mark-dark.png) center / contain no-repeat;
-  mask: url(/logo-mark-dark.png) center / contain no-repeat;
+  -webkit-mask: url(/assets/brand/logo-mark-dark.png) center / contain no-repeat;
+  mask: url(/assets/brand/logo-mark-dark.png) center / contain no-repeat;
   transition: background-color 0.3s ease;
 }
 
@@ -13391,11 +13614,6 @@ body,
   box-shadow: 6px 6px 0 rgba(3, 13, 18, 0.52), inset 0 0 0 1px rgba(88, 226, 208, 0.13);
 }
 
-[data-theme="cartograph"] .composer:focus-within::after {
-  opacity: 1;
-  animation: cartograph-carriage 2.4s linear infinite;
-}
-
 [data-theme="cartograph"] #btn-send {
   border-radius: 2px;
   background: var(--btn-send-gradient);
@@ -13491,11 +13709,6 @@ body,
 @keyframes cartograph-plot-in-user {
   from { opacity: 0; clip-path: inset(0 0 0 100%); transform: translateX(5px); }
   to   { opacity: 1; clip-path: inset(0 0 0 0); transform: translateX(0); }
-}
-
-@keyframes cartograph-carriage {
-  from { left: -24%; }
-  to   { left: 110%; }
 }
 
 @keyframes cartograph-calibrate {
@@ -15613,6 +15826,7 @@ body,
   grid-template-columns: minmax(0, 1fr) auto;
   grid-template-areas:
     "deck deck"
+    "queue queue"
     "tray tray"
     "input input"
     "tools foot";
@@ -15678,6 +15892,10 @@ body,
 
 [data-theme] .image-tray {
   grid-area: tray;
+}
+
+[data-theme] .message-queue {
+  grid-area: queue;
 }
 
 [data-theme] .composer-input-wrap {
@@ -15759,6 +15977,18 @@ body,
 [data-theme] .composer-foot #btn-send:hover {
   background: var(--btn-send-gradient) !important;
   filter: brightness(1.07);
+}
+
+[data-theme] .composer-foot #btn-send.queue-mode {
+  color: var(--accent) !important;
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-inset)) !important;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent) !important;
+  box-shadow: none !important;
+}
+
+[data-theme] .composer-foot #btn-send.queue-mode:hover {
+  color: var(--accent-hover) !important;
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-inset)) !important;
 }
 
 [data-theme] .composer-foot #btn-stop {
@@ -16811,6 +17041,7 @@ pre.code-card.streaming-plain code {
 /* Composer tabs: live notices, skills, activity and approval gates rise from
    behind the prompt box on one compact, deliberately narrower surface. */
 [data-theme] .composer-wrap {
+  --composer-wrap-top-pad: 14px;
   flex-direction: column;
   align-items: center;
   isolation: isolate;
@@ -16823,16 +17054,20 @@ pre.code-card.streaming-plain code {
 }
 
 [data-theme] .composer-wrap > .revealer-deck {
-  position: relative;
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% - var(--composer-wrap-top-pad));
   z-index: 1;
   grid-area: unset;
   width: calc(100% - 42px);
   max-width: 850px;
-  margin: 0 0 -12px;
-  padding: 0 0 12px;
+  margin: 0;
+  padding: 0;
   border-radius: 16px 16px 0 0;
   box-sizing: border-box;
   overflow: visible;
+  pointer-events: none;
+  transform: translateX(-50%);
 }
 
 [data-theme] .composer-wrap > .revealer-deck > .revealer-card {
@@ -16845,6 +17080,7 @@ pre.code-card.streaming-plain code {
     0 -6px 20px color-mix(in srgb, var(--fg) 9%, transparent),
     inset 0 1px 0 color-mix(in srgb, #fff 8%, transparent);
   animation: composer-tab-rise .34s cubic-bezier(.22, .78, .2, 1) both;
+  pointer-events: auto;
 }
 
 [data-theme] .composer-wrap > .revealer-deck > .revealer-card.collapsed {
@@ -17016,99 +17252,6 @@ pre.code-card.streaming-plain code {
   border-color: color-mix(in srgb, var(--warning) 35%, var(--border-subtle));
 }
 
-[data-theme] .revealer-card.skill-load .skill-load-body {
-  flex: 1 1 auto;
-  gap: 8px;
-  min-width: 0;
-  overflow: hidden;
-}
-
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.skill-load {
-  transition:
-    width .42s cubic-bezier(.22, .78, .2, 1),
-    min-height .32s ease,
-    max-height .32s ease,
-    padding .32s ease,
-    gap .32s ease,
-    transform .3s cubic-bezier(.32, .72, .24, 1.05),
-    opacity .24s ease,
-    margin .3s cubic-bezier(.32, .72, .24, 1.05);
-}
-
-[data-theme] .revealer-card.skill-load .notification-copy {
-  max-width: 560px;
-  overflow: hidden;
-  opacity: 1;
-  transform: translateX(0);
-  transition:
-    max-width .38s cubic-bezier(.22, .78, .2, 1),
-    opacity .2s ease,
-    transform .32s ease,
-    visibility 0s linear;
-}
-
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.skill-load.is-compact {
-  width: 76px;
-  min-height: 44px;
-  max-height: 44px;
-  padding: 7px 10px;
-  gap: 8px;
-}
-
-[data-theme] .revealer-card.skill-load.is-compact .skill-load-body {
-  flex: 0 0 18px;
-  gap: 0;
-}
-
-[data-theme] .revealer-card.skill-load.is-compact .notification-copy {
-  max-width: 0;
-  opacity: 0;
-  visibility: hidden;
-  transform: translateX(-6px);
-  transition-delay: 0s, 0s, 0s, .38s;
-}
-
-[data-theme] svg.skill-loader {
-  width: 18px;
-  height: 18px;
-  display: block;
-  flex: 0 0 18px;
-  overflow: visible;
-}
-
-[data-theme] svg.skill-loader :is(rect, path) {
-  fill: none;
-  stroke: var(--accent);
-  stroke-width: 1.6;
-  stroke-linecap: round;
-}
-
-[data-theme] svg.skill-loader rect {
-  stroke-dasharray: 44;
-  animation: skill-tab-dash 1.4s cubic-bezier(.45, 0, .55, 1) infinite;
-}
-
-[data-theme] svg.skill-loader path {
-  stroke-dasharray: 8;
-  animation: skill-tab-pulse 1.4s ease-in-out infinite;
-}
-
-[data-theme] .revealer-card.skill-load.is-done svg.skill-loader :is(rect, path) {
-  animation: none;
-  opacity: .48;
-}
-
-@keyframes skill-tab-dash {
-  0% { stroke-dashoffset: 44; opacity: .35; }
-  48% { stroke-dashoffset: 0; opacity: 1; }
-  100% { stroke-dashoffset: -44; opacity: .35; }
-}
-
-@keyframes skill-tab-pulse {
-  0%, 100% { stroke-dashoffset: 8; opacity: .3; }
-  50% { stroke-dashoffset: 0; opacity: 1; }
-}
-
 [data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions {
   border-color: color-mix(in srgb, var(--warning) 34%, var(--border-subtle));
 }
@@ -17121,6 +17264,13 @@ pre.code-card.streaming-plain code {
   border-radius: 9px;
   color: var(--warning);
   background: color-mix(in srgb, var(--warning) 12%, transparent);
+}
+
+[data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions .revealer-card-icon svg {
+  display: block;
+  width: 17px;
+  height: 17px;
+  overflow: visible;
 }
 
 [data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions .revealer-card-body {
@@ -17150,11 +17300,15 @@ pre.code-card.streaming-plain code {
 }
 
 @media (max-width: 600px) {
+  [data-theme] .composer-wrap {
+    --composer-wrap-top-pad: 7px;
+  }
+
   [data-theme] .composer-wrap > .revealer-deck {
     width: calc(100% - 22px);
     max-width: none;
-    margin-bottom: -8px;
-    padding-bottom: 8px;
+    margin: 0;
+    padding: 0;
   }
 
   [data-theme] .composer-wrap > .revealer-deck > .revealer-card {
@@ -17165,13 +17319,6 @@ pre.code-card.streaming-plain code {
     width: calc(100% - 8px);
     min-height: 46px;
     padding: 8px 10px;
-  }
-
-  [data-theme] .composer-wrap > .revealer-deck > .revealer-card.skill-load.is-compact {
-    width: 76px;
-    min-height: 44px;
-    max-height: 44px;
-    padding: 7px 10px;
   }
 
   [data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions {
@@ -17186,11 +17333,16 @@ pre.code-card.streaming-plain code {
   }
 }
 
+@media (min-width: 601px) and (max-width: 820px) {
+  [data-theme] .composer-wrap {
+    --composer-wrap-top-pad: 10px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   [data-theme] .composer-wrap > .revealer-deck > .revealer-card,
   [data-theme] .composer-wrap > .revealer-deck > .revealer-card.notifications,
-  [data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions,
-  [data-theme] svg.skill-loader :is(rect, path) {
+  [data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions {
     animation: none;
     transition: none;
   }
