@@ -3158,6 +3158,48 @@ button {
   overflow: hidden;
 }
 
+.topbar-chat-context,
+.topbar-project-context,
+.topbar-branch,
+.topbar-project {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.topbar-chat-context { gap: 6px; }
+
+.topbar-project-context {
+  gap: 18px;
+  max-width: 100%;
+  color: var(--fg-muted);
+}
+
+.topbar-branch,
+.topbar-project { gap: 7px; }
+
+.topbar-project {
+  overflow: hidden;
+  color: var(--fg);
+  font-weight: 500;
+}
+
+.topbar-project > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topbar-project-context .ph {
+  flex: 0 0 auto;
+  font-size: 16px;
+  color: var(--fg-muted);
+}
+
+.topbar-project-context[hidden],
+.topbar-chat-context[hidden],
+.topbar-branch[hidden] { display: none; }
+
 .topbar .path .em {
   color: var(--fg);
   font-weight: 500;
@@ -5271,16 +5313,48 @@ body.remote-client .chat-scroll {
   display: none;
 }
 
-/* The live activity list uses concrete tool icons instead of a faux process
-   diagram. That keeps it close to the reference UI and removes the gangly rail. */
-.activity-group .tool-group-body::before,
-.activity-group .tool-line::before {
+/* Activity rows share one quiet tree rail. Each row draws its own rounded
+   elbow, which lets the final row terminate cleanly without fixed heights. */
+.activity-group .tool-group-body::before {
   display: none;
 }
 
-.activity-group .tool-line {
+.activity-group .tool-group-body .tool-line {
+  --activity-rail: color-mix(in srgb, var(--fg-faint) 52%, transparent);
   gap: 8px;
-  padding: 3px 0;
+  min-height: 24px;
+  padding: 3px 0 3px 30px;
+}
+
+.activity-group .tool-group-body .tool-line::before {
+  content: "";
+  display: block;
+  position: absolute;
+  left: 7px;
+  top: -2px;
+  width: 14px;
+  height: calc(50% + 2px);
+  border: 0;
+  border-left: 1px solid var(--activity-rail);
+  border-bottom: 1px solid var(--activity-rail);
+  border-radius: 0 0 0 7px;
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+  animation: none;
+}
+
+.activity-group .tool-group-body .tool-line::after {
+  content: "";
+  position: absolute;
+  left: 7px;
+  top: 50%;
+  bottom: -2px;
+  border-left: 1px solid var(--activity-rail);
+}
+
+.activity-group .tool-group-body .tool-line:last-of-type::after {
+  display: none;
 }
 
 .activity-group .tool-line > :is(svg, .tool-svg) {
@@ -9832,6 +9906,9 @@ body,
     display: none !important;
   }
 
+  .topbar-project-context { gap: 10px; }
+  .topbar-project-context .topbar-branch { display: none; }
+
   .topbar .path {
     justify-content: center;
     flex: 1 1 auto;
@@ -14196,6 +14273,11 @@ body,
   animation: cartograph-dot-breathe 1.8s ease-in-out infinite;
 }
 
+[data-theme="cartograph"] .activity-group .tool-group-body .tool-line.running::before {
+  background: transparent;
+  animation: none;
+}
+
 [data-theme="cartograph"] .tool-group.done-pill .tool-group-head {
   color: var(--fg-muted);
 }
@@ -14772,6 +14854,10 @@ body,
 
 :is([data-theme="aperture"], [data-theme="aperture-dark"]) .tool-group-body .tool-line.running::before {
   box-shadow: 0 0 0 4px rgba(76, 89, 242, 0.09);
+}
+
+:is([data-theme="aperture"], [data-theme="aperture-dark"]) .activity-group .tool-group-body .tool-line.running::before {
+  box-shadow: none;
 }
 
 :is([data-theme="aperture"], [data-theme="aperture-dark"]) :is(.modal, .palette, .drawer) {

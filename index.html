@@ -58,7 +58,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.7.9</span>
+        <span class="v" id="brand-v">v0.8.0</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -185,10 +185,16 @@
       <button class="iconbtn" id="btn-toggle-sidebar-m" title="Collapse sidebar" aria-label="Collapse sidebar"><i class="ph ph-list"></i></button>
       <button class="iconbtn mobile-only" id="btn-settings-m" title="Settings"><i class="ph ph-gear-six"></i></button>
       <div class="path">
-        <i class="ph ph-chat-circle-dots"></i>
-        <span class="em" id="chat-title">new session</span>
-        <span class="sep">·</span>
-        <span id="chat-meta">local</span>
+        <span class="topbar-project-context" id="topbar-project-context" hidden>
+          <span class="topbar-branch" id="topbar-branch" hidden><i class="ph ph-git-branch" aria-hidden="true"></i><span id="topbar-branch-name"></span></span>
+          <span class="topbar-project"><i class="ph ph-folder-simple" aria-hidden="true"></i><span id="topbar-project-name"></span></span>
+        </span>
+        <span class="topbar-chat-context" id="topbar-chat-context">
+          <i class="ph ph-chat-circle-dots"></i>
+          <span class="em" id="chat-title">new session</span>
+          <span class="sep">·</span>
+          <span id="chat-meta">local</span>
+        </span>
       </div>
       <div class="actions">
         <div class="client-context-control" title="Browser device and command target">

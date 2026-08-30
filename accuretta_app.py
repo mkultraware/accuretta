@@ -193,7 +193,7 @@ def _read_app_version() -> str:
             return m.group(1)
     except Exception:
         pass
-    return "0.7.9"
+    return "0.8.0"
 
 
 def _signal_field_js() -> str:

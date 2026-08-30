@@ -79,5 +79,7 @@ github_stats.db
 promo_video/
 AUDIT_AND_ROADMAP.md
 
-# internal test suite — not shipped to users
-tests/
+# Internal test output is not shipped. Keep the agent protocol regression
+# suite because it guards file writes and execution-target isolation.
+tests/*
+!tests/test_agent_protocol.py

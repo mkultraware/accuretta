@@ -1041,7 +1041,7 @@
   const COMMAND_TOOLS = new Set([
     "write_file", "delete_file", "edit_file", "patch_file",
     "run_powershell", "run_tests", "sandbox_run", "sandbox_nmap", "sandbox_sqlmap", "open_program",
-    "remote_shell", "remote_write_file", "remote_save_code_block",
+    "remote_shell", "remote_write_file",
     "remote_file_begin", "remote_file_append", "remote_file_commit",
     "remote_copy_to", "remote_copy_from",
     "desktop_launch_app", "desktop_focus_window", "desktop_click",
@@ -1432,7 +1432,6 @@
       case "sandbox_run":    return `Running in WSL guest…`;
       case "remote_shell":   return `Running on Mac…`;
       case "remote_write_file": return `Writing ${shortPath(args.path)} on Mac…`;
-      case "remote_save_code_block": return `Saving chat code to ${shortPath(args.path)} on Mac…`;
       case "remote_file_begin": return `Preparing ${shortPath(args.path)} on Mac…`;
       case "remote_file_append": return `Sending the next file chunk to Mac…`;
       case "remote_file_commit": return `Finishing the Mac file…`;
@@ -1474,8 +1473,7 @@
       case "update_plan":    return `Updated the task plan`;
       case "capability_report": return `Checked available capabilities`;
       case "remote_shell":   return `Mac command completed`;
-      case "remote_write_file":
-      case "remote_save_code_block": return `Wrote ${shortPath(res.path)} on Mac${res.bytes != null ? ` (${res.bytes} bytes)` : ""}`;
+      case "remote_write_file": return `Wrote ${shortPath(res.path)} on Mac${res.bytes != null ? ` (${res.bytes} bytes)` : ""}`;
       case "remote_file_begin": return `Mac file ready for chunks`;
       case "remote_file_append": return `Sent chunk ${res.chunks || ""}${res.bytes != null ? ` · ${res.bytes} bytes total` : ""}`;
       case "remote_file_commit": return `Finished ${shortPath(res.path)} on Mac${res.bytes != null ? ` (${res.bytes} bytes)` : ""}`;
@@ -3279,6 +3277,30 @@
     } catch (_) {}
   }
 
+  function renderTopbarContext(chat) {
+    const chatContext = $("#topbar-chat-context");
+    const projectContext = $("#topbar-project-context");
+    const branch = $("#topbar-branch");
+    const branchName = $("#topbar-branch-name");
+    const projectName = $("#topbar-project-name");
+    const worktree = chat?.github_worktree || chat?.project_workspace || null;
+    const project = String(worktree?.repo || worktree?.name || "").trim();
+    const branchValue = String(worktree?.branch || "").trim();
+
+    $("#chat-title").textContent = chat ? chat.title : "new session";
+    if (!chatContext || !projectContext) return;
+
+    const showProject = !!project;
+    chatContext.hidden = showProject;
+    projectContext.hidden = !showProject;
+    if (!showProject) return;
+
+    projectName.textContent = project;
+    projectContext.title = String(worktree?.path || project);
+    branch.hidden = !branchValue;
+    branchName.textContent = branchValue;
+  }
+
   async function selectChat(id) {
     state.chatId = id;
     let chat = state.chats.chats[id];
@@ -3338,7 +3360,7 @@
       state.foldBoundaryIdx = -1;
       state.foldMark = null;
     }
-    $("#chat-title").textContent = chat ? chat.title : "new session";
+    renderTopbarContext(chat);
     // Restore the last-used mode for this chat so the toolbar feels sticky.
     // IDE is unavailable in compact layouts because the preview pane is hidden.
     if (chat && chat.last_mode) {
@@ -5841,12 +5863,14 @@
       // content away for a progress placeholder. Highlighting happens once,
       // at the final render.
       const fence = scanOpenFenceState(answer);
+      const fenceLang = (fence.infoStr || "").split(/\s+/)[0].toLowerCase();
       if (fence.inFence && fence.bodyLen > 4000
+          && fenceLang !== "tool_code" && fenceLang !== "tool_call"
           && fenceBodyLooksLikeCode(answer.slice(fence.bodyStart), fence.infoStr)) {
         const now = Date.now();
         if (now - (bubble._lastPlainAt || 0) >= 250) {
           bubble._lastPlainAt = now;
-          const lang = (fence.infoStr || "code").split(/\s+/)[0].toLowerCase() || "code";
+          const lang = fenceLang || "code";
           const lines = (answer.slice(fence.bodyStart).match(/\n/g) || []).length + 1;
           const kb = (fence.bodyLen / 1024).toFixed(1);
           const head = answer.slice(tailStart, fence.openIdx);
