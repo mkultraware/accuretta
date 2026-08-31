@@ -104,7 +104,7 @@ Accuretta also records verification debt. A file edit adds the path to the task'
 
 ## Approvals and audit records
 
-Reads can run without stopping the conversation. Raw Windows or WSL shell commands, project test commands, and persistent host-session input always require a fresh approval. File writes, Git changes, desktop input, remote changes, and MCP calls follow the selected access mode unless the operation has a stricter gate.
+Reads can run without stopping the conversation. In Soft mode, normal workspace writes, non-destructive Windows or WSL commands, project tests, persistent host-session input, and routine MCP actions can also continue automatically. Medium mode only trusts normal workspace writes. Hard mode asks for every action. Deletions, mutating Git actions, program launches, desktop input, protected or remote changes, and execution following recent web content keep stricter gates regardless of the convenience mode.
 
 Approved actions write a bounded record to `data/action_audit.jsonl`. It stores the tool, target, time, outcome, authorization identity, and hashes of the arguments and result. It does not copy prompts, commands, typed text, or tool output into the audit file.
 

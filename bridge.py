@@ -932,6 +932,20 @@ def _model_config_signature(snapshot: dict) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+_HARNESS_INTERVENTION_KEYS = (
+    "context_retry", "server_retry", "reasoning_guard", "tool_call_repair",
+    "empty_reply_retry", "auto_continue", "loop_guard",
+)
+
+
+def _sanitize_interventions(value) -> dict[str, int]:
+    source = value if isinstance(value, dict) else {}
+    return {
+        key: max(0, int(source.get(key, 0) or 0))
+        for key in _HARNESS_INTERVENTION_KEYS
+    }
+
+
 def _model_observed(row: dict, observations: list[dict] | None = None) -> dict:
     source = observations if observations is not None else None
     if source is not None:
@@ -949,6 +963,11 @@ def _model_observed(row: dict, observations: list[dict] | None = None) -> dict:
         peaks = sorted(max(0, int(x.get("peak_context_tokens", 0) or 0)) for x in source)
         compactions = sum(max(0, int(x.get("compactions", 0) or 0)) for x in source)
         compaction_failures = sum(max(0, int(x.get("compaction_failures", 0) or 0)) for x in source)
+        interventions = {
+            key: sum(_sanitize_interventions(x.get("interventions")).get(key, 0)
+                     for x in source)
+            for key in _HARNESS_INTERVENTION_KEYS
+        }
     else:
         turns = max(0, int(row.get("turns", 0) or 0))
         completed = max(0, int(row.get("completed_turns", 0) or 0))
@@ -965,6 +984,7 @@ def _model_observed(row: dict, observations: list[dict] | None = None) -> dict:
                        for x in (row.get("observations") or []) if isinstance(x, dict))
         compactions = max(0, int(row.get("compactions", 0) or 0))
         compaction_failures = max(0, int(row.get("compaction_failures", 0) or 0))
+        interventions = _sanitize_interventions(row.get("interventions"))
     denom_turns = max(1, turns)
     p90_peak = 0
     if peaks:
@@ -985,6 +1005,7 @@ def _model_observed(row: dict, observations: list[dict] | None = None) -> dict:
         "native_fallback_rate": round(fallbacks / denom_turns, 3),
         "compactions": compactions,
         "compaction_failures": compaction_failures,
+        "interventions": interventions,
     }
 
 
@@ -997,7 +1018,8 @@ def _record_model_observation(model: str, *, prompt_tokens: int = 0,
                               prompt_ms: float = 0.0, eval_ms: float = 0.0,
                               compactions: int = 0,
                               compaction_failures: int = 0,
-                              tool_outcomes: list | None = None) -> None:
+                              tool_outcomes: list | None = None,
+                              interventions: dict | None = None) -> None:
     """Local-only, content-free observations from normal use.
 
     This replaces a mandatory per-model benchmark. It costs no extra inference,
@@ -1016,6 +1038,7 @@ def _record_model_observation(model: str, *, prompt_tokens: int = 0,
     key = _model_profile_key(model)
     config = _model_runtime_config(settings)
     config_key = _model_config_signature(config)
+    intervention_counts = _sanitize_interventions(interventions)
     now = int(time.time())
     day = time.strftime("%Y-%m-%d", time.localtime(now))
     # Sessions must mean distinct chats. A missing chat id must never collapse
@@ -1049,6 +1072,9 @@ def _record_model_observation(model: str, *, prompt_tokens: int = 0,
         row["eval_ms"] = round(float(row.get("eval_ms", 0.0)) + max(0.0, float(eval_ms or 0)), 3)
         row["compactions"] = int(row.get("compactions", 0) or 0) + max(0, int(compactions or 0))
         row["compaction_failures"] = int(row.get("compaction_failures", 0) or 0) + max(0, int(compaction_failures or 0))
+        row_interventions = row.setdefault("interventions", {})
+        for intervention, count in intervention_counts.items():
+            row_interventions[intervention] = int(row_interventions.get(intervention, 0) or 0) + count
         row["native_fallback_turns"] = int(row.get("native_fallback_turns", 0)) + int(bool(native_fallback))
         row["last_seen"] = now
         row["last_context"] = int(_llama_props_ctx() or settings.get("num_ctx") or 0)
@@ -1081,6 +1107,9 @@ def _record_model_observation(model: str, *, prompt_tokens: int = 0,
         cfg["peak_context_sum"] = int(cfg.get("peak_context_sum", 0) or 0) + _peak
         cfg["compactions"] = int(cfg.get("compactions", 0) or 0) + max(0, int(compactions or 0))
         cfg["compaction_failures"] = int(cfg.get("compaction_failures", 0) or 0) + max(0, int(compaction_failures or 0))
+        cfg_interventions = cfg.setdefault("interventions", {})
+        for intervention, count in intervention_counts.items():
+            cfg_interventions[intervention] = int(cfg_interventions.get(intervention, 0) or 0) + count
         cfg["last_seen"] = now
         cfg["last_context"] = row["last_context"]
         sessions = [str(x)[:16] for x in (cfg.get("sessions") or []) if x]
@@ -1109,6 +1138,7 @@ def _record_model_observation(model: str, *, prompt_tokens: int = 0,
             "native_fallback": bool(native_fallback),
             "compactions": max(0, int(compactions or 0)),
             "compaction_failures": max(0, int(compaction_failures or 0)),
+            "interventions": intervention_counts,
         })
         cfg["observations"] = obs[-_MODEL_ADVISOR_OBSERVATION_CAP:]
         _append_model_dataset({
@@ -1132,6 +1162,7 @@ def _record_model_observation(model: str, *, prompt_tokens: int = 0,
             "compaction_failures": max(0, int(compaction_failures or 0)),
             "tool_calls": max(0, int(tool_calls or 0)),
             "tool_errors": max(0, int(tool_errors or 0)),
+            "interventions": intervention_counts,
             "tools": _sanitize_tool_outcomes(tool_outcomes),
         })
         save_json(MODEL_RUNTIME_FILE, data)
@@ -1214,9 +1245,20 @@ def _usage_stats() -> dict:
     settings = get_settings()
     telemetry_enabled = bool(settings.get("passive_model_telemetry", True))
     profiles = _model_runtime_profiles().get("models") or {}
+    models_dir = str(settings.get("models_dir") or "").strip()
+    installed_models: set[str] | None = None
+    if models_dir and safe_exists(models_dir) and safe_is_dir(models_dir):
+        installed_models = set()
+        for item in scan_gguf_dir(models_dir):
+            filename = str(item.get("name") or "")
+            if filename:
+                installed_models.add(filename.casefold())
+                installed_models.add(Path(filename).stem.casefold())
     models = []
     for name, row in profiles.items():
         if not isinstance(row, dict):
+            continue
+        if installed_models is not None and str(name).casefold() not in installed_models:
             continue
         turns = max(0, int(row.get("turns", 0) or 0))
         if turns < 1:
@@ -1270,6 +1312,7 @@ def _usage_stats() -> dict:
     dataset_input = 0
     dataset_output = 0
     dataset_elapsed = 0.0
+    interventions = {key: 0 for key in _HARNESS_INTERVENTION_KEYS}
     try:
         with open(MODEL_DATASET_FILE, "r", encoding="utf-8") as handle:
             for line in handle:
@@ -1287,16 +1330,21 @@ def _usage_stats() -> dict:
                 dataset_input += prompt
                 dataset_output += output
                 dataset_elapsed += elapsed
+                for key, count in _sanitize_interventions(item.get("interventions")).items():
+                    interventions[key] += count
                 if re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
                     bucket = daily.setdefault(day, {"day": day, "turns": 0, "tokens": 0, "elapsed_ms": 0.0})
                     bucket["turns"] += 1
                     bucket["tokens"] += prompt + output
                     bucket["elapsed_ms"] += elapsed
-                if longest is None or elapsed > longest["elapsed_ms"]:
+                item_model = str(item.get("model") or "Unknown model")[:180]
+                model_is_installed = (installed_models is None
+                                      or item_model.casefold() in installed_models)
+                if model_is_installed and (longest is None or elapsed > longest["elapsed_ms"]):
                     session = str(item.get("session") or "")[:16]
                     longest = {
                         "elapsed_ms": round(elapsed, 1),
-                        "model": str(item.get("model") or "Unknown model")[:180],
+                        "model": item_model,
                         "day": day,
                         "title": chat_titles.get(session) or "Chat no longer available",
                         "chat_available": session in chat_titles,
@@ -1351,6 +1399,10 @@ def _usage_stats() -> dict:
         },
         "savings": savings,
         "compression": fold,
+        "interventions": {
+            **interventions,
+            "total": sum(interventions.values()),
+        },
         "repos": {
             "unique": len(repo_keys),
             "sessions": repo_sessions,
@@ -2192,7 +2244,7 @@ def _client_context_prompt(ctx: dict) -> str:
     ]
     if machine:
         label = re.sub(r"[\r\n]+", " ", str(machine.get("label") or "paired Mac"))[:80]
-        lines.append(f"Selected command and file target: paired macOS machine '{label}'.")
+        lines.append(f"Initial command and file target: paired macOS machine '{label}'.")
         lines.append(
             "Use the remote_* tools for terminal and file actions. For a newly generated Mac file, "
             "write directly with remote_write_file; do not stage it with the PC write_file tool. "
@@ -2202,11 +2254,18 @@ def _client_context_prompt(ctx: dict) -> str:
             "remote_file_append, then remote_file_commit. That flow asks once and writes atomically."
         )
     else:
-        lines.append("Selected command and file target: inference PC.")
+        lines.append("Initial command and file target: inference PC.")
+    lines.append(
+        "The target selector is the default. If the user explicitly asks to work on a different "
+        "named device, call switch_execution_target before any device-specific tool. A successful "
+        "switch result supersedes the initial target for the rest of the turn and updates the selector. "
+        "Never switch devices merely because a file was not found."
+    )
     if remote and client_os != ctx.get("inference_os"):
         lines.append(
             "Do not call the inference PC 'your computer' or promise to place files on an unqualified Desktop. "
-            "Name the PC or active client explicitly, and ask which device only when the selected target does not settle it."
+            "Name the PC or active client explicitly, and ask which device when neither the user's wording nor "
+            "the selected target settles it."
         )
     lines.append("Never silently fall back to another machine when the selected target is unavailable.")
     return "\n".join(lines)
@@ -6145,6 +6204,23 @@ _GIT_READONLY_VERBS = {
     "status", "log", "diff", "show", "remote", "rev-parse",
     "ls-files", "ls-tree", "grep", "blame",
 }
+_GIT_REMOTE_MUTATING_VERBS = {
+    "add", "remove", "rm", "rename", "set-head", "set-branches",
+    "set-url", "prune", "update",
+}
+
+
+def _git_argv_is_readonly(argv) -> bool:
+    if not isinstance(argv, list) or not argv or not isinstance(argv[0], str):
+        return False
+    verb = argv[0].lower()
+    if verb not in _GIT_READONLY_VERBS:
+        return False
+    if verb != "remote":
+        return True
+    subcommand = next((str(arg).lower() for arg in argv[1:]
+                       if isinstance(arg, str) and not arg.startswith("-")), "")
+    return subcommand not in _GIT_REMOTE_MUTATING_VERBS
 
 
 def _approval_mode() -> str:
@@ -6182,6 +6258,37 @@ def _is_destructive_command(cmd: str) -> bool:
     if not cmd:
         return False
     return any(p.search(cmd) for p in _SOFT_DESTRUCTIVE_RES)
+
+
+_SOFT_SENSITIVE_COMMAND_RES = [re.compile(p, re.IGNORECASE) for p in (
+    r"\bstart-process\b", r"\binvoke-item\b", r"\bexplorer(?:\.exe)?\b",
+    r"\btaskkill\b", r"\bstop-process\b", r"\bkill(?:all)?\b",
+    r"\bshutdown\b", r"\brestart-computer\b", r"\bstop-computer\b",
+    r"\bsc(?:\.exe)?\s+(?:create|config|delete|start|stop)\b",
+    r"\b(?:new|set|disable|enable|unregister)-scheduledtask\b",
+    r"\bnetsh\b", r"\bset-netfirewall", r"\bbcdedit\b",
+    r"\brunas\b", r"\bstart-process\b[^\r\n]*\b-verb\s+runas\b",
+    r"\b(?:set-content|out-file)\b", r"(?<![<>=])>(?![>=])",
+)]
+
+
+def _soft_command_needs_approval(cmd: str) -> bool:
+    """Keep Soft useful for normal project work without silently allowing
+    commands that delete/overwrite data, launch or kill apps, or change core
+    operating-system state."""
+    text = cmd or ""
+    git_match = re.search(r"\bgit(?:\.exe)?\s+([a-z][a-z-]*)\b", text, re.IGNORECASE)
+    mutating_git = False
+    if git_match:
+        verb = git_match.group(1).lower()
+        mutating_git = verb not in _GIT_READONLY_VERBS
+        if verb == "remote":
+            remote_tail = text[git_match.end():]
+            remote_subcommand = re.match(r"\s*(?:-\S+\s+)*([a-z][a-z-]*)", remote_tail, re.IGNORECASE)
+            mutating_git = bool(remote_subcommand
+                                and remote_subcommand.group(1).lower() in _GIT_REMOTE_MUTATING_VERBS)
+    return (_is_destructive_command(text) or mutating_git
+            or any(pattern.search(text) for pattern in _SOFT_SENSITIVE_COMMAND_RES))
 
 
 def _critical_path_gate(path: str, kind: str, title: str) -> dict | None:
@@ -6297,9 +6404,10 @@ _MCP_BROWSER_TOOL_RE = re.compile(
 
 def request_approval(title: str, command: str, details: dict | None = None, timeout_s: int = 600) -> dict:
     """Create a pending approval, block worker until user responds, return decision.
-    When `auto_approve_write` is set, safe in-workspace file writes are approved
-    instantly; delete / registry / powershell / git / desktop / launch always
-    still prompt."""
+    Soft mode automatically allows routine, non-destructive project work.
+    Medium only trusts validated in-workspace writes. Hard prompts for every
+    action. Critical, remote, web-tainted and explicitly forced actions always
+    keep their stricter gate."""
     details = details or {}
     kind = details.get("kind")
     # Web-taint gate: untrusted web/MCP content entered the context recently,
@@ -6337,11 +6445,11 @@ def request_approval(title: str, command: str, details: dict | None = None, time
                         # soft mode; ANY mutating git verb prompts — a wrong
                         # push/commit/checkout rewrites history, which the
                         # destructive regex can't catch for every verb.
-                        argv0 = (details.get("argv") or [None])[0] if isinstance(details.get("argv"), list) else None
-                        if isinstance(argv0, str) and argv0 in _GIT_READONLY_VERBS:
-                            if not _is_destructive_command(command or ""):
+                        argv = details.get("argv")
+                        if _git_argv_is_readonly(argv):
+                            if not _soft_command_needs_approval(command or ""):
                                 return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
-                    elif not _is_destructive_command(command or ""):
+                    elif not _soft_command_needs_approval(command or ""):
                         return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
                 elif kind:
                     return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
@@ -8118,9 +8226,6 @@ def tool_run_powershell(args: dict) -> dict:
             details={
                 "kind": "powershell",
                 "target": "host",
-                # A free-form shell is an execution boundary. Classification is
-                # useful copy, never the thing that decides whether it may run.
-                "force_prompt": True,
                 "executes_code": executes_code,
                 "red_team_context": red_team_context,
             },
@@ -8937,7 +9042,7 @@ def tool_session_start(args: dict) -> dict:
         command=command,
         details={
             "kind": "session", "target": "host", "cwd": cwd,
-            "force_prompt": True, "executes_code": True,
+            "executes_code": True,
             "red_team_context": bool(_rt_authorized_mission(_rt_context_chat())),
         },
     )
@@ -8989,7 +9094,7 @@ def tool_session_send(args: dict) -> dict:
         command=text,
         details={
             "kind": "session", "session_id": sid, "target": "host",
-            "force_prompt": True, "executes_code": True,
+            "executes_code": True,
             "red_team_context": bool(_rt_authorized_mission(_rt_context_chat())),
         },
     )
@@ -12931,7 +13036,9 @@ def tool_extract_archive(args: dict) -> dict:
     approval = request_approval(
         title="Extract archive",
         command=f'extract: "{src.name}" -> "{dest.name}"',
-        details={"kind": "extract_archive", "source": str(src), "dest": str(dest)},
+        details={"kind": "delete" if dest.exists() else "extract_archive",
+                 "source": str(src), "dest": str(dest),
+                 "overwrite": bool(dest.exists())},
     )
     if approval.get("decision") != "approve":
         return {"error": f"user denied extraction ({approval.get('status')})"}
@@ -13089,7 +13196,9 @@ def tool_carve_file(args: dict) -> dict:
     approval = request_approval(
         title="Carve file",
         command=f'carve: "{src.name}" [0x{offset:x}..+0x{length:x}] -> "{dest.name}"',
-        details={"kind": "carve_file", "source": str(src), "dest": str(dest),
+        details={"kind": "delete" if dest.exists() else "carve_file",
+                 "source": str(src), "dest": str(dest),
+                 "overwrite": bool(dest.exists()),
                  "offset": offset, "length": length},
     )
     if approval.get("decision") != "approve":
@@ -13140,7 +13249,8 @@ def tool_carve_file(args: dict) -> dict:
 def tool_extract_squashfs(args: dict) -> dict:
     """Extract a squashfs image into a sandbox subdirectory next to the source.
     Pure-Python via PySquashfsImage — no system squashfs-tools needed. Refuses
-    path-traversal in archive members. Requires user approval (destructive)."""
+    path-traversal in archive members. Overwriting an existing destination
+    keeps the deletion approval gate."""
     if not _HAVE_SQUASHFS:
         return {"error": "PySquashfsImage not installed. pip install PySquashfsImage"}
     path, err = _fw_check_path(args.get("path") or "")
@@ -13168,7 +13278,9 @@ def tool_extract_squashfs(args: dict) -> dict:
     approval = request_approval(
         title="Extract squashfs",
         command=f'extract squashfs: "{src.name}" -> "{dest.name}"',
-        details={"kind": "extract_squashfs", "source": str(src), "dest": str(dest)},
+        details={"kind": "delete" if dest.exists() else "extract_squashfs",
+                 "source": str(src), "dest": str(dest),
+                 "overwrite": bool(dest.exists())},
     )
     if approval.get("decision") != "approve":
         return {"error": f"user denied extraction ({approval.get('status')})"}
@@ -15058,7 +15170,7 @@ def tool_scan_secrets(args: dict) -> dict:
     aid = request_approval(
         "Secret scan",
         f"Scan {target} for hardcoded secrets",
-        {"target": str(target), "extensions": list(exts)}
+        {"kind": "secret_scan", "target": str(target), "extensions": list(exts)}
     )
     if aid.get("decision") != "approve":
         return {"error": "user denied"}
@@ -15171,7 +15283,9 @@ def tool_parse_evtx(args: dict) -> dict:
         except Exception:
             pass
 
-    aid = request_approval("Parse event log", f"Read {target}", {"target": str(target)})
+    aid = request_approval(
+        "Parse event log", f"Read {target}",
+        {"kind": "parse_event_log", "target": str(target)})
     if aid.get("decision") != "approve":
         return {"error": "user denied"}
 
@@ -15328,7 +15442,9 @@ def tool_analyze_pcap(args: dict) -> dict:
     dns_only = args.get("dns_only", False)
     http_only = args.get("http_only", False)
 
-    aid = request_approval("Analyze packet capture", f"Parse {target}", {"target": str(target)})
+    aid = request_approval(
+        "Analyze packet capture", f"Parse {target}",
+        {"kind": "analyze_pcap", "target": str(target)})
     if aid.get("decision") != "approve":
         return {"error": "user denied"}
 
@@ -19217,6 +19333,11 @@ def tool_run_tests(args: dict) -> dict:
     if catastrophic:
         return not_run(f"refused: this command {catastrophic}", "catastrophic",
                        catastrophic=True)
+    clickfix = _clickfix_cmd(command)
+    if clickfix:
+        return not_run(
+            f"refused: this command {clickfix} (ClickFix signature)",
+            "clickfix", clickfix=True)
     approval = request_approval(
         title="Run project tests on Windows host",
         command=command,
@@ -19224,7 +19345,6 @@ def tool_run_tests(args: dict) -> dict:
             "kind": "test",
             "cwd": cwd,
             "target": "host",
-            "force_prompt": True,
             "executes_code": True,
             "red_team_context": bool(_rt_authorized_mission(_rt_context_chat())),
         },
@@ -19643,7 +19763,7 @@ def _load_mcp_servers():
 
             # Inject into the global TOOLS dictionary
             TOOLS[prefixed_name] = {
-                "description": f"[MCP: {server_name}] {tool_def.get('description', '')}. Requires user approval.",
+                "description": f"[MCP: {server_name}] {tool_def.get('description', '')}. Approval follows the selected access mode.",
                 "parameters": tool_def.get("inputSchema", {}),
                 "fn": make_tool_callable(client, tool_name, tool_def.get('description', ''), prefixed_name),
             }
@@ -19783,7 +19903,7 @@ TOOLS: dict[str, dict] = {
     "run_tests": {
         "description": (
             "Run a test command (e.g. pytest, npm test) directly on the Windows host and get a "
-            "structured summary of failures. Every test command requires user approval. To run a "
+            "structured summary of failures. Approval follows the selected access mode. To run a "
             "test inside the WSL guest instead, use sandbox_run."
         ),
         "parameters": {
@@ -19800,7 +19920,7 @@ TOOLS: dict[str, dict] = {
 
 
     "scan_secrets": {
-        "description": "Scan a file or directory for hardcoded secrets (API keys, tokens, passwords). Read-only. Requires user approval.",
+        "description": "Scan a file or directory for hardcoded secrets (API keys, tokens, passwords). Read-only; approval follows the selected access mode.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -19815,7 +19935,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_scan_secrets,
     },
     "parse_evtx": {
-        "description": "Parse Windows .evtx event log files. Requires user approval.",
+        "description": "Parse Windows .evtx event log files. Read-only; approval follows the selected access mode.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -19830,7 +19950,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_parse_evtx,
     },
     "analyze_pcap": {
-        "description": "Analyze a PCAP or PCAPNG packet capture file. Requires user approval.",
+        "description": "Analyze a PCAP or PCAPNG packet capture file. Read-only; approval follows the selected access mode.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -20255,7 +20375,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_read_file,
     },
     "write_file": {
-        "description": "Write or overwrite a file. Requires user approval. ONLY for new files or complete rewrites (>30 lines changed). For fixes to an existing file, prefer edit_file. Provide content for new text, or source='visible_code_block' to copy a prior visible chat fence losslessly without regenerating it.",
+        "description": "Write or overwrite a workspace file. Approval follows the selected access mode. ONLY for new files or complete rewrites (>30 lines changed). For fixes to an existing file, prefer edit_file. Provide content for new text, or source='visible_code_block' to copy a prior visible chat fence losslessly without regenerating it.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -20346,7 +20466,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_delete_file,
     },
     "run_powershell": {
-        "description": "Request a PowerShell command on the Windows host. Every free-form host command requires user approval and its real process lifecycle is shown in the Host terminal.",
+        "description": "Run a PowerShell command on the Windows host. Approval follows the selected access mode; destructive or sensitive commands keep a gate. Its real process lifecycle is shown in the Host terminal.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -20503,7 +20623,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_remote_copy_from,
     },
     "session_start": {
-        "description": "Open a PERSISTENT process directly on the Windows host and drive it statefully across turns (unlike run_powershell, which is one-shot and loses cwd, environment, and connections). Use it for SSH, a REPL, DB client, or debugger. `command` is the process to launch (defaults to a local shell). Returns a session_id + initial output; then use session_send / session_read / session_stop. The user can watch the same process in the Shell tab. Starting it always requires approval.",
+        "description": "Open a PERSISTENT process directly on the Windows host and drive it statefully across turns (unlike run_powershell, which is one-shot and loses cwd, environment, and connections). Use it for SSH, a REPL, DB client, or debugger. `command` is the process to launch (defaults to a local shell). Returns a session_id + initial output; then use session_send / session_read / session_stop. The user can watch the same process in the Shell tab. Approval follows the selected access mode.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -20516,7 +20636,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_session_start,
     },
     "session_send": {
-        "description": "Send a line to a persistent Windows host process created by session_start and return new output. State persists between calls. Every input requires approval because shell and REPL input can execute code.",
+        "description": "Send a line to a persistent Windows host process created by session_start and return new output. State persists between calls. Approval follows the selected access mode; destructive or sensitive input keeps a gate.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -20620,7 +20740,7 @@ TOOLS: dict[str, dict] = {
             "no install. Use to spot weird traffic — unknown processes phoning "
             "home, unexpected open ports, suspicious resolved domains. Can save a "
             "named local baseline and compare a later snapshot for drift. Windows-only "
-            "for now. Each capture requires user approval."
+            "for now. Approval follows the selected access mode."
         ),
         "parameters": {
             "type": "object",
@@ -20638,7 +20758,7 @@ TOOLS: dict[str, dict] = {
             "(4624/4625), process creation (4688), scheduled-task creation "
             "(4698), service installs (7045), boot/shutdown (1074/6005/6006), "
             "and crashes (1001). log: 'security' | 'system' | 'application'. "
-            "Read-only, each call requires user approval. The Security log "
+            "Read-only; approval follows the selected access mode. The Security log "
             "needs an elevated session; when denied, the tool says so and still "
             "returns whatever other logs had. Use with persistence_hunt for a "
             "host triage: 'anything changed recently that shouldn't have?'"
@@ -20673,7 +20793,7 @@ TOOLS: dict[str, dict] = {
             "user dirs), and WMI event subscriptions. Returns a short flagged "
             "list ('worth a look') plus the full inventory for context. WMI "
             "event subscriptions are ALWAYS flagged — almost nothing legitimate "
-            "uses them. Each call requires user approval. Use with "
+            "uses them. Approval follows the selected access mode. Use with "
             "parse_event_logs for a read-only host triage."
         ),
         "parameters": {
@@ -20962,7 +21082,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_find_files,
     },
     "extract_archive": {
-        "description": "Auto-detect and extract gzip/tar/zip/xz/bzip2/squashfs into a sandbox folder next to the source. Requires user approval.",
+        "description": "Auto-detect and extract gzip/tar/zip/xz/bzip2/squashfs into a sandbox folder next to the source. Approval follows the selected access mode.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -20981,7 +21101,7 @@ TOOLS: dict[str, dict] = {
             "gzip/squashfs/etc inside a custom container (e.g. the 0xd00dfe "
             "TP-Link/ASUS .pkgtb wrapper) — carve the range, then run "
             "extract_archive or extract_squashfs on the carved file. "
-            "length=0 carves to EOF. Requires user approval."
+            "length=0 carves to EOF. Approval follows the selected access mode."
         ),
         "parameters": {
             "type": "object",
@@ -21003,7 +21123,7 @@ TOOLS: dict[str, dict] = {
             "sandbox folder next to the source. Pure-Python via PySquashfsImage "
             "— no system squashfs-tools needed. Use AFTER you've located a "
             "squashfs.img (e.g. via binwalk_scan + extract_archive on a tar). "
-            "Requires user approval."
+            "Approval follows the selected access mode."
         ),
         "parameters": {
             "type": "object",
@@ -21862,6 +21982,149 @@ def _selected_execution_target(chat_id: str = "") -> str:
     return str(ctx.get("execution_target") or "host")
 
 
+def _execution_target_allows_tool(name: str, chat_id: str = "") -> bool:
+    """Whether the active target may see a device-affine tool."""
+    canon = _resolve_tool_name(name)
+    if _selected_execution_target(chat_id) == "host":
+        return canon not in _REMOTE_TOOL_NAMES
+    return not _tool_targets_inference_host(canon)
+
+
+def _ready_remote_machines() -> list[dict]:
+    return [
+        row for row in _load_remote_machines().get("machines", [])
+        if row.get("status") == "ready" and row.get("enabled", True)
+    ]
+
+
+_TARGET_ACTION = r"(?:on|in|from|to|use|using|check|search|scan|inspect|open|look\s+(?:at|in)|work\s+on)"
+_HOST_TARGET_INTENT_RE = re.compile(
+    rf"(?:\b{_TARGET_ACTION}\s+(?:the\s+)?(?:pc|inference\s+(?:pc|device|host)|windows\s+(?:pc|host|machine))\b"
+    r"|\bpc\s+workspace\b|\bmeant\s+(?:on\s+)?(?:the\s+)?(?:pc|inference\s+(?:pc|device|host))\b)",
+    re.IGNORECASE,
+)
+_REMOTE_TARGET_INTENT_RE = re.compile(
+    rf"(?:\b{_TARGET_ACTION}\s+(?:the\s+)?(?:mac|macbook|macos|paired\s+mac|remote\s+mac(?:hine)?)\b"
+    r"|\bmac(?:book)?\s+workspace\b|\bmeant\s+(?:on\s+)?(?:the\s+)?(?:mac|macbook|paired\s+mac)\b)",
+    re.IGNORECASE,
+)
+
+
+def _user_explicitly_requested_execution_target(target: str, machine: dict | None = None) -> bool:
+    """Conservative user-intent gate for a model-requested target change."""
+    context = _client_context_by_chat.get(_get_current_chat() or "", {})
+    text = str(context.get("_user_text") or "")
+    if target == "host":
+        return bool(_HOST_TARGET_INTENT_RE.search(text))
+    if _REMOTE_TARGET_INTENT_RE.search(text):
+        return True
+    label = str((machine or {}).get("label") or "").strip()
+    if not label or label.casefold() not in text.casefold():
+        return False
+    prefix = text.casefold().split(label.casefold(), 1)[0][-80:]
+    return bool(re.search(_TARGET_ACTION + r"\s+(?:the\s+)?$", prefix, re.IGNORECASE))
+
+
+def tool_switch_execution_target(args: dict) -> dict:
+    """Change the chat's device routing without performing work on either device."""
+    chat_id = _get_current_chat()
+    if not chat_id:
+        return {"error": "No active chat is available for an execution-target switch."}
+
+    requested = str(args.get("target") or "").strip()
+    remotes = _ready_remote_machines()
+    resolved = requested
+    machine = None
+    if requested.lower() in {"pc", "windows", "inference_pc", "inference-host"}:
+        resolved = "host"
+    elif requested.lower() in {"mac", "remote", "paired_mac", "paired-mac"}:
+        if len(remotes) != 1:
+            return {
+                "error": "A paired Mac alias is only unambiguous when exactly one ready Mac exists.",
+                "available_targets": [
+                    {"id": "host", "label": "Inference PC"},
+                    *[{"id": str(row.get("id") or ""), "label": str(row.get("label") or "Paired Mac")}
+                      for row in remotes],
+                ],
+            }
+        machine = remotes[0]
+        resolved = str(machine.get("id") or "")
+    elif requested != "host":
+        machine = next((row for row in remotes if str(row.get("id") or "") == requested), None)
+        if machine is None:
+            return {
+                "error": f"Unknown or unavailable execution target: {requested}",
+                "available_targets": [
+                    {"id": "host", "label": "Inference PC"},
+                    *[{"id": str(row.get("id") or ""), "label": str(row.get("label") or "Paired Mac")}
+                      for row in remotes],
+                ],
+            }
+
+    previous = _selected_execution_target(chat_id)
+    if previous != resolved and not _user_explicitly_requested_execution_target(resolved, machine):
+        previous_machine = _remote_machine(previous) if previous != "host" else None
+        previous_label = str((previous_machine or {}).get("label") or "Inference PC")
+        next_label = str((machine or {}).get("label") or "Inference PC")
+        approval = request_approval(
+            title="Switch command target",
+            command=f"{previous_label} -> {next_label}",
+            details={
+                "kind": "execution_target",
+                "force_prompt": True,
+                "from_target": previous,
+                "target": resolved,
+            },
+        )
+        if approval.get("decision") != "approve":
+            return {
+                "error": f"User denied execution-target switch ({approval.get('status')}).",
+                "not_executed": True,
+                "execution_target": previous,
+            }
+    current = dict(_client_context_by_chat.get(chat_id) or {})
+    current["execution_target"] = resolved
+    current["target_label"] = str(machine.get("label") or "Paired Mac") if machine else "Inference PC"
+    _client_context_by_chat[chat_id] = current
+    if resolved != "host":
+        _unlock_bundle(chat_id, "remote")
+
+    if resolved == "host":
+        next_step = "Use the inference-PC workspace tools now exposed, such as list_directory, find_files, and read_file."
+    else:
+        next_step = "Use the remote Mac tools now exposed, such as remote_list_directory and remote_read_file."
+    return {
+        "ok": True,
+        "execution_target_changed": previous != resolved,
+        "execution_target": resolved,
+        "previous_target": previous,
+        "target_label": current["target_label"],
+        "next_step": next_step,
+    }
+
+
+TOOLS["switch_execution_target"] = {
+    "description": (
+        "Switch this chat's command and file target when the user explicitly names a different device "
+        "than the top-bar selection. This only changes routing; it does not read, write, or run anything. "
+        "Use target='host' for the inference PC. Use target='remote' only when exactly one paired Mac is "
+        "ready, otherwise use the exact machine id returned after an ambiguity error. Never switch merely "
+        "because a search returned no match."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "'host' for the inference PC, 'remote' for the sole paired Mac, or an exact paired-machine id.",
+            },
+        },
+        "required": ["target"],
+    },
+    "fn": tool_switch_execution_target,
+}
+
+
 _RT_SCOPE_AWARE_GENERIC_TOOLS = {"web_fetch", "audit_http_headers"}
 _RT_SCOPE_AWARE_COMMAND_TOOLS = {
     "run_powershell": "command",
@@ -21908,7 +22171,7 @@ _CORE_TOOL_NAMES = {
     "check_syntax", "run_tests", "check_deps", "run_powershell", "open_program",
     # planning / memory / probe
     "update_plan", "record_finding", "list_findings", "pin_note", "unpin_note", "remember", "forget", "edit_memory",
-    "list_more_tools", "compact_history", "save_skill",
+    "list_more_tools", "compact_history", "save_skill", "switch_execution_target",
     # web
     "web_search", "web_image_search", "web_fetch",
     # interactive sessions
@@ -21927,12 +22190,12 @@ _SMALL_CTX_CORE_TOOL_NAMES = {
     "project_map", "capability_report", "read_file", "write_file", "edit_file", "list_directory",
     "find_files", "grep_files", "check_syntax", "run_tests", "run_powershell",
     "update_plan", "record_finding", "list_findings", "pin_note", "unpin_note", "list_more_tools",
-    "compact_history", "save_skill", "git_status", "git_diff",
+    "compact_history", "save_skill", "switch_execution_target", "git_status", "git_diff",
 }
 _TINY_CTX_CORE_TOOL_NAMES = {
     "project_map", "read_file", "write_file", "edit_file", "list_directory",
     "grep_files", "check_syntax", "run_powershell", "update_plan",
-    "list_more_tools", "compact_history", "save_skill",
+    "list_more_tools", "compact_history", "save_skill", "switch_execution_target",
 }
 # None = dynamic (all TOOLS keys with the given prefix, resolved at call time).
 _TOOL_BUNDLES: dict[str, set[str] | None] = {
@@ -22440,11 +22703,10 @@ def _visible_tool_names(include_exploit: bool = True, chat_id: str = "") -> set[
         # first-party worker. Every other MCP connector remains hidden.
         visible = {n for n in visible
                    if not (n.startswith("mcp_") and not n.startswith("mcp_playwright_"))}
-    # Execution target is a backend capability boundary. When a paired Mac is
-    # selected, do not show PC-affine tools and hope the model reads a prose
-    # reminder. Project only the remote file/shell surface into its schema.
+    # Execution target is a backend capability boundary. Project only the
+    # selected device's file/shell surface instead of relying on prose routing.
+    visible = {n for n in visible if _execution_target_allows_tool(n, chat_id)}
     if _selected_execution_target(chat_id) != "host":
-        visible = {n for n in visible if not _tool_targets_inference_host(n)}
         visible |= _REMOTE_TOOL_NAMES
     # The system prompt advertises the guest whenever it is ready. Keep the
     # actual schema in lockstep so the model never substitutes host PowerShell
@@ -22469,14 +22731,22 @@ def tool_list_more_tools(args: dict) -> dict:
             continue
         # Advertise only bundles at least one of whose tools the current
         # settings would actually load (desktop / red-team / analysis gates).
-        usable = sorted(n for n in btools if n in TOOLS and n not in excluded)
+        usable = sorted(
+            n for n in btools
+            if n in TOOLS and n not in excluded
+            and _execution_target_allows_tool(n, chat_id)
+        )
         if usable:
             enabled[bname] = usable
     if not bundle:
         loaded = set(_unlocked_bundles_by_chat.get(chat_id, ()))
         return {
-            "note": "Call again with a bundle name (e.g. {\"bundle\": \"git\"}) to inspect its tools and load it into this chat's schema.",
-            "core": sorted(n for n in _base_core_tool_names() if n in TOOLS and n not in excluded),
+            "note": "Call again with one of the bundle names shown below to inspect its tools and load it into this chat's schema.",
+            "core": sorted(
+                n for n in _base_core_tool_names()
+                if n in TOOLS and n not in excluded
+                and _execution_target_allows_tool(n, chat_id)
+            ),
             "bundles": {b: {"tools": names, "loaded": b in loaded}
                         for b, names in enabled.items()},
         }
@@ -23023,6 +23293,7 @@ def _strip_unparsed_tool_markup(text: str) -> str:
 _tool_history_lock = threading.Lock()
 _tool_call_history: dict[str, dict[str, dict]] = {}    # chat_id -> sig -> rec
 _tool_write_history: dict[str, dict[str, int]] = {}    # chat_id -> path -> count
+_tool_family_history: dict[str, dict[str, int]] = {}   # chat_id -> family -> consecutive calls
 # Cross-tool URL tracking: web_fetch and http_request are separate tools with
 # independent loop-breaker streaks, but the model ping-pongs between them on the
 # same URL to dodge per-tool limits. Track fetches at the URL level across all
@@ -23032,6 +23303,8 @@ _FETCH_LIKE_TOOLS = frozenset({"web_fetch", "http_request"})
 TOOL_REPEAT_LIMIT = 3       # 4th SAME-RESULT call in a row gets refused.
 TOOL_REPEAT_HARD_LIMIT = 20  # absolute backstop for wobbly-output tools (below max_tool_rounds).
 URL_CROSS_TOOL_LIMIT = 5     # same URL hit 5× via ANY fetch tool combo → refuse.
+DIRECTORY_WALK_LIMIT = 8     # directory browsing must change strategy before it becomes a maze.
+_DIRECTORY_WALK_TOOLS = frozenset({"list_directory", "remote_list_directory"})
 
 # Per-turn context — chat_id and other state reachable from deep inside tool
 # implementations without threading the id through every function signature.
@@ -23054,6 +23327,20 @@ def _reset_tool_call_history(chat_id: str) -> None:
         _tool_call_history[chat_id] = {}
         _tool_write_history[chat_id] = {}
         _tool_url_history[chat_id] = {}
+        _tool_family_history[chat_id] = {}
+
+
+def _reserve_tool_family_call(canon: str) -> int:
+    """Reserve a consecutive family slot and reset the streak on a new strategy."""
+    chat_id = _get_current_chat()
+    with _tool_history_lock:
+        families = _tool_family_history.setdefault(chat_id, {})
+        if canon not in _DIRECTORY_WALK_TOOLS:
+            families["directory_walk"] = 0
+            return 0
+        count = int(families.get("directory_walk", 0) or 0) + 1
+        families["directory_walk"] = count
+        return count
 
 
 # Rewrite-loop breaker: count full write_file rewrites per path per turn so a
@@ -23408,20 +23695,35 @@ def invoke_tool(name: str, args: dict) -> dict:
         _record_action_audit(canon, args or {}, result)
         return result
     selected_target = _selected_execution_target()
+    if selected_target == "host" and canon in _REMOTE_TOOL_NAMES:
+        return _finish({
+            "error": (
+                "refused: the selected execution target is the inference PC, but "
+                f"{canon} acts on a paired Mac. Use switch_execution_target first."
+            ),
+            "wrong_execution_target": True,
+            "selected_target": selected_target,
+            "tool": canon,
+            "suggested_tool": "switch_execution_target",
+            "not_executed": True,
+            "loop_breaker": True,
+        })
     if selected_target != "host" and _tool_targets_inference_host(canon):
         suggested = _REMOTE_TOOL_EQUIVALENTS.get(canon)
-        correction = (f" Use {suggested} instead." if suggested else
-                      " Use an available remote_* tool instead.")
+        remote_alternative = suggested or "an available remote_* tool"
         return _finish({
             "error": (
                 "refused: the selected execution target is the paired Mac, but "
-                f"{canon} acts on the inference PC.{correction}"
+                f"{canon} acts on the inference PC. If the user explicitly named the PC, "
+                f"call switch_execution_target with target='host'. If the Mac remains intended, "
+                f"use {remote_alternative} instead."
             ),
             "wrong_execution_target": True,
             "selected_target": selected_target,
             "tool": canon,
             "suggested_tool": suggested or "",
             "not_executed": True,
+            "loop_breaker": True,
         })
     missing = _missing_required_tool_args(canon, args)
     if missing:
@@ -23541,6 +23843,20 @@ def invoke_tool(name: str, args: dict) -> dict:
             "repeat_count": n,
             "tool": canon,
             "loop_breaker": True,
+        })
+    directory_walk_count = _reserve_tool_family_call(canon)
+    if directory_walk_count > DIRECTORY_WALK_LIMIT:
+        return _finish({
+            "error": (
+                f"refused: directory listing has been used {directory_walk_count} times consecutively "
+                "without changing strategy. Stop walking folders one by one. Use recursive search, "
+                "switch_execution_target if the user named another device, or report that the item "
+                "was not found in the locations already checked."
+            ),
+            "repeat_count": directory_walk_count,
+            "tool": canon,
+            "loop_breaker": True,
+            "tool_family": "directory_walk",
         })
     try:
         result = t["fn"](args or {})
@@ -25278,6 +25594,12 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
     turn_eval_ms_total = 0.0
     turn_compactions = 0
     turn_compaction_failures = 0
+    turn_interventions = {key: 0 for key in _HARNESS_INTERVENTION_KEYS}
+
+    def note_intervention(kind: str) -> None:
+        if kind in turn_interventions:
+            turn_interventions[kind] += 1
+
     _profile_recorded = False
     _chat_emitters[chat_id] = emit
     with _chat_live_activity_lock:
@@ -25484,7 +25806,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
 
         while True:
             if cancel_ev.is_set():
-                emit({"type": "notice", "note": "stopped by user"})
+                emit({"type": "notice", "note": "stopped by user", "quiet": True})
                 return {
                     "role": "assistant", "content": "", "_stopped": True,
                     "_appended_intermediate": list(conversation[_start_len:]),
@@ -25916,7 +26238,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         payload["messages"] = _sanitize_messages_for_openai(
                             trimmed, stub_old_tools=stub_old_tools)
                         _emit_ctx_fill()
-                        emit({"type": "notice",
+                        note_intervention("context_retry")
+                        emit({"type": "notice", "quiet": True,
                               "note": "prompt exceeded the context window — trimmed older turns and retrying"})
                         continue
                     if _transient_retries < 2 and _is_transient_server_error(e):
@@ -25925,7 +26248,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         time.sleep(_wait)
                         _det = getattr(e, "code", None) or type(e).__name__
                         _body_tail = _http_error_body(e).strip().replace("\n", " ")[-160:]
-                        emit({"type": "notice",
+                        note_intervention("server_retry")
+                        emit({"type": "notice", "quiet": True,
                               "note": (f"llama-server faulted ({_det}) — retrying in {int(_wait)}s"
                                        + (f" · server said: …{_body_tail}" if _body_tail else ""))})
                         continue
@@ -26239,7 +26563,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
 
             if cancel_ev.is_set():
                 try:
-                    emit({"type": "notice", "note": "stopped by user"})
+                    emit({"type": "notice", "note": "stopped by user", "quiet": True})
                 except Exception:
                     pass
                 partial = {"role": "assistant", "content": "".join(content_buf)}
@@ -26276,7 +26600,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             f"({_think_cap:,} target; ~{safety_ceiling:,} ceiling) — writing the answer now")
                 else:
                     note = "repetitive reasoning loop stopped — writing the answer now"
-                emit({"type": "notice", "note": note})
+                note_intervention("reasoning_guard")
+                emit({"type": "notice", "note": note, "quiet": True})
                 if rounds < max_tool_rounds:
                     force_no_think = True
                     continue
@@ -26349,7 +26674,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         "content": full_text,
                         "_tool_call_prefill": True,
                     })
-                    emit({"type": "notice",
+                    note_intervention("tool_call_repair")
+                    emit({"type": "notice", "quiet": True,
                           "note": f"reply hit the output budget inside a tool call — continuing it "
                                   f"across rounds ({carry_rounds})"})
                     continue
@@ -26388,7 +26714,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             "without explaining the recovery."
                         ),
                     })
-                    emit({"type": "notice",
+                    note_intervention("tool_call_repair")
+                    emit({"type": "notice", "quiet": True,
                           "note": "oversized tool call stopped advancing; switching to smaller file edits"})
                     continue
 
@@ -26550,7 +26877,9 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             "explain, and do not ask for permission."
                         ),
                     })
-                    emit({"type": "notice", "note": "model returned no executable action or visible answer — retrying"})
+                    note_intervention("empty_reply_retry")
+                    emit({"type": "notice", "quiet": True,
+                          "note": "model returned no executable action or visible answer — retrying"})
                     continue
                 elif not _final_text:
                     completed = any(item.get("ok") for item in turn_tool_outcomes)
@@ -26611,7 +26940,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             "actually complete, write the final summary of what was done instead."
                         ),
                     })
-                    emit({"type": "notice",
+                    note_intervention("auto_continue")
+                    emit({"type": "notice", "quiet": True,
                           "note": f"model paused mid-plan — auto-continuing ({auto_continues}/3)"})
                     continue
                 # Persist whole-turn token totals (summed across every round),
@@ -26712,6 +27042,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         compactions=turn_compactions,
                         compaction_failures=turn_compaction_failures,
                         tool_outcomes=turn_tool_outcomes,
+                        interventions=turn_interventions,
                     )
                 except Exception:
                     # Passive profiling is advisory. A damaged/unwritable
@@ -26776,7 +27107,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         "\n".join(_example_lines)
                     ),
                 })
-                emit({"type": "notice",
+                note_intervention("tool_call_repair")
+                emit({"type": "notice", "quiet": True,
                       "note": "Tool arguments were incomplete. Retrying through the reliable text parser."})
                 # This model's native tool parsing is broken — remember it for
                 # the rest of the session so future turns skip Round 1 instead
@@ -26803,18 +27135,25 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # run concurrently (last-write-wins races), so those are grouped
             # into serial batches.
             _batches: list[list[dict]] = []
-            # A report closes the engagement. Always execute it after every
-            # other call in the round and alone, so a parallel exploit cannot
-            # race the server-side close gate.
-            _ordered_calls = ([c for c in parsed_calls if _resolve_tool_name(c.get("name") or "") != "rt_generate_report"]
-                              + [c for c in parsed_calls if _resolve_tool_name(c.get("name") or "") == "rt_generate_report"])
+            # Target switches run first and alone so a same-round file call sees
+            # the new boundary. A report runs last and alone so a parallel
+            # exploit cannot race the server-side close gate.
+            _round_serial_tools = {"switch_execution_target", "rt_generate_report"}
+            _ordered_calls = (
+                [c for c in parsed_calls
+                 if _resolve_tool_name(c.get("name") or "") == "switch_execution_target"]
+                + [c for c in parsed_calls
+                   if _resolve_tool_name(c.get("name") or "") not in _round_serial_tools]
+                + [c for c in parsed_calls
+                   if _resolve_tool_name(c.get("name") or "") == "rt_generate_report"]
+            )
             for _call in _ordered_calls:
-                if _resolve_tool_name(_call.get("name") or "") == "rt_generate_report":
+                if _resolve_tool_name(_call.get("name") or "") in _round_serial_tools:
                     _batches.append([_call])
                     continue
                 _key = _call_serial_key(_call)
                 for _b in _batches:
-                    if any(_resolve_tool_name(x.get("name") or "") == "rt_generate_report" for x in _b):
+                    if any(_resolve_tool_name(x.get("name") or "") in _round_serial_tools for x in _b):
                         continue
                     if not _key or not any(_call_serial_key(x) == _key for x in _b):
                         _b.append(_call)
@@ -27043,7 +27382,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         "plain text only."
                     ),
                 })
-                emit({"type": "notice",
+                note_intervention("loop_guard")
+                emit({"type": "notice", "quiet": True,
                       "note": f"loop guard: repeated identical tool refusals ({_rb_names}) — "
                               "ending the turn with a final answer"})
             if tool_cap_no_think and _batches:
@@ -27083,6 +27423,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     compactions=turn_compactions,
                     compaction_failures=turn_compaction_failures,
                     tool_outcomes=turn_tool_outcomes,
+                    interventions=turn_interventions,
                 )
             except Exception:
                 pass
@@ -28377,7 +28718,7 @@ def _sandbox_scope_block(command: str) -> str | None:
 
 def tool_sandbox_run(args: dict) -> dict:
     """Run a shell command inside the separate accuretta-sbx Linux guest.
-    Every free-form command requires approval and catastrophic commands are
+    Approval follows the selected access mode and catastrophic commands are
     hard-refused. This is a convenience WSL guest, not a malware containment
     boundary: mounted Windows paths remain real host files. A delete targeting
     /mnt is a delete of the user's real files, hence the same guards."""
@@ -28429,7 +28770,6 @@ def tool_sandbox_run(args: dict) -> dict:
             "distro": SANDBOX_DISTRO,
             "target": "sandbox (WSL guest)",
             "cwd": requested_cwd,
-            "force_prompt": True,
             "executes_code": executes_code,
             "host_mounts_exposed": True,
             "windows_interop_disabled": True,
@@ -28450,8 +28790,8 @@ TOOLS["sandbox_run"] = {
         "from normal host processes. It is NOT malware-grade containment: never "
         "execute an unknown sample, and mounted Windows paths are still real host "
         "files. The workspace is visible at /mnt/<drive>/... ; pass `cwd` as a Windows path and "
-        "it is translated. Every free-form guest command requires approval; "
-        "drive-wipes are refused. "
+        "it is translated. Approval follows the selected access mode; destructive "
+        "or sensitive commands keep a gate and drive-wipes are refused. "
         "PREINSTALLED and working — USE THESE, do not write your own replacement for a "
         "tool that is already here: python3/pip3, nmap, sqlmap, binwalk (extraction "
         "works: `binwalk -e file` runs its extractors as root automatically), file, "
@@ -28967,6 +29307,8 @@ class Handler(BaseHTTPRequestHandler):
                     with _tool_history_lock:
                         _tool_call_history.pop(cid, None)
                         _tool_write_history.pop(cid, None)
+                        _tool_url_history.pop(cid, None)
+                        _tool_family_history.pop(cid, None)
                     with _TOOL_BUNDLE_LOCK:
                         _unlocked_bundles_by_chat.pop(cid, None)
                     _client_context_by_chat.pop(cid, None)
@@ -30422,6 +30764,7 @@ class Handler(BaseHTTPRequestHandler):
             global _last_user_text
             _last_user_text = user_text
             _update_task_anchor(chat, user_text)
+        client_ctx["_user_text"] = user_text
         chat["updated"] = int(time.time())
         save_json(CHATS_FILE, chats)
 
@@ -34085,6 +34428,10 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
         chat["messages"].append({"role": "user", "content": user_text})
         global _last_user_text
         _last_user_text = user_text
+        discord_ctx = dict(_client_context_by_chat.get(chat_id) or {})
+        discord_ctx.setdefault("execution_target", "host")
+        discord_ctx["_user_text"] = user_text
+        _client_context_by_chat[chat_id] = discord_ctx
         _update_task_anchor(chat, user_text)
         _enforce_chat_retention(chat)
         chat["updated"] = int(time.time())

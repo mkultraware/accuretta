@@ -58,7 +58,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.8.0</span>
+        <span class="v" id="brand-v">v0.8.1</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -275,7 +275,7 @@
             </div>
             <button class="chip" id="btn-attach-image" title="Attach image — the vision model reads it and hands a description to the main model"><i class="ph ph-image"></i>Image</button>
             <button class="chip" id="btn-attach-file" title="Upload files from this browser into the PC workspace"><i class="ph ph-paperclip"></i>File</button>
-            <button class="chip" id="btn-perms" title="Access approval mode. Raw host or WSL commands, project tests, and persistent host-session input always ask. Soft allows routine low-risk actions, medium also trusts workspace writes, and hard asks for every action. Click to cycle."><i class="ph ph-keyhole"></i>Access</button>
+            <button class="chip" id="btn-perms" title="Access approval mode. Soft runs routine project work and non-destructive commands automatically. Medium only trusts workspace writes. Hard asks for every action. Risky operations keep their stricter gates. Click to cycle."><i class="ph ph-keyhole"></i>Access</button>
             <input type="file" id="file-image" accept="image/*" multiple hidden>
             <input type="file" id="file-client" multiple hidden>
             <div class="toolbar-overflow-wrap">
@@ -729,7 +729,7 @@
           <div class="faq-list">
             <details class="faq-item">
               <summary><span>What do Soft, Medium, and Hard approval modes mean?</span><i class="ph ph-plus"></i></summary>
-              <div><p><strong>Soft</strong> allows routine low-risk actions. <strong>Medium</strong> also trusts normal writes inside the workspace. <strong>Hard</strong> asks for every action. Raw commands, tests, deletions, program launches, desktop control, and protected operations keep stricter gates. Some destructive actions are refused outright.</p></div>
+              <div><p><strong>Soft</strong> runs routine project work, workspace writes, non-destructive commands, tests, and persistent sessions without stopping. <strong>Medium</strong> only trusts normal writes inside the workspace. <strong>Hard</strong> asks for every action. Deletions, mutating Git actions, program launches, desktop control, protected or remote changes, and commands influenced by recent web content keep stricter gates. Some destructive actions are refused outright.</p></div>
             </details>
             <details class="faq-item">
               <summary><span>Can keyboard shortcuts approve protected actions?</span><i class="ph ph-plus"></i></summary>
@@ -1161,7 +1161,7 @@
       <span>Approvals</span>
     </div>
     <div class="form-row">
-      <span class="hint"><b>soft</b> allows routine low-risk actions. <b>medium</b> also trusts workspace file writes and edits. <b>hard</b> asks for every action. raw host or WSL commands, project tests, persistent host-session input, deletions, program launches, desktop actions and protected operations always ask. drive wipes and bridge self-harm are refused outright.</span>
+      <span class="hint"><b>soft</b> runs routine project work, workspace writes, non-destructive host or WSL commands, tests and persistent sessions automatically. <b>medium</b> only trusts workspace file writes and edits. <b>hard</b> asks for every action. deletions, mutating Git actions, program launches, desktop control, protected or remote changes, and commands following recent web content keep stricter gates. drive wipes, download-and-run pipelines and bridge self-harm are refused outright.</span>
     </div>
     <div class="form-row inline">
       <label>Approval mode</label>

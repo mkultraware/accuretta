@@ -1429,6 +1429,7 @@
       case "git_diff":       return `Reviewing repository changes…`;
       case "update_plan":    return `Updating the task plan…`;
       case "capability_report": return `Checking available capabilities…`;
+      case "switch_execution_target": return `Switching command target…`;
       case "sandbox_run":    return `Running in WSL guest…`;
       case "remote_shell":   return `Running on Mac…`;
       case "remote_write_file": return `Writing ${shortPath(args.path)} on Mac…`;
@@ -1472,6 +1473,7 @@
       case "git_diff":       return `Reviewed repository changes`;
       case "update_plan":    return `Updated the task plan`;
       case "capability_report": return `Checked available capabilities`;
+      case "switch_execution_target": return `Commands now target ${res.target_label || "the selected device"}`;
       case "remote_shell":   return `Mac command completed`;
       case "remote_write_file": return `Wrote ${shortPath(res.path)} on Mac${res.bytes != null ? ` (${res.bytes} bytes)` : ""}`;
       case "remote_file_begin": return `Mac file ready for chunks`;
@@ -6125,6 +6127,16 @@
       secretRailToolResult(row, evt.name, evt.result);
       attackRailToolResult(row, evt.name, evt.result);
       osintCardToolResult(row, evt.name, evt.result);
+      if (evt.name === "switch_execution_target" && evt.result?.ok && evt.result.execution_target) {
+        state.executionTarget = String(evt.result.execution_target);
+        localStorage.setItem("accuretta:execution-target", state.executionTarget);
+        if (state.remoteAccess?.context) {
+          state.remoteAccess.context.execution_target = state.executionTarget;
+          state.remoteAccess.context.target_label = evt.result.target_label || "Inference PC";
+        }
+        renderClientContext();
+        toast(`Commands now target ${evt.result.target_label || "the selected device"}`, "info", 2200);
+      }
       if (evt.name === "save_skill") {
         const chatId = state.liveTurn?.chatId || state.chatId;
         const failed = toolResultFailed(evt.result);
@@ -6435,7 +6447,7 @@
       setTimeout(() => checkModelAdvisor({ notify: true }).catch(() => {}), 700);
       }
     } else if (evt.type === "notice") {
-      toast(evt.note || "", "info", 3000, "ctx-notice");
+      if (!evt.quiet) toast(evt.note || "", "info", 3000, "ctx-notice");
     } else if (evt.type === "breach") {
       if (!isAttackRailEnabled(row)) return;
       // Cyber-range / CTF: a FLAG{...} was captured in a tool response = a
@@ -7416,6 +7428,7 @@
     const totals = data.totals || {};
     const compression = data.compression || {};
     const repos = data.repos || {};
+    const interventions = data.interventions || {};
     const longest = data.longest;
     const models = Array.isArray(data.models) ? data.models : [];
     const ranked = models.filter(model => model.ranked);
@@ -7449,6 +7462,9 @@
       </div>`;
     }).join("");
     const providerOptions = Object.entries(CLOUD_PRICING).map(([key, item]) => `<option value="${key}"${key === state.costProvider ? " selected" : ""}>${esc(item.label)}</option>`).join("");
+    const retryRecoveries = Number(interventions.context_retry || 0)
+      + Number(interventions.server_retry || 0)
+      + Number(interventions.empty_reply_retry || 0);
     content.innerHTML = `
       <section class="usage-kpis">
         <article><i class="ph ph-chat-centered-text"></i><span>Model turns</span><strong>${usageCompactNumber(totals.turns)}</strong><small>${usageCompactNumber(inputTokens + outputTokens)} tokens processed</small></article>
@@ -7481,6 +7497,18 @@
         <div class="usage-section-head"><div><span class="usage-eyebrow">Observed model health</span><h2>Model performance</h2></div><span class="usage-method">Reliability = finished turns + tool success</span></div>
         <div class="usage-model-list">${modelRows || '<div class="usage-empty">No model telemetry yet.</div>'}</div>
         <p class="usage-footnote">Ranking starts after five observed turns. Small samples are shown but left unranked.</p>
+      </section>
+
+      <section class="usage-panel usage-interventions-panel">
+        <div class="usage-section-head"><div><span class="usage-eyebrow">Harness self-corrections</span><h2>${Number(interventions.total || 0).toLocaleString()} quiet interventions</h2></div><i class="ph ph-wrench"></i></div>
+        <div class="usage-breakdown">
+          <div><span>Automatic retries</span><strong>${retryRecoveries.toLocaleString()}</strong></div>
+          <div><span>Tool-call repairs</span><strong>${Number(interventions.tool_call_repair || 0).toLocaleString()}</strong></div>
+          <div><span>Reasoning guards</span><strong>${Number(interventions.reasoning_guard || 0).toLocaleString()}</strong></div>
+          <div><span>Plan continuations</span><strong>${Number(interventions.auto_continue || 0).toLocaleString()}</strong></div>
+          <div><span>Loop guards</span><strong>${Number(interventions.loop_guard || 0).toLocaleString()}</strong></div>
+        </div>
+        <p class="usage-footnote">These recoveries stay out of the notification feed. Failures that need your attention still surface normally.</p>
       </section>
 
       <section class="usage-two-col">
@@ -13369,9 +13397,9 @@
     const permsBtn = $("#btn-perms");
     if (permsBtn) {
       const permsToast = {
-        soft:   ["Soft mode allows routine low-risk actions. Commands, tests, deletions, launches and protected actions still ask.", "warn", 5000],
-        medium: ["Medium mode - workspace file writes save without asking; everything else asks.", "info", 3000],
-        hard:   ["Hard mode - every action asks for approval.", "info", 3000],
+        soft:   ["Soft mode runs routine project work and non-destructive commands without asking. Risky actions stay gated.", "warn", 5000],
+        medium: ["Medium mode: workspace file writes save without asking; other actions ask.", "info", 3000],
+        hard:   ["Hard mode: every action asks for approval.", "info", 3000],
       };
       permsBtn.addEventListener("click", async () => {
         const cur = (state.settings && state.settings.approval_mode) ||
@@ -13391,7 +13419,7 @@
       const tb = $("#btn-perms");
       if (tb) {
         tb.classList.toggle("on", mode !== "hard");
-        tb.title = "Access mode: " + mode + ". Host or WSL commands, project tests, and persistent host-session input always ask. Soft allows routine low-risk actions, medium also trusts workspace writes, and hard asks for every action. Click to cycle.";
+        tb.title = "Access mode: " + mode + ". Soft runs routine project work and non-destructive commands automatically. Medium only trusts workspace writes. Hard asks for every action. Risky operations keep their stricter gates. Click to cycle.";
       }
     };
     syncApprovalMode();
@@ -13400,9 +13428,9 @@
         const mode = c.dataset.approvalMode;
         try { await saveSettings({ approval_mode: mode, auto_approve_write: mode !== "hard" }); } catch (_) {}
         syncApprovalMode();
-        toast(mode === "soft" ? "Soft mode allows routine low-risk actions. Commands, tests, deletions, launches and protected actions still ask."
-          : mode === "medium" ? "Medium mode - workspace file writes save without asking; everything else asks."
-          : "Hard mode - every action asks for approval.",
+        toast(mode === "soft" ? "Soft mode runs routine project work and non-destructive commands without asking. Risky actions stay gated."
+          : mode === "medium" ? "Medium mode: workspace file writes save without asking; other actions ask."
+          : "Hard mode: every action asks for approval.",
           mode === "soft" ? "warn" : "info", 4500);
       }));
     $("#file-image")?.addEventListener("change", async (e) => {
