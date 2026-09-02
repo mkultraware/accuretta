@@ -58,7 +58,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.8.1</span>
+        <span class="v" id="brand-v">v0.8.2</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -151,6 +151,13 @@
         <div class="side-foot-actions" style="display: flex; gap: 8px; align-items: center; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-muted);">
           <button class="iconbtn" id="btn-theme-side" title="Cycle theme"><i class="ph ph-sparkle" id="btn-theme-side-icon"></i></button>
           <button class="iconbtn" id="btn-faq" title="FAQ / About"><i class="ph ph-question"></i></button>
+          <button class="iconbtn" id="btn-security-overview" title="Security Overview" aria-label="Security Overview">
+            <svg class="security-signal-mark" viewBox="0 0 24 24" aria-hidden="true">
+              <path class="security-signal-frame" d="M8 4H4v4M16 4h4v4M20 16v4h-4M8 20H4v-4"></path>
+              <g class="security-signal-dots"><circle cx="9" cy="9" r="1"></circle><circle cx="12" cy="9" r="1"></circle><circle cx="15" cy="9" r="1"></circle><circle cx="9" cy="12" r="1"></circle><circle cx="15" cy="12" r="1"></circle><circle cx="9" cy="15" r="1"></circle><circle cx="12" cy="15" r="1"></circle><circle cx="15" cy="15" r="1"></circle></g>
+              <circle class="security-signal-focus" cx="12" cy="12" r="2.15"></circle>
+            </svg>
+          </button>
           <button class="iconbtn" id="btn-usage-stats" title="Usage stats"><i class="ph ph-chart-line-up"></i></button>
           <span class="grow"></span>
           <button class="iconbtn" id="btn-settings" title="Settings"><i class="ph ph-gear-six"></i></button>
@@ -219,6 +226,14 @@
       <button class="mm-item" type="button" role="menuitem" data-mm="theme"><i class="ph ph-moon"></i><span id="mm-theme-label">Dark mode</span></button>
       <button class="mm-item" type="button" role="menuitem" data-mm="target"><i class="ph ph-device-mobile"></i><span id="mm-target-label">Command target</span></button>
       <button class="mm-item" type="button" role="menuitem" data-mm="github"><i class="ph ph-git-branch"></i>GitHub activity</button>
+      <button class="mm-item" type="button" role="menuitem" data-mm="security">
+        <svg class="security-signal-mark" viewBox="0 0 24 24" aria-hidden="true">
+          <path class="security-signal-frame" d="M8 4H4v4M16 4h4v4M20 16v4h-4M8 20H4v-4"></path>
+          <g class="security-signal-dots"><circle cx="9" cy="9" r="1"></circle><circle cx="12" cy="9" r="1"></circle><circle cx="15" cy="9" r="1"></circle><circle cx="9" cy="12" r="1"></circle><circle cx="15" cy="12" r="1"></circle><circle cx="9" cy="15" r="1"></circle><circle cx="12" cy="15" r="1"></circle><circle cx="15" cy="15" r="1"></circle></g>
+          <circle class="security-signal-focus" cx="12" cy="12" r="2.15"></circle>
+        </svg>
+        Security Overview
+      </button>
       <button class="mm-item" type="button" role="menuitem" data-mm="usage"><i class="ph ph-chart-line-up"></i>Usage stats</button>
       <button class="mm-item" type="button" role="menuitem" data-mm="history"><i class="ph ph-terminal-window"></i>Command history</button>
       <div class="mm-sep"></div>
@@ -496,6 +511,137 @@
   </div>
 </section>
 
+<!-- ====== SECURITY OVERVIEW PAGE ====== -->
+<section class="security-page" id="security-page" aria-hidden="true" aria-labelledby="security-title">
+  <header class="security-page-head">
+    <button class="security-back" id="btn-close-security" type="button" aria-label="Back to chat"><i class="ph ph-arrow-left"></i><span>Back</span></button>
+    <div>
+      <span class="security-eyebrow">Read-only local monitoring</span>
+      <h1 id="security-title">Security Overview</h1>
+    </div>
+    <button class="security-refresh" id="btn-refresh-security" type="button" title="Run a fresh local scan"><span>Scan now</span><i class="ph ph-arrow-clockwise"></i></button>
+  </header>
+
+  <div class="security-page-scroll">
+    <div class="security-shell">
+      <section class="security-briefing" id="security-briefing" data-risk="quiet" aria-live="polite">
+        <div class="security-briefing-mark" aria-hidden="true">
+          <svg class="security-signal-mark" viewBox="0 0 24 24">
+            <path class="security-signal-frame" d="M8 4H4v4M16 4h4v4M20 16v4h-4M8 20H4v-4"></path>
+            <g class="security-signal-dots"><circle cx="9" cy="9" r="1"></circle><circle cx="12" cy="9" r="1"></circle><circle cx="15" cy="9" r="1"></circle><circle cx="9" cy="12" r="1"></circle><circle cx="15" cy="12" r="1"></circle><circle cx="9" cy="15" r="1"></circle><circle cx="12" cy="15" r="1"></circle><circle cx="15" cy="15" r="1"></circle></g>
+            <circle class="security-signal-focus" cx="12" cy="12" r="2.15"></circle>
+          </svg>
+        </div>
+        <div class="security-briefing-copy">
+          <div class="security-briefing-meta">
+            <span id="security-risk-label">Waiting for first scan</span>
+            <span id="security-summary-source">Rules summary</span>
+          </div>
+          <h2 id="security-summary-headline">Security Overview is ready</h2>
+          <p id="security-summary-text">Run the first read-only scan to establish a local baseline.</p>
+          <div class="security-summary-foot">
+            <span id="security-coverage-note">No sources have been read yet.</span>
+            <button type="button" id="btn-security-analyze"><i class="ph ph-sparkle"></i>Update analysis</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="security-scan-status" id="security-scan-status" hidden aria-live="polite">
+        <span class="security-dot-matrix" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+          <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+        </span>
+        <div><strong>Reading this machine</strong><span id="security-scan-stage">Preparing local collectors</span></div>
+        <span class="security-scan-track" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+      </section>
+
+      <section class="security-metrics" aria-label="Security metrics">
+        <article><span>Open alerts</span><strong id="security-metric-alerts">0</strong><small>after whitelist filtering</small></article>
+        <article><span>Windows events</span><strong id="security-metric-events">0</strong><small>high-signal records in 24 hours</small></article>
+        <article><span>Network</span><strong id="security-metric-network">0</strong><small>active TCP connections</small></article>
+        <article><span>Coverage</span><strong id="security-metric-coverage">0/0</strong><small>collectors available</small></article>
+      </section>
+
+      <div class="security-grid">
+        <section class="security-panel security-alerts-panel">
+          <header class="security-panel-head">
+            <div><span class="security-eyebrow">Triage queue</span><h3>Notable activity</h3></div>
+            <label class="security-filter"><input type="checkbox" id="security-show-whitelisted"><span>Show whitelisted</span></label>
+          </header>
+          <div class="security-alert-list" id="security-alert-list">
+            <div class="security-empty"><i class="ph ph-radar"></i><strong>No scan data yet</strong><span>Run a scan to inspect the current machine state.</span></div>
+          </div>
+        </section>
+
+        <aside class="security-panel security-coverage-panel">
+          <header class="security-panel-head"><div><span class="security-eyebrow">Visibility</span><h3>Coverage</h3></div></header>
+          <div class="security-coverage-list" id="security-coverage-list">
+            <div class="security-empty compact"><span>No collectors have reported yet.</span></div>
+          </div>
+        </aside>
+      </div>
+
+      <section class="security-panel security-timeline-panel">
+        <header class="security-panel-head">
+          <div><span class="security-eyebrow">Evidence trail</span><h3>Recent system activity</h3></div>
+          <span class="security-panel-note" id="security-updated-at">Never scanned</span>
+        </header>
+        <div class="security-timeline-viewport">
+          <div class="security-timeline" id="security-timeline">
+            <div class="security-empty compact"><span>No timeline entries yet.</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="security-panel security-whitelist-panel">
+        <header class="security-panel-head">
+          <div><span class="security-eyebrow">User trust</span><h3>Whitelist</h3></div>
+          <span class="security-panel-note">Trusted items stay recorded but stop routine noise.</span>
+        </header>
+        <div class="security-whitelist-list" id="security-whitelist-list">
+          <div class="security-empty compact"><span>No applications have been whitelisted.</span></div>
+        </div>
+      </section>
+
+      <footer class="security-privacy"><i class="ph ph-lock-key"></i><span>Evidence, cases, and whitelist decisions stay on this machine. Scans are read-only.</span></footer>
+    </div>
+  </div>
+
+  <div class="security-dialog-scrim" id="security-whitelist-scrim" hidden>
+    <aside class="security-dialog" role="dialog" aria-modal="true" aria-labelledby="security-whitelist-title">
+      <button class="security-dialog-close" id="security-whitelist-close" type="button" aria-label="Close"><i class="ph ph-x"></i></button>
+      <span class="security-eyebrow">User trust decision</span>
+      <h2 id="security-whitelist-title">Whitelist this application?</h2>
+      <p id="security-whitelist-copy">Routine alerts for this application will be hidden. New behaviour can still bring it back for review.</p>
+      <label class="security-reason-label" for="security-whitelist-reason">Reason <span>optional</span></label>
+      <input id="security-whitelist-reason" class="security-reason-input" type="text" maxlength="300" placeholder="Mod, local build, experimental software..." autocomplete="off">
+      <div class="security-dialog-actions">
+        <button type="button" class="btn" id="security-whitelist-cancel">Cancel</button>
+        <button type="button" class="btn accent" id="security-whitelist-confirm">Whitelist</button>
+      </div>
+    </aside>
+  </div>
+
+  <div class="security-dialog-scrim" id="security-case-scrim" hidden>
+    <aside class="security-case" role="dialog" aria-modal="true" aria-labelledby="security-case-title">
+      <header class="security-case-head">
+        <div><span class="security-eyebrow">Read-only investigation</span><h2 id="security-case-title">Building case</h2></div>
+        <button class="security-dialog-close" id="security-case-close" type="button" aria-label="Close"><i class="ph ph-x"></i></button>
+      </header>
+      <div class="security-case-body" id="security-case-body">
+        <div class="security-case-loading">
+          <span class="security-dot-matrix is-large" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+          </span>
+          <strong>Correlating evidence</strong>
+          <span>Comparing the alert with the bounded local record</span>
+        </div>
+      </div>
+    </aside>
+  </div>
+</section>
+
 <!-- ====== SHUTDOWN MODAL ====== -->
 <div class="modal-scrim" id="shutdown-scrim"></div>
 <aside class="modal" id="shutdown-modal" aria-hidden="true">
@@ -635,9 +781,10 @@
           <a href="#faq-essentials" data-faq-nav="faq-essentials"><span>01</span>Essentials</a>
           <a href="#faq-models" data-faq-nav="faq-models"><span>02</span>Models &amp; images</a>
           <a href="#faq-memory" data-faq-nav="faq-memory"><span>03</span>Memory</a>
-          <a href="#faq-safety" data-faq-nav="faq-safety"><span>04</span>Safety &amp; privacy</a>
-          <a href="#faq-workflow" data-faq-nav="faq-workflow"><span>05</span>Workflow</a>
-          <a href="#faq-trouble" data-faq-nav="faq-trouble"><span>06</span>Troubleshooting</a>
+          <a href="#faq-security" data-faq-nav="faq-security"><span>04</span>Security Overview</a>
+          <a href="#faq-safety" data-faq-nav="faq-safety"><span>05</span>Safety &amp; privacy</a>
+          <a href="#faq-workflow" data-faq-nav="faq-workflow"><span>06</span>Workflow</a>
+          <a href="#faq-trouble" data-faq-nav="faq-trouble"><span>07</span>Troubleshooting</a>
         </nav>
         <p>Written for the current build. No mythology, no cloud required.</p>
       </aside>
@@ -724,8 +871,34 @@
           </div>
         </section>
 
+        <section class="faq-group" id="faq-security" data-faq-section>
+          <header><span>04</span><div><h3>Security Overview</h3><p>A local snapshot of what deserves attention and where the view stops.</p></div></header>
+          <div class="faq-list">
+            <details class="faq-item">
+              <summary><span>What does Security Overview actually do?</span><i class="ph ph-plus"></i></summary>
+              <div><p>It runs a read-only check of this Windows machine. It looks at recent System, Application, and Security events, current network activity, common startup and persistence locations, and Accuretta's recent action history. Fixed rules turn that evidence into a short review queue. It does not change the system while scanning.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Which parts are written by the local model?</span><i class="ph ph-plus"></i></summary>
+              <div><p>The collectors and fixed rules gather evidence, set alert severity, and decide what enters the review queue. When the loaded local model is available, it writes the headline, situation paragraph, coverage note, explanations for notable alerts, and suggested checks. If the model is busy or unavailable, Accuretta uses a rules-based summary instead. This model call is separate from chat and receives no chat history, memories, skills, or tools.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Does this replace a SIEM or antivirus?</span><i class="ph ph-plus"></i></summary>
+              <div><p>No. Security Overview is a point-in-time local check. It does not continuously collect every event, keep a full security log archive, block malware, quarantine files, or prove that a machine is clean. Missing Windows permissions or disabled logs create blind spots. Keep Windows Security or your chosen endpoint protection enabled.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>What happens when I click Investigate?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Accuretta opens a read-only case for that alert using the evidence already collected. The case separates known facts from missing information and gives a confidence level and a sensible next check. The local model may help word that assessment, but it cannot run commands, inspect extra files, or change the machine from this view.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>What does Whitelist mean?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Whitelist tells Accuretta that you recognize a specific application or identity and want routine repeats hidden. The reason is stored locally, and materially different behavior can bring the item back for review. Whitelisting does not make a file safe, change Windows permissions, or add an antivirus exception. You can remove an entry from the Whitelist panel at any time.</p></div>
+            </details>
+          </div>
+        </section>
+
         <section class="faq-group" id="faq-safety" data-faq-section>
-          <header><span>04</span><div><h3>Safety &amp; privacy</h3><p>Local-first still requires a steering wheel and brakes.</p></div></header>
+          <header><span>05</span><div><h3>Safety &amp; privacy</h3><p>Local-first still requires a steering wheel and brakes.</p></div></header>
           <div class="faq-list">
             <details class="faq-item">
               <summary><span>What do Soft, Medium, and Hard approval modes mean?</span><i class="ph ph-plus"></i></summary>
@@ -747,7 +920,7 @@
         </section>
 
         <section class="faq-group" id="faq-workflow" data-faq-section>
-          <header><span>05</span><div><h3>Workflow</h3><p>Small conveniences that prevent repetitive finger gymnastics.</p></div></header>
+          <header><span>06</span><div><h3>Workflow</h3><p>Small conveniences that prevent repetitive finger gymnastics.</p></div></header>
           <div class="faq-list">
             <details class="faq-item">
               <summary><span>Can I bind my own keyboard shortcuts?</span><i class="ph ph-plus"></i></summary>
@@ -769,7 +942,7 @@
         </section>
 
         <section class="faq-group" id="faq-trouble" data-faq-section>
-          <header><span>06</span><div><h3>Troubleshooting</h3><p>Common failures, translated from machine grunting.</p></div></header>
+          <header><span>07</span><div><h3>Troubleshooting</h3><p>Common failures, translated from machine grunting.</p></div></header>
           <div class="faq-list">
             <details class="faq-item">
               <summary><span>Why did the model produce no visible answer?</span><i class="ph ph-plus"></i></summary>

@@ -3251,6 +3251,7 @@
 
   // ---------- chat ----------
   async function newChat() {
+    closeSecurityOverview();
     // Tag the session with where it was born so the chat list can show a phone
     // icon for mobile-started sessions. The bridge persists this on the chat
     // record; it never changes after creation.
@@ -7543,6 +7544,7 @@
     const page = $("#usage-page");
     if (!page) return;
     closeFaq();
+    closeSecurityOverview();
     page.classList.add("open");
     page.setAttribute("aria-hidden", "false");
     drawUsageMark(true);
@@ -7553,6 +7555,332 @@
     const page = $("#usage-page");
     if (!page) return;
     cancelAnimationFrame(usageMarkFrame);
+    page.classList.remove("open");
+    page.setAttribute("aria-hidden", "true");
+  }
+
+  // ---------- Security Overview ----------
+  let securityOverviewData = null;
+  let securityPollTimer = null;
+  let pendingWhitelistAlertId = "";
+
+  function securityWhen(epochSeconds) {
+    if (!epochSeconds) return "Never scanned";
+    try {
+      return new Intl.DateTimeFormat(undefined, {
+        dateStyle: "medium", timeStyle: "short",
+      }).format(new Date(Number(epochSeconds) * 1000));
+    } catch {
+      return new Date(Number(epochSeconds) * 1000).toLocaleString();
+    }
+  }
+
+  function securitySourceLabel(value) {
+    return String(value || "unknown").replaceAll("_", " ");
+  }
+
+  function renderSecurityOverview(data) {
+    securityOverviewData = data || {};
+    const summary = data?.summary || {};
+    const risk = data?.risk || { state: "quiet" };
+    const metrics = data?.metrics || {};
+    const briefing = $("#security-briefing");
+    if (briefing) briefing.dataset.risk = risk.state || "quiet";
+    if ($("#security-risk-label")) $("#security-risk-label").textContent = securitySourceLabel(risk.state || "quiet");
+    if ($("#security-summary-source")) $("#security-summary-source").textContent = summary.source === "model" ? "Local model analysis" : "Rules summary";
+    if ($("#security-summary-headline")) $("#security-summary-headline").textContent = summary.headline || risk.headline || "Security Overview";
+    if ($("#security-summary-text")) $("#security-summary-text").textContent = summary.situation || risk.detail || "No current summary is available.";
+    if ($("#security-coverage-note")) $("#security-coverage-note").textContent = summary.coverage_note || "Coverage has not been measured.";
+    if ($("#security-metric-alerts")) $("#security-metric-alerts").textContent = Number(metrics.open_alerts || 0).toLocaleString();
+    if ($("#security-metric-events")) $("#security-metric-events").textContent = Number(metrics.windows_events || 0).toLocaleString();
+    if ($("#security-metric-network")) $("#security-metric-network").textContent = Number(metrics.tcp_connections || 0).toLocaleString();
+    if ($("#security-metric-coverage")) $("#security-metric-coverage").textContent = `${Number(metrics.coverage_available || 0)}/${Number(metrics.coverage_total || 0)}`;
+    if ($("#security-updated-at")) $("#security-updated-at").textContent = data?.generated_at ? `Updated ${securityWhen(data.generated_at)}` : "Never scanned";
+
+    const scanning = data?.scan?.status === "scanning";
+    const scanFailed = data?.scan?.status === "error";
+    const scanStatus = $("#security-scan-status");
+    if (scanStatus) {
+      scanStatus.hidden = !scanning && !scanFailed;
+      scanStatus.dataset.state = scanFailed ? "error" : "scanning";
+      const heading = scanStatus.querySelector("strong");
+      if (heading) heading.textContent = scanFailed ? "The last scan stopped" : "Reading this machine";
+    }
+    if ($("#security-scan-stage")) $("#security-scan-stage").textContent = scanFailed
+      ? (data?.scan?.error || "A collector failed unexpectedly.")
+      : (data?.scan?.stage || "Preparing local collectors");
+    const refresh = $("#btn-refresh-security");
+    if (refresh) refresh.disabled = scanning;
+    const analyze = $("#btn-security-analyze");
+    if (analyze) analyze.disabled = scanning || !data?.generated_at;
+    if (scanning) scheduleSecurityPoll();
+    else clearSecurityPoll();
+
+    renderSecurityAlerts();
+    renderSecurityCoverage(data?.coverage || []);
+    renderSecurityTimeline(data?.timeline || []);
+    renderSecurityWhitelist(data?.whitelist || []);
+  }
+
+  function renderSecurityAlerts() {
+    const list = $("#security-alert-list");
+    if (!list) return;
+    const showWhitelisted = !!$("#security-show-whitelisted")?.checked;
+    const active = Array.isArray(securityOverviewData?.alerts) ? securityOverviewData.alerts : [];
+    const hidden = showWhitelisted && Array.isArray(securityOverviewData?.whitelisted_activity)
+      ? securityOverviewData.whitelisted_activity.map(item => ({ ...item, _whitelisted: true })) : [];
+    const alerts = [...active, ...hidden];
+    if (!alerts.length) {
+      const scanned = !!securityOverviewData?.generated_at;
+      list.innerHTML = `<div class="security-empty"><i class="ph ${scanned ? "ph-shield-check" : "ph-radar"}"></i><strong>${scanned ? "Nothing currently needs attention" : "No scan data yet"}</strong><span>${scanned ? "Whitelist filtering and deterministic checks produced an empty queue." : "Run a scan to inspect the current machine state."}</span></div>`;
+      return;
+    }
+    list.innerHTML = alerts.map(alert => `
+      <article class="security-alert ${alert._whitelisted ? "is-whitelisted" : ""}" data-alert-id="${esc(alert.id || "")}" data-severity="${esc(alert.severity || "info")}">
+        <span class="security-alert-severity">${esc(alert._whitelisted ? "trusted" : alert.severity || "info")}</span>
+        <div class="security-alert-copy">
+          <h4>${esc(alert.title || "Security alert")}</h4>
+          <p>${esc(alert.detail || "No additional detail was recorded.")}</p>
+          <span class="security-alert-entity" title="${esc(alert.entity_label || "")}">${esc(alert.entity_label || securitySourceLabel(alert.source))}</span>
+        </div>
+        <div class="security-alert-actions">
+          <button type="button" data-security-action="investigate">Investigate</button>
+          ${alert._whitelisted || alert.whitelistable === false ? "" : '<button type="button" data-security-action="whitelist">Whitelist</button>'}
+        </div>
+      </article>`).join("");
+    list.querySelectorAll("[data-security-action]").forEach(button => button.addEventListener("click", event => {
+      const row = event.currentTarget.closest("[data-alert-id]");
+      const alertId = row?.dataset.alertId || "";
+      if (event.currentTarget.dataset.securityAction === "investigate") openSecurityInvestigation(alertId);
+      else openSecurityWhitelist(alertId);
+    }));
+  }
+
+  function renderSecurityCoverage(rows) {
+    const list = $("#security-coverage-list");
+    if (!list) return;
+    if (!rows.length) {
+      list.innerHTML = '<div class="security-empty compact"><span>No collectors have reported yet.</span></div>';
+      return;
+    }
+    list.innerHTML = rows.map(row => `
+      <div class="security-coverage-row" data-state="${esc(row.state || "error")}">
+        <span class="security-coverage-dot"></span>
+        <div class="security-coverage-copy"><strong>${esc(securitySourceLabel(row.source))}</strong><span>${esc(row.note || "")}</span></div>
+        <span class="security-coverage-time">${Number(row.duration_ms || 0).toLocaleString()} ms</span>
+      </div>`).join("");
+  }
+
+  function renderSecurityTimeline(rows) {
+    const list = $("#security-timeline");
+    if (!list) return;
+    if (!rows.length) {
+      list.innerHTML = '<div class="security-empty compact"><span>No notable timeline entries were returned.</span></div>';
+      return;
+    }
+    list.innerHTML = rows.slice(0, 10).map(row => `
+      <div class="security-timeline-row">
+        <time>${esc(row.time || "Unknown time")}</time>
+        <strong>${esc(row.label || securitySourceLabel(row.source))}</strong>
+        <span>${esc(row.detail || "")}</span>
+      </div>`).join("");
+  }
+
+  function renderSecurityWhitelist(rows) {
+    const list = $("#security-whitelist-list");
+    if (!list) return;
+    if (!rows.length) {
+      list.innerHTML = '<div class="security-empty compact"><span>No applications have been whitelisted.</span></div>';
+      return;
+    }
+    list.innerHTML = rows.map(row => `
+      <div class="security-whitelist-row" data-whitelist-id="${esc(row.id || "")}">
+        <div class="security-whitelist-main"><strong title="${esc(row.label || "")}">${esc(row.label || "Trusted application")}</strong><span>Added ${esc(securityWhen(row.created_at))}</span></div>
+        <span class="security-whitelist-reason">${esc(row.reason || "No reason recorded")}</span>
+        <button type="button">Remove</button>
+      </div>`).join("");
+    list.querySelectorAll("button").forEach(button => button.addEventListener("click", async event => {
+      const id = event.currentTarget.closest("[data-whitelist-id]")?.dataset.whitelistId || "";
+      event.currentTarget.disabled = true;
+      try {
+        const result = await api("/api/security/whitelist/remove", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }),
+        });
+        if (!result?.ok) throw new Error(result?.error || "Could not remove whitelist entry.");
+        renderSecurityOverview(result.overview);
+        toast("Whitelist entry removed.", "ok", 1800);
+      } catch (error) {
+        event.currentTarget.disabled = false;
+        toast(error.message || String(error), "warn", 3500);
+      }
+    }));
+  }
+
+  async function loadSecurityOverview() {
+    try {
+      const data = await api("/api/security/overview");
+      if (data?.error) throw new Error(data.error);
+      renderSecurityOverview(data);
+      return data;
+    } catch (error) {
+      const status = $("#security-scan-status");
+      if (status) {
+        status.hidden = false;
+        status.querySelector("strong").textContent = "Security Overview unavailable";
+        $("#security-scan-stage").textContent = error.message || String(error);
+      }
+      return null;
+    }
+  }
+
+  function clearSecurityPoll() {
+    if (securityPollTimer) clearTimeout(securityPollTimer);
+    securityPollTimer = null;
+  }
+
+  function scheduleSecurityPoll() {
+    clearSecurityPoll();
+    securityPollTimer = setTimeout(async () => {
+      if (!$("#security-page")?.classList.contains("open")) return;
+      const data = await loadSecurityOverview();
+      if (data?.scan?.status === "scanning") scheduleSecurityPoll();
+    }, 1400);
+  }
+
+  async function refreshSecurityOverview() {
+    const refresh = $("#btn-refresh-security");
+    if (refresh) refresh.disabled = true;
+    try {
+      const result = await api("/api/security/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      if (result?.error) throw new Error(result.error);
+      await loadSecurityOverview();
+      scheduleSecurityPoll();
+    } catch (error) {
+      if (refresh) refresh.disabled = false;
+      toast(`Security scan: ${error.message || error}`, "warn", 4200);
+    }
+  }
+
+  async function updateSecurityAnalysis() {
+    const button = $("#btn-security-analyze");
+    if (button) button.disabled = true;
+    try {
+      const result = await api("/api/security/summarize", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      if (!result?.ok) throw new Error(result?.error || "Analysis was unavailable.");
+      renderSecurityOverview(result.overview);
+    } catch (error) {
+      toast(error.message || String(error), "info", 4200);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  function openSecurityWhitelist(alertId) {
+    const alert = [...(securityOverviewData?.alerts || []), ...(securityOverviewData?.whitelisted_activity || [])]
+      .find(item => item.id === alertId);
+    if (!alert) return;
+    pendingWhitelistAlertId = alertId;
+    $("#security-whitelist-title").textContent = `Whitelist ${alert.entity_label || "this application"}?`;
+    $("#security-whitelist-copy").textContent = "Routine alerts for this identity will be hidden. Materially new behaviour can still bring it back for review.";
+    $("#security-whitelist-reason").value = "";
+    $("#security-whitelist-scrim").hidden = false;
+    setTimeout(() => $("#security-whitelist-reason")?.focus(), 0);
+  }
+
+  function closeSecurityWhitelist() {
+    pendingWhitelistAlertId = "";
+    if ($("#security-whitelist-scrim")) $("#security-whitelist-scrim").hidden = true;
+  }
+
+  async function confirmSecurityWhitelist() {
+    if (!pendingWhitelistAlertId) return;
+    const button = $("#security-whitelist-confirm");
+    if (button) button.disabled = true;
+    try {
+      const result = await api("/api/security/whitelist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ alert_id: pendingWhitelistAlertId, reason: $("#security-whitelist-reason")?.value || "" }),
+      });
+      if (!result?.ok) throw new Error(result?.error || "Could not whitelist this application.");
+      closeSecurityWhitelist();
+      renderSecurityOverview(result.overview);
+      toast("Application whitelisted. Routine alerts are now quiet.", "ok", 2600);
+    } catch (error) {
+      toast(error.message || String(error), "warn", 4200);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  function closeSecurityCase() {
+    if ($("#security-case-scrim")) $("#security-case-scrim").hidden = true;
+  }
+
+  async function openSecurityInvestigation(alertId) {
+    const scrim = $("#security-case-scrim");
+    const body = $("#security-case-body");
+    if (!scrim || !body) return;
+    scrim.hidden = false;
+    $("#security-case-title").textContent = "Building case";
+    body.innerHTML = `<div class="security-case-loading">
+      <span class="security-dot-matrix is-large" aria-hidden="true">${"<i></i>".repeat(16)}</span>
+      <strong>Correlating evidence</strong>
+      <span>Comparing the alert with the bounded local record</span>
+    </div>`;
+    try {
+      const result = await api("/api/security/investigate", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ alert_id: alertId }),
+      });
+      if (!result?.ok) throw new Error(result?.error || "Investigation failed.");
+      renderSecurityCase(result.investigation);
+      loadSecurityOverview();
+    } catch (error) {
+      $("#security-case-title").textContent = "Investigation unavailable";
+      body.innerHTML = `<div class="security-empty"><i class="ph ph-warning"></i><strong>Could not build the case</strong><span>${esc(error.message || String(error))}</span></div>`;
+    }
+  }
+
+  function renderSecurityCase(report) {
+    const body = $("#security-case-body");
+    if (!body) return;
+    const assessment = report?.model_assessment || report?.assessment || {};
+    const known = report?.model_assessment?.what_is_known?.length ? report.model_assessment.what_is_known : report?.verified || [];
+    const unknown = report?.model_assessment?.what_is_unknown?.length ? report.model_assessment.what_is_unknown : report?.unknown || [];
+    $("#security-case-title").textContent = report?.alert?.title || "Security investigation";
+    const list = values => (values || []).map(value => `<li>${esc(value)}</li>`).join("") || "<li>None recorded.</li>";
+    body.innerHTML = `
+      <section class="security-case-verdict">
+        <div><h3>${esc(securitySourceLabel(assessment.verdict || "unresolved"))}</h3><p>${esc(assessment.summary || report?.alert?.detail || "The available evidence does not support a stronger conclusion.")}</p></div>
+        <span class="security-case-confidence">${esc(assessment.confidence || "low")} confidence</span>
+      </section>
+      ${report?.model_deferred ? '<p class="security-panel-note" style="margin:14px 0 0;text-align:left;">The local model was busy, so this case uses deterministic evidence only.</p>' : ""}
+      <div class="security-case-columns">
+        <section class="security-case-section"><h4>What is known</h4><ul>${list(known)}</ul></section>
+        <section class="security-case-section"><h4>What remains unknown</h4><ul>${list(unknown)}</ul></section>
+      </div>
+      <section class="security-case-section security-case-evidence"><h4>Bounded evidence</h4><pre>${esc(JSON.stringify(report?.evidence || [], null, 2))}</pre></section>`;
+  }
+
+  async function openSecurityOverview() {
+    const page = $("#security-page");
+    if (!page) return;
+    closeFaq();
+    closeUsageStats();
+    closeSettings();
+    page.classList.add("open");
+    page.setAttribute("aria-hidden", "false");
+    const data = await loadSecurityOverview();
+    const stale = !data?.generated_at || (Date.now() / 1000 - Number(data.generated_at)) > 90;
+    if (stale && data?.scan?.status !== "scanning") refreshSecurityOverview();
+  }
+
+  function closeSecurityOverview() {
+    const page = $("#security-page");
+    if (!page) return;
+    clearSecurityPoll();
+    closeSecurityWhitelist();
+    closeSecurityCase();
     page.classList.remove("open");
     page.setAttribute("aria-hidden", "true");
   }
@@ -7595,6 +7923,7 @@
     const page = $("#faq-page");
     if (!page) return;
     closeUsageStats();
+    closeSecurityOverview();
     closeSettings();
     page.classList.add("open");
     page.setAttribute("aria-hidden", "false");
@@ -9428,6 +9757,8 @@
         renderApprovals();
       } else if (evt.type === "settings:update") {
         loadSettings().then(renderStatus).then(renderModelPill);
+      } else if (evt.type === "security:update") {
+        if ($("#security-page")?.classList.contains("open")) loadSecurityOverview();
       } else if (evt.type === "workspace:update") {
         loadWorkspace().then(renderWorkspace);
       } else if (evt.type === "skills:update") {
@@ -10018,6 +10349,15 @@
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action, recommendation_id: recommendationId }),
       });
+      if (!result?.ok) {
+        if (result?.error === "recommendation is no longer current") {
+          clearModelAdvisorNotifications();
+          await loadModelHealth();
+          return;
+        }
+        throw new Error(result?.error || "the setup advisor could not complete that action");
+      }
+      if (action === "apply" || action === "dismiss") clearModelAdvisorNotifications();
       await reloadModelHealthSettings(result, action);
       if (action === "dismiss") toast("recommendation dismissed for this setup", "info", 2200);
       if (action === "keep") toast("recommended settings kept", "ok", 2200);
@@ -10029,25 +10369,46 @@
   }
 
   let _modelAdvisorNotificationId = "";
+
+  function clearModelAdvisorNotifications() {
+    const tracked = _toasts.get("model-advisor");
+    const rows = new Set();
+    if (tracked) rows.add(tracked);
+    document.querySelectorAll(".advisor-toast-copy").forEach(copy => {
+      const row = copy.closest(".revealer-card.notifications, .toast");
+      if (row) rows.add(row);
+    });
+    rows.forEach(row => {
+      clearTimeout(row?._dismissTimer);
+      try { row.remove(); } catch {}
+    });
+    _toasts.delete("model-advisor");
+    _syncDeckStack();
+  }
+
   function showModelAdvisorNotification(data) {
     const recommendation = data?.recommendation;
     if (!recommendation?.id || recommendation.id === _modelAdvisorNotificationId) return;
     _modelAdvisorNotificationId = recommendation.id;
+    clearModelAdvisorNotifications();
     const summary = (recommendation.changes || []).slice(0, 3)
       .map(change => `${change.label}: ${modelHealthValue(change.from)} to ${modelHealthValue(change.to)}`)
       .join("; ");
     const row = toast(
       `<span class="advisor-toast-copy"><strong>A better setup is ready</strong><small>${esc(summary || recommendation.reason || "Measured from normal local use.")}</small></span>` +
       `<button type="button" class="advisor-toast-apply">Use recommended settings</button>` +
-      `<button type="button" class="advisor-toast-review">Review</button>`,
+      `<button type="button" class="advisor-toast-review">Review</button>` +
+      `<button type="button" class="advisor-toast-dismiss" title="Dismiss" aria-label="Dismiss"><i class="ph ph-x"></i></button>`,
       "info", 45000, "model-advisor", true,
     );
     row?.querySelector(".advisor-toast-apply")?.addEventListener("click", event =>
       runModelHealthAction("apply", recommendation.id, event.currentTarget));
     row?.querySelector(".advisor-toast-review")?.addEventListener("click", async () => {
+      clearModelAdvisorNotifications();
       await openSettings();
       revealSettingsControl("#model-health-recommendation");
     });
+    row?.querySelector(".advisor-toast-dismiss")?.addEventListener("click", clearModelAdvisorNotifications);
     api("/api/model-health/action", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "seen", recommendation_id: recommendation.id }),
@@ -10057,7 +10418,7 @@
   async function checkModelAdvisor(options = {}) {
     const data = await api("/api/model-health");
     renderModelHealth(data);
-    if (options.notify && data?.notification_needed) showModelAdvisorNotification(data);
+    if (options.notify && data?.notification_needed && !data?.trial) showModelAdvisorNotification(data);
     return data;
   }
 
@@ -10121,6 +10482,9 @@
   }
 
   async function openSettings() {
+    closeSecurityOverview();
+    closeFaq();
+    closeUsageStats();
     initSettingsSections();
     $("#drawer-scrim").classList.add("open");
     $("#settings-drawer").classList.add("open");
@@ -12889,6 +13253,21 @@
       drawUsageMark(true);
       loadUsageStats();
     });
+    $("#btn-security-overview")?.addEventListener("click", openSecurityOverview);
+    $("#btn-close-security")?.addEventListener("click", closeSecurityOverview);
+    $("#btn-refresh-security")?.addEventListener("click", refreshSecurityOverview);
+    $("#btn-security-analyze")?.addEventListener("click", updateSecurityAnalysis);
+    $("#security-show-whitelisted")?.addEventListener("change", renderSecurityAlerts);
+    $("#security-whitelist-close")?.addEventListener("click", closeSecurityWhitelist);
+    $("#security-whitelist-cancel")?.addEventListener("click", closeSecurityWhitelist);
+    $("#security-whitelist-confirm")?.addEventListener("click", confirmSecurityWhitelist);
+    $("#security-whitelist-scrim")?.addEventListener("click", event => {
+      if (event.target === event.currentTarget) closeSecurityWhitelist();
+    });
+    $("#security-case-close")?.addEventListener("click", closeSecurityCase);
+    $("#security-case-scrim")?.addEventListener("click", event => {
+      if (event.target === event.currentTarget) closeSecurityCase();
+    });
     $("#btn-close-cmd-history")?.addEventListener("click", closeCmdHistory);
     $("#cmd-history-scrim")?.addEventListener("click", closeCmdHistory);
     $("#btn-cmd-history-refresh")?.addEventListener("click", loadCmdHistory);
@@ -14058,11 +14437,13 @@
         return;
       }
       if (a === "github") { $("#btn-github-activity")?.click(); return; }
+      if (a === "security") { openSecurityOverview(); return; }
       if (a === "usage") { openUsageStats(); return; }
       if (a === "history") { $("#btn-cmd-history")?.click(); return; }
       if (a === "settings") { openSettings(); return; }
       if (a === "faq") { $("#btn-faq")?.click(); return; }
       if (a === "chat" || a === "sessions" || a === "approvals") {
+        closeSecurityOverview();
         state.mobileTab = a;
         applyMobileTab();
       }
@@ -14125,6 +14506,21 @@
 
     // built-in navigation shortcuts
     window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !$("#security-whitelist-scrim")?.hidden) {
+        e.preventDefault();
+        closeSecurityWhitelist();
+        return;
+      }
+      if (e.key === "Escape" && !$("#security-case-scrim")?.hidden) {
+        e.preventDefault();
+        closeSecurityCase();
+        return;
+      }
+      if (e.key === "Escape" && $("#security-page")?.classList.contains("open")) {
+        e.preventDefault();
+        closeSecurityOverview();
+        return;
+      }
       if (e.key === "Escape" && $("#faq-page")?.classList.contains("open")) {
         e.preventDefault();
         closeFaq();
