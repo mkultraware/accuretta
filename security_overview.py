@@ -673,6 +673,50 @@ class SecurityOverviewService:
         self.emit({"type": "security:update", "status": "ready"})
         return {"ok": True, "overview": self.get_overview()}
 
+    def investigation_context(self, alert_id: str) -> dict:
+        """Return a small, server-resolved evidence snapshot for a new chat."""
+        raw = self._latest_raw()
+        alert = next(
+            (item for item in (raw or {}).get("alerts_all", []) if item.get("id") == alert_id),
+            None,
+        )
+        if not alert:
+            return {"ok": False, "error": "Alert not found in the latest scan."}
+
+        coverage_gaps = [
+            {
+                "source": _bounded(item.get("source"), 80),
+                "state": _bounded(item.get("state"), 40),
+                "note": _bounded(item.get("note"), 240),
+            }
+            for item in ((raw or {}).get("coverage") or [])
+            if item.get("state") != "available"
+        ][:4]
+        evidence = []
+        for item in (alert.get("evidence") or [])[:4]:
+            if isinstance(item, dict):
+                evidence.append({
+                    _bounded(key, 64): _bounded(value, 280)
+                    for key, value in list(item.items())[:8]
+                })
+            else:
+                evidence.append(_bounded(item, 500))
+
+        context = {
+            "alert_id": _bounded(alert.get("id"), 120),
+            "source": _bounded(alert.get("source"), 80),
+            "kind": _bounded(alert.get("kind"), 100),
+            "severity": _bounded(alert.get("severity"), 20),
+            "title": _bounded(alert.get("title"), 220),
+            "detail": _bounded(alert.get("detail"), 700),
+            "entity": _bounded(alert.get("entity_label"), 240),
+            "first_seen": alert.get("first_seen"),
+            "evidence": evidence,
+            "coverage_gaps": coverage_gaps,
+            "scan_created_at": (raw or {}).get("generated_at"),
+        }
+        return {"ok": True, "context": context}
+
     def investigate(self, alert_id: str) -> dict:
         raw = self._latest_raw()
         alert = next((item for item in (raw or {}).get("alerts_all", []) if item.get("id") == alert_id), None)

@@ -21,15 +21,16 @@
 <script>
   (function () {
     var theme = localStorage.getItem('accuretta:theme') || 'light';
-    if (theme === 'neobrutalism-dark' || theme === 'kinetic') theme = 'aperture';
+    if (theme === 'neobrutalism' || theme === 'neobrutalism-dark') theme = 'amaranth';
+    if (theme === 'kinetic') theme = 'aperture';
     document.documentElement.setAttribute('data-theme', theme);
   })();
 </script>
-<link rel="stylesheet" href="/app.css?v=70">
-<script src="https://unpkg.com/@phosphor-icons/web"></script>
-<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js?v=2" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js?v=2" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js?v=2" defer></script>
+<link rel="stylesheet" href="/app.css?v=72">
+<link rel="stylesheet" href="/assets/vendor/web/icons.css">
+<script src="/assets/vendor/html2canvas/dist/html2canvas.min.js" defer></script>
+<script src="/assets/vendor/jszip/dist/jszip.min.js" defer></script>
+<script src="/assets/vendor/qrcode-generator/qrcode.js" defer></script>
 <style>
   img[src^="/assets/reactions/"] {
     height: 44px !important;
@@ -58,7 +59,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.8.2</span>
+        <span class="v" id="brand-v">v0.8.3</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -522,6 +523,36 @@
     <button class="security-refresh" id="btn-refresh-security" type="button" title="Run a fresh local scan"><span>Scan now</span><i class="ph ph-arrow-clockwise"></i></button>
   </header>
 
+  <section class="security-scan-intro" id="security-scan-intro" hidden aria-live="polite" aria-label="Local system scan in progress">
+    <canvas id="security-scan-canvas" aria-hidden="true"></canvas>
+    <div class="security-scan-intro-chrome">
+      <header>
+        <span class="security-intro-kicker">Local acquisition / first pass</span>
+        <span class="security-intro-controls"><span class="security-intro-clock" id="security-intro-clock">00:00.0</span><button type="button" id="btn-security-intro-skip">Continue in background</button></span>
+      </header>
+      <div class="security-intro-copy">
+        <span class="security-intro-index" id="security-intro-index">00 / 08</span>
+        <h2>Mapping this machine</h2>
+        <p id="security-intro-stage">Preparing local collectors</p>
+      </div>
+      <div class="security-intro-sources" aria-label="Scan sources">
+        <span data-security-source="network">Network</span>
+        <span data-security-source="system">System</span>
+        <span data-security-source="application">Application</span>
+        <span data-security-source="security">Security</span>
+        <span data-security-source="persistence">Persistence</span>
+        <span data-security-source="actions">Actions</span>
+        <span data-security-source="correlate">Correlate</span>
+        <span data-security-source="summary">Summary</span>
+      </div>
+      <footer>
+        <span>Read-only collectors</span>
+        <span class="security-intro-progress" aria-hidden="true"><i id="security-intro-progress"></i></span>
+        <strong id="security-intro-percent">4%</strong>
+      </footer>
+    </div>
+  </section>
+
   <div class="security-page-scroll">
     <div class="security-shell">
       <section class="security-briefing" id="security-briefing" data-risk="quiet" aria-live="polite">
@@ -603,7 +634,7 @@
         </div>
       </section>
 
-      <footer class="security-privacy"><i class="ph ph-lock-key"></i><span>Evidence, cases, and whitelist decisions stay on this machine. Scans are read-only.</span></footer>
+      <footer class="security-privacy"><i class="ph ph-lock-key"></i><span>Evidence, investigation context, and whitelist decisions stay on this machine. Scans are read-only.</span></footer>
     </div>
   </div>
 
@@ -622,24 +653,6 @@
     </aside>
   </div>
 
-  <div class="security-dialog-scrim" id="security-case-scrim" hidden>
-    <aside class="security-case" role="dialog" aria-modal="true" aria-labelledby="security-case-title">
-      <header class="security-case-head">
-        <div><span class="security-eyebrow">Read-only investigation</span><h2 id="security-case-title">Building case</h2></div>
-        <button class="security-dialog-close" id="security-case-close" type="button" aria-label="Close"><i class="ph ph-x"></i></button>
-      </header>
-      <div class="security-case-body" id="security-case-body">
-        <div class="security-case-loading">
-          <span class="security-dot-matrix is-large" aria-hidden="true">
-            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-          </span>
-          <strong>Correlating evidence</strong>
-          <span>Comparing the alert with the bounded local record</span>
-        </div>
-      </div>
-    </aside>
-  </div>
 </section>
 
 <!-- ====== SHUTDOWN MODAL ====== -->
@@ -888,7 +901,7 @@
             </details>
             <details class="faq-item">
               <summary><span>What happens when I click Investigate?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Accuretta opens a read-only case for that alert using the evidence already collected. The case separates known facts from missing information and gives a confidence level and a sensible next check. The local model may help word that assessment, but it cannot run commands, inspect extra files, or change the machine from this view.</p></div>
+              <div><p>Accuretta opens a fresh chat and quietly gives the model a small evidence snapshot from that alert. It does not copy your other chats, send a fake message as you, or start checking things by itself. You decide what to ask next. If you ask it to inspect further, the session follows the same tool and approval rules as any other chat.</p></div>
             </details>
             <details class="faq-item">
               <summary><span>What does Whitelist mean?</span><i class="ph ph-plus"></i></summary>
@@ -1002,13 +1015,19 @@
 </div>
 
 <div class="drawer-scrim" id="drawer-scrim"></div>
-<aside class="drawer" id="settings-drawer" aria-hidden="true">
+<aside class="drawer" id="settings-drawer" role="dialog" aria-modal="true" aria-label="Settings" aria-hidden="true">
   <div class="drawer-head">
     <i class="ph ph-gear-six"></i>
     <h3>Settings</h3>
-    <button class="iconbtn" id="btn-close-settings"><i class="ph ph-x"></i></button>
+    <button class="iconbtn" id="btn-close-settings" aria-label="Close settings"><i class="ph ph-x"></i></button>
   </div>
   <div class="drawer-body" id="settings-body">
+    <div class="form-group">Network</div>
+    <div class="form-row">
+      <label for="set-offline-mode"><input type="checkbox" id="set-offline-mode"> Offline mode</label>
+      <span class="hint">Disables update checks, web integrations, Discord and MCP on restart. Fonts and interface libraries are bundled locally. Approved commands and external programs can still use the network; use firewall rules if those must be isolated too.</span>
+      <span class="hint" id="offline-status" role="status"></span>
+    </div>
     <div class="form-group">Model</div>
     <div class="form-row">
       <label>Models folder</label>
@@ -1268,7 +1287,7 @@
       <div class="sw" id="sw-web"></div>
     </div>
     <div class="form-row">
-      <span class="hint">when on, the preview iframe can load fonts.googleapis.com, images, and other cross-origin resources. off = air-gapped preview.</span>
+      <span class="hint">when on, the preview iframe can load online fonts, images, and other cross-origin resources. off keeps previews local.</span>
     </div>
 
     <div class="form-group">Appearance</div>
@@ -1282,7 +1301,7 @@
         <option value="nebula">Nebula</option>
         <option value="operator">Operator</option>
         <option value="neumorphic">Neumorphic</option>
-        <option value="neobrutalism">Neobrutalism</option>
+        <option value="amaranth">Amaranth</option>
         <option value="aperture">Aperture</option>
         <option value="aperture-dark">Aperture Dark</option>
         <option value="soft">Soft</option>
@@ -1638,8 +1657,9 @@
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
-<script src="/app.js?v=2026082701"></script>
+<script src="/assets/vendor/highlight.js/highlight.min.js"></script>
+  <script src="/security-scan-field.js?v=6"></script>
+<script src="/app.js?v=2026090501"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {

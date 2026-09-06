@@ -96,15 +96,19 @@ The model can work inside a selected workspace instead of pasting every result i
 
 IDE mode expects one HTML document and renders it in the right pane while the model writes. Each result becomes a saved preview version, so an earlier page is one click away.
 
+Previews run separately from the control interface. Their temporary browser storage is discarded on reload. Screenshot capture supports ordinary HTML, styles, form values, and readable images; embedded pages and some complex effects are not reproduced. Protected images or external background images can prevent capture.
+
 <p align="center">
   <img src="assets/docs/build-preview-demo.gif" alt="Accuretta building and rendering a web page beside the chat." width="900" />
 </p>
 
-Accuretta also records verification debt. A file edit adds the path to the task's structured state. A successful syntax check or project test clears it. Context compaction and restarts preserve that record, so an untested edit cannot quietly become “finished” because the model lost the earlier messages.
+Accuretta also records verification debt. A file edit adds the path to the task's structured state. Syntax checks label a file as syntax checked, while a recognised whole-project test run can clear it only when the file's content is unchanged. Context compaction and restarts preserve that record, so an untested edit cannot quietly become “finished” because the model lost the earlier messages.
 
 ## Approvals and audit records
 
 Reads can run without stopping the conversation. In Soft mode, normal workspace writes, non-destructive Windows or WSL commands, project tests, persistent host-session input, and routine MCP actions can also continue automatically. Medium mode only trusts normal workspace writes. Hard mode asks for every action. Deletions, mutating Git actions, program launches, desktop input, protected or remote changes, and execution following recent web content keep stricter gates regardless of the convenience mode.
+
+Tests are kept in a private ignored folder for development and release checks. They are not part of the public product checkout. The bridge still reports when a changed file has only had a syntax check, and only a recognised whole-project test run clears that verification warning.
 
 Approved actions write a bounded record to `data/action_audit.jsonl`. It stores the tool, target, time, outcome, authorization identity, and hashes of the arguments and result. It does not copy prompts, commands, typed text, or tool output into the audit file.
 
@@ -239,16 +243,18 @@ Bigger context costs memory and prompt-processing time. The tuner aims for a con
 - **llama-server closes immediately on NVIDIA:** the matching CUDA runtime DLLs may be missing. Put the `cudart-llama-bin-win-cuda-*.zip` contents beside `llama-server.exe`, and match the build to the CUDA version shown by `nvidia-smi`.
 - **A model reports a missing tensor:** the llama.cpp build may be older than the model architecture. Update llama.cpp or use a compatible GGUF.
 - **Speculative decoding crashes during load:** set it to `off` or `ngram-mod`. `draft-mtp` requires MTP heads in the model and support in the installed binary.
-- **Port 8787 is occupied:** `start.bat` clears a stale Accuretta process. In manual mode, set `ACCURETTA_PORT` to another port.
+- **Port 8787 is occupied:** Accuretta leaves the existing listener alone and starts no model. Close the existing Accuretta window, or set `ACCURETTA_PORT` to another port before starting a separate instance.
 - **A tool is missing:** run the read-only capability report in Accuretta. It names the package, operating-system feature, setting, or authorization that tool needs.
 
 ## Privacy
 
 Model inference, prompts, chat history, settings, and workspace files stay on the bridge computer. Accuretta has no telemetry, analytics account, or cloud-sync service.
 
-Outbound traffic occurs when you ask the agent to search or fetch the web, enable Tailscale Serve, connect a Discord bot, call an MCP server that uses the network, or run a security tool against an authorized target. The interface also loads fonts, icons, syntax highlighting, export helpers, and QR support from Google Fonts, unpkg, and jsDelivr. Those providers receive normal request metadata, not chat or workspace contents.
+Outbound traffic occurs when you ask the agent to search or fetch the web, enable Tailscale Serve, connect a Discord bot, call an MCP server that uses the network, or run a security tool against an authorized target. Interface fonts, icons, syntax highlighting, export helpers, and QR support are bundled locally with their licences.
 
-For a network-silent session, block the bridge and its browser or webview at the firewall after the model is loaded. Local inference, files, and ordinary chat continue to work.
+Online mode also checks GitHub for app updates. Link icons can contact DuckDuckGo, link previews fetch the linked page, and dependency checks query OSV. Generated previews may fetch online resources when enabled. Offline mode disables those external requests.
+
+For a network-silent session, enable Offline mode in Settings and restart Accuretta. It disables update checks, web integrations, Discord, and MCP, and the page's network policy blocks external browser connections. Approved commands and external programs are still separate processes, so use normal firewall rules if those must be isolated too. Local inference, files, and ordinary chat continue to work.
 
 ## Limits
 
@@ -264,6 +270,10 @@ For a network-silent session, block the bridge and its browser or webview at the
 ```text
 accuretta/
   bridge.py              model launcher, tool runtime, approvals, and HTTP server
+  bridge-client.js       request-token wrapper for browser mutations
+  preview-runtime.js     isolated preview storage, console, and capture bridge
+  task_state.py          revision-aware private undo journals
+  network_policy.py      offline-mode network guard
   accuretta_app.py       desktop launcher using pywebview
   start.bat              Windows launcher
   index.html             interface shell
@@ -272,6 +282,7 @@ accuretta/
   colors_and_type.css    theme tokens
   requirements.txt       optional Python packages
   assets/
+    vendor/               pinned local UI libraries, fonts, and licences
     audio/               notification sounds
     brand/               light and dark logo marks
     docs/                README screenshots and demos

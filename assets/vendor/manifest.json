@@ -1,0 +1,242 @@
+[
+  {
+    "file": "html2canvas/LICENSE",
+    "source": "https://registry.npmjs.org/html2canvas/-/html2canvas-1.4.1.tgz",
+    "sha256": "86200ce4e92d9a22c41c8647a55f7a5fddff304ff89b4d36ecc699ed8c123d2c"
+  },
+  {
+    "file": "html2canvas/dist/html2canvas.min.js",
+    "source": "https://registry.npmjs.org/html2canvas/-/html2canvas-1.4.1.tgz",
+    "sha256": "e87e550794322e574a1fda0c1549a3c70dae5a93d9113417a429016838eab8cb"
+  },
+  {
+    "file": "jszip/dist/jszip.min.js",
+    "source": "https://registry.npmjs.org/jszip/-/jszip-3.10.1.tgz",
+    "sha256": "acc7e41455a80765b5fd9c7ee1b8078a6d160bbbca455aeae854de65c947d59e"
+  },
+  {
+    "file": "jszip/LICENSE.markdown",
+    "source": "https://registry.npmjs.org/jszip/-/jszip-3.10.1.tgz",
+    "sha256": "566c953c6090b1218ca6217dd7359d45dde46581968586dc607d59a78af6a9c4"
+  },
+  {
+    "file": "qrcode-generator/qrcode.js",
+    "source": "https://registry.npmjs.org/qrcode-generator/-/qrcode-generator-1.4.4.tgz",
+    "sha256": "18ae399f81182bc9de916e9c77b195df20cc58d6f2d55a62b085a299f1bf1780"
+  },
+  {
+    "file": "highlight.js/LICENSE",
+    "source": "https://registry.npmjs.org/highlight.js/-/highlight.js-11.9.0.tgz",
+    "sha256": "6c081431591d9df696c82dc598fe1423765b8a299b200ed00b281afd0f64c490"
+  },
+  {
+    "file": "web/LICENSE",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "81bb1bfd8e3730c19a3895ff4a82839980933504725960c52b1c207b29398f07"
+  },
+  {
+    "file": "web/src/bold/style.css",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "c8a32df67f8bd57f70c6371e15ec232df25ddeba3eb9060d7aaa68101a6ce240"
+  },
+  {
+    "file": "web/src/duotone/style.css",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "fc6d37f7f0f7ffdcdf714c54181fdd27911969e4737d3151b972d4b806e5ae5d"
+  },
+  {
+    "file": "web/src/fill/style.css",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "555980683a582c1910a954648b4ae38f58d76e797f02bfdc2c5e817901e6d4fc"
+  },
+  {
+    "file": "web/src/light/style.css",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "f2e59699faaeee27da9edb86dd18f5ed3bd5113db3e4e388fdd23afcaf308865"
+  },
+  {
+    "file": "web/src/regular/style.css",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "873761b8711147dc516b6102936e9ad005f3a3015349efcde1a496f0326f1051"
+  },
+  {
+    "file": "web/src/thin/style.css",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "41e0eae512457cbef8f0106108fbfb995952c24b3e600dca38516990b441c2af"
+  },
+  {
+    "file": "web/src/bold/Phosphor-Bold.ttf",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "10a0a1cb4f8156a420f9f84cf34c4e9871e58ed2ddea1f6a8079ad07243a7fb2"
+  },
+  {
+    "file": "web/src/duotone/Phosphor-Duotone.ttf",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "80e6f0d6fa8ce96a9933f48aaabddc592c5d2b52caf8f010a7e54a17c74084bf"
+  },
+  {
+    "file": "web/src/fill/Phosphor-Fill.ttf",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "a53f5d2630cab5e3b7536ecb9d69d71519a2190298c22b1f8d770dd37bc2940a"
+  },
+  {
+    "file": "web/src/light/Phosphor-Light.ttf",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "a10ef7a0631da04626fca2eab921d14b391749fddfa3465749368f21b28fd46c"
+  },
+  {
+    "file": "web/src/thin/Phosphor-Thin.ttf",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "f40473506b4ab4fcfd2b5c32fb235f9e22def891e58e01da866e1e18974e79f2"
+  },
+  {
+    "file": "web/src/regular/Phosphor.ttf",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "06b91e022b7ee899a63efced879392a74f0bacbda54e4467e9f663220d173a10"
+  },
+  {
+    "file": "web/src/bold/Phosphor-Bold.woff",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "de4dcc9d18cf33363c19d2c924c9d9d51e210978bd3e6ec508aec71670b3db06"
+  },
+  {
+    "file": "web/src/duotone/Phosphor-Duotone.woff",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "fca99cff3f3ec82cec7e5ec9973e229deb8efec7432485b9a339bfa97b6d7b75"
+  },
+  {
+    "file": "web/src/fill/Phosphor-Fill.woff",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "5dea68e9198122686ec2788f81e345cd50c2ee9980f6c907d742f91cad481d48"
+  },
+  {
+    "file": "web/src/light/Phosphor-Light.woff",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "6d34d73a01305a3260b1e85e89c65bc0170274c5874b8995a01b79c863a7a1c1"
+  },
+  {
+    "file": "web/src/thin/Phosphor-Thin.woff",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "a68d54a19a82cf5a64f3bd21a8f50f429b2def0b6db582418af8535e1f2679b3"
+  },
+  {
+    "file": "web/src/regular/Phosphor.woff",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "396c5eae7f2dfb4d1f5432edd87109eda2f92a451b2167e43a26165b82770f75"
+  },
+  {
+    "file": "web/src/bold/Phosphor-Bold.woff2",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "2153b52cea9e06fc0cc8496048be485b381a0f8bf130adea5a9756fc8f100b87"
+  },
+  {
+    "file": "web/src/duotone/Phosphor-Duotone.woff2",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "93d163cd4b1f07736d34bfef80803646ab0322efa947a98e3973a1450e3d20cc"
+  },
+  {
+    "file": "web/src/fill/Phosphor-Fill.woff2",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "660bd6045c0e0d9756cddb8ba2ece3aad855df7d4a170ef23f7b1c0bf511c430"
+  },
+  {
+    "file": "web/src/light/Phosphor-Light.woff2",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "9c45e81688520e967e2dd93d702eed59d25a3a97d8cc82932b1d17267a279887"
+  },
+  {
+    "file": "web/src/thin/Phosphor-Thin.woff2",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "79f36354836fb87863c7d140e3333446c1d1ec9748a207a09798912d8a3c64d5"
+  },
+  {
+    "file": "web/src/regular/Phosphor.woff2",
+    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
+    "sha256": "c2ea45ea05ff5c7df1936770c104725f2a68f43fd343f35f3da23a30b27de32a"
+  },
+  {
+    "file": "highlight.js/highlight.min.js",
+    "source": "https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js",
+    "sha256": "837a6fa5b0c736b52bbde2b2b6190f305da3fc9ed41681db5321507057b5c846"
+  },
+  {
+    "file": "fonts/google-original.css",
+    "source": "https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&family=Space+Mono:wght@400;700&family=Inter+Tight:wght@400;500;600;700&display=swap",
+    "sha256": "21c7fb04cd73b8f5e7ef3d2e7d59b4a5cc19583d10f9ed9152675128727431df"
+  },
+  {
+    "file": "fonts/722ff42d0080d1505c01.ttf",
+    "source": "https://fonts.gstatic.com/s/intertight/v9/NGSnv5HMAFg6IuGlBNMjxJEL2VmU3NS7Z2mj0QiqXA.ttf",
+    "sha256": "a40a1fdc93cadcbb0e3ba16d6010988118a1a3add06a097330b09cb41c2b8d45"
+  },
+  {
+    "file": "fonts/3ff89d14ef3d36416916.ttf",
+    "source": "https://fonts.gstatic.com/s/intertight/v9/NGSnv5HMAFg6IuGlBNMjxJEL2VmU3NS7Z2mj6AiqXA.ttf",
+    "sha256": "98272f3512338c52940816f5db61966ca1cdbc3cdb3c0d981da22612723da59e"
+  },
+  {
+    "file": "fonts/42aaaf7a68ce5eb565c7.ttf",
+    "source": "https://fonts.gstatic.com/s/intertight/v9/NGSnv5HMAFg6IuGlBNMjxJEL2VmU3NS7Z2mjDw-qXA.ttf",
+    "sha256": "27350bc95b961b9b4e1a80d872f49e903fe727f290f6b2a079e67ceb1685fb1f"
+  },
+  {
+    "file": "fonts/ba08b16a00221416a87b.ttf",
+    "source": "https://fonts.gstatic.com/s/intertight/v9/NGSnv5HMAFg6IuGlBNMjxJEL2VmU3NS7Z2mjPQ-qXA.ttf",
+    "sha256": "c2a4bdafb30500a3bd0843f95ad659ad38492f025837803e6a8ef8672c575e8e"
+  },
+  {
+    "file": "fonts/655ecee898b68ff3ce8c.ttf",
+    "source": "https://fonts.gstatic.com/s/jetbrainsmono/v24/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8-qxjPQ.ttf",
+    "sha256": "3386a05f6ece969e4537de6be894170d20558e82f7d56c8c5d332972ef172160"
+  },
+  {
+    "file": "fonts/5f6675d606a21f264f6c.ttf",
+    "source": "https://fonts.gstatic.com/s/jetbrainsmono/v24/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8FqtjPQ.ttf",
+    "sha256": "df54dbfafba61d4911eb3dab9bba2d20531fb009f01d64dd42fa96ab862584d8"
+  },
+  {
+    "file": "fonts/c1c656933a1f4b14b7cc.ttf",
+    "source": "https://fonts.gstatic.com/s/jetbrainsmono/v24/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8L6tjPQ.ttf",
+    "sha256": "a1d92abc6b02a87faed23d98067ab1027e8e95242fd7c9978a072ea383b89d1a"
+  },
+  {
+    "file": "fonts/32bf30e94c6c5d0b371a.ttf",
+    "source": "https://fonts.gstatic.com/s/jetbrainsmono/v24/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8SKtjPQ.ttf",
+    "sha256": "bc31e0b0583e8530795907883e768597bf7bdb4e47a65861dc393b4411439e22"
+  },
+  {
+    "file": "fonts/b95b576b0912b261b6f1.ttf",
+    "source": "https://fonts.gstatic.com/s/jetbrainsmono/v24/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8lqxjPQ.ttf",
+    "sha256": "62bbab00e0b0faffb38a3d111341a814f8731fd50778aa0b495d3293b8290aaf"
+  },
+  {
+    "file": "fonts/6d83b1a12212ea9e5ba8.ttf",
+    "source": "https://fonts.gstatic.com/s/jetbrainsmono/v24/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxjPQ.ttf",
+    "sha256": "44ce4a84f20d60f24539bd0cef11f79c29e38609e0f8adf18551c9794a5d9dc3"
+  },
+  {
+    "file": "fonts/c7e8ebe771b6b255589c.ttf",
+    "source": "https://fonts.gstatic.com/s/spacemono/v17/i7dMIFZifjKcF5UAWdDRaPpZYFI.ttf",
+    "sha256": "5be2b984cdb8befc8ad1871d10f1aa8337f7d2bae3c6bf0ce720d0745ac1a8ec"
+  },
+  {
+    "file": "fonts/4664a706f8240435a7e0.ttf",
+    "source": "https://fonts.gstatic.com/s/spacemono/v17/i7dPIFZifjKcF5UAWdDRUEY.ttf",
+    "sha256": "829aad32ab9525358de2a7ebc718d05a6b335e67421aad5e1e09cd1fa796af4e"
+  },
+  {
+    "file": "fonts/jetbrainsmono-OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/jetbrainsmono/OFL.txt",
+    "sha256": "b2fe5e8987594e9ffd1d2ca52a2f5d73eb8335243893c5d6254b5ad69269591d"
+  },
+  {
+    "file": "fonts/spacemono-OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/spacemono/OFL.txt",
+    "sha256": "8e4ee42b2553e1e01504e61cb0d46d148cd8c9e5eacaa3622a7df2d4f2955b9f"
+  },
+  {
+    "file": "fonts/intertight-OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/intertight/OFL.txt",
+    "sha256": "50240ab035cf1b6b3307940235481d515c4b6de3ab1fa843dbe59e7892cb9d58"
+  }
+]

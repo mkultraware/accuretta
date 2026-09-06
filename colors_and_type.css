@@ -11,7 +11,7 @@
    are the closest Google Font matches for "mono-forward technical".
    Please provide licensed fonts if a specific family is desired.
 -------------------------------------------------------------- */
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&family=Space+Mono:wght@400;700&family=Inter+Tight:wght@400;500;600;700&display=swap');
+@import url("/assets/vendor/fonts/fonts.css");
 
 :root {
   /* ---- TYPE FAMILIES ---- */
@@ -424,6 +424,7 @@
 [data-theme="aurora"] body,
 [data-theme="nebula"] body,
 [data-theme="operator"] body,
+[data-theme="amaranth"] body,
 [data-theme="aperture"] body,
 [data-theme="aperture-dark"] body,
 [data-theme="pastel"] body,
@@ -749,63 +750,63 @@
 }
 
 /* ============================================================
-   NEOBRUTALISM — bold, chunky, unapologetic.
-   Cream paper background, near-black text, hard offset shadows
-   with zero blur, thick ink borders, and one electric yellow
-   accent. Nothing soft, nothing glowy: every surface either
-   punches out of the page or gets pressed into it.
+   AMARANTH: carbon black, dark amaranth, and silver.
+   Restrained red light lifts the dark surfaces without changing
+   the app's geometry or turning every panel into a glowing prop.
    ============================================================ */
-[data-theme="neobrutalism"] {
-  /* Warm paper white, not clinical grey — the canvas for ink. */
-  --bg:        #F4F0E6;
-  --bg-raised: #FCF9F0;
-  --bg-sunken: #E8E2D2;
-  --bg-inset:  #DED6C2;
+[data-theme="amaranth"] {
+  --bg:        #1E1C1D;
+  --bg-raised: #272325;
+  --bg-sunken: #151314;
+  --bg-inset:  #33282C;
 
-  --glass-bg:       rgba(252, 249, 240, 0.78);
-  --glass-border:   rgba(17, 17, 17, 0.18);
+  --glass-bg:     rgba(39, 35, 37, 0.88);
+  --glass-border: rgba(175, 175, 175, 0.08);
+  --glass-blur:   16px;
 
-  /* Ink text, full contrast. */
-  --fg:        #1A1A1A;
-  --fg-muted:  #4A4A4A;
-  --fg-subtle: #6E6E6E;
-  --fg-faint:  #9C9C9C;
-  --fg-invert: #FFFFFF;
+  --bg-gradient:
+    radial-gradient(circle at 82% -14%, rgba(138, 26, 48, 0.24), transparent 38%),
+    radial-gradient(circle at 8% 105%, rgba(175, 175, 175, 0.08), transparent 31%),
+    linear-gradient(155deg, #262123 0%, #1E1C1D 48%, #151314 100%);
 
-  /* Borders are ink, not tinted haze. */
-  --border:        #1A1A1A;
-  --border-strong: #000000;
-  --border-subtle: #C9C2AE;
+  --fg:        #F0EDEF;
+  --fg-muted:  #AFAFAF;
+  --fg-subtle: #877E81;
+  --fg-faint:  #625A5D;
+  --fg-invert: #1E1C1D;
 
-  /* Electric yellow — the loudest accent in the set, and the
-     only yellow. Reads like a highlighter on paper. */
-  --accent:        #FFD60A;
-  --accent-hover:  #FFE13D;
-  --accent-subtle: rgba(255, 214, 10, 0.28);
-  --accent-fg:     #1A1A1A;
+  --border:        #3A3033;
+  --border-strong: #554047;
+  --border-subtle: #2C2729;
 
-  --success-subtle: rgba(80, 160, 80, 0.16);
-  --warning-subtle: rgba(200, 130, 20, 0.16);
-  --danger-subtle:  rgba(190, 50, 40, 0.16);
-  --info-subtle:    rgba(50, 110, 190, 0.14);
+  --accent:        #A82340;
+  --accent-hover:  #D14A68;
+  --accent-subtle: rgba(138, 26, 48, 0.22);
+  --accent-fg:     #FFFFFF;
 
-  /* Hard offset shadows, no blur — the neobrutalist signature. */
-  --shadow-xs: 2px 2px 0 rgba(0, 0, 0, 0.8);
-  --shadow-sm: 3px 3px 0 rgba(0, 0, 0, 0.85);
-  --shadow-md: 5px 5px 0 rgba(0, 0, 0, 0.85);
-  --shadow-lg: 8px 8px 0 rgba(0, 0, 0, 0.85);
-  --shadow-pop: 10px 10px 0 rgba(0, 0, 0, 0.9);
+  --success: #65C299;
+  --warning: #D8B25A;
+  --danger:  #FF6B72;
+  --info:    #D14A68;
 
-  /* Sunken wells press inward instead of fading out. */
-  --shadow-inset: inset 2px 2px 0 rgba(0, 0, 0, 0.12), inset -1px -1px 0 rgba(255, 255, 255, 0.55);
+  --success-subtle: rgba(101, 194, 153, 0.14);
+  --warning-subtle: rgba(216, 178, 90, 0.14);
+  --danger-subtle:  rgba(255, 107, 114, 0.14);
+  --info-subtle:    rgba(209, 74, 104, 0.14);
 
-  /* Buttons are chunky stamps; active = pressed flat into the page. */
-  --btn-shadow-rest:   3px 3px 0 rgba(0, 0, 0, 0.85);
-  --btn-shadow-hover:  5px 5px 0 rgba(0, 0, 0, 0.85);
-  --btn-shadow-active: inset 2px 2px 0 rgba(0, 0, 0, 0.25);
+  --shadow-xs: 0 1px 0 rgba(0, 0, 0, 0.34);
+  --shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.34), 0 0 0 1px rgba(255, 255, 255, 0.025);
+  --shadow-md: 0 8px 22px rgba(0, 0, 0, 0.40), 0 0 0 1px rgba(255, 255, 255, 0.035);
+  --shadow-lg: 0 18px 44px rgba(0, 0, 0, 0.48), 0 0 0 1px rgba(255, 255, 255, 0.045);
+  --shadow-pop: 0 28px 76px rgba(0, 0, 0, 0.56), 0 0 0 1px rgba(255, 255, 255, 0.055);
+  --shadow-inset: inset 0 1px 0 rgba(0, 0, 0, 0.32), inset 0 0 0 1px rgba(255, 255, 255, 0.035);
 
-  --btn-send-gradient: linear-gradient(135deg, #FFD60A 0%, #FFC300 100%);
-  --btn-send-glow:     0 0 0 rgba(0, 0, 0, 0);
+  --btn-shadow-rest: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 2px 7px rgba(0, 0, 0, 0.28);
+  --btn-shadow-hover: inset 0 1px 0 rgba(255, 255, 255, 0.09), 0 7px 18px rgba(0, 0, 0, 0.34);
+  --btn-shadow-active: inset 0 2px 4px rgba(0, 0, 0, 0.42);
+
+  --btn-send-gradient: linear-gradient(135deg, #B62B49 0%, #8A1A30 58%, #621220 100%);
+  --btn-send-glow: 0 7px 22px rgba(138, 26, 48, 0.38);
 }
 
 /* ============================================================

@@ -9,13 +9,8 @@ REM   no lingering console). Falls back to browser mode if the
 REM   desktop UI dependency can't be installed.
 REM ============================================================
 
-REM ---- free port 8787 (kill any stale bridge) ------------------
-for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":8787" ^| findstr "LISTENING"') do taskkill /F /PID %%p >nul 2>&1
-
-REM ---- free port 8080 (stale llama-server from a crash: the app
-REM       only captures backend output for the backend tab when it
-REM       spawns llama itself, so clean up any orphan) -------------
-for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":8080" ^| findstr "LISTENING"') do taskkill /F /PID %%p >nul 2>&1
+REM The bridge reserves its port before loading a model. Never kill a process
+REM merely because it listens on a port used by Accuretta or llama.cpp.
 
 REM ---- find console python (for pip) --------------------------
 set "PYEXE="

@@ -967,7 +967,7 @@
       let host = "";
       try { host = new URL(r.url).hostname.replace(/^www\./, ""); } catch {}
       const label = host || r.url;
-      const fav = host ? `https://icons.duckduckgo.com/ip3/${host}.ico` : "";
+      const fav = host && !state.settings.offline_active ? `https://icons.duckduckgo.com/ip3/${host}.ico` : "";
       // Wrap: globe fallback always rendered; img sits on top, hides itself on error.
       const favHtml = `<span class="web-fav-wrap">${TOOL_SVG.globe}${fav ? `<img class="web-fav" src="${esc(fav)}" alt="" loading="lazy" onerror="this.style.display='none'">` : ""}</span>`;
       return `<a class="web-chip" href="${esc(r.url)}" target="_blank" rel="noopener noreferrer" title="${esc(r.title || r.url)}">${favHtml}<span>${esc(label)}</span></a>`;
@@ -1088,7 +1088,7 @@
       let host = "";
       try { host = new URL(r.url).hostname.replace(/^www\./, ""); } catch {}
       const label = host || r.url;
-      const fav = host ? `https://icons.duckduckgo.com/ip3/${host}.ico` : "";
+      const fav = host && !state.settings.offline_active ? `https://icons.duckduckgo.com/ip3/${host}.ico` : "";
       const favHtml = `<span class="tool-chip-fav">${TOOL_SVG.globe}${fav ? `<img src="${esc(fav)}" alt="" loading="lazy" onerror="this.style.display='none'">` : ""}</span>`;
       return `<a class="tool-chip" href="${esc(r.url)}" target="_blank" rel="noopener noreferrer" title="${esc(r.title || r.url)}">${favHtml}<span>${esc(label)}</span></a>`;
     }).join("");
@@ -2802,7 +2802,7 @@
     const url = trimTrailingPunct(rawUrl);
     let host = "";
     try { host = new URL(url).hostname.replace(/^www\./, ""); } catch {}
-    const fav = host ? `https://icons.duckduckgo.com/ip3/${host}.ico` : "";
+    const fav = host && !state.settings.offline_active ? `https://icons.duckduckgo.com/ip3/${host}.ico` : "";
     const text = label != null ? label : (host || url);
     const safeUrl = url.replace(/"/g, "&quot;");
     const safeHost = (host || "").replace(/"/g, "&quot;");
@@ -2950,7 +2950,7 @@
     descEl.style.display = data.description ? "" : "none";
     urlEl.textContent = data.url || "";
     hostEl.textContent = data.site_name || host || "";
-    if (host) favEl.src = `https://icons.duckduckgo.com/ip3/${host}.ico`;
+    if (host && !state.settings.offline_active) favEl.src = `https://icons.duckduckgo.com/ip3/${host}.ico`;
     else favEl.removeAttribute("src");
     if (data.image) {
       imgWrap.style.backgroundImage = `url("${data.image.replace(/"/g, '\\"')}")`;
@@ -3129,11 +3129,13 @@
   }
   async function saveSettings(update) {
     const prevModel = state.settings.model;
-    state.settings = await api("/api/settings", {
+    const saved = await api("/api/settings", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(update),
     });
+    if (!saved || saved.error) throw new Error(saved?.error || "Settings could not be saved");
+    state.settings = saved;
     // model changed mid-stream → abort so next send uses fresh model cleanly
     if (update.model && update.model !== prevModel && state.streaming) {
       stopStreaming();
@@ -3276,7 +3278,7 @@
       state._lastMsgPromptTokens = result.prompt_tokens;
       state._ctxSource = result.source || "";
       if (Number.isFinite(result.capacity) && result.capacity > 0) state._ctxCapacity = result.capacity;
-      renderCtxGauge();
+      renderStatus();
     } catch (_) {}
   }
 
@@ -3623,7 +3625,7 @@
       { kind: "cmd", icon: "ph-gear-six", label: "Open Settings", action: () => { closePalette(); openSettings(); } },
       { kind: "cmd", icon: "ph-brain", label: "Open Long-term memory", action: () => { closePalette(); openSettings(); setTimeout(() => revealSettingsControl("#btn-mem-refresh"), 80); } },
       { kind: "cmd", icon: "ph-arrow-counter-clockwise", label: "Regenerate last reply", action: () => { closePalette(); regenerateLast(); } },
-      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / neobrutalism / aperture / aperture-dark / soft / pastel / velvet / cartograph / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
+      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / amaranth / aperture / aperture-dark / soft / pastel / velvet / cartograph / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
       { kind: "cmd", icon: "ph-browser", label: "Toggle preview pane", action: () => { closePalette(); app.classList.toggle("preview-collapsed"); } },
       { kind: "cmd", icon: "ph-camera", label: "Screenshot preview", action: () => { closePalette(); screenshotPreview(); } },
       { kind: "cmd", icon: "ph-package", label: "Export project", action: () => { closePalette(); exportProjectZip(); } },
@@ -3699,9 +3701,11 @@
       // SECONDARY signal, the dot is the primary.
       const isGitHubChat = c.origin === "github" || !!c.github_worktree;
       const isProjectChat = c.origin === "project" || !!c.project_workspace;
+      const isSecurityChat = c.origin === "security" || !!c.security_investigation;
       const iconClass = c.origin === "mobile" ? "ph ph-device-mobile"
         : (isGitHubChat ? "ph ph-git-branch"
-          : (isProjectChat ? "ph ph-folder-simple" : "ph ph-chat-circle"));
+          : (isProjectChat ? "ph ph-folder-simple"
+            : (isSecurityChat ? "ph ph-magnifying-glass" : "ph ph-chat-circle")));
       if (isGitHubChat) row.classList.add("gh-branch");
       if (isProjectChat) row.classList.add("project-session");
       row.innerHTML = `
@@ -3807,6 +3811,22 @@
       } else {
         inner.appendChild(buildFoldDivider(state.foldMark));
       }
+    }
+    const recoveries = state.chats?.chats?.[state.chatId]?.undo_turns || [];
+    if (recoveries.length) {
+      const recovery = document.createElement("details");
+      recovery.className = "saved-recovery";
+      const summary = document.createElement("summary");
+      summary.textContent = `File recovery (${recoveries.length} recent edits)`;
+      recovery.appendChild(summary);
+      for (const changes of recoveries) {
+        const row = document.createElement("div");
+        row.className = "bubble-row";
+        row.innerHTML = '<div class="bubble-col"></div>';
+        recovery.appendChild(row);
+        renderTurnChanges(row, changes);
+      }
+      inner.appendChild(recovery);
     }
     if (state.compactingChats.has(state.chatId)) ensureCompactionRow(state.chatId);
     renderRegenerateChip();
@@ -7563,6 +7583,112 @@
   let securityOverviewData = null;
   let securityPollTimer = null;
   let pendingWhitelistAlertId = "";
+  let securityIntroSeen = false;
+  let securityIntroVisual = null;
+  let securityIntroStartedAt = 0;
+  let securityIntroFinishTimer = null;
+  let securityIntroFinishing = false;
+
+  const SECURITY_INTRO_STAGES = [
+    { key: "network", match: "network", percent: 14 },
+    { key: "system", match: "system", percent: 27 },
+    { key: "application", match: "application", percent: 40 },
+    { key: "security", match: "security", percent: 53 },
+    { key: "persistence", match: "persistence", percent: 66 },
+    { key: "actions", match: "action history", percent: 78 },
+    { key: "correlate", match: "correlating", percent: 89 },
+    { key: "summary", match: "summary", percent: 96 },
+  ];
+
+  function securityIntroStage(stage = "") {
+    const value = String(stage).toLowerCase();
+    const index = SECURITY_INTRO_STAGES.findIndex(item => value.includes(item.match));
+    return index >= 0 ? { ...SECURITY_INTRO_STAGES[index], index } : { key: "", index: -1, percent: 4 };
+  }
+
+  function updateSecurityIntroClock(elapsedMs) {
+    const clock = $("#security-intro-clock");
+    if (!clock) return;
+    const seconds = Math.max(0, elapsedMs) / 1000;
+    const minutes = Math.floor(seconds / 60);
+    clock.textContent = `${String(minutes).padStart(2, "0")}:${(seconds % 60).toFixed(1).padStart(4, "0")}`;
+  }
+
+  function ensureSecurityIntroVisual() {
+    if (securityIntroVisual) return securityIntroVisual;
+    const canvas = $("#security-scan-canvas");
+    const factory = window.AccurettaSecurityScanField;
+    if (!canvas || !factory?.create) return null;
+    securityIntroVisual = factory.create(canvas, { onTick: updateSecurityIntroClock });
+    return securityIntroVisual;
+  }
+
+  function updateSecurityScanIntro(stage = "Preparing local collectors") {
+    const current = securityIntroStage(stage);
+    if ($("#security-intro-stage")) $("#security-intro-stage").textContent = stage;
+    if ($("#security-intro-index")) $("#security-intro-index").textContent = `${String(current.index + 1).padStart(2, "0")} / 08`;
+    if ($("#security-intro-percent")) $("#security-intro-percent").textContent = `${current.percent}%`;
+    if ($("#security-intro-progress")) $("#security-intro-progress").style.width = `${current.percent}%`;
+    securityIntroVisual?.setProgress(current.percent / 100, current.index);
+    $$("[data-security-source]").forEach((node, index) => {
+      node.classList.toggle("is-complete", current.index > index);
+      node.classList.toggle("is-active", current.index === index);
+    });
+  }
+
+  function startSecurityScanIntro(stage) {
+    if (securityIntroSeen) return;
+    const overlay = $("#security-scan-intro");
+    if (!overlay) return;
+    securityIntroSeen = true;
+    securityIntroFinishing = false;
+    securityIntroStartedAt = performance.now();
+    overlay.hidden = false;
+    overlay.classList.remove("is-leaving");
+    overlay.dataset.state = "scanning";
+    const visual = ensureSecurityIntroVisual();
+    visual?.start();
+    updateSecurityScanIntro(stage || "Preparing local collectors");
+  }
+
+  function hideSecurityScanIntro(immediate = false) {
+    const overlay = $("#security-scan-intro");
+    if (!overlay || overlay.hidden) {
+      securityIntroVisual?.stop();
+      return;
+    }
+    clearTimeout(securityIntroFinishTimer);
+    const hide = () => {
+      overlay.hidden = true;
+      overlay.classList.remove("is-leaving");
+      securityIntroVisual?.stop();
+    };
+    if (immediate || matchMedia("(prefers-reduced-motion: reduce)").matches) hide();
+    else {
+      overlay.classList.add("is-leaving");
+      securityIntroFinishTimer = setTimeout(hide, 430);
+    }
+  }
+
+  function finishSecurityScanIntro(failed = false) {
+    const overlay = $("#security-scan-intro");
+    if (!overlay || overlay.hidden || securityIntroFinishing) return;
+    securityIntroFinishing = true;
+    const wait = Math.max(0, 3200 - (performance.now() - securityIntroStartedAt));
+    securityIntroFinishTimer = setTimeout(() => {
+      overlay.dataset.state = failed ? "error" : "complete";
+      securityIntroVisual?.setState(failed ? "error" : "complete");
+      if ($("#security-intro-index")) $("#security-intro-index").textContent = failed ? "SCAN STOPPED" : "08 / 08";
+      if ($("#security-intro-stage")) $("#security-intro-stage").textContent = failed ? "Scan stopped before completion" : "Local snapshot complete";
+      if ($("#security-intro-percent")) $("#security-intro-percent").textContent = failed ? "--" : "100%";
+      if ($("#security-intro-progress")) $("#security-intro-progress").style.width = "100%";
+      $$("[data-security-source]").forEach(node => {
+        node.classList.remove("is-active");
+        node.classList.toggle("is-complete", !failed);
+      });
+      securityIntroFinishTimer = setTimeout(() => hideSecurityScanIntro(), failed ? 1500 : 1150);
+    }, wait);
+  }
 
   function securityWhen(epochSeconds) {
     if (!epochSeconds) return "Never scanned";
@@ -7599,6 +7725,12 @@
 
     const scanning = data?.scan?.status === "scanning";
     const scanFailed = data?.scan?.status === "error";
+    if (scanning && $("#security-page")?.classList.contains("open")) {
+      startSecurityScanIntro(data?.scan?.stage);
+      updateSecurityScanIntro(data?.scan?.stage || "Preparing local collectors");
+    } else if (!$("#security-scan-intro")?.hidden) {
+      finishSecurityScanIntro(scanFailed);
+    }
     const scanStatus = $("#security-scan-status");
     if (scanStatus) {
       scanStatus.hidden = !scanning && !scanFailed;
@@ -7651,7 +7783,7 @@
     list.querySelectorAll("[data-security-action]").forEach(button => button.addEventListener("click", event => {
       const row = event.currentTarget.closest("[data-alert-id]");
       const alertId = row?.dataset.alertId || "";
-      if (event.currentTarget.dataset.securityAction === "investigate") openSecurityInvestigation(alertId);
+      if (event.currentTarget.dataset.securityAction === "investigate") openSecurityInvestigation(alertId, event.currentTarget);
       else openSecurityWhitelist(alertId);
     }));
   }
@@ -7729,6 +7861,7 @@
         status.querySelector("strong").textContent = "Security Overview unavailable";
         $("#security-scan-stage").textContent = error.message || String(error);
       }
+      finishSecurityScanIntro(true);
       return null;
     }
   }
@@ -7750,6 +7883,7 @@
   async function refreshSecurityOverview() {
     const refresh = $("#btn-refresh-security");
     if (refresh) refresh.disabled = true;
+    startSecurityScanIntro("Preparing local collectors");
     try {
       const result = await api("/api/security/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
       if (result?.error) throw new Error(result.error);
@@ -7757,6 +7891,7 @@
       scheduleSecurityPoll();
     } catch (error) {
       if (refresh) refresh.disabled = false;
+      finishSecurityScanIntro(true);
       toast(`Security scan: ${error.message || error}`, "warn", 4200);
     }
   }
@@ -7813,53 +7948,36 @@
     }
   }
 
-  function closeSecurityCase() {
-    if ($("#security-case-scrim")) $("#security-case-scrim").hidden = true;
-  }
-
-  async function openSecurityInvestigation(alertId) {
-    const scrim = $("#security-case-scrim");
-    const body = $("#security-case-body");
-    if (!scrim || !body) return;
-    scrim.hidden = false;
-    $("#security-case-title").textContent = "Building case";
-    body.innerHTML = `<div class="security-case-loading">
-      <span class="security-dot-matrix is-large" aria-hidden="true">${"<i></i>".repeat(16)}</span>
-      <strong>Correlating evidence</strong>
-      <span>Comparing the alert with the bounded local record</span>
-    </div>`;
-    try {
-      const result = await api("/api/security/investigate", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ alert_id: alertId }),
-      });
-      if (!result?.ok) throw new Error(result?.error || "Investigation failed.");
-      renderSecurityCase(result.investigation);
-      loadSecurityOverview();
-    } catch (error) {
-      $("#security-case-title").textContent = "Investigation unavailable";
-      body.innerHTML = `<div class="security-empty"><i class="ph ph-warning"></i><strong>Could not build the case</strong><span>${esc(error.message || String(error))}</span></div>`;
+  async function openSecurityInvestigation(alertId, button) {
+    if (!alertId || button?.disabled) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Opening...";
     }
-  }
-
-  function renderSecurityCase(report) {
-    const body = $("#security-case-body");
-    if (!body) return;
-    const assessment = report?.model_assessment || report?.assessment || {};
-    const known = report?.model_assessment?.what_is_known?.length ? report.model_assessment.what_is_known : report?.verified || [];
-    const unknown = report?.model_assessment?.what_is_unknown?.length ? report.model_assessment.what_is_unknown : report?.unknown || [];
-    $("#security-case-title").textContent = report?.alert?.title || "Security investigation";
-    const list = values => (values || []).map(value => `<li>${esc(value)}</li>`).join("") || "<li>None recorded.</li>";
-    body.innerHTML = `
-      <section class="security-case-verdict">
-        <div><h3>${esc(securitySourceLabel(assessment.verdict || "unresolved"))}</h3><p>${esc(assessment.summary || report?.alert?.detail || "The available evidence does not support a stronger conclusion.")}</p></div>
-        <span class="security-case-confidence">${esc(assessment.confidence || "low")} confidence</span>
-      </section>
-      ${report?.model_deferred ? '<p class="security-panel-note" style="margin:14px 0 0;text-align:left;">The local model was busy, so this case uses deterministic evidence only.</p>' : ""}
-      <div class="security-case-columns">
-        <section class="security-case-section"><h4>What is known</h4><ul>${list(known)}</ul></section>
-        <section class="security-case-section"><h4>What remains unknown</h4><ul>${list(unknown)}</ul></section>
-      </div>
-      <section class="security-case-section security-case-evidence"><h4>Bounded evidence</h4><pre>${esc(JSON.stringify(report?.evidence || [], null, 2))}</pre></section>`;
+    try {
+      const chat = await api("/api/chats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ origin: "security", security_alert_id: alertId }),
+      });
+      if (!chat?.id) throw new Error(chat?.error || "Could not open an investigation session.");
+      closeSecurityOverview();
+      await loadChats();
+      await selectChat(chat.id);
+      const input = $("#composer-input");
+      if (input) {
+        input.value = "";
+        autoResize(input);
+        input.focus();
+      }
+      toast("Investigation session ready. Ask what you want to check.", "ok", 2600);
+    } catch (error) {
+      if (button) {
+        button.disabled = false;
+        button.textContent = "Investigate";
+      }
+      toast(error.message || String(error), "warn", 4200);
+    }
   }
 
   async function openSecurityOverview() {
@@ -7879,8 +7997,8 @@
     const page = $("#security-page");
     if (!page) return;
     clearSecurityPoll();
+    hideSecurityScanIntro(true);
     closeSecurityWhitelist();
-    closeSecurityCase();
     page.classList.remove("open");
     page.setAttribute("aria-hidden", "true");
   }
@@ -8202,9 +8320,11 @@
 
   function injectConsoleForwarder(html) {
     if (!html) return html;
-    if (/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i, m => m + CONSOLE_FORWARDER);
-    if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, m => m + "<head>" + CONSOLE_FORWARDER + "</head>");
-    return CONSOLE_FORWARDER + html;
+    const runtime = `<script src="/preview-runtime.js"><\/script>`;
+    const injected = runtime + CONSOLE_FORWARDER;
+    if (/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i, m => m + injected);
+    if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, m => m + "<head>" + injected + "</head>");
+    return injected + html;
   }
 
   function pushConsoleLog(level, text) {
@@ -8229,8 +8349,10 @@
   // single global listener — receives postMessage from *any* preview iframe
   window.addEventListener("message", (e) => {
     const d = e && e.data;
-    if (!d || d.__acc !== "console") return;
-    pushConsoleLog(d.level || "log", d.text || "");
+    if (e.source !== document.getElementById("preview-frame")?.contentWindow || e.origin !== "null") return;
+    if (!d || d.__acc !== "console" || typeof d.text !== "string") return;
+    if (!["log", "info", "warn", "error", "debug"].includes(d.level)) return;
+    pushConsoleLog(d.level, d.text.slice(0, 16000));
   });
 
   // ---------- viewport presets ----------
@@ -8353,7 +8475,7 @@
     const fresh = document.createElement("iframe");
     fresh.id = "preview-frame";
     fresh.className = "preview-frame";
-    fresh.setAttribute("sandbox", "allow-scripts allow-forms allow-modals allow-popups allow-same-origin");
+    fresh.setAttribute("sandbox", "allow-scripts allow-forms allow-modals allow-popups");
     fresh.src = wsFileUrl(wp.root, wp.rel);
     old?.replaceWith(fresh);
   }
@@ -8564,15 +8686,8 @@
       const fresh = document.createElement("iframe");
       fresh.id = "preview-frame";
       fresh.className = "preview-frame";
-      // allow-same-origin so the page can read its own localStorage / cookies
-      // (theme toggles commonly do `localStorage.getItem("theme")`, which
-      // throws DOMException in an opaque-origin srcdoc and the page silently
-      // falls back to its light-mode default — visible as a white iframe even
-      // though "open in new tab" renders the same HTML correctly because the
-      // tab gets a real origin). The HTML in this iframe is generated by the
-      // local agent on the user's own machine, not arbitrary web input, so
-      // the scripts+same-origin combination is acceptable here.
-      fresh.setAttribute("sandbox", "allow-scripts allow-forms allow-modals allow-popups allow-same-origin");
+      // Preview scripts receive an opaque origin, separate from the control UI.
+      fresh.setAttribute("sandbox", "allow-scripts allow-forms allow-modals allow-popups");
       // tabindex makes the iframe element itself focusable, which is what
       // lets contentWindow.focus() actually take effect from the parent.
       fresh.setAttribute("tabindex", "0");
@@ -8613,35 +8728,38 @@
   }
 
   async function captureIframePng({ scale = 1 } = {}) {
-    if (!state.currentHtml) {
-      toast("Nothing in the preview yet.", "warn", 2200);
-      return null;
-    }
-    if (typeof window.html2canvas !== "function") {
-      toast("Screenshot library hasn't loaded yet — try again in a second.", "warn", 2500);
-      return null;
-    }
-    // srcdoc iframes inherit the parent origin, so contentDocument is accessible
     const frame = $("#preview-frame");
-    const doc = frame && frame.contentDocument;
-    const body = doc && doc.body;
-    if (!body) {
-      toast("Preview frame isn't ready.", "warn", 2500);
-      return null;
-    }
+    if (!frame || (!state.currentHtml && !state.workspacePreview)) return null;
     try {
-      const canvas = await window.html2canvas(body, {
-        backgroundColor: getComputedStyle(body).backgroundColor || "#ffffff",
-        useCORS: true,
-        allowTaint: true,
-        scale,
-        logging: false,
-        windowWidth: doc.documentElement.scrollWidth,
-        windowHeight: doc.documentElement.scrollHeight,
+      const dataUrl = await new Promise((resolve, reject) => {
+        const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+        const source = frame.contentWindow;
+        const timer = setTimeout(() => finish(new Error("Preview capture timed out")), 15000);
+        function finish(error, image) {
+          clearTimeout(timer);
+          window.removeEventListener("message", receive);
+          if (error) reject(error); else resolve(image);
+        }
+        function receive(event) {
+          const data = event.data;
+          if (event.source !== source || event.origin !== "null" || data?.__acc !== "capture-result" || data.id !== id) return;
+          if (typeof data.image !== "string" || !data.image.startsWith("data:image/png;base64,") || data.image.length > 32 * 1024 * 1024) {
+            finish(new Error(String(data.error || "Invalid preview image").slice(0, 300)));
+          } else finish(null, data.image);
+        }
+        window.addEventListener("message", receive);
+        source.postMessage({ __acc: "capture", id, scale }, "*");
       });
+      const picture = new Image();
+      picture.src = dataUrl;
+      await picture.decode();
+      if (picture.width > 8192 || picture.height > 8192) throw new Error("Preview image is too large");
+      const canvas = document.createElement("canvas");
+      canvas.width = picture.width; canvas.height = picture.height;
+      canvas.getContext("2d").drawImage(picture, 0, 0);
       return canvas;
-    } catch (e) {
-      toast(`Screenshot failed: ${e.message || e}`, "err", 3500);
+    } catch (error) {
+      toast(`Screenshot failed: ${error.message}`, "err", 4000);
       return null;
     }
   }
@@ -10481,13 +10599,17 @@
     }
   }
 
+  let settingsReturnFocus = null;
   async function openSettings() {
     closeSecurityOverview();
     closeFaq();
     closeUsageStats();
     initSettingsSections();
     $("#drawer-scrim").classList.add("open");
+    settingsReturnFocus = document.activeElement;
     $("#settings-drawer").classList.add("open");
+    $("#settings-drawer").setAttribute("aria-hidden", "false");
+    $("#btn-close-settings").focus();
     const health = loadModelHealth();
     await loadModels();
     populateSettingsForm();
@@ -11008,6 +11130,8 @@
   function closeSettings() {
     $("#drawer-scrim").classList.remove("open");
     $("#settings-drawer").classList.remove("open");
+    settingsReturnFocus?.focus();
+    $("#settings-drawer").setAttribute("aria-hidden", "true");
   }
 
   // ---------- Command history drawer ----------
@@ -11167,6 +11291,10 @@
   }
 
   function populateSettingsForm() {
+    $("#set-offline-mode").checked = !!state.settings.offline_mode;
+    $("#offline-status").textContent = !!state.settings.offline_mode !== !!state.settings.offline_active
+      ? "Saved. Quit and reopen Accuretta to apply this change."
+      : state.settings.offline_active ? "Offline mode is active." : "Online features are available.";
     const s = state.settings;
     const fill = (id, v) => { const el = $(id); if (el) el.value = v ?? ""; };
 
@@ -11457,13 +11585,14 @@
   }
 
   // THEME_CYCLE is the source of truth for the selector and cycle controls.
-  // Retired theme names normalize to Aperture so old settings do not leave the
+  // Retired theme names normalize to a supported theme so old settings do not leave the
   // document in a theme state with no matching CSS.
   const THEME_MIGRATIONS = Object.freeze({
-    "neobrutalism-dark": "aperture",
+    neobrutalism: "amaranth",
+    "neobrutalism-dark": "amaranth",
     kinetic: "aperture",
   });
-  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "neobrutalism", "aperture", "aperture-dark", "soft", "pastel", "velvet", "cartograph", "light"];
+  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "amaranth", "aperture", "aperture-dark", "soft", "pastel", "velvet", "cartograph", "light"];
   const THEME_ICONS = {
     dark:              "ph ph-moon",
     dim:               "ph ph-moon-stars",
@@ -11472,7 +11601,7 @@
     nebula:            "ph ph-planet",
     operator:          "ph ph-command",
     neumorphic:        "ph ph-drop-half",
-    neobrutalism:      "ph ph-lightning",
+    amaranth:          "ph ph-circle-half",
     aperture:          "ph ph-aperture",
     "aperture-dark":   "ph ph-moon",
     soft:              "ph ph-cloud",
@@ -11813,10 +11942,10 @@
       // prompt_eval_count from a completed turn, "tokenize" = exact tokenizer
       // count of the assembled prompt before the first turn has run.
       source = state._ctxSource === "tokenize"
-        ? "tokenizer count (no completed turn yet)"
+        ? "estimated next prompt"
         : state._ctxSource === "estimate"
-          ? "live estimate (round in flight)"
-          : "llama-server prompt_eval_count";
+          ? "estimated prompt usage"
+          : "last measured prompt";
     } else {
       const systemPromptChars = 2500;
       const msgChars = (state.messages || []).reduce((a, m) => {
@@ -11842,6 +11971,14 @@
     arc.setAttribute("stroke-dasharray", circ.toFixed(2));
     arc.setAttribute("stroke-dashoffset", (circ * (1 - pct)).toFixed(2));
     label.textContent = `${Math.round(pct * 100)}%`;
+    const statusContext = document.querySelector(".status-ctx");
+    if (statusContext) {
+      statusContext.title = `${used.toLocaleString()} / ${capacity.toLocaleString()} tokens (${source})`;
+      statusContext.classList.toggle("is-warn", pct >= 0.7 && pct < 0.9);
+      statusContext.classList.toggle("is-crit", pct >= 0.9);
+      const value = statusContext.querySelector("span");
+      if (value) value.textContent = `${Math.round(pct * 100)}%`;
+    }
     const gauge = $("#ctx-gauge");
     gauge.classList.toggle("warn", pct >= 0.7 && pct < 0.9);
     gauge.classList.toggle("crit", pct >= 0.9);
@@ -11930,31 +12067,36 @@
     return inCost + outCost;
   }
 
+  function formatEstimatedCost(value) {
+    return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(value);
+  }
+
   function renderCostWidget() {
     const el = $("#cost-amount");
     if (!el) return;
     const allTimeCost = calcCost(state.costProvider);
     const sessionCost = calcSessionCost(state.costProvider);
     // Main big number = all-time total
-    el.textContent = allTimeCost < 0.005 ? "$0.00" : "$" + allTimeCost.toFixed(2);
+    el.textContent = formatEstimatedCost(allTimeCost);
     el.classList.toggle("zero", allTimeCost < 0.005);
 
     // Update the "saved vs" label dynamically with the provider name
     const label = $("#cost-widget .cost-widget-label");
     if (label) {
       const p = CLOUD_PRICING[state.costProvider];
-      label.textContent = `Saved Vs ${p ? p.label : state.costProvider} Cost`;
+      label.textContent = `Estimated ${p ? p.label : state.costProvider} API cost`;
+      label.title = "Token-count comparison using the listed rates. Excludes hardware and electricity, and does not imply equal model quality.";
     }
 
     // Session row
     const sessionEl = $("#cost-session");
     if (sessionEl) {
-      sessionEl.textContent = sessionCost < 0.005 ? "$0.00" : "$" + sessionCost.toFixed(2);
+      sessionEl.textContent = formatEstimatedCost(sessionCost);
     }
     // All-time row
     const alltimeEl = $("#cost-alltime");
     if (alltimeEl) {
-      alltimeEl.textContent = allTimeCost < 0.005 ? "$0.00" : "$" + allTimeCost.toFixed(2);
+      alltimeEl.textContent = formatEstimatedCost(allTimeCost);
     }
     // Since row — the start date makes months of accrual legible.
     const sinceEl = $("#cost-since");
@@ -13234,6 +13376,25 @@
     $("#btn-settings").addEventListener("click", openSettings);
     $("#btn-settings-m")?.addEventListener("click", openSettings);
     $("#btn-close-settings").addEventListener("click", closeSettings);
+    $("#set-offline-mode").addEventListener("change", async e => {
+      try {
+        await saveSettings({ offline_mode: e.target.checked });
+        $("#offline-status").textContent = "Saved. Quit and reopen Accuretta to apply this change.";
+      } catch (error) {
+        e.target.checked = !e.target.checked;
+        toast("Could not save offline mode: " + error.message, "error");
+      }
+    });
+    $("#settings-drawer").addEventListener("keydown", event => {
+      if (!event.currentTarget.classList.contains("open")) return;
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); closeSettings(); return; }
+      if (event.key !== "Tab") return;
+      const controls = [...event.currentTarget.querySelectorAll('button, input, select, textarea, a[href], summary, [tabindex="0"]')]
+        .filter(el => !el.disabled && el.getClientRects().length && getComputedStyle(el).visibility !== "hidden");
+      const first = controls[0], last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    });
     $("#drawer-scrim").addEventListener("click", closeSettings);
     $("#btn-cmd-history")?.addEventListener("click", openCmdHistory);
     // Topbar Plan toggle: show/hide the plan panel. Auto-pops when the model
@@ -13257,16 +13418,13 @@
     $("#btn-close-security")?.addEventListener("click", closeSecurityOverview);
     $("#btn-refresh-security")?.addEventListener("click", refreshSecurityOverview);
     $("#btn-security-analyze")?.addEventListener("click", updateSecurityAnalysis);
+    $("#btn-security-intro-skip")?.addEventListener("click", () => hideSecurityScanIntro());
     $("#security-show-whitelisted")?.addEventListener("change", renderSecurityAlerts);
     $("#security-whitelist-close")?.addEventListener("click", closeSecurityWhitelist);
     $("#security-whitelist-cancel")?.addEventListener("click", closeSecurityWhitelist);
     $("#security-whitelist-confirm")?.addEventListener("click", confirmSecurityWhitelist);
     $("#security-whitelist-scrim")?.addEventListener("click", event => {
       if (event.target === event.currentTarget) closeSecurityWhitelist();
-    });
-    $("#security-case-close")?.addEventListener("click", closeSecurityCase);
-    $("#security-case-scrim")?.addEventListener("click", event => {
-      if (event.target === event.currentTarget) closeSecurityCase();
     });
     $("#btn-close-cmd-history")?.addEventListener("click", closeCmdHistory);
     $("#cmd-history-scrim")?.addEventListener("click", closeCmdHistory);
@@ -13296,7 +13454,8 @@
     $("#btn-shutdown-no-save")?.addEventListener("click", async () => {
       window.__allowClose = true;
       try { await api("/api/shutdown", { method: "POST", body: { save: false } }); } catch (e) {}
-      window.close();
+      if (window.pywebview?.api?.close_window) window.pywebview.api.close_window();
+      else window.close();
     });
     
     $("#btn-shutdown-save")?.addEventListener("click", async () => {
@@ -13342,6 +13501,15 @@
         await api("/api/shutdown", { method: "POST", body: { save: true, messages: state.messages } });
       } catch (e) {
         console.error("Shutdown save failed", e);
+        clearInterval(interval);
+        btnSave.disabled = false;
+        btnNoSave.disabled = false;
+        if (actions) {
+          actions.style.opacity = "1";
+          actions.style.pointerEvents = "auto";
+        }
+        loader.textContent = "Could not save. Please retry, or choose Close Without Saving.";
+        return;
       }
       
       clearInterval(interval);
@@ -13355,7 +13523,7 @@
             <div class="shutdown-success-icon" style="font-size: 48px; color: var(--success); margin-bottom: 0.5rem; animation: success-bounce 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275) both;">
               <i class="ph ph-check-circle"></i>
             </div>
-            <p style='color: var(--success); font-weight: 600; font-size: 1.1em; animation: fade-in-up 0.4s ease both;'>Done! It is now safe to close this window.</p>
+            <p style='color: var(--success); font-weight: 600; font-size: 1.1em; animation: fade-in-up 0.4s ease both;'>Saved. Closing Accuretta…</p>
           `;
           loader.style.opacity = "1";
         }, 300);
@@ -13363,7 +13531,8 @@
       
       // Wait 1.8 seconds so the user can see the checkmark, then close
       setTimeout(() => {
-        window.close();
+        if (window.pywebview?.api?.close_window) window.pywebview.api.close_window();
+        else window.close();
       }, 1800);
     });
 
@@ -14404,7 +14573,7 @@
       // user knows what the tap will do, mirroring the desktop cycle.
       const cur = document.documentElement.getAttribute("data-theme") || "light";
       const next = nextTheme(cur);
-      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", neumorphic: "Neumorphic", neobrutalism: "Neobrutalism", aperture: "Aperture", "aperture-dark": "Aperture Dark", soft: "Soft", pastel: "Pastel", velvet: "Velvet", cartograph: "Cartograph", light: "Light" }[next] || next;
+      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", neumorphic: "Neumorphic", amaranth: "Amaranth", aperture: "Aperture", "aperture-dark": "Aperture Dark", soft: "Soft", pastel: "Pastel", velvet: "Velvet", cartograph: "Cartograph", light: "Light" }[next] || next;
       const lbl = $("#mm-theme-label");
       if (lbl) lbl.textContent = `Switch to ${niceName.toLowerCase()}`;
       const targetSelect = $("#execution-target-select");
@@ -14509,11 +14678,6 @@
       if (e.key === "Escape" && !$("#security-whitelist-scrim")?.hidden) {
         e.preventDefault();
         closeSecurityWhitelist();
-        return;
-      }
-      if (e.key === "Escape" && !$("#security-case-scrim")?.hidden) {
-        e.preventDefault();
-        closeSecurityCase();
         return;
       }
       if (e.key === "Escape" && $("#security-page")?.classList.contains("open")) {

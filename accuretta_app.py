@@ -15,7 +15,8 @@ Package it into a single windowed .exe (no console) with PyInstaller:
     pip install pywebview pyinstaller
     pyinstaller --noconfirm --windowed --name Accuretta ^
         --add-data "index.html;." --add-data "app.js;." --add-data "app.css;." ^
-        --add-data "signal-field.js;." ^
+        --add-data "bridge-client.js;." --add-data "preview-runtime.js;." ^
+        --add-data "signal-field.js;." --add-data "security-scan-field.js;." ^
         --add-data "assets;assets" ^
         --add-data "colors_and_type.css;." --add-data "manifest.webmanifest;." ^
         --icon assets/icons/accuretta.ico accuretta_app.py
@@ -33,6 +34,8 @@ import socket
 import sys
 import threading
 import time
+import json
+import urllib.request
 from pathlib import Path
 
 # App mode: hide the llama-server console (bridge reads this), and do not let the
@@ -50,14 +53,16 @@ import bridge   # the existing server; module-level init runs on import
 PORT = int(os.environ.get("ACCURETTA_PORT", "8787"))
 
 
-def _wait_ready(host: str = "127.0.0.1", port: int = PORT, timeout: float = 40.0) -> bool:
+def _wait_ready(host: str = "127.0.0.1", port: int = PORT, timeout: float = 180.0) -> bool:
     """Block until the bridge is accepting connections (or give up)."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with socket.create_connection((host, port), timeout=1):
-                return True
-        except OSError:
+            with urllib.request.urlopen(f"http://{host}:{port}/api/health", timeout=2) as response:
+                if json.load(response).get("application") == "accuretta":
+                    return True
+                return False
+        except (OSError, ValueError):
             time.sleep(0.25)
     return False
 
@@ -90,6 +95,8 @@ def _acquire_single_instance(lock_port: int = 8799) -> bool:
     global _lock_sock
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         s.bind(("127.0.0.1", lock_port))  # fails if another instance holds it
         s.listen(1)
         _lock_sock = s
@@ -108,10 +115,11 @@ _LIGHT_THEMES = {"", "light", "soft", "pastel", "retro", "neumorphic", "neobruta
 _KNOWN_THEMES = {
     "light", "dark", "dim", "retro", "aurora", "nebula", "operator",
     "neumorphic", "neobrutalism", "aperture", "aperture-dark", "soft",
-    "pastel", "velvet", "cartograph",
+    "pastel", "velvet", "cartograph", "amaranth",
 }
 _THEME_ALIASES = {
-    "neobrutalism-dark": "aperture",
+    "neobrutalism": "amaranth",
+    "neobrutalism-dark": "amaranth",
     "kinetic": "aperture",
 }
 
@@ -193,7 +201,7 @@ def _read_app_version() -> str:
             return m.group(1)
     except Exception:
         pass
-    return "0.8.2"
+    return "0.8.3"
 
 
 def _signal_field_js() -> str:
@@ -499,12 +507,31 @@ _FAILED_HTML = ("<body style='font-family:system-ui,sans-serif;background:#12151
                 f"<p>The local bridge did not come up on port {PORT}. Check the logs, then relaunch.</p></body>")
 
 
+class DesktopWindowApi:
+    def __init__(self):
+        self._window = None
+
+    def close_window(self):
+        if self._window is not None:
+            # Destroying synchronously inside the WebView2 bridge callback can
+            # leave the callback waiting on the window it is trying to close.
+            # Let the callback return, then close on the GUI thread.
+            threading.Timer(0.05, self._window.destroy).start()
+        return True
+
+
 def _watch_bridge(win) -> None:
     """Close the window (exit the app) once the bridge stops responding, e.g.
     right after the in-app Shutdown button stops it."""
     time.sleep(3)
     misses = 0
     while True:
+        if bridge._shutdown_ready.is_set():
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            return
         try:
             with socket.create_connection(("127.0.0.1", PORT), timeout=1):
                 misses = 0
@@ -566,8 +593,17 @@ def _set_app_icon() -> None:
 
 def main() -> int:
     if not _acquire_single_instance():
-        webview.create_window("Accuretta", html=_ALREADY_RUNNING_HTML, width=440, height=220)
-        webview.start(gui="edgechromium" if sys.platform == "win32" else None)
+        if sys.platform == "win32":
+            import ctypes
+            user32 = ctypes.windll.user32
+            user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+            user32.FindWindowW.restype = ctypes.c_void_p
+            user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+            hwnd = user32.FindWindowW(None, "Accuretta")
+            if hwnd:
+                user32.ShowWindow(hwnd, 9)
+                user32.SetForegroundWindow(hwnd)
         return 0
 
     # Show the branded splash immediately; boot the bridge in the background and
@@ -578,9 +614,11 @@ def main() -> int:
     # selection + Ctrl+C + right-click copy. UI chrome stays unselectable via the
     # `user-select: none` CSS on buttons, the sidebar, and code line numbers.
     splash_created_at = time.monotonic()
-    win = webview.create_window("Accuretta", html=_build_splash_html(),
+    desktop_api = DesktopWindowApi()
+    win = webview.create_window("Accuretta", html=_build_splash_html(), js_api=desktop_api,
                                 width=1440, height=920, min_size=(960, 640),
                                 text_select=True)
+    desktop_api._window = win
 
     def _boot() -> None:
         def _stage(label: str, pct: int) -> None:
