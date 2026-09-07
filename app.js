@@ -1503,7 +1503,7 @@
   }
   function toolResultLabel(name, res) {
     res = res || {};
-    if (toolResultFailed(res)) return toolFailureLabel(name);
+    if (toolResultFailed(res)) return toolFailureLabel(name, res);
     if (res.code_check?.status === "issues_found") return "Edit saved · Code check found issues";
     switch (name) {
       case "list_directory": {
@@ -1590,7 +1590,14 @@
     }
   }
 
-  function toolFailureLabel(name) {
+  function toolFailureLabel(name, result = {}) {
+    if (result.expected_type === "directory" && result.actual_type === "file") return "Expected a folder, received a file";
+    if (/not a directory:/i.test(String(result.error || ""))) return "Expected a folder path";
+    if (/path outside workspace/i.test(String(result.error || ""))) return "Path is outside the selected workspace";
+    if (name === "tool_unavailable" || name === "tools_unavailable") {
+      const missing = result.tool || result.name || result.requested_name;
+      return missing ? `${String(missing).replaceAll("_", " ")} is unavailable` : "Requested tool is unavailable";
+    }
     if (name && name.startsWith("mcp_")) {
       const match = name.match(/^mcp_[^_]+_(.+)$/);
       const tool = (match ? match[1] : name.slice(4)).replaceAll("_", " ");
@@ -1606,17 +1613,23 @@
       case "run_tests": return "Tests did not complete";
       case "read_file":
       case "read_skeleton": return "File could not be read";
+      case "list_directory": return "Folder could not be listed";
+      case "project_map": return "Project map could not be read";
       case "write_file":
       case "edit_file":
       case "delete_file": return "File action did not complete";
-      default: return "Tool unavailable";
+      default: {
+        const readable = String(name || "action").replaceAll("_", " ");
+        return `${readable[0].toUpperCase()}${readable.slice(1)} could not be completed`;
+      }
     }
   }
 
   function toolFailureDetail(res) {
     res = res || {};
-    const raw = res.error ?? res.message ?? res.stderr ?? res.output ?? res.details;
-    if (raw == null) return "";
+    const raw = res.error ?? res.message ?? res.reason ?? res.unavailable_reason
+      ?? res.stderr ?? res.output ?? res.details ?? res.detail;
+    if (raw == null || raw === "") return "The requested tool could not be run.";
     if (typeof raw === "string") return raw.slice(0, 600);
     try { return JSON.stringify(raw).slice(0, 600); } catch { return String(raw).slice(0, 600); }
   }
@@ -9744,9 +9757,18 @@
 
   function updateRevealerDeck(row) {
     const deck = $("#revealer-deck");
-    if (!deck || !row || row._activityFinished) return;
+    if (!deck || !row) return;
+    if (row._activityFinished) {
+      deck.querySelector('[data-card-type="activity"]')?.remove();
+      clearInterval(row._statusTimer);
+      return;
+    }
     const allLines = [...row.querySelectorAll(".tool-line")];
-    const lines = allLines.filter(line => line.matches(".running, .err"))
+    // An earlier error remains in history once a later action starts.
+    // Moving on does not establish that the underlying issue was resolved.
+    const latest = allLines.at(-1);
+    const lines = allLines.filter(line => line.classList.contains("running")
+      || (line === latest && line.classList.contains("err")))
       .filter(line => !line.dataset.statusDismissed);
     const active = lines.filter(line => line.classList.contains("running"));
     const failures = lines.filter(line => line.classList.contains("err"));
@@ -9758,9 +9780,8 @@
     if (!current) return;
     const label = current.querySelector(".tool-line-label")?.textContent || "Working";
     const waiting = current.dataset.waiting === "true";
-    const laterActivity = allLines.indexOf(current) < allLines.length - 1;
     const title = waiting ? "Waiting for command approval" : active.length ? label
-      : laterActivity ? "Earlier action failed · task continued" : "Last action failed";
+      : "Action needs review";
     const card = document.createElement("div");
     card.className = "revealer-card task-activity";
     card.dataset.cardType = "activity";

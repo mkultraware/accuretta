@@ -6750,7 +6750,8 @@ def tool_list_directory(args: dict) -> dict:
     if is_blocked_path(path):
         return {"error": "path blocked (Windows/System32)"}
     if not os.path.isdir(path):
-        return {"error": f"not a directory: {path}"}
+        return {"error": f"not a directory: {path}", "expected_type": "directory",
+                "actual_type": "file" if os.path.isfile(path) else "unknown"}
     out = []
     skipped = 0
     try:
@@ -13086,7 +13087,8 @@ def tool_find_files(args: dict) -> dict:
     if err:
         return err
     if not os.path.isdir(root):
-        return {"error": f"not a directory: {root}"}
+        return {"error": f"not a directory: {root}", "expected_type": "directory",
+                "actual_type": "file" if os.path.isfile(root) else "unknown"}
     pattern = (args.get("pattern") or "*").strip() or "*"
     max_size = int(args.get("max_size") or 0)  # 0 = no cap
     max_results = max(1, min(int(args.get("max_results") or 500), 5000))
@@ -13478,7 +13480,8 @@ def tool_grep_files(args: dict) -> dict:
     if err:
         return err
     if not os.path.isdir(root):
-        return {"error": f"not a directory: {root}"}
+        return {"error": f"not a directory: {root}", "expected_type": "directory",
+                "actual_type": "file" if os.path.isfile(root) else "unknown"}
     pattern = args.get("pattern") or ""
     if not pattern:
         return {"error": "missing pattern"}
@@ -27189,13 +27192,20 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 dangling = _unclosed_tool_tail(full_text)
                 if dangling:
                     full_text = full_text[:max(0, len(full_text) - len(dangling))].strip()
+                _completed_tools = [item.get("name") for item in turn_tool_outcomes
+                                    if item.get("ok")]
+                _completed_note = (
+                    " A previous tool action did complete before the follow-up stalled."
+                    if _completed_tools else " No tool action was executed from the incomplete call."
+                )
                 full_text = (full_text + "\n\n" if full_text else "") + (
-                    "I stopped an oversized file operation because its continuation repeated without "
-                    "making progress. No truncated tool call was executed. Retry the request and I will "
-                    "write the file in smaller sections."
+                    "The oversized file operation stopped making progress, so I stopped the follow-up safely."
+                    + _completed_note + " Retry the request and I will write the file in smaller sections."
                 )
                 emit({"type": "error",
-                      "error": "Oversized file generation stalled; no partial tool call was executed."})
+                      "error": ("Oversized file generation stalled after a previous action completed."
+                                if _completed_tools else
+                                "Oversized file generation stalled; no incomplete tool call was executed.")})
 
             # assemble native tool calls
             parsed_calls: list[dict] = []
