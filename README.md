@@ -90,9 +90,31 @@ Download one GGUF model from Hugging Face. A `Q4_K_M` quant of a 7B to 35B model
 
 The wizard detects the GPU, finds models, offers an appropriate llama.cpp build, and tunes the selected model before starting it. Sessions, settings, workspace pointers, memories, model profiles, and preview versions are stored under `data/`.
 
+### Preferences and memory
+
+In Settings, standing preferences stay in every chat's instructions. Searchable facts stay on disk and the model can retrieve them with `search_memories` when you ask about past information. Search uses local words and phrases, so different wording may require another search. Retrieval requires a mode with tools enabled.
+
+Existing notes are treated as searchable facts. You can edit, reclassify, or remove each note. Standing preferences must be saved explicitly as preferences. The preference profile has a 6,000-character budget; additions that exceed it are refused with an explanation, and existing preferences are never automatically evicted. Each new or edited note supports up to 2,000 characters without silent shortening. Changing a preference uses its existing ID; unrelated preferences remain intact.
+
 ## Files, code, and live previews
 
+### Following and reviewing a task
+
+While the model works, use the normal send button to send a correction or extra instruction. The Task updates strip shows delivery status. The update enters the current task at the next safe stopping point; an action already running may finish first. If delivery fails, use Retry. The separate stop button ends the task.
+
+Open search with **Ctrl+K** or **⌘K** to find conversation messages, filenames mentioned in chats, tool output, and errors. Selecting a content result jumps to its matching message. This searches saved conversations, not the contents of every workspace file.
+
+After file edits, **Review changes** opens the recorded text differences. Supported files can open in a preview or source view; files without a text preview offer **Show in folder**. Undo is available for changes with a restorable snapshot and asks for confirmation. Verification results describe the checks that ran, so an untested change is not presented as verified.
+
+The activity panel shows the current action and keeps earlier errors in its expandable details. An earlier command error can be followed by successful work; it does not establish the final task outcome. Replies follow the bottom automatically until you scroll up to read. Return to the bottom or click the down arrow to resume following.
+
+Notification sounds distinguish permission requests, completed tasks, and failed tasks. Completion and failure sounds are reserved for tasks lasting at least 40 seconds; permission sounds play immediately when sound is enabled.
+
+### Working with files
+
 The model can work inside a selected workspace instead of pasting every result into chat. Its coding tools cover file reads and edits, project maps, symbol lookup, reference search, syntax checks, test runs, and Git operations.
+
+For authorized red-team work, Accuretta keeps a per-engagement evidence ledger. Scope-aware requests can be captured as receipts, compared as baseline/test/control observations, and tracked against planned feature and identity checks. A finding stays a candidate until its exact receipts, separate reproduction, control, expected boundary, demonstrated impact, alternative explanation, disproof check, and limitations pass the review step. A denied request, expired authentication, WAF response, timeout, or truncated capture remains inconclusive. The report includes only the active engagement's findings and evidence receipts.
 
 IDE mode expects one HTML document and renders it in the right pane while the model writes. Each result becomes a saved preview version, so an earlier page is one click away.
 

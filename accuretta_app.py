@@ -15,7 +15,7 @@ Package it into a single windowed .exe (no console) with PyInstaller:
     pip install pywebview pyinstaller
     pyinstaller --noconfirm --windowed --name Accuretta ^
         --add-data "index.html;." --add-data "app.js;." --add-data "app.css;." ^
-        --add-data "bridge-client.js;." --add-data "preview-runtime.js;." ^
+        --add-data "bridge-client.js;." --add-data "preview-runtime.js;." --add-data "appearance.js;." ^
         --add-data "signal-field.js;." --add-data "security-scan-field.js;." ^
         --add-data "assets;assets" ^
         --add-data "colors_and_type.css;." --add-data "manifest.webmanifest;." ^
@@ -111,11 +111,11 @@ def _acquire_single_instance(lock_port: int = 8799) -> bool:
 
 # Themes whose splash background needs the dark-ink logo mark. Keep this in
 # sync with the actual palette luminance, including the softer and pastel sets.
-_LIGHT_THEMES = {"", "light", "soft", "pastel", "retro", "neumorphic", "neobrutalism", "aperture"}
+_LIGHT_THEMES = {"", "light", "soft", "pastel", "retro", "neumorphic", "neobrutalism", "aperture", "folio"}
 _KNOWN_THEMES = {
     "light", "dark", "dim", "retro", "aurora", "nebula", "operator",
     "neumorphic", "neobrutalism", "aperture", "aperture-dark", "soft",
-    "pastel", "velvet", "cartograph", "amaranth",
+    "pastel", "velvet", "cartograph", "amaranth", "folio",
 }
 _THEME_ALIASES = {
     "neobrutalism": "amaranth",
@@ -176,6 +176,17 @@ def _splash_palette(theme: str) -> dict:
                 pal[key] = resolve(vmap[var])
     except Exception:
         pass
+    try:
+        colors = bridge.get_settings().get("custom_palettes", {}).get(theme)
+        if isinstance(colors, dict) and all(isinstance(colors.get(k), str) and re.fullmatch(r"#[0-9a-fA-F]{6}", colors[k]) for k in ("background", "surface", "accent")):
+            pal["bg"] = colors["background"]
+            pal["accent"] = colors["accent"]
+            rgb = [int(pal["bg"][i:i + 2], 16) / 255 for i in (1, 3, 5)]
+            linear = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in rgb]
+            pal["fg"] = "#202024" if sum(v * w for v, w in zip(linear, (0.2126, 0.7152, 0.0722))) > 0.179 else "#faf9f6"
+            pal["muted"] = "#" + "".join(format(int(int(pal["bg"][i:i + 2], 16) * 0.28 + int(pal["fg"][i:i + 2], 16) * 0.72 + 0.5), "02x") for i in (1, 3, 5))
+    except (AttributeError, TypeError, ValueError):
+        pass
     return pal
 
 
@@ -229,7 +240,8 @@ def _build_splash_html() -> str:
     """
     theme = _read_saved_theme()
     pal = _splash_palette(theme)
-    logo = _logo_data_uri(theme)
+    logo_theme = "light" if pal["fg"].lower() == "#202024" else "dark" if pal["fg"].lower() == "#faf9f6" else theme
+    logo = _logo_data_uri(logo_theme)
     accent = pal["accent"]
     theme_label = re.sub(r"[^a-z0-9 -]", "", (theme or "light").replace("-", " ")).strip() or "light"
     version = _read_app_version()

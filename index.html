@@ -26,7 +26,8 @@
     document.documentElement.setAttribute('data-theme', theme);
   })();
 </script>
-<link rel="stylesheet" href="/app.css?v=72">
+<script src="/appearance.js?v=1"></script>
+<link rel="stylesheet" href="/app.css?v=73">
 <link rel="stylesheet" href="/assets/vendor/web/icons.css">
 <script src="/assets/vendor/html2canvas/dist/html2canvas.min.js" defer></script>
 <script src="/assets/vendor/jszip/dist/jszip.min.js" defer></script>
@@ -59,7 +60,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.8.3</span>
+        <span class="v" id="brand-v">v0.8.4</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -270,6 +271,7 @@
 
       <div class="composer-wrap">
         <div class="revealer-deck" id="revealer-deck" role="status" aria-live="polite" aria-relevant="additions text"></div>
+        <section class="message-queue hidden" id="message-queue" aria-label="Your pending updates" aria-live="polite"></section>
         <div class="composer">
           <div class="composer-tools">
             <div class="mode-control" id="composer-mode-control">
@@ -317,7 +319,6 @@
             <span class="composer-spacer"></span>
           </div>
           <div class="image-tray hidden" id="image-tray"></div>
-          <section class="message-queue hidden" id="message-queue" aria-label="Queued messages" aria-live="polite"></section>
           <div class="composer-input-wrap">
             <div class="composer-mirror" id="composer-mirror" aria-hidden="true"></div>
             <textarea class="composer-input" id="composer-input" rows="2" placeholder="ask, build, or instruct…" spellcheck="false" autocomplete="off"></textarea>
@@ -936,6 +937,26 @@
           <header><span>06</span><div><h3>Workflow</h3><p>Small conveniences that prevent repetitive finger gymnastics.</p></div></header>
           <div class="faq-list">
             <details class="faq-item">
+              <summary><span>Can I correct the model while it is working?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Yes. Type your update and use the normal send button. Task updates shows whether it is waiting, delivered, or needs a retry. The model receives it at a safe stopping point; an action already running may finish first. Use the separate stop button to end the task.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>How do I find an old message or tool error?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Press <code>Ctrl+K</code> or <code>⌘K</code> and enter at least two characters. Search covers saved messages, tool output, errors, and filenames mentioned in conversations. Select a result to jump to its message. It does not search every workspace file's contents.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>What does Review changes show?</span><i class="ph ph-plus"></i></summary>
+              <div><p>It shows recorded text differences for files changed during the task. Supported files open in a preview or source view. Binary or unsupported files offer Show in folder. Undo requires a restorable snapshot and confirmation. The verification summary reports checks that actually ran.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Why does activity mention an earlier failure after more work?</span><i class="ph ph-plus"></i></summary>
+              <div><p>An individual action can fail before the model tries another approach. The panel distinguishes earlier errors from the current action and keeps the error details available. Continued work alone does not prove the original problem was fixed.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>How do scrolling and notification sounds work?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Replies follow the bottom while they grow. Scroll up to read older text without being pulled back down; return to the bottom or click the down arrow to resume. When sound is enabled, permission requests, completion, and failure use distinct sounds. Completion and failure alerts play for tasks lasting at least 40 seconds.</p></div>
+            </details>
+            <details class="faq-item">
               <summary><span>Can I bind my own keyboard shortcuts?</span><i class="ph ph-plus"></i></summary>
               <div><p>Yes. Open Settings → Keyboard shortcuts, choose an action, and press the combination you want. Shortcuts can approve or deny the newest request, open pages, create a chat, focus the composer, or stop generation. Use Delete or Backspace while recording to clear a binding.</p></div>
             </details>
@@ -1005,7 +1026,7 @@
 <div class="palette hidden" id="palette" role="dialog" aria-label="Session switcher">
   <div class="palette-head">
     <i class="ph ph-magnifying-glass"></i>
-    <input type="text" id="palette-input" placeholder="Switch session or type a command…" autocomplete="off" spellcheck="false">
+    <input type="text" id="palette-input" placeholder="Search conversations, files, errors, or commands…" aria-label="Search conversations and commands" autocomplete="off" spellcheck="false">
     <span class="kbd">Esc</span>
   </div>
   <div class="palette-list" id="palette-list"></div>
@@ -1308,8 +1329,21 @@
         <option value="pastel">Pastel</option>
         <option value="velvet">Velvet</option>
         <option value="cartograph">Cartograph</option>
+        <option value="folio">Folio</option>
         <option value="light">Light</option>
       </select>
+    </div>
+    <div class="form-row appearance-custom">
+      <p class="hint">Make this theme yours. Colors are saved separately for each theme and used on the startup screen. Text adapts to your background.</p>
+      <div class="appearance-colors">
+        <label for="set-color-background">Background<input type="color" id="set-color-background"></label>
+        <label for="set-color-surface">Surfaces<input type="color" id="set-color-surface"></label>
+        <label for="set-color-accent">Accent<input type="color" id="set-color-accent"></label>
+      </div>
+      <div id="appearance-preview" class="appearance-preview"><span>A space for your next idea.</span><span class="appearance-preview-card">Your workspace <b>Start creating</b></span></div>
+      <p class="hint" id="appearance-color-hint" aria-live="polite">Preview only until saved.</p>
+      <div class="appearance-actions"><button type="button" class="btn sm" id="btn-save-colors">Save colors</button><button type="button" class="btn sm" id="btn-reset-colors">Restore theme defaults</button></div>
+      <p class="hint">Restore this theme's original built-in colors, including any unsaved color changes. Your other customized themes stay as they are.</p>
     </div>
     <div class="form-row">
       <button class="btn sm" id="btn-run-setup-wizard" type="button"><i class="ph ph-magic-wand"></i>Run Setup Wizard</button>
@@ -1353,15 +1387,17 @@
       <span>Approvals</span>
     </div>
     <div class="form-row">
-      <span class="hint"><b>soft</b> runs routine project work, workspace writes, non-destructive host or WSL commands, tests and persistent sessions automatically. <b>medium</b> only trusts workspace file writes and edits. <b>hard</b> asks for every action. deletions, mutating Git actions, program launches, desktop control, protected or remote changes, and commands following recent web content keep stricter gates. drive wipes, download-and-run pipelines and bridge self-harm are refused outright.</span>
+      <span class="hint">Choose when Accuretta pauses to ask before taking an action.</span>
     </div>
-    <div class="form-row inline">
+    <div class="form-row">
       <label>Approval mode</label>
-      <div class="seg" id="seg-approval-mode">
-        <button class="chip" data-approval-mode="soft" type="button">soft</button>
-        <button class="chip" data-approval-mode="medium" type="button">medium</button>
-        <button class="chip" data-approval-mode="hard" type="button">hard</button>
+      <div class="approval-mode-options" id="seg-approval-mode" role="group" aria-label="Approval mode">
+        <button class="chip" data-approval-mode="soft" type="button" aria-pressed="false"><strong>Soft · Allow routine project work</strong><span>Normal workspace edits, non-destructive commands, tests, and routine tool actions can run automatically.</span><small>Example: edit a project file and run its tests without stopping.</small></button>
+        <button class="chip" data-approval-mode="medium" type="button" aria-pressed="false"><strong>Medium · Allow workspace edits</strong><span>Normal workspace writes can run automatically. Commands and other approval-controlled actions ask first.</span><small>Example: edit a project file automatically, then ask before running tests.</small></button>
+        <button class="chip" data-approval-mode="hard" type="button" aria-pressed="false"><strong>Hard · Ask for each action</strong><span>Ask for approval on each action handled by the approval system, including workspace writes and commands.</span><small>Example: ask before editing a project file and again before running tests.</small></button>
       </div>
+      <div class="approval-mode-note"><strong>Stricter rules still apply</strong><p>Deletions, Git changes, program launches, desktop control, protected or remote changes, and actions influenced by recent web content keep their additional checks in every mode. Some destructive actions are blocked outright.</p></div>
+      <details class="approval-mode-details"><summary>Reading files and remembered approvals</summary><p>Ordinary read-only tools can run without approval. Choices you explicitly remember for the current session can still allow eligible actions, including in Hard mode. Stricter gates take priority over those choices.</p></details>
     </div>
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
       <span>Red team tools</span>
@@ -1378,7 +1414,7 @@
       <div class="sw" id="sw-rt-force-exploit"></div>
     </div>
     <div class="form-row">
-      <span class="hint">skips the recon-to-exploit gate: offers the break-in tools (http_request, sql_injection, jwt_tool, fuzz, batch_probe, tcp_send, auth spray) from the first turn instead of waiting for a validate_finding confirm. use when the model won't validate on its own. adds ~2,200 tokens per turn while on.</span>
+      <span class="hint">Offers exploit tools from the first turn instead of waiting for an evidence-reviewed finding. This overrides the normal phase gate; it does not validate findings or expand the authorized scope.</span>
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
@@ -1563,20 +1599,22 @@
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
-      <span>Long-term memory</span>
+      <span>Preferences and memory</span>
       <span class="grow" style="flex:1;"></span>
       <span id="mem-count" class="hint" style="font-size:10px;"></span>
       <button class="btn sm" id="btn-mem-refresh" type="button" title="Reload"><i class="ph ph-arrow-clockwise"></i></button>
       <button class="btn danger sm" id="btn-mem-clear" type="button" title="Forget every long-term memory"><i class="ph ph-trash"></i>Clear</button>
     </div>
     <div class="form-row">
-      <span class="hint">durable lessons the model learned about you and carried across sessions. delete anything stale or wrong — the model can always re-learn.</span>
+      <span class="hint">Standing preferences stay active in every chat. Saved facts are searched when needed. Your existing notes are searchable facts.</span>
     </div>
+    <div class="form-row"><span class="hint" id="mem-profile-status" role="status"></span></div>
     <div class="form-row">
       <div class="mem-list" id="mem-list"></div>
     </div>
-    <div class="form-row inline" style="gap:6px;">
-      <input type="text" id="mem-add-text" placeholder="add a long-term memory…" style="flex:1;">
+    <div class="form-row inline mem-add-row">
+      <select id="mem-add-kind" aria-label="New memory type"><option value="fact">Searchable fact</option><option value="preference">Standing preference</option></select>
+      <input type="text" id="mem-add-text" maxlength="2000" aria-label="New memory" placeholder="What should Accuretta remember?">
       <button class="btn sm" id="btn-mem-add"><i class="ph ph-plus"></i>Add</button>
     </div>
 

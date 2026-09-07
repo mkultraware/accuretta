@@ -598,9 +598,11 @@
     const s = $("#chat-scroll");
     return s.scrollHeight - s.scrollTop - s.clientHeight < 120;
   }
+  let chatFollowBottom = true;
   function scrollToBottom(force = false) {
     const s = $("#chat-scroll");
-    if (force || isNearBottom()) {
+    if (force) chatFollowBottom = true;
+    if (chatFollowBottom) {
       s.scrollTop = s.scrollHeight;
     }
   }
@@ -623,17 +625,45 @@
       });
     };
 
-    scroller.addEventListener("scroll", update, { passive: true });
+    let lastHeight = scroller.scrollHeight;
+    let lastViewport = scroller.clientHeight;
+    scroller.addEventListener("wheel", event => {
+      if (event.deltaY < 0) chatFollowBottom = false;
+    }, { passive: true });
+    let touchY = null;
+    scroller.addEventListener("touchstart", event => { touchY = event.touches[0]?.clientY; }, { passive: true });
+    scroller.addEventListener("touchmove", event => {
+      const y = event.touches[0]?.clientY;
+      if (touchY != null && y > touchY) chatFollowBottom = false;
+      touchY = y;
+    }, { passive: true });
+    scroller.addEventListener("keydown", event => {
+      if (event.target.closest("input, textarea, [contenteditable=true]")) return;
+      if (["ArrowUp", "PageUp", "Home"].includes(event.key)) chatFollowBottom = false;
+    });
+    scroller.addEventListener("scroll", () => {
+      const resized = lastHeight !== scroller.scrollHeight || lastViewport !== scroller.clientHeight;
+      if (isNearBottom()) chatFollowBottom = true;
+      else if (!resized) chatFollowBottom = false;
+      lastHeight = scroller.scrollHeight;
+      lastViewport = scroller.clientHeight;
+      update();
+    }, { passive: true });
     button.addEventListener("click", () => {
+      chatFollowBottom = true;
       scroller.scrollTo({
         top: scroller.scrollHeight,
-        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+        behavior: "instant",
       });
     });
 
     if ("ResizeObserver" in window) {
       scroller._jumpButtonObserver?.disconnect();
-      scroller._jumpButtonObserver = new ResizeObserver(update);
+      scroller._jumpButtonObserver = new ResizeObserver(() => {
+        scrollToBottom();
+        update();
+      });
+      scroller._jumpButtonObserver.observe(scroller);
       scroller._jumpButtonObserver.observe($("#chat-inner"));
     }
     update();
@@ -777,18 +807,20 @@
   }
   function playApprovalSound() {
     playNotificationAsset({
+      src: "/assets/audio/permission_required.wav?v=2026090701",
       fallbackNotes: [{ f: 523.25, t: 0, dur: 0.28 }, { f: 783.99, t: 0.13, dur: 0.5 }],
       fallbackVolume: 0.15,
     });
   }
   function playCompletionSound() {
     playNotificationAsset({
+      src: "/assets/audio/task_completed.wav?v=2026090701",
       fallbackNotes: [{ f: 523.25, t: 0, dur: 0.22 }, { f: 659.25, t: 0.1, dur: 0.22 }, { f: 783.99, t: 0.2, dur: 0.6 }],
     });
   }
   function playFailureSound() {
     playNotificationAsset({
-      src: "/assets/audio/notification-error.wav?v=2026082401",
+      src: "/assets/audio/task_failed.wav?v=2026090701",
       volume: 0.68,
       fallbackNotes: [{ f: 392, t: 0, dur: 0.28 }, { f: 293.66, t: 0.14, dur: 0.55 }],
       fallbackVolume: 0.13,
@@ -1112,6 +1144,9 @@
   // the models final response, faded, not look like part of the answer bubble."
   function finalizeToolGroup(row) {
     if (!row) return;
+    row._activityFinished = true;
+    clearInterval(row._statusTimer);
+    $("#revealer-deck")?.querySelector('[data-card-type="activity"]')?.remove();
     const stack = row.querySelector(".tool-stack");
     const bubble = row.querySelector(".bubble");
     if (!stack || !bubble) return;
@@ -1276,6 +1311,9 @@
     line.dataset.callId = String(evt.call_id || "");
     line.dataset.path = String(evt.arguments?.path || "");
     line.dataset.t0 = String(Date.now());
+    line.dataset.targetLabel = evt.name?.startsWith("mcp_") ? "Connected tool"
+      : evt.name?.startsWith("sandbox_") ? "WSL guest"
+      : state.executionTarget && state.executionTarget !== "host" ? "Selected remote computer" : "This PC";
     line.innerHTML = `${toolIconHtml(evt.name, "run") || WRENCH_SVG}<span class="tool-line-label shimmer">${esc(label)}</span>`;
     body.appendChild(line);
     toolCards.set(key, line);
@@ -1295,6 +1333,7 @@
   function setToolActivityLabel(stack, toolCards, evt, label) {
     const line = findToolActivity(stack, toolCards, evt);
     const text = line?.querySelector(".tool-line-label");
+    if (line) line.dataset.waiting = String(/waiting.*approval/i.test(label || ""));
     if (text && label) text.textContent = label;
   }
 
@@ -1304,6 +1343,17 @@
     const isErr = toolResultFailed(evt.result);
     line.classList.remove("running");
     line.classList.add(isErr ? "err" : "done");
+    if (!isErr && evt.result?.code_check?.status === "issues_found") {
+      line.classList.add("has-code-findings");
+      const details = document.createElement("details");
+      details.className = "code-check-details";
+      const summary = document.createElement("summary");
+      summary.textContent = "Code check details";
+      const text = document.createElement("pre");
+      text.textContent = evt.result.code_check.details || "";
+      details.append(summary, text);
+      line.appendChild(details);
+    }
     const label = line.querySelector(".tool-line-label");
     if (label) {
       label.classList.remove("shimmer");
@@ -1454,6 +1504,7 @@
   function toolResultLabel(name, res) {
     res = res || {};
     if (toolResultFailed(res)) return toolFailureLabel(name);
+    if (res.code_check?.status === "issues_found") return "Edit saved · Code check found issues";
     switch (name) {
       case "list_directory": {
         const n = (res.entries || []).length;
@@ -3598,6 +3649,9 @@
   }
   function closePalette() {
     state.palette.open = false;
+    clearTimeout(paletteSearchTimer);
+    paletteSearchController?.abort();
+    paletteSearchRevision++;
     const scrim = $("#palette-scrim");
     const pal = $("#palette");
     if (scrim) { scrim.classList.add("hidden"); scrim.classList.remove("open"); }
@@ -3615,7 +3669,58 @@
     }
     return i === q.length ? score : -1;
   }
-  function refreshPaletteList(query) {
+  let paletteSearchTimer = null;
+  let paletteSearchController = null;
+  let paletteSearchRevision = 0;
+
+  async function openConversationMatch(match) {
+    closePalette();
+    if (state.chats.chats[match.chat_id]) state.chats.chats[match.chat_id]._summary = true;
+    await selectChat(match.chat_id);
+    if (state.chatId !== match.chat_id) return;
+    const index = match.visible_index;
+    if (index == null) { toast("This match has no visible conversation message.", "info", 3000); return; }
+    state.messageWindowStart = Math.max(0, index - 8);
+    renderMessages();
+    chatFollowBottom = false;
+    const row = document.querySelector(`[data-message-index="${index}"]`);
+    if (!row) return;
+    if (match.internal) {
+      const details = document.createElement("details");
+      details.className = "conversation-search-source";
+      details.open = true;
+      const summary = document.createElement("summary");
+      summary.textContent = match.role === "tool" ? "Matching tool output" : "Matching intermediate response";
+      const content = document.createElement("p");
+      content.textContent = match.excerpt;
+      details.append(summary, content);
+      (row.querySelector(".bubble-col") || row).appendChild(details);
+    }
+    row.classList.add("conversation-search-hit");
+    requestAnimationFrame(() => row.scrollIntoView({ block: "center", behavior: "instant" }));
+    setTimeout(() => row.classList.remove("conversation-search-hit"), 5000);
+  }
+
+  function refreshPaletteList(query, contentMatches = null, searchError = "") {
+    if (contentMatches === null) {
+      clearTimeout(paletteSearchTimer);
+      paletteSearchController?.abort();
+      const revision = ++paletteSearchRevision;
+      if (query.trim().length >= 2) {
+        paletteSearchTimer = setTimeout(async () => {
+          const controller = new AbortController();
+          paletteSearchController = controller;
+          try {
+            const response = await fetch(`/api/chat-search?q=${encodeURIComponent(query)}`, { signal: controller.signal });
+            if (!response.ok) throw new Error("Conversation search is unavailable");
+            const result = await response.json();
+            if (revision === paletteSearchRevision && state.palette.open) refreshPaletteList(query, result.results || []);
+          } catch (error) {
+            if (error.name !== "AbortError" && revision === paletteSearchRevision && state.palette.open) refreshPaletteList(query, [], error.message);
+          }
+        }, 180);
+      }
+    }
     const list = $("#palette-list");
     list.innerHTML = "";
     const items = [];
@@ -3625,7 +3730,7 @@
       { kind: "cmd", icon: "ph-gear-six", label: "Open Settings", action: () => { closePalette(); openSettings(); } },
       { kind: "cmd", icon: "ph-brain", label: "Open Long-term memory", action: () => { closePalette(); openSettings(); setTimeout(() => revealSettingsControl("#btn-mem-refresh"), 80); } },
       { kind: "cmd", icon: "ph-arrow-counter-clockwise", label: "Regenerate last reply", action: () => { closePalette(); regenerateLast(); } },
-      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / amaranth / aperture / aperture-dark / soft / pastel / velvet / cartograph / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
+      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / amaranth / aperture / aperture-dark / soft / pastel / velvet / cartograph / folio / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
       { kind: "cmd", icon: "ph-browser", label: "Toggle preview pane", action: () => { closePalette(); app.classList.toggle("preview-collapsed"); } },
       { kind: "cmd", icon: "ph-camera", label: "Screenshot preview", action: () => { closePalette(); screenshotPreview(); } },
       { kind: "cmd", icon: "ph-package", label: "Export project", action: () => { closePalette(); exportProjectZip(); } },
@@ -3652,6 +3757,11 @@
         score: s,
       });
     }
+    for (const match of contentMatches || []) {
+      items.push({ kind: match.role === "tool" ? "tool output" : "message", icon: "ph-magnifying-glass",
+        label: match.title, sub: match.excerpt, score: 20,
+        action: () => openConversationMatch(match) });
+    }
     items.sort((a, b) => b.score - a.score);
     state.palette.items = items;
     state.palette.idx = 0;
@@ -3669,7 +3779,7 @@
       list.appendChild(el);
     });
     if (!items.length) {
-      list.innerHTML = `<div class="palette-empty">no matches.</div>`;
+      list.innerHTML = `<div class="palette-empty">${contentMatches === null && query.trim().length >= 2 ? "Searching conversations…" : searchError ? esc(searchError) : "No matches."}</div>`;
     }
   }
   function paletteMove(delta) {
@@ -3794,9 +3904,11 @@
       });
       inner.appendChild(history);
     }
-    for (const m of state.messages.slice(start)) {
+    for (const [offset, m] of state.messages.slice(start).entries()) {
       if (m.invisible) continue;
-      inner.appendChild(renderBubble(m));
+      const row = renderBubble(m);
+      row.dataset.messageIndex = String(start + offset);
+      inner.appendChild(row);
     }
     // Persistent fold divider: sits exactly where the rolling summary absorbed
     // the older turns, so past conversations visibly show "compaction happened
@@ -3817,7 +3929,7 @@
       const recovery = document.createElement("details");
       recovery.className = "saved-recovery";
       const summary = document.createElement("summary");
-      summary.textContent = `File recovery (${recoveries.length} recent edits)`;
+      summary.textContent = `Task results (${recoveries.length} recent tasks)`;
       recovery.appendChild(summary);
       for (const changes of recoveries) {
         const row = document.createElement("div");
@@ -3885,6 +3997,28 @@
   }
 
   function renderBubble(m) {
+    if (m.role === "user" && m._steering_id) {
+      const row = document.createElement("div");
+      row.className = "bubble-row task-update-message";
+      row.dataset.updateId = m._steering_id;
+      row.innerHTML = `
+        <article class="task-update-card" aria-label="Applied task update">
+          <div class="task-update-heading">
+            <svg class="task-update-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 3v6a4 4 0 0 0 4 4h8m-4-4 4 4-4 4"/></svg>
+            <span>Your update</span>
+            <span class="task-update-status"><i class="ph ph-check" aria-hidden="true"></i>Applied</span>
+          </div>
+          <div class="task-update-text"></div>
+        </article>`;
+      row.querySelector(".task-update-text").textContent = stripMentionRefs(m.content || "");
+      if (m.images?.length) {
+        const attachments = document.createElement("div");
+        attachments.className = "task-update-attachments";
+        attachments.textContent = `${m.images.length} attached ${m.images.length === 1 ? "image" : "images"}`;
+        row.querySelector(".task-update-card").appendChild(attachments);
+      }
+      return row;
+    }
     if (m.role === "system" && m._note) {
       const row = document.createElement("div");
       row.className = "bubble-row github-event-row";
@@ -4279,74 +4413,66 @@
     if (!host) return;
     const queue = messageQueue();
     host.classList.toggle("hidden", !queue.length);
-    if (!queue.length) {
-      host.innerHTML = "";
-      state.queueEditId = null;
-      return;
-    }
-    host.innerHTML = `
-      <div class="message-queue-head">
-        <span><i class="ph ph-stack"></i>Next up</span>
-        <small>${queue.length} queued</small>
-      </div>
-      <div class="message-queue-list">
-        ${queue.map((item, index) => {
-          const editing = state.queueEditId === item.id;
-          const fallback = item.images?.length || item.files?.length ? "Attachments only" : "Empty message";
-          return `<article class="queued-message${editing ? " is-editing" : ""}" data-queue-id="${esc(item.id)}">
-            <span class="queued-message-index">${index + 1}</span>
-            <div class="queued-message-body">
-              ${editing
-                ? `<textarea class="queued-message-editor" rows="2" aria-label="Edit queued message">${esc(item.text || "")}</textarea>`
-                : `<div class="queued-message-text" title="${esc(item.text || fallback)}">${esc(item.text || fallback)}</div>`}
-              <div class="queued-message-meta">${queuedMessageMeta(item).map(part => `<span>${esc(part)}</span>`).join("")}</div>
-            </div>
-            <div class="queued-message-actions">
-              ${editing
-                ? `<button type="button" data-queue-act="save" title="Save"><i class="ph ph-check"></i></button><button type="button" data-queue-act="cancel" title="Cancel"><i class="ph ph-x"></i></button>`
-                : `<button type="button" data-queue-act="up" title="Move up"${index === 0 ? " disabled" : ""}><i class="ph ph-caret-up"></i></button><button type="button" data-queue-act="down" title="Move down"${index === queue.length - 1 ? " disabled" : ""}><i class="ph ph-caret-down"></i></button><button type="button" data-queue-act="edit" title="Edit"><i class="ph ph-pencil-simple"></i></button><button type="button" data-queue-act="remove" title="Remove"><i class="ph ph-trash"></i></button>`}
-            </div>
-          </article>`;
-        }).join("")}
-      </div>`;
+    host.innerHTML = queue.length ? `<div class="message-queue-head"><span><i class="ph ph-paper-plane-tilt" aria-hidden="true"></i>Your updates <span class="queue-count">${queue.length}</span></span><small>Waiting to be applied</small></div><div class="message-queue-list">${queue.map(item => {
+      const label = item.status === "sending" ? "Sending…" : item.status === "pending" ? "Queued" : item.status === "failed" ? "Not delivered" : "Queued";
+      return `<article class="queued-message" data-status="${esc(item.status)}" data-queue-id="${esc(item.id)}"><div class="queued-message-body"><div class="queued-message-text">${esc(item.text || "Attached files")}</div>${item.status === "failed" && item.error ? `<div class="queued-message-meta">${esc(item.error)}</div>` : ""}</div><span class="task-update-status">${label}</span>${item.status === "failed" ? '<div class="queued-message-actions"><button type="button" data-update-action="retry">Retry</button><button type="button" data-update-action="remove">Remove</button></div>' : ""}</article>`;
+    }).join("")}</div>` : "";
+    host.querySelectorAll("[data-update-action]").forEach(button => button.addEventListener("click", async () => {
+      const item = queue.find(entry => entry.id === button.closest("[data-queue-id]").dataset.queueId);
+      if (!item) return;
+      if (button.dataset.updateAction === "remove") {
+        const receipt = await taskUpdateRequest("/api/chat/steer-status", { chat_id: item.chatId, id: item.id }).catch(() => null);
+        if (!receipt) { toast("Could not check delivery. Try again before removing this update.", "warn", 3500); return; }
+        if (receipt.status === "pending") { item.status = "pending"; renderMessageQueue(); return; }
+        queue.splice(queue.indexOf(item), 1); renderMessageQueue();
+      } else if (state.streaming && state.liveTurn?.chatId === item.chatId) {
+        const receipt = await taskUpdateRequest("/api/chat/steer-status", { chat_id: item.chatId, id: item.id }).catch(() => null);
+        if (!receipt) { toast("Could not check delivery. Please try again.", "warn", 3000); return; }
+        if (receipt.status === "applied") { queue.splice(queue.indexOf(item), 1); renderMessageQueue(); return; }
+        if (receipt.status === "deferred") item.id = queuedMessageId();
+        await submitTaskUpdate(item);
+      } else {
+        const receipt = await taskUpdateRequest("/api/chat/steer-status", { chat_id: item.chatId, id: item.id }).catch(() => null);
+        if (!receipt) { toast("Could not check delivery. Please try again.", "warn", 3000); return; }
+        if (receipt.status === "applied") { queue.splice(queue.indexOf(item), 1); renderMessageQueue(); return; }
+        if (receipt.status === "pending") { item.status = "pending"; renderMessageQueue(); return; }
+        item.status = "queued"; scheduleMessageQueueDrain(item.chatId);
+      }
+    }));
+  }
 
-    host.querySelectorAll("[data-queue-act]").forEach(button => {
-      button.addEventListener("click", () => {
-        const row = button.closest(".queued-message");
-        const id = row?.dataset.queueId;
-        const index = queue.findIndex(item => item.id === id);
-        if (index < 0) return;
-        const action = button.dataset.queueAct;
-        if (action === "remove") {
-          queue.splice(index, 1);
-          if (state.queueEditId === id) state.queueEditId = null;
-        } else if (action === "up" && index > 0) {
-          [queue[index - 1], queue[index]] = [queue[index], queue[index - 1]];
-        } else if (action === "down" && index < queue.length - 1) {
-          [queue[index + 1], queue[index]] = [queue[index], queue[index + 1]];
-        } else if (action === "edit") {
-          state.queueEditId = id;
-        } else if (action === "cancel") {
-          state.queueEditId = null;
-        } else if (action === "save") {
-          const nextText = row.querySelector(".queued-message-editor")?.value.trim() || "";
-          if (!nextText && !queue[index].images?.length && !queue[index].files?.length) {
-            queue.splice(index, 1);
-          } else {
-            queue[index].text = nextText;
-          }
-          state.queueEditId = null;
-        }
-        renderMessageQueue();
-        if (action === "edit") {
-          const editor = host.querySelector(`[data-queue-id="${CSS.escape(id)}"] .queued-message-editor`);
-          editor?.focus();
-          editor?.setSelectionRange(editor.value.length, editor.value.length);
-        } else if (!state.streaming && !state.queueDispatching) {
-          scheduleMessageQueueDrain(state.chatId);
-        }
+  async function taskUpdateRequest(path, payload) {
+    const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    const result = await response.json();
+    if (!response.ok && result.status !== "inactive") throw new Error(result.error || "Could not deliver the update");
+    return result;
+  }
+
+  async function submitTaskUpdate(item) {
+    item.status = "sending";
+    if (state.chatId === item.chatId) renderMessageQueue();
+    try {
+      if (item.files.length && !item.uploadedFiles) item.uploadedFiles = await uploadClientFiles(item.files);
+      if (!item.wireText) {
+        const fileBlock = item.uploadedFiles?.length ? "\n\n[Files uploaded into the workspace]\n" + item.uploadedFiles.map(file => `${file.name}: ${file.path}`).join("\n") : "";
+        item.wireText = withMentionRefs(item.text) + fileBlock;
+      }
+      const result = await taskUpdateRequest("/api/chat/steer", {
+        chat_id: item.chatId, id: item.id, text: item.wireText,
+        images: item.images.map(image => typeof image === "string" ? image : image.dataUrl),
       });
-    });
+      const queue = messageQueue(item.chatId);
+      if (!queue.includes(item)) return;
+      if (result.status === "applied") queue.splice(queue.indexOf(item), 1);
+      else if (result.status === "inactive") item.status = "queued";
+      else if (result.status === "deferred") { item.status = "failed"; item.error = "The task ended before this update was delivered."; }
+      else item.status = "pending";
+    } catch (error) {
+      item.status = "failed";
+      item.error = error.message || "Could not confirm delivery";
+    }
+    if (state.chatId === item.chatId) renderMessageQueue();
+    if (!state.streaming) scheduleMessageQueueDrain(item.chatId);
   }
 
   async function enqueueMessage(opts = {}) {
@@ -4391,10 +4517,15 @@
       invisible: !!opts.invisible,
       mission: opts.mission || null,
       createdAt: Date.now(),
+      status: "queued",
     };
     messageQueue(chatId, true).push(item);
     if (state.chatId === chatId) renderMessageQueue();
-    appendAgentLog("Message added to queue.");
+    if (state.streaming && state.liveTurn?.chatId === chatId && !item.mission) {
+      await submitTaskUpdate(item);
+      return true;
+    }
+    appendAgentLog("Message will be sent when the current task finishes.");
     if (state.chatId === chatId && !state.streaming && !state.queueDispatching) scheduleMessageQueueDrain(chatId);
     return true;
   }
@@ -4408,6 +4539,15 @@
     if (!chatId || state.chatId !== chatId || state.streaming || state.queueDispatching || state.queueEditId) return;
     const queue = messageQueue(chatId);
     if (!queue.length) return;
+    for (const update of [...queue].filter(item => item.status === "pending")) {
+      try {
+        const receipt = await taskUpdateRequest("/api/chat/steer-status", { chat_id: chatId, id: update.id });
+        if (receipt.status === "applied") queue.splice(queue.indexOf(update), 1);
+        else if (receipt.status !== "pending") { update.status = "failed"; update.error = "The task ended before delivery was confirmed. Retry to send again."; }
+      } catch (error) { update.status = "failed"; update.error = "Could not confirm delivery. Retry to check."; }
+    }
+    renderMessageQueue();
+    if (!queue.length || queue[0].status !== "queued" || state.streaming || state.queueDispatching) return;
     const item = queue.shift();
     state.queueEditId = null;
     state.queueDispatching = true;
@@ -4415,9 +4555,10 @@
     let accepted = false;
     try {
       accepted = await send({
-        prompt: item.text,
+        prompt: item.wireText || item.text,
+        preparedPrompt: !!item.wireText,
         images: item.images,
-        files: item.files,
+        files: item.uploadedFiles ? [] : item.files,
         mode: item.mode,
         reasoningEffort: item.reasoningEffort,
         clientContext: item.clientContext,
@@ -4608,7 +4749,7 @@
     state.liveTurn = { chatId: state.chatId, row: agentRow, userMsg };
 
     try {
-      await streamChat(withMentionRefs(text), agentRow, state.abortCtl.signal, images, opts);
+      await streamChat(opts.preparedPrompt ? text : withMentionRefs(text), agentRow, state.abortCtl.signal, images, opts);
     } catch (e) {
       if (e.beforeStream && images.length && fromComposer) {
         state.pendingImages = [...images, ...state.pendingImages];
@@ -4647,11 +4788,11 @@
   function setStreamingUI(on, outcome = "completed") {
     const sendButton = $("#btn-send");
     sendButton.classList.remove("hidden");
-    sendButton.classList.toggle("queue-mode", on);
-    sendButton.title = on ? "Add message to queue" : "Send (⌘⏎)";
-    sendButton.setAttribute("aria-label", on ? "Add message to queue" : "Send message");
+    sendButton.classList.remove("queue-mode");
+    sendButton.title = on ? "Send an update to the current task" : "Send (⌘⏎)";
+    sendButton.setAttribute("aria-label", on ? "Update current task" : "Send message");
     const sendIcon = sendButton.querySelector("i");
-    if (sendIcon) sendIcon.className = on ? "ph ph-plus" : "ph-bold ph-arrow-up";
+    if (sendIcon) sendIcon.className = "ph-bold ph-arrow-up";
     $("#btn-stop").classList.toggle("hidden", !on);
     $("#composer-input").disabled = false; // always allow typing next message
     const comp = document.querySelector(".composer");
@@ -5934,6 +6075,35 @@
 
   function handleEvent(evt, ctx) {
     const { bubble, toolStack, toolCards, row } = ctx;
+    if (evt.type === "steering_applied") {
+      const queue = messageQueue(evt.chat_id);
+      const index = queue.findIndex(item => item.id === evt.id);
+      if (index >= 0) queue.splice(index, 1);
+      if (state.chatId === evt.chat_id) renderMessageQueue();
+      row._appliedUpdates ||= new Set();
+      if (!row._appliedUpdates.has(evt.id)) {
+        row._appliedUpdates.add(evt.id);
+        const update = renderBubble({ role: "user", content: evt.text, images: evt.images || [], _steering_id: evt.id, t: Date.now() / 1000 });
+        row.before(update);
+      }
+      ctx.setBuf("");
+      row._answerBufBase = 0;
+      row._thinkBuf = "";
+      clearTimeout(bubble._collapseTimer);
+      bubble._collapsing = false;
+      bubble._incRender = null;
+      bubble.innerHTML = "";
+      bubble.classList.add("hidden");
+      updateThinkLine(row, true, "Considering your update…");
+      return;
+    }
+    if (evt.type === "steering_deferred") {
+      for (const item of messageQueue(evt.chat_id)) {
+        if ((evt.ids || []).includes(item.id)) { item.status = "failed"; item.error = "Task stopped before delivery. Retry to send this update."; }
+      }
+      if (state.chatId === evt.chat_id) renderMessageQueue();
+      return;
+    }
     if (evt.type === "delta") {
       const newBuf = ctx.getBuf() + evt.content;
       ctx.setBuf(newBuf);
@@ -6009,6 +6179,13 @@
       setToolActivityLabel(toolStack, toolCards, evt, "Waiting for command approval…");
       updateRevealerDeck(row);
     } else if (evt.type === "command_spawned") {
+      const liveActivity = findToolActivity(toolStack, toolCards, evt);
+      if (liveActivity) {
+        liveActivity.dataset.waiting = "false";
+        liveActivity.dataset.t0 = String(Date.now());
+        liveActivity.dataset.targetLabel = executionTarget(evt) === "sandbox" ? "WSL guest" : "This PC";
+        setToolActivityLabel(toolStack, toolCards, evt, evt.name === "run_tests" ? "Running project tests" : "Running command");
+      }
       const target = executionTarget(evt);
       const item = executionActivity(row, evt);
       if (item) {
@@ -6024,7 +6201,7 @@
       appendExecutionText(target, `\n${heading}\n$ ${evt.command || ""}\n`, false, true);
       appendAgentLog(`${target === "sandbox" ? "WSL GUEST" : "HOST"} command started: ${evt.command || ""}`);
       setToolActivityLabel(toolStack, toolCards, evt,
-        target === "sandbox" ? "Running in WSL guest…" : "Running on host…");
+        evt.name === "run_tests" ? "Running project tests" : "Running command");
       updateRevealerDeck(row);
     } else if (evt.type === "command_finished") {
       const target = executionTarget(evt);
@@ -6542,6 +6719,92 @@
     return cut > 0 ? prefix.slice(0, cut) : "";
   }
 
+  function taskFileLocation(file) {
+    const path = String(file.path || "").replace(/\\/g, "/");
+    for (const folder of [...(state.workspace?.folders || [])].sort((a, b) => b.length - a.length)) {
+      const root = folder.replace(/\\/g, "/").replace(/\/$/, "");
+      const insensitive = /^[a-z]:\//i.test(root);
+      if ((insensitive ? path.toLowerCase() : path).startsWith((insensitive ? root.toLowerCase() : root) + "/")) {
+        return { root: folder, rel: path.slice(root.length + 1) };
+      }
+    }
+    return null;
+  }
+
+  function taskFileAction(file) {
+    if (file.removed || !taskFileLocation(file)) return "";
+    if (file.text_diff && /\.html?$/i.test(file.name)) return "Open preview";
+    if (file.text_diff && /\.md$/i.test(file.name)) return "View document";
+    return file.text_diff ? "Open file" : "Show in folder";
+  }
+
+  async function openTaskFile(file) {
+    const location = taskFileLocation(file);
+    if (!location) throw new Error("This file is outside the current workspace");
+    const { root, rel } = location;
+    if (file.text_diff && /\.html?$/i.test(file.name)) previewWorkspaceHtml(root, rel, file.name);
+    else if (file.text_diff && /\.md$/i.test(file.name)) await previewWorkspaceMarkdown(root, rel, file.name);
+    else if (file.text_diff) await previewWorkspaceSource(root, rel, file.name);
+    else {
+      const path = file.path.replace(/[\\/][^\\/]+$/, "");
+      const result = await api("/api/open-folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) });
+      if (result.error) throw new Error(result.error);
+    }
+  }
+
+  async function reviewTaskChanges(evt, chatId) {
+    const dialog = document.createElement("dialog");
+    dialog.className = "task-review-dialog";
+    dialog.setAttribute("aria-label", "Review task changes");
+    dialog.innerHTML = `<div class="task-review-head"><div><h2>Review changes</h2><p>Recorded edits from this task. Open actions show the current workspace file.</p></div><button type="button" class="btn sm task-review-close">Close</button></div>
+      <div class="task-review-toolbar"><label>File <select aria-label="Changed file"></select></label><button type="button" class="btn sm task-review-open" hidden></button></div>
+      <p class="task-review-status" role="status">Loading recorded changes…</p><pre class="task-review-diff" aria-label="Before and after diff"></pre>`;
+    document.body.appendChild(dialog);
+    dialog.querySelector(".task-review-close").onclick = () => dialog.close();
+    dialog.addEventListener("close", () => dialog.remove(), { once: true });
+    dialog.showModal();
+    const status = dialog.querySelector(".task-review-status"), select = dialog.querySelector("select");
+    const diff = dialog.querySelector(".task-review-diff"), open = dialog.querySelector(".task-review-open");
+    let request = 0;
+    const read = async (fileIndex) => {
+      const result = await api("/api/task-review", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+        turn_id: evt.turn_id, chat_id: chatId, ...(fileIndex === undefined ? {} : { file_index: fileIndex }),
+      }) });
+      if (result.error) throw new Error(result.error);
+      return result;
+    };
+    try {
+      const record = await read();
+      if (!dialog.isConnected) return;
+      record.files.forEach((file, index) => select.add(new Option(file.path, String(index))));
+      const load = async () => {
+        const id = ++request;
+        diff.replaceChildren(); open.hidden = true; status.textContent = "Loading recorded changes…";
+        try {
+          const file = await read(Number(select.value));
+          if (id !== request || !dialog.isConnected) return;
+          const notes = [file.created ? "Created" : file.removed ? "Deleted" : "Modified"];
+          if (file.before_size != null && file.after_size != null) notes.push(`${humanBytes(file.before_size)} → ${humanBytes(file.after_size)}`);
+          if (file.changed_since) notes.push("The workspace file has changed since this task. This diff is the saved record.");
+          if (file.notice) notes.push(file.notice);
+          if (file.truncated) notes.push("Large diff: only the first portion is shown.");
+          status.textContent = notes.join(" · ");
+          (file.diff || []).forEach((line, index) => {
+            const span = document.createElement("span");
+            span.className = line.startsWith("@@") ? "diff-context" : index >= 2 && line.startsWith("+") ? "diff-add" : index >= 2 && line.startsWith("-") ? "diff-remove" : "";
+            span.textContent = line || " "; diff.appendChild(span);
+          });
+          const action = taskFileAction(file);
+          open.hidden = !action;
+          open.textContent = action === "Open file" ? "Open current file" : action;
+          open.onclick = async () => { try { await openTaskFile(file); dialog.close(); } catch (error) { status.textContent = error.message; } };
+        } catch (error) { if (id === request) status.textContent = error.message || "Could not load recorded changes"; }
+      };
+      select.addEventListener("change", load);
+      if (record.files.length) await load(); else status.textContent = "No recorded file changes.";
+    } catch (error) { status.textContent = error.message || "Could not load recorded changes"; }
+  }
+
   function renderTurnChanges(row, evt) {
     if (!row || !evt || !Array.isArray(evt.files) || !evt.files.length) return;
     const col = row.querySelector(".bubble-col");
@@ -6551,7 +6814,8 @@
     const files = evt.files.map(f => {
       const tag = f.created ? `<span class="tc-tag tc-new">new</span>`
                 : (f.removed ? `<span class="tc-tag tc-del-tag">deleted</span>` : "");
-      return `<span class="tc-file" title="${esc(f.path || f.name)}"><i class="ph ph-file-text"></i><span class="tc-name">${esc(f.name)}</span>${tag}<span class="tc-stat"><span class="tc-add">+${f.added|0}</span> <span class="tc-del">−${f.deleted|0}</span></span></span>`;
+      const action = taskFileAction(f);
+      return `<div class="tc-file" title="${esc(f.path || f.name)}"><i class="ph ph-file-text"></i><span class="tc-name">${esc(f.name)}</span>${tag}<span class="tc-stat">${f.text_diff === false ? "File changed" : `<span class="tc-add">+${f.added|0}</span> <span class="tc-del">−${f.deleted|0}</span>`}</span>${action ? `<button type="button" class="tc-file-open" data-file-index="${evt.files.indexOf(f)}">${action}</button>` : ""}</div>`;
     }).join("");
     // "Open folder" target: the shared parent of this turn's files; falls back
     // to the first workspace root when the files span roots or lack paths.
@@ -6563,14 +6827,29 @@
     const bar = document.createElement("div");
     bar.className = "turn-changes";
     bar.dataset.turnId = evt.turn_id || "";
+    const chatId = evt.chat_id || state.chatId;
+    const verification = evt.verification || { status: "unchecked", checks: [] };
+    const checkLabels = { passed: "Checks passed", failed: "Checks failed", partial: "Partially checked", unchecked: "Not checked" };
+    const checkRows = (verification.checks || []).map(check => `<li><span>${esc(check.label)} · ${check.status === "passed" ? "Passed" : "Failed"}</span>${check.detail ? `<p>${esc(check.detail)}</p>` : ""}</li>`).join("");
     bar.innerHTML = `
       <div class="tc-head">
-        <span class="tc-title">${n} file${n === 1 ? "" : "s"} changed <span class="tc-add">+${evt.added | 0}</span> <span class="tc-del">−${evt.deleted | 0}</span></span>
-        <button class="tc-openfolder" type="button" title="Open the folder these files live in"><i class="ph ph-folder-open"></i><span>Open folder</span></button>
-        <button class="tc-undo" type="button"><i class="ph ph-arrow-counter-clockwise"></i><span>Undo</span></button>
+        <span class="tc-title">${n} file${n === 1 ? "" : "s"} changed</span>
+        <span class="tc-verification ${evt.undone ? "" : esc(verification.status)}">${evt.undone ? "Text edits undone" : esc(checkLabels[verification.status] || "Not checked")}</span>
       </div>
-      <div class="tc-files">${files}</div>`;
+      <div class="tc-files">${files}</div>
+      <details class="tc-checks"><summary>View checks</summary>${checkRows ? `<ul>${checkRows}</ul>` : "<p>No recorded checks for these edits.</p>"}${verification.status === "partial" ? "<p>Successful checks do not cover every final file revision. Syntax checks alone do not verify behavior.</p>" : ""}</details>
+      <div class="tc-actions">
+        <button class="tc-review" type="button">Review changes</button>
+        <button class="tc-openfolder" type="button" title="Open the folder these files live in"><i class="ph ph-folder-open"></i><span>Open folder</span></button>
+        <button class="tc-undo" type="button" ${evt.undone || evt.files.every(f => f.restorable === false) ? "hidden" : ""}><i class="ph ph-arrow-counter-clockwise"></i><span>Undo file edits</span></button>
+      </div>
+      <p class="tc-coverage">Undo covers recorded text file edits. Commands, external actions, and files edited again are preserved.</p>`;
     col.appendChild(bar);
+    bar.querySelector(".tc-review").onclick = () => reviewTaskChanges(evt, chatId);
+    bar.querySelectorAll(".tc-file-open").forEach(button => button.addEventListener("click", async () => {
+      try { await openTaskFile(evt.files[Number(button.dataset.fileIndex)]); }
+      catch (error) { toast(error.message || "Could not open file", "err", 3500); }
+    }));
     // Fade + scroll affordance for long lists: mark the card as scrollable when
     // the file list overflows, and clear the bottom fade once scrolled to the end.
     const filesEl = bar.querySelector(".tc-files");
@@ -6600,6 +6879,10 @@
     const btn = bar.querySelector(".tc-undo");
     btn.addEventListener("click", async () => {
       if (btn.disabled) return;
+      const confirmed = await confirmModal({ title: "Undo file edits?",
+        message: "Restore this task’s recorded text files. Files edited again, commands, and external actions will be preserved.",
+        confirmText: "Undo file edits" });
+      if (!confirmed || !btn.isConnected) return;
       btn.disabled = true;
       btn.innerHTML = `<i class="ph ph-circle-notch tc-spin"></i><span>Undoing…</span>`;
       try {
@@ -6611,6 +6894,9 @@
         if (r && r.ok) {
           bar.classList.add("tc-undone");
           bar.querySelector(".tc-title").innerHTML = `<i class="ph ph-check"></i> Reverted ${r.restored} file${r.restored === 1 ? "" : "s"}`;
+          bar.querySelector(".tc-verification").textContent = "Edits undone";
+          bar.querySelector(".tc-verification").className = "tc-verification";
+          if (r.errors?.length) toast(r.errors.join("\n"), "warn", 5000);
           btn.remove();
           try { await loadWorkspace(); renderWorkspace(); } catch {}
         } else {
@@ -9458,62 +9744,44 @@
 
   function updateRevealerDeck(row) {
     const deck = $("#revealer-deck");
-    if (!deck) return;
-    
-    const collapsedStates = {};
-    deck.querySelectorAll(".revealer-card").forEach(c => {
-      const type = c.dataset.cardType;
-      if (type) {
-        collapsedStates[type] = c.classList.contains("collapsed");
-      }
-    });
-    
-    const isCollapsed = (type) => {
-      if (collapsedStates[type] !== undefined) return collapsedStates[type];
-      return true; // default minimized!
+    if (!deck || !row || row._activityFinished) return;
+    const allLines = [...row.querySelectorAll(".tool-line")];
+    const lines = allLines.filter(line => line.matches(".running, .err"))
+      .filter(line => !line.dataset.statusDismissed);
+    const active = lines.filter(line => line.classList.contains("running"));
+    const failures = lines.filter(line => line.classList.contains("err"));
+    const current = active.at(-1) || failures.at(-1);
+    const old = deck.querySelector('[data-card-type="activity"]');
+    const expanded = old?.querySelector("details")?.open || false;
+    old?.remove();
+    clearInterval(row._statusTimer);
+    if (!current) return;
+    const label = current.querySelector(".tool-line-label")?.textContent || "Working";
+    const waiting = current.dataset.waiting === "true";
+    const laterActivity = allLines.indexOf(current) < allLines.length - 1;
+    const title = waiting ? "Waiting for command approval" : active.length ? label
+      : laterActivity ? "Earlier action failed · task continued" : "Last action failed";
+    const card = document.createElement("div");
+    card.className = "revealer-card task-activity";
+    card.dataset.cardType = "activity";
+    card.innerHTML = `<div class="task-activity-head"><div class="task-activity-copy"><strong>${esc(title)}</strong><span class="task-activity-meta"></span></div><button type="button" class="btn sm task-activity-action">${active.length ? "Stop task" : "Dismiss"}</button></div>
+      <details ${expanded ? "open" : ""}><summary>Activity details${failures.length ? ` · ${failures.length} failed` : ""}</summary><ul>${lines.map(line => `<li><strong>${esc(line.querySelector(".tool-line-label")?.textContent || line.dataset.name)}</strong><span>${line.classList.contains("err") ? "Failed" : line.dataset.waiting === "true" ? "Waiting for approval" : "Running"}</span>${line.title ? `<p>${esc(line.title)}</p>` : ""}</li>`).join("")}</ul></details>`;
+    deck.appendChild(card);
+    const updateTime = () => {
+      if (!card.isConnected || row._activityFinished) { clearInterval(row._statusTimer); return; }
+      const elapsed = Math.max(0, Math.floor((Date.now() - Number(current.dataset.t0 || Date.now())) / 1000));
+      const context = current.dataset.targetLabel || "Tool activity";
+      card.querySelector(".task-activity-meta").textContent = [context,
+        active.length ? `${elapsed}s elapsed` : "See error details",
+        active.length > 1 ? `${active.length} actions running` : "",
+        active.length && failures.length ? `${failures.length} failed` : ""].filter(Boolean).join(" · ");
     };
-    
-    const activities = row._activities || { writes: [], commands: [], mcp: [] };
-    // The live deck above the composer shows ONLY in-progress work — a finished
-    // command/write/tool drops out the moment its result lands (its record is
-    // kept in _activities and rendered, collapsed, into the chat history by
-    // finalizeToolGroup at turn end). live=true renders the per-card kill button.
-    const running = {
-      writes: activities.writes.filter(w => w.status === "running"),
-      commands: activities.commands.filter(c => c.status === "running" || c.status === "requested"),
-      mcp: activities.mcp.filter(m => m.status === "running"),
+    updateTime();
+    if (active.length) row._statusTimer = setInterval(updateTime, 1000);
+    card.querySelector(".task-activity-action").onclick = () => {
+      if (active.length) stopStreaming();
+      else { failures.forEach(line => { line.dataset.statusDismissed = "true"; }); updateRevealerDeck(row); }
     };
-
-    let html = "";
-    html += buildWritesCardHtml(running.writes, isCollapsed("writes"), true);
-    html += buildCommandsCardHtml(running.commands, isCollapsed("commands"), true);
-    html += buildMcpCardHtml(running.mcp, isCollapsed("mcp"), true);
-
-    deck.querySelectorAll('[data-card-type="writes"], [data-card-type="commands"], [data-card-type="mcp"]').forEach(c => c.remove());
-    if (html) {
-      deck.insertAdjacentHTML("beforeend", html);
-    }
-
-    deck.querySelectorAll('[data-card-type="writes"], [data-card-type="commands"], [data-card-type="mcp"]').forEach(card => {
-      const head = card.querySelector(".revealer-card-head");
-      if (head) head.addEventListener("click", () => card.classList.toggle("collapsed"));
-
-      const killBtn = card.querySelector(".revealer-card-kill");
-      if (killBtn) killBtn.addEventListener("click", (e) => { e.stopPropagation(); killCurrentCommand(); });
-
-      card.querySelectorAll(".btn-preview-file").forEach(btn => {
-        btn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          const path = btn.dataset.path;
-          if (path) {
-            const root = state.workspace?.folders?.[0] || "";
-            const rel = path.replace(/\\/g, "/").replace(root.replace(/\\/g, "/"), "").replace(/^\//, "");
-            previewWorkspaceSource(root, rel, rel);
-          }
-        });
-      });
-    });
-    if (deck.children.length === 0) deck.innerHTML = "";
   }
 
   function renderPermissionsChecklist(a) {
@@ -10610,9 +10878,9 @@
     $("#settings-drawer").classList.add("open");
     $("#settings-drawer").setAttribute("aria-hidden", "false");
     $("#btn-close-settings").focus();
+    populateSettingsForm();
     const health = loadModelHealth();
     await loadModels();
-    populateSettingsForm();
     loadSystemContext();
     loadDetectedVram();
     refreshSandboxStatus();
@@ -11055,7 +11323,7 @@
     if (!host) return;
     host.innerHTML = "";
     if (!items || !items.length) {
-      host.innerHTML = `<div class="mem-empty">no memories yet — add one below, or let the model call <code>remember</code>.</div>`;
+      host.innerHTML = `<div class="mem-empty">No saved preferences or facts yet. Add one below or ask Accuretta to remember it.</div>`;
       return;
     }
     for (const m of items) {
@@ -11067,10 +11335,47 @@
       row.innerHTML = `
         <div class="mem-text">${esc(m.text || "")}</div>
         <div class="mem-foot">
+          <select class="mem-kind" aria-label="Memory type">
+            <option value="preference" ${m.kind === "preference" ? "selected" : ""}>Standing preference</option>
+            <option value="fact" ${m.kind === "fact" ? "selected" : ""}>Searchable fact</option>
+          </select>
           ${tags}
-          <span class="mem-ts">${m.t ? relTime(m.t) : ""}</span>
-          <button class="btn ghost sm mem-del" type="button" title="Forget"><i class="ph ph-trash"></i></button>
+          <span class="mem-ts">${m.kind === "preference" ? "Always included" : "Retrieved when needed"}</span>
+          <button class="btn ghost sm mem-edit" type="button">Edit</button>
+          <button class="btn ghost sm mem-del" type="button" title="Forget" aria-label="Forget memory"><i class="ph ph-trash"></i></button>
         </div>`;
+      row.querySelector(".mem-kind").addEventListener("change", async (event) => {
+        const control = event.currentTarget;
+        control.disabled = true;
+        try {
+          await api("/api/memories/edit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: m.id, kind: control.value }) });
+          await loadMemories();
+        } catch (e) { control.value = m.kind; toast(e.message, "error"); }
+        finally { control.disabled = false; }
+      });
+      row.querySelector(".mem-edit").addEventListener("click", () => {
+        if (row.querySelector("textarea")) return;
+        const editor = document.createElement("textarea");
+        editor.value = m.text || "";
+        editor.maxLength = 2000;
+        editor.setAttribute("aria-label", "Edit memory");
+        const actions = document.createElement("div");
+        actions.className = "mem-edit-actions";
+        const save = document.createElement("button");
+        save.type = "button"; save.className = "btn sm"; save.textContent = "Save";
+        const cancel = document.createElement("button");
+        cancel.type = "button"; cancel.className = "btn ghost sm"; cancel.textContent = "Cancel";
+        cancel.addEventListener("click", () => { editor.remove(); actions.remove(); });
+        save.addEventListener("click", async () => {
+          save.disabled = true;
+          try {
+            await api("/api/memories/edit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: m.id, text: editor.value }) });
+            await loadMemories();
+          } catch (e) { toast(e.message, "error"); }
+          finally { save.disabled = false; }
+        });
+        actions.append(save, cancel); row.append(editor, actions); editor.focus();
+      });
       row.querySelector(".mem-del").addEventListener("click", async () => {
         try {
           await api("/api/memories/forget", {
@@ -11078,6 +11383,7 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ id: m.id }),
           });
+          await loadMemories();
         } catch (e) { toast("forget failed: " + e.message, "error"); }
       });
       host.appendChild(row);
@@ -11087,6 +11393,11 @@
     try {
       const r = await api("/api/memories");
       renderMemoriesList(r.memories || []);
+      const profile = r.profile || {};
+      const status = $("#mem-profile-status");
+      if (status) status.textContent = `${profile.characters || 0} / ${profile.budget || 6000} preference characters. ${profile.warning || "Adding a note never removes another."}`;
+      const count = $("#mem-count");
+      if (count) count.textContent = `${(r.memories || []).length} saved`;
     } catch (e) {
       const host = $("#mem-list");
       if (host) host.innerHTML = `<div class="mem-empty">(failed: ${esc(e.message || String(e))})</div>`;
@@ -11103,9 +11414,10 @@
       await api("/api/memories", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, kind: $("#mem-add-kind")?.value || "fact" }),
       });
       input.value = "";
+      await loadMemories();
     } catch (e) {
       toast("add failed: " + e.message, "error");
     } finally {
@@ -11408,6 +11720,7 @@
     if (reasoningCap) reasoningCap.value = s.reasoning_capability_override || "auto";
     const themeSel = $("#set-theme");
     if (themeSel) themeSel.value = normalizeTheme(s.theme || "light");
+    fillAppearanceColors();
     $("#sw-web").classList.toggle("on", s.allow_web_preview !== false);
 
     // IDE toggles mirror back into the composer chips
@@ -11520,6 +11833,7 @@
       thinking_budget: n("#set-think-budget"),
       reasoning_capability_override: $("#set-reasoning-capability")?.value || "auto",
       theme: ($("#set-theme")?.value || "light"),
+      custom_palettes: appearanceDraft(),
       allow_web_preview: $("#sw-web").classList.contains("on"),
       desktop_enabled: $("#sw-desktop-enabled")?.classList.contains("on") || false,
       sound_notifications: $("#sw-sound-notifications")?.classList.contains("on") ?? true,
@@ -11592,7 +11906,7 @@
     "neobrutalism-dark": "amaranth",
     kinetic: "aperture",
   });
-  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "amaranth", "aperture", "aperture-dark", "soft", "pastel", "velvet", "cartograph", "light"];
+  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "amaranth", "aperture", "aperture-dark", "soft", "pastel", "velvet", "cartograph", "folio", "light"];
   const THEME_ICONS = {
     dark:              "ph ph-moon",
     dim:               "ph ph-moon-stars",
@@ -11608,8 +11922,41 @@
     pastel:            "ph ph-flower-tulip",
     velvet:            "ph ph-crown",
     cartograph:        "ph ph-compass",
+    folio:             "ph ph-book-open",
     light:             "ph ph-sun",
   };
+  function appearanceDraft() {
+    const palettes = { ...(state.settings.custom_palettes || {}) };
+    if (document.getElementById('appearance-preview')?.dataset.dirty === 'true') {
+      palettes[$('#set-theme').value] = Object.fromEntries(['background', 'surface', 'accent'].map(key => [key, $('#set-color-' + key).value]));
+    }
+    return palettes;
+  }
+  function fillAppearanceColors() {
+    const css = getComputedStyle(document.documentElement);
+    for (const [key, token] of [['background', '--bg'], ['surface', '--bg-raised'], ['accent', '--accent']]) {
+      const input = $('#set-color-' + key);
+      if (input) {
+        const probe = document.createElement('span');
+        probe.style.color = css.getPropertyValue(token).trim();
+        document.body.appendChild(probe);
+        const channels = getComputedStyle(probe).color.match(/\d+/g);
+        input.value = '#' + channels.slice(0, 3).map(value => Number(value).toString(16).padStart(2, '0')).join('');
+        probe.remove();
+      }
+    }
+    previewAppearanceColors();
+    $('#appearance-preview').dataset.dirty = 'false';
+  }
+  function previewAppearanceColors() {
+    const colors = Object.fromEntries(['background', 'surface', 'accent'].map(key => [key, $('#set-color-' + key).value]));
+    const preview = $('#appearance-preview');
+    const tokens = window.AccurettaAppearance.tokens(colors);
+    Object.entries(tokens).forEach(([key, value]) => preview.style.setProperty(key, value));
+    preview.style.setProperty('--surface-ink', window.AccurettaAppearance.ink(colors.surface));
+    preview.dataset.dirty = 'true';
+    $('#appearance-color-hint').textContent = 'Preview only until saved. Text adapts automatically.';
+  }
   function normalizeTheme(theme) {
     return THEME_MIGRATIONS[theme] || theme;
   }
@@ -11627,6 +11974,7 @@
     theme = normalizeTheme(theme);
     if (!THEME_CYCLE.includes(theme)) theme = "light";
     document.documentElement.dataset.theme = theme;
+    window.AccurettaAppearance.apply(theme, state.settings.custom_palettes);
     localStorage.setItem("accuretta:theme", theme);
     const iconClass = THEME_ICONS[theme] || THEME_ICONS.light;
     const topBtn = $("#btn-theme");
@@ -13560,11 +13908,31 @@
       persistUiPreference({ keyboard_shortcuts: {} });
       toast("keyboard shortcuts cleared", "ok", 1800);
     });
-    $("#set-theme")?.addEventListener("change", e => {
+    $("#set-theme")?.addEventListener("change", async e => {
       const next = e.target.value;
-      applyTheme(next);
-      saveSettings({ theme: next });
+      try {
+        await saveSettings({ theme: next });
+        applyTheme(next);
+        fillAppearanceColors();
+      } catch (error) {
+        e.target.value = state.settings.theme || "light";
+        toast("theme was not saved: " + error.message, "error", 5000);
+      }
     });
+    document.querySelectorAll('.appearance-colors input').forEach(input => input.addEventListener('input', previewAppearanceColors));
+    for (const reset of [false, true]) {
+      $(reset ? '#btn-reset-colors' : '#btn-save-colors')?.addEventListener('click', async () => {
+        const theme = state.settings.theme || 'light';
+        const palettes = appearanceDraft();
+        if (reset) delete palettes[theme];
+        try {
+          await saveSettings({ custom_palettes: palettes });
+          applyTheme(theme);
+          fillAppearanceColors();
+          toast(reset ? 'Original colors restored for this theme.' : 'colors saved, including startup screen', 'ok', 2500);
+        } catch (error) { toast('colors were not saved: ' + error.message, 'error', 5000); }
+      });
+    }
     // Auto-save on toggle (the "Save settings" button isn't the only path, and
     // "save & quit" doesn't flush the form — so persist eagerly or an enabled
     // toggle silently vanishes on restart). Feature gates only; load-time
@@ -13962,8 +14330,11 @@
     const syncApprovalMode = () => {
       const mode = (state.settings && state.settings.approval_mode) ||
         ((state.settings && state.settings.auto_approve_write) ? "medium" : "hard");
-      document.querySelectorAll("#seg-approval-mode .chip").forEach(c =>
-        c.classList.toggle("on", c.dataset.approvalMode === mode));
+      document.querySelectorAll("#seg-approval-mode .chip").forEach(c => {
+        const selected = c.dataset.approvalMode === mode;
+        c.classList.toggle("on", selected);
+        c.setAttribute("aria-pressed", String(selected));
+      });
       const tb = $("#btn-perms");
       if (tb) {
         tb.classList.toggle("on", mode !== "hard");
@@ -13974,7 +14345,8 @@
     document.querySelectorAll("#seg-approval-mode .chip").forEach(c =>
       c.addEventListener("click", async () => {
         const mode = c.dataset.approvalMode;
-        try { await saveSettings({ approval_mode: mode, auto_approve_write: mode !== "hard" }); } catch (_) {}
+        try { await saveSettings({ approval_mode: mode, auto_approve_write: mode !== "hard" }); }
+        catch (error) { toast("Could not save approval mode: " + (error.message || error), "err", 4000); return; }
         syncApprovalMode();
         toast(mode === "soft" ? "Soft mode runs routine project work and non-destructive commands without asking. Risky actions stay gated."
           : mode === "medium" ? "Medium mode: workspace file writes save without asking; other actions ask."

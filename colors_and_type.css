@@ -1048,6 +1048,48 @@
    CARTOGRAPH — spatial instrument UI.
    Black ceramic, smoked glass, warm vellum, signal orange.
    ============================================================ */
+[data-theme="folio"] {
+  color-scheme: light;
+  --bg: #EEEAE2;
+  --bg-raised: #FAF7F0;
+  --bg-sunken: #E4DFD5;
+  --bg-inset: #E8E2D9;
+  --fg: #302A35;
+  --fg-muted: #655C69;
+  --fg-subtle: #756B76;
+  --fg-faint: #908691;
+  --fg-invert: #FAF7F0;
+  --accent: #713F63;
+  --accent-hover: #59304E;
+  --accent-subtle: #E5D8DF;
+  --accent-fg: #FFFFFF;
+  --border: #D7CED1;
+  --border-strong: #B9AAB4;
+  --border-subtle: #E1DADD;
+  --glass-bg: #FAF7F0;
+  --glass-border: #D7CED1;
+  --glass-blur: 0px;
+  --font-display: Georgia, 'Times New Roman', serif;
+  --r-sm: 5px;
+  --r-md: 12px;
+  --r-lg: 22px;
+  --shadow-xs: 0 1px 2px #302A3508;
+  --shadow-sm: 0 4px 14px #302A3508;
+  --shadow-md: 0 12px 32px #302A3510;
+  --shadow-lg: 0 24px 60px #302A3518;
+  --shadow-pop: 0 32px 90px #302A3526;
+  --shadow-inset: inset 0 1px 2px #302A3508;
+  --btn-shadow-rest: none;
+  --btn-shadow-hover: 0 3px 0 #302A3512;
+  --btn-shadow-active: none;
+  --btn-send-gradient: linear-gradient(#713F63, #713F63);
+  --btn-send-glow: none;
+  --wb-a: #D4B7C8;
+  --wb-b: #B9B5A0;
+  --wb-c: #713F63;
+  --wb-strength: 0.5;
+}
+
 [data-theme="cartograph"] {
   color-scheme: dark;
   --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter Tight', 'Segoe UI', sans-serif;

@@ -13,6 +13,29 @@ import time
 import uuid
 
 
+_REVIEW_TEXT_LIMIT = 2 * 1024 * 1024
+
+
+def _capture_file(path: str) -> dict:
+    file = Path(path)
+    if not file.exists():
+        return {"exists": False, "hash": None, "text": "", "size": 0, "kind": "text"}
+    try:
+        size = file.stat().st_size
+        if size > _REVIEW_TEXT_LIMIT:
+            return {"exists": True, "hash": file_revision(file), "text": None,
+                    "size": size, "kind": "large"}
+        data = file.read_bytes()
+        try:
+            content = data.decode("utf-8") if b"\x00" not in data else None
+        except UnicodeError:
+            content = None
+        return {"exists": True, "hash": hashlib.sha256(data).hexdigest(),
+                "text": content, "size": len(data), "kind": "text" if content is not None else "binary"}
+    except OSError:
+        return {"exists": True, "hash": None, "text": None, "size": None, "kind": "unavailable"}
+
+
 def file_revision(path: str | Path) -> str | None:
     try:
         with Path(path).open("rb") as stream:
@@ -61,13 +84,10 @@ class UndoStore:
         with self.lock:
             if path in state["entries"] or Path(path).is_dir():
                 return
-            exists = Path(path).is_file()
-            try:
-                prior = Path(path).read_bytes().decode("utf-8") if exists else None
-            except (OSError, UnicodeError):
-                return
-            state["entries"][path] = {"path": path, "existed": exists,
-                                       "prior": prior, "checkpointed": False}
+            before = _capture_file(path)
+            state["entries"][path] = {"path": path, "existed": before["exists"],
+                                       "prior": before["text"], "before": before,
+                                       "restorable": before["kind"] == "text", "checkpointed": False}
             self._save(state)
 
     def checkpoint(self, path: str) -> None:
@@ -78,7 +98,9 @@ class UndoStore:
         with self.lock:
             entry = state["entries"].get(path)
             if entry is not None:
-                entry.update(after_hash=file_revision(path), after_exists=Path(path).exists(), checkpointed=True)
+                after = _capture_file(path)
+                entry.update(after_hash=after["hash"], after_exists=after["exists"],
+                             after=after, checkpointed=True)
                 self._save(state)
 
     def commit(self) -> dict | None:
@@ -90,25 +112,74 @@ class UndoStore:
             for path, entry in state["entries"].items():
                 if not entry.get("checkpointed"):
                     continue
-                try:
-                    current = Path(path).read_bytes().decode("utf-8") if Path(path).is_file() else ""
-                except (OSError, UnicodeError):
-                    current = ""
+                after = entry.get("after") or {}
+                before = entry.get("before") or {}
+                current = after.get("text")
                 prior = entry["prior"] or ""
-                if current == prior and entry["existed"] == entry["after_exists"]:
+                if (before.get("hash") == after.get("hash")
+                        and entry["existed"] == entry["after_exists"]
+                        and after.get("kind") != "unavailable"):
                     continue
-                lines = list(difflib.unified_diff(prior.splitlines(), current.splitlines(), n=0))
+                text_diff = current is not None and entry["prior"] is not None
+                lines = list(difflib.unified_diff(prior.splitlines(), current.splitlines(), n=0)) if text_diff else []
                 files.append({"path": path, "name": Path(path).name,
-                              "added": sum(line.startswith("+") and not line.startswith("+++") for line in lines),
-                              "deleted": sum(line.startswith("-") and not line.startswith("---") for line in lines),
-                              "created": not entry["existed"], "removed": not entry["after_exists"]})
+                              "added": sum(line.startswith("+") for line in lines[2:]),
+                              "deleted": sum(line.startswith("-") for line in lines[2:]),
+                              "created": not entry["existed"], "removed": not entry["after_exists"],
+                              "text_diff": text_diff, "after_hash": entry.get("after_hash"),
+                              "restorable": entry.get("restorable", True),
+                              "before_size": before.get("size"), "after_size": after.get("size")})
             self._save(state)
             self.current.set(None)
             if not files:
                 return None
-            return {"turn_id": state["turn_id"], "files": files,
+            review = {"turn_id": state["turn_id"], "chat_id": state["chat_id"],
+                      "files": [{**item, "before": state["entries"][item["path"]].get("before"),
+                                 "after": state["entries"][item["path"]].get("after")}
+                                for item in files]}
+            _atomic_json(self.directory / "reviews" / f"{state['turn_id']}.json", review)
+            return {"turn_id": state["turn_id"], "chat_id": state["chat_id"], "files": files,
                     "added": sum(f["added"] for f in files),
                     "deleted": sum(f["deleted"] for f in files)}
+
+    def review(self, turn_id: str, chat_id: str, index: int | None = None) -> dict:
+        if (not isinstance(turn_id, str) or len(turn_id) != 32
+                or any(c not in "0123456789abcdef" for c in turn_id)):
+            return {"error": "Invalid review identifier"}
+        with self.lock:
+            try:
+                record = json.loads((self.directory / "reviews" / f"{turn_id}.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return {"error": "Recorded changes are unavailable for this older task."}
+            if not chat_id or record.get("chat_id") != chat_id:
+                return {"error": "Recorded changes are unavailable for this task."}
+            files = record.get("files", [])
+            if index is None:
+                return {"turn_id": turn_id, "files": [{k: v for k, v in item.items()
+                                                         if k not in {"before", "after"}} for item in files]}
+            if type(index) is not int or not 0 <= index < len(files):
+                return {"error": "Invalid file selection"}
+            item = files[index]
+            before, after = item.get("before") or {}, item.get("after") or {}
+            result = {k: v for k, v in item.items() if k not in {"before", "after"}}
+            result["changed_since"] = (Path(item["path"]).exists() != after.get("exists")
+                                       or file_revision(item["path"]) != after.get("hash"))
+            if before.get("text") is None or after.get("text") is None:
+                result["notice"] = "No text diff is available for binary, oversized, or unreadable files."
+            else:
+                diff = difflib.unified_diff(before["text"].splitlines(), after["text"].splitlines(),
+                                           fromfile="Before", tofile="After", n=3)
+                lines, size = [], 0
+                for line in diff:
+                    if len(lines) >= 4000 or size + len(line) > 250000:
+                        result["truncated"] = True
+                        break
+                    lines.append(line)
+                    size += len(line)
+                result["diff"] = lines
+                if not lines:
+                    result["notice"] = "Only file existence, line endings, or the final newline changed."
+            return result
 
     def restore(self, turn_id: str) -> dict:
         if not turn_id or any(c not in "0123456789abcdef" for c in turn_id) or len(turn_id) != 32:
@@ -122,6 +193,9 @@ class UndoStore:
             retained, errors, restored = [], [], 0
             for entry in payload.get("entries", []):
                 path = Path(entry["path"])
+                if not entry.get("restorable", True):
+                    errors.append(f"{path.name}: No restorable text snapshot. File preserved.")
+                    continue
                 try:
                     if (not entry.get("checkpointed")
                             or (entry.get("after_exists") and not entry.get("after_hash"))
