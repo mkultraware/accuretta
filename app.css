@@ -13567,96 +13567,34 @@ body,
   }
 }
 
-/* ====== DECK NOTIFICATIONS — stacked-deck cards ======
-   Newest message floats in front as a rounded card; older ones settle
-   BEHIND it — inset, scaled down, dimmed, peeking out above the front
-   card's top edge. Depth classes are set from JS (_syncDeckStack). */
-
+/* ====== DECK NOTIFICATIONS — docked tab ====== */
 .revealer-card.notifications {
   position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
-  width: calc(100% - 16px);
-  margin: 5px auto;
-  padding: 10px 14px;
+  width: 100%;
+  margin: 0;
+  padding: 8px 12px;
   min-height: 38px;
   max-height: 200px;
-  background: var(--bg-raised);
-  border: 1px solid var(--border-subtle);
-  border-radius: 14px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
   box-sizing: border-box;
   overflow: hidden;
-  z-index: 3;
-  /* the base card's slide-down-reveal animation would pin opacity/transform
-     over the note-pre -> settled transition; notifications animate purely
-     through transitions so burying/unburying re-runs them smoothly */
-  animation: none;
-  box-shadow: 0 4px 16px color-mix(in srgb, var(--fg) 9%, transparent);
-  transition:
-    transform .3s cubic-bezier(.32, .72, .24, 1.05),
-    opacity .24s ease,
-    margin .3s cubic-bezier(.32, .72, .24, 1.05),
-    max-height .26s ease,
-    min-height .26s ease,
-    padding .26s ease;
-}
-
-/* entrance: start collapsed + dropped, transition into place */
-.revealer-card.notifications.note-pre {
-  max-height: 0;
-  min-height: 0;
-  padding-top: 0;
-  padding-bottom: 0;
-  margin-top: 0;
-  margin-bottom: 0;
-  opacity: 0;
-  transform: translateY(14px) scale(.97);
-}
-
-/* buried one level: peeks out above the front card */
-.revealer-card.notifications.depth-1 {
-  z-index: 2;
-  transform: translateY(-3px) scale(.972);
-  opacity: .55;
-  margin-bottom: -40px;
-  filter: saturate(.85);
-  box-shadow: none;
-}
-
-/* buried two levels: barely visible edge */
-.revealer-card.notifications.depth-2 {
   z-index: 1;
-  transform: translateY(-6px) scale(.945);
-  opacity: .28;
-  margin-bottom: -43px;
-  filter: saturate(.7);
+  animation: none;
   box-shadow: none;
+  transition: opacity .2s ease;
 }
 
-.revealer-card.notifications:is(.depth-1, .depth-2) > * {
+.revealer-card.notifications.note-pre {
   opacity: 0;
 }
 
-/* three-plus deep: out of the stack entirely */
-.revealer-card.notifications.depth-3 {
-  opacity: 0;
-  pointer-events: none;
-  margin-bottom: -38px;
-}
-
-/* exit: collapse upward back into the deck seam */
 .revealer-card.notifications.fade-out {
   opacity: 0;
-  transform: translateY(-8px) scale(.97);
-  max-height: 0;
-  min-height: 0;
-  padding-top: 0;
-  padding-bottom: 0;
-  margin-top: 0;
-  margin-bottom: 0;
-  border-color: transparent;
-  box-shadow: none;
   pointer-events: none;
 }
 
@@ -17612,32 +17550,364 @@ pre.code-card.streaming-plain code {
 }
 
 [data-theme] .composer-wrap > .revealer-deck {
-  /* Reserve the panel's height so it cannot cover the conversation. */
+  /* Unified docked tab: docked directly on top of prompt box container */
   position: relative;
-  flex: 0 0 auto;
   z-index: 1;
+  flex: 0 0 auto;
   grid-area: unset;
-  width: calc(100% - 42px);
-  max-width: 850px;
-  margin: 0;
+  width: 87%;
+  max-width: 783px;
+  margin: 0 auto -1px auto;
   padding: 0;
-  border-radius: 16px 16px 0 0;
+  border-radius: 10px 10px 0 0;
+  border: 1px solid color-mix(in srgb, var(--fg) 13%, transparent);
+  border-bottom: none;
+  background: color-mix(in srgb, var(--bg-raised) 96%, transparent);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: 0 -4px 14px color-mix(in srgb, var(--fg) 6%, transparent);
   box-sizing: border-box;
-  overflow: visible;
-  pointer-events: none;
+  overflow: hidden;
+  pointer-events: auto;
   transform: none;
+  transition: max-height .24s ease, opacity .2s ease;
 }
 
+[data-theme] .composer-wrap > .revealer-deck:empty {
+  display: none !important;
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+
+/* ====== SINGLE-ROW PRIMARY STATE ====== */
+.status-tab {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.status-tab-primary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 38px;
+  padding: 6px 12px;
+  box-sizing: border-box;
+}
+
+.status-tab-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: 0 0 auto;
+}
+
+.status-dot.live {
+  background: var(--accent);
+  animation: status-live-pulse 1.8s ease-in-out infinite;
+}
+
+.status-dot.err {
+  background: var(--danger);
+}
+
+.status-dot.ok {
+  background: var(--success);
+}
+
+.status-dot.warn {
+  background: var(--warning);
+}
+
+@keyframes status-live-pulse {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.25);
+    opacity: .75;
+  }
+}
+
+.status-env-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font: 600 10px/1.2 var(--font-sans);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.status-env-badge.env-wsl {
+  background: color-mix(in srgb, #00b4d8 14%, transparent);
+  border: 1px solid color-mix(in srgb, #00b4d8 30%, transparent);
+  color: #00b4d8;
+}
+
+.status-env-badge.env-host {
+  background: color-mix(in srgb, #a855f7 14%, transparent);
+  border: 1px solid color-mix(in srgb, #a855f7 30%, transparent);
+  color: #a855f7;
+}
+
+.status-env-badge.env-agent {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  color: var(--accent);
+}
+
+.status-env-badge.env-recon {
+  background: color-mix(in srgb, #f59e0b 14%, transparent);
+  border: 1px solid color-mix(in srgb, #f59e0b 30%, transparent);
+  color: #f59e0b;
+}
+
+.status-task-title {
+  font: 500 12px/1.4 var(--font-sans);
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.status-task-title code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.status-timer {
+  font: 11px/1 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-muted);
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.status-queue-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font: 600 10px/1 var(--font-sans);
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+  color: var(--fg-muted);
+  border: 1px solid var(--border-subtle);
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.status-tab-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.status-action-btn {
+  height: 26px;
+  padding: 0 10px;
+  font: 500 11px/1 var(--font-sans);
+  border-radius: 6px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-subtle);
+  color: var(--fg);
+  cursor: pointer;
+  transition: all .15s ease;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.status-action-btn:hover {
+  background: var(--border-subtle);
+  color: var(--fg);
+}
+
+.status-drawer-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+  transition: all .15s ease;
+  font-size: 10px;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+
+.status-drawer-toggle:hover {
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  color: var(--fg);
+}
+
+.status-drawer-toggle .chevron-icon {
+  display: inline-block;
+  user-select: none;
+  font-size: 9px;
+}
+
+/* ====== EXPANDABLE EVENT DRAWER ====== */
+.status-drawer {
+  border-top: 1px solid color-mix(in srgb, var(--fg) 9%, transparent);
+  background: color-mix(in srgb, var(--bg-sunken) 40%, transparent);
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 6px 10px 8px;
+  box-sizing: border-box;
+}
+
+.status-drawer[hidden] {
+  display: none !important;
+}
+
+.status-drawer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.status-drawer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  transition: background .12s ease;
+}
+
+.status-drawer-row:hover {
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+}
+
+.status-drawer-row-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.status-drawer-task-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 0 1 auto;
+  color: var(--fg);
+  font: 500 11.5px/1.4 var(--font-sans);
+}
+
+.status-drawer-task-title code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.status-drawer-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.status-kill-btn {
+  height: 22px;
+  padding: 0 8px;
+  font: 500 10px/1 var(--font-sans);
+  border-radius: 4px;
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--danger);
+  cursor: pointer;
+  transition: all .15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.status-kill-btn:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+.status-drawer-history {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid color-mix(in srgb, var(--fg) 7%, transparent);
+}
+
+.status-drawer-history summary {
+  cursor: pointer;
+  color: var(--fg-muted);
+  font-size: 10.5px;
+  user-select: none;
+}
+
+.status-drawer-history ul {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.status-drawer-history li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10.5px;
+  color: var(--fg-muted);
+  padding: 2px 4px;
+}
+
+.status-drawer-history li strong {
+  color: var(--fg);
+  font-weight: 500;
+}
+
+/* Card base & notifications inside docked tab */
 [data-theme] .composer-wrap > .revealer-deck > .revealer-card {
   width: 100%;
-  margin: 6px 0 0;
-  border-radius: 15px 15px 0 0;
-  border-bottom-color: transparent;
-  transform-origin: bottom center;
-  box-shadow:
-    0 -6px 20px color-mix(in srgb, var(--fg) 9%, transparent),
-    inset 0 1px 0 color-mix(in srgb, #fff 8%, transparent);
-  animation: composer-tab-rise .34s cubic-bezier(.22, .78, .2, 1) both;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
   pointer-events: auto;
 }
 
@@ -17645,173 +17915,70 @@ pre.code-card.streaming-plain code {
   max-height: none;
 }
 
-@keyframes composer-tab-rise {
-  from { opacity: 0; transform: translateY(26px) scale(.975); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
-}
-
 [data-theme] .composer-wrap > .revealer-deck > .revealer-card.notifications {
-  width: min(700px, calc(100% - 28px));
-  margin-right: auto;
-  margin-left: auto;
-  min-height: 48px;
-  max-height: 180px;
-  margin-top: 6px;
-  padding: 9px 13px;
+  width: 100%;
+  margin: 0;
+  min-height: 38px;
+  padding: 6px 12px;
   gap: 10px;
-  animation: none;
-  background: color-mix(in srgb, var(--bg-raised) 96%, transparent);
-  border-color: color-mix(in srgb, var(--fg) 13%, transparent);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: none;
 }
 
 /* Approval is the only thing the user can act on while a tool is blocked.
    Keep status and write cards mounted, but out of its way until it is decided. */
 [data-theme] .composer-wrap > .revealer-deck:has(> .revealer-card.permissions)
-  > .revealer-card:not(.permissions) {
+  > .revealer-card:not(.permissions),
+[data-theme] .composer-wrap > .revealer-deck:has(> .revealer-card.permissions)
+  > .status-tab {
   display: none;
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.notifications.depth-1 {
-  min-height: 14px;
-  max-height: 14px;
-  margin-top: 0;
-  margin-bottom: -4px;
-  padding: 0;
+@media (max-width: 768px) {
+  [data-theme] .composer-wrap > .revealer-deck {
+    width: 88%;
+    margin: 0 auto -1px auto;
+  }
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.notifications.depth-2 {
-  min-height: 12px;
-  max-height: 12px;
-  margin-top: 0;
-  margin-bottom: -4px;
-  padding: 0;
+/* Flat card integration inside docked tab */
+[data-theme] .composer-wrap > .revealer-deck > .revealer-card {
+  width: 100%;
+  margin: 0;
+  border-radius: 10px 10px 0 0;
+  border: none;
+  border-bottom: none;
+  background: transparent;
+  box-shadow: none;
+  pointer-events: auto;
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions {
-  width: min(700px, calc(100% - 28px));
-  margin-right: auto;
-  margin-left: auto;
-  position: relative;
-  animation: none;
-  transform-origin: bottom center;
-  background: var(--bg-raised);
-  transition:
-    transform .3s cubic-bezier(.32, .72, .24, 1.05),
-    opacity .24s ease,
-    margin .3s cubic-bezier(.32, .72, .24, 1.05),
-    max-height .26s ease;
+[data-theme] .composer-wrap > .revealer-deck > .revealer-card.collapsed {
+  max-height: none;
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions.approval-front {
-  z-index: 6;
-  box-shadow:
-    0 -7px 22px color-mix(in srgb, var(--fg) 10%, transparent),
-    inset 0 1px 0 color-mix(in srgb, #fff 8%, transparent);
-}
-
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions.approval-depth-1 {
-  z-index: 5;
-  pointer-events: none;
-  transform: translateY(1px) scale(.972);
-  opacity: .66;
-  margin-bottom: -38px;
-  filter: saturate(.86);
+[data-theme] .composer-wrap > .revealer-deck > .revealer-card.notifications {
+  width: 100%;
+  margin: 0;
+  min-height: 38px;
+  padding: 6px 12px;
+  border: none;
+  background: transparent;
   box-shadow: none;
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions.approval-depth-2 {
-  z-index: 4;
-  pointer-events: none;
-  transform: translateY(2px) scale(.944);
-  opacity: .34;
-  margin-bottom: -39px;
-  filter: saturate(.7);
-  box-shadow: none;
-}
-
-.revealer-card.permissions .revealer-card-stats {
-  display: none;
-}
-
-.revealer-card.permissions:is(.approval-depth-1, .approval-depth-2) .revealer-card-head > * {
-  opacity: 0;
-}
-
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions.approval-depth-hidden {
-  display: none;
-}
-
-.approval-stack-count {
-  flex: 0 0 auto;
-  padding: 3px 7px;
-  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border-subtle));
-  border-radius: 999px;
-  color: var(--fg-muted);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  font: 650 9px/1 var(--font-sans);
-  letter-spacing: .025em;
-  white-space: nowrap;
-}
-
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.notifications.note-pre {
-  min-height: 0;
-  max-height: 0;
-  margin-top: 0;
-  padding-top: 0;
-  padding-bottom: 0;
-  opacity: 0;
-  transform: translateY(28px) scale(.975);
-}
-
-[data-theme] .notification-icon {
-  width: 28px;
-  height: 28px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 28px;
-  border-radius: 9px;
-  font-size: 15px;
-  background: color-mix(in srgb, currentColor 10%, transparent);
-}
-
-[data-theme] .notification-copy {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-[data-theme] .notification-label {
-  color: var(--fg);
-  font-family: var(--font-sans);
-  font-size: 11.5px;
-  font-weight: 700;
-  line-height: 1.25;
-}
-
-[data-theme] .notification-text {
-  min-width: 0;
-  color: var(--fg-muted);
-  font-family: var(--font-sans);
-  font-size: 11.5px;
-  line-height: 1.35;
-  overflow-wrap: anywhere;
-}
-
-[data-theme] .revealer-card.notifications.err {
-  border-color: color-mix(in srgb, var(--danger) 36%, var(--border-subtle));
-}
-
-[data-theme] .revealer-card.notifications.warn {
-  border-color: color-mix(in srgb, var(--warning) 35%, var(--border-subtle));
-}
-
 [data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions {
-  border-color: color-mix(in srgb, var(--warning) 34%, var(--border-subtle));
+  width: 100%;
+  margin: 0;
+  border-radius: 10px 10px 0 0;
+  border: none;
+  border-bottom: none;
+  background: transparent;
+  box-shadow: none;
 }
 
 [data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions .revealer-card-icon {
@@ -17824,75 +17991,22 @@ pre.code-card.streaming-plain code {
   background: color-mix(in srgb, var(--warning) 12%, transparent);
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions .revealer-card-icon svg {
-  display: block;
-  width: 17px;
-  height: 17px;
-  overflow: visible;
-}
-
 [data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions .revealer-card-body {
   max-height: min(260px, 38dvh);
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card {
-  border-bottom-color: transparent !important;
-}
-
-[data-theme] .skill-pill-x {
-  width: 24px;
-  height: 24px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  margin: -4px -5px -4px 0;
-  border-radius: 50%;
-  touch-action: manipulation;
-}
-
-[data-theme] .skill-pill-x:hover,
-[data-theme] .skill-pill-x:focus-visible {
-  color: var(--danger);
-  background: color-mix(in srgb, var(--danger) 12%, transparent);
-  outline: none;
-}
-
 @media (max-width: 600px) {
   [data-theme] .composer-wrap > .revealer-deck {
-    width: calc(100% - 22px);
-    max-width: none;
-    margin: 0;
-    padding: 0;
-  }
-
-  [data-theme] .composer-wrap > .revealer-deck > .revealer-card {
-    border-radius: 13px 13px 0 0;
-  }
-
-  [data-theme] .composer-wrap > .revealer-deck > .revealer-card.notifications {
-    width: calc(100% - 8px);
-    min-height: 46px;
-    padding: 8px 10px;
-  }
-
-  [data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions {
-    width: calc(100% - 8px);
-  }
-
-  .approval-stack-count { display: none; }
-
-  [data-theme] .notification-label,
-  [data-theme] .notification-text {
-    font-size: 11px;
+    width: 88%;
+    margin: 0 auto -1px auto;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  [data-theme] .composer-wrap > .revealer-deck > .revealer-card,
-  [data-theme] .composer-wrap > .revealer-deck > .revealer-card.notifications,
-  [data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions {
-    animation: none;
-    transition: none;
+  [data-theme] .composer-wrap > .revealer-deck,
+  .status-dot.live {
+    animation: none !important;
+    transition: none !important;
   }
 }
 
@@ -18365,7 +18479,100 @@ html[data-custom-ink="light"] .brand .brand-mark-dark { display: block; }
 .conversation-search-source summary { cursor: pointer; font-size: 12px; }
 .conversation-search-source p { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 10px; }
 #palette-list .pi-sub { white-space: normal; overflow-wrap: anywhere; }
+/* Keep the original deck flow. Only the contents are refreshed in place, so
+   action updates do not move the notification surface to a new location. */
+/* Status seam and notifications handled cleanly by status-tab */
+/* Keep the live rail and action card on the same column as the composer.
+   The narrower 850px deck made the rail look detached from the prompt. */
+[data-theme] .composer-wrap > .revealer-deck {
+  width: 87%;
+  max-width: 783px;
+}
+[data-theme] .composer-wrap > #revealer-deck > :is(.attack-rail, .task-activity) {
+  width: 100%;
+  margin-left: 0;
+  margin-right: 0;
+}
+.task-activity-head { min-height: 48px; box-sizing: border-box; }
+.task-activity-copy { flex: 1; flex-direction: column; flex-wrap: nowrap; gap: 1px; }
+.task-activity-copy strong, .task-activity-meta { width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-activity-meta { font-variant-numeric: tabular-nums; }
+.task-activity-action { flex: 0 0 auto; }
+.attack-rail .ar-summary { display: flex; align-items: center; gap: 12px; margin-top: 8px; font-size: 11px; }
+.attack-rail .ar-summary .ar-phase { color: var(--fg); }
+.attack-rail .ar-summary .ar-elapsed { margin-left: auto; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
+.attack-rail .ar-details { margin-top: 5px; }
+.attack-rail .ar-details > summary { cursor: pointer; color: var(--fg-muted); font-size: 10px; }
+.attack-rail .ar-coverage-note, .attack-rail .ar-phase-history { margin: 8px 0 0; color: var(--fg-muted); font-size: 10px; line-height: 1.5; }
+[data-theme] .composer-wrap > #revealer-deck > .attack-rail {
+  padding: 11px 18px 10px;
+  border: 1px solid color-mix(in srgb, var(--fg) 13%, transparent);
+  border-bottom-color: transparent;
+  border-radius: 15px 15px 0 0;
+  background: color-mix(in srgb, var(--bg-raised) 96%, transparent);
+  box-shadow:
+    0 -6px 20px color-mix(in srgb, var(--fg) 9%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #fff 8%, transparent);
+}
+.attack-rail::before { display: none; }
+#revealer-deck .attack-rail .ar-head { margin: 0; }
+#revealer-deck .attack-rail .ar-kicker { display: none; }
+#revealer-deck .attack-rail .ar-target-title { max-width: none; font: 600 12px/1.5 var(--font-sans); }
+#revealer-deck .attack-rail .ar-state { border: 0; padding: 0; min-height: 0; background: transparent; }
+#revealer-deck .attack-rail .ar-activity { margin: 5px 0 0; padding: 0; border: 0; background: none; min-height: 16px; }
+#revealer-deck .attack-rail .ar-activity-text { white-space: nowrap; }
+#revealer-deck .attack-rail .ar-cmd { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.attack-rail .ar-state-dot, .attack-rail .ar-pulse { animation: none !important; box-shadow: none; }
+[data-theme] .composer-wrap > #revealer-deck > .attack-rail .ar-activity {
+  margin-left: 0;
+  margin-right: 0;
+}
 @media (pointer: coarse) {
   .turn-changes button, .task-activity button, .task-review-dialog button { min-height: 44px; }
+}
+
+/* Compact deck contents without shrinking the icon buttons' click areas. */
+#revealer-deck .status-tab-primary {
+  min-height: 30px;
+  gap: 8px;
+  padding: 3px 10px;
+}
+
+[data-theme] .composer-wrap > #revealer-deck > .revealer-card.notifications {
+  min-height: 36px;
+  padding: 3px 10px;
+}
+
+#revealer-deck :is(.status-env-badge, .status-queue-badge, .permission-item-badge) {
+  font-size: 9px;
+  line-height: 1.2;
+  letter-spacing: .02em;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+#revealer-deck .status-tab-left { gap: 6px; }
+#revealer-deck .status-dot { width: 5px; height: 5px; }
+#revealer-deck .status-action-btn { padding-inline: 7px; font-size: 10px; }
+#revealer-deck .revealer-card-head { padding: 6px 10px; gap: 6px; }
+#revealer-deck .revealer-card-title { font-size: 12px; }
+#revealer-deck .task-activity-head { min-height: 40px; }
+
+[data-theme] .composer-wrap > #revealer-deck > .revealer-card.permissions .revealer-card-icon {
+  width: 22px;
+  height: 22px;
+  flex-basis: 22px;
+  border-radius: 6px;
+}
+
+#revealer-deck :is(button, .revealer-card-icon, .permission-item-icon, .file-icon) svg {
+  display: block;
+  width: 13px;
+  height: 13px;
+  flex: 0 0 13px;
+}
+
+#revealer-deck :is(button, .revealer-card-icon, .permission-item-icon, .file-icon) .ph {
+  font-size: 13px;
 }
 

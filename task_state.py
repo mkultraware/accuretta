@@ -181,17 +181,28 @@ class UndoStore:
                     result["notice"] = "Only file existence, line endings, or the final newline changed."
             return result
 
-    def restore(self, turn_id: str) -> dict:
+    def restore(self, turn_id: str, *, chat_id: str = "", file_index: int | None = None) -> dict:
         if not turn_id or any(c not in "0123456789abcdef" for c in turn_id) or len(turn_id) != 32:
             return {"error": "Invalid undo identifier"}
         journal = self.directory / f"{turn_id}.json"
         with self.lock:
+            selected_path = None
+            if file_index is not None:
+                selected = self.review(turn_id, chat_id, file_index)
+                if selected.get("error"):
+                    return selected
+                selected_path = selected["path"]
             try:
                 payload = json.loads(journal.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 return {"error": "Undo record is unavailable"}
+            if selected_path and not any(entry["path"] == selected_path for entry in payload.get("entries", [])):
+                return {"error": "This file has already been restored or has no undo snapshot."}
             retained, errors, restored = [], [], 0
             for entry in payload.get("entries", []):
+                if selected_path and entry["path"] != selected_path:
+                    retained.append(entry)
+                    continue
                 path = Path(entry["path"])
                 if not entry.get("restorable", True):
                     errors.append(f"{path.name}: No restorable text snapshot. File preserved.")
@@ -220,6 +231,6 @@ class UndoStore:
                 _atomic_json(journal, {**payload, "entries": retained})
             else:
                 journal.unlink(missing_ok=True)
-            return {"ok": not retained, "restored": restored, "errors": errors,
+            return {"ok": not errors if selected_path else not retained, "restored": restored, "errors": errors,
                     "error": "; ".join(errors) if errors else None,
                     "remaining": len(retained)}

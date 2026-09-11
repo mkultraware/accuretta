@@ -7,7 +7,7 @@ import re
 import threading
 import time
 import uuid
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 def encoded(value):
@@ -16,6 +16,11 @@ def encoded(value):
 
 def digest(value):
     return hashlib.sha256(encoded(value)).hexdigest()
+
+
+def identity_fingerprint(headers):
+    return digest({str(key).lower(): value for key, value in headers.items()
+                   if str(key).lower() in {"authorization", "cookie"}})
 
 
 def feedback(name, result):
@@ -27,7 +32,9 @@ def feedback(name, result):
         return result
     result = dict(result)
     message = str(result.get("error") or result.get("reason") or "").lower()
-    if result.get("scope_blocked") or result.get("wrong_execution_target"):
+    if name == "check_syntax" and result.get("check_status") == "unchecked":
+        kind, step = "check_unavailable", "Report this file as not checked. Use a supported checker if available; do not claim a syntax failure or success."
+    elif result.get("scope_blocked") or result.get("wrong_execution_target"):
         kind, step = "scope_blocked", "Check the selected target and authorized scope. Do not retry through another tool."
     elif "denied" in message or result.get("reason") == "denied":
         kind, step = "permission_denied", "The action was denied. Continue with permitted work or report the blocked step."
@@ -64,19 +71,133 @@ def verification_advice(path="", kind="change"):
 
 
 def response_state(result):
-    if result.get("scope_blocked") or result.get("not_executed"):
+    if result.get("scope_blocked") or result.get("not_executed") or result.get("executed") is False:
         return "blocked"
-    if result.get("error") or result.get("potentially_truncated") or result.get("exit_code") not in (None, 0):
+    if (result.get("error") or result.get("potentially_truncated") or result.get("fetch_errors")
+            or result.get("scan_warnings") or result.get("exit_code") not in (None, 0)):
         return "inconclusive"
     headers = {str(k).lower(): str(v) for k, v in (result.get("headers") or {}).items()}
     destination = headers.get("location", "") or str(result.get("final_url") or "")
     if result.get("status") in (401, 403) or re.search(r"/(login|signin|sign-in)(?:[/?#]|$)", destination, re.I):
         return "authentication_unavailable"
-    if result.get("status") in (429, 503):
+    if result.get("status") == 429 or isinstance(result.get("status"), int) and result["status"] >= 500:
         return "inconclusive"
     if result.get("ok") is False and not result.get("status"):
         return "inconclusive"
     return "observed"
+
+
+def request_context(tool, args, result):
+    parameters = {"query": sorted(parse_qs(urlsplit(str(args.get("url") or "")).query))}
+    data = args.get("data") or args.get("body")
+    if isinstance(data, dict):
+        parameters["body"] = sorted(str(key) for key in data)
+    elif isinstance(data, str):
+        try:
+            decoded = json.loads(data)
+        except ValueError:
+            decoded = parse_qs(data)
+        if isinstance(decoded, dict):
+            parameters["body"] = sorted(decoded)
+    parameters["header"] = sorted(str(key).lower() for key in (args.get("headers") or {}))
+    method = str(result.get("method") or args.get("method") or
+                 ("POST" if tool == "http_request" and data else "GET")).upper()
+    if tool == "sandbox_sqlmap":
+        method = "SCANNER"
+    elif tool == "rt_browser":
+        method = "BROWSER"
+        parameters["interaction"] = [str(args.get("action") or "snapshot").lower()]
+    return {"method": method, "parameters": parameters}
+
+
+def check_predicate(result, predicate):
+    """Evaluate a bounded assertion against a recorded response, never against prose."""
+    path = predicate.get("path")
+    if not isinstance(path, list) or not 1 <= len(path) <= 8:
+        raise ValueError("Assertion path must select a recorded result field.")
+    value = result
+    for key in path:
+        if isinstance(value, dict) and isinstance(key, str) and key in value:
+            value = value[key]
+        elif isinstance(value, list) and isinstance(key, int) and 0 <= key < len(value):
+            value = value[key]
+        else:
+            raise ValueError("Assertion field is missing from a recorded response.")
+    expected = predicate.get("value")
+    operation = predicate.get("operation")
+    if operation == "contains":
+        if not isinstance(expected, str) or not 4 <= len(expected.strip()) <= 2000 or not isinstance(value, (str, list)):
+            raise ValueError("Contains assertions need 4-2000 characters and string or list evidence.")
+        return expected in value
+    if operation == "equals":
+        if isinstance(expected, (dict, list)) or isinstance(value, (dict, list)):
+            raise ValueError("Equals assertions compare scalar recorded values only.")
+        return value == expected
+    if operation in {"greater_than", "less_than"}:
+        if isinstance(value, bool) or isinstance(expected, bool) or not isinstance(value, (int, float)) or not isinstance(expected, (int, float)):
+            raise ValueError("Numeric assertions require recorded and expected numbers.")
+        return value > expected if operation == "greater_than" else value < expected
+    raise ValueError("Use contains, equals, greater_than, or less_than for the response assertion.")
+
+
+def review_test_contract(records, control, challenge):
+    issues = []
+    contract = challenge.get("test")
+    if not isinstance(contract, dict) or not isinstance(contract.get("assertion"), dict):
+        return ["Supply a test contract with method, parameter location/name, and a response assertion."]
+    method = contract.get("method")
+    location, parameter = contract.get("location"), contract.get("parameter")
+    if not isinstance(method, str) or method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "BROWSER"}:
+        issues.append("Specify the actual HTTP method; scanner summaries are candidate evidence only.")
+    if not isinstance(location, str) or location not in {"query", "body", "header", "interaction", "none"} or not isinstance(parameter, str):
+        return issues + ["Specify query, body, header, interaction, or none and the exact tested input."]
+    if (location != "none" and not parameter) or (location == "none" and parameter):
+        issues.append("Parameter must be nonempty unless location is none.")
+    for record in records:
+        context = record.get("request_context") or {}
+        if context.get("method") != method:
+            issues.append("The test and reproduction must record the stated method.")
+        if location != "none" and parameter not in context.get("parameters", {}).get(location, []):
+            issues.append("The test and reproduction must record the tested parameter or interaction in the stated location.")
+        if record.get("tool") == "sandbox_sqlmap":
+            issues.append("Scanner output cannot substitute for a captured reproduction response.")
+        try:
+            if not check_predicate(record["result"], contract["assertion"]):
+                issues.append("The response assertion must pass on both supporting observations.")
+        except (ValueError, TypeError) as exc:
+            issues.append(str(exc))
+    if len({r.get("identity_fingerprint") for r in records}) != 1:
+        issues.append("Reproduction must use the same recorded identity as the original test.")
+    if control:
+        if control["call_id"] in {r["call_id"] for r in records}:
+            issues.append("The control must come from a separate tool call.")
+        strategy = contract.get("control_strategy") or "same_endpoint"
+        test_endpoint = {(urlsplit(r["target"]).scheme, urlsplit(r["target"]).netloc,
+                          urlsplit(r["target"]).path or "/") for r in records}
+        control_endpoint = (urlsplit(control["target"]).scheme, urlsplit(control["target"]).netloc,
+                            urlsplit(control["target"]).path or "/")
+        if strategy == "same_endpoint":
+            if len(test_endpoint | {control_endpoint}) != 1:
+                issues.append("A same-endpoint control must use the tested endpoint.")
+            context = control.get("request_context") or {}
+            if context.get("method") != method or (location != "none" and parameter not in context.get("parameters", {}).get(location, [])):
+                issues.append("A same-endpoint control must use the stated method and tested input.")
+        elif strategy == "equivalent":
+            purpose = (challenge.get("control") or {}).get("purpose")
+            if not isinstance(purpose, str) or len(purpose.strip()) < 12:
+                issues.append("Explain why the alternate control is equivalent to the tested behavior.")
+            if len({urlsplit(r["target"]).netloc for r in [*records, control]}) != 1:
+                issues.append("An equivalent control must remain on the same authorized origin.")
+        else:
+            issues.append("Control strategy must be same_endpoint or equivalent.")
+        try:
+            if check_predicate(control["result"], contract["assertion"]):
+                issues.append("The response assertion must fail on the control.")
+        except (ValueError, TypeError) as exc:
+            issues.append(str(exc))
+    else:
+        issues.append("The control receipt must be loaded and checked.")
+    return list(dict.fromkeys(issues))
 
 
 class EvidenceStore:
@@ -95,16 +216,20 @@ class EvidenceStore:
         headers = args.get("headers") or {}
         credentials = {str(k).lower(): v for k, v in headers.items()
                        if str(k).lower() in {"authorization", "cookie"}}
-        credentials["cookies"] = args.get("cookies") or {}
+        if args.get("cookies") and "cookie" not in credentials:
+            credentials["cookie"] = "; ".join(f"{key}={value}" for key, value in args["cookies"].items())
         record = {
             "id": receipt_id, "chat_id": chat_id, "mission_id": mission_id,
             "call_id": call_id or uuid.uuid4().hex, "tool": tool, "target": target,
             "identity": str(args.get("session") or ("explicit credentials" if any(credentials.values()) else "anonymous")),
-            "identity_fingerprint": digest([args.get("session"), credentials]),
-            "request_sha256": digest(args), "method": str(args.get("method") or "GET").upper(),
+            "identity_fingerprint": (result.get("request_identity_fingerprint")
+                                     or digest([args.get("session"), identity_fingerprint(credentials)])),
+            "request_sha256": digest(args), "method": request_context(tool, args, result)["method"],
+            "request_context": request_context(tool, args, result),
             "created": time.time(), "state": response_state(result),
             "result": result, "result_sha256": digest(result),
         }
+        record["record_sha256"] = digest(record)
         with self.lock:
             folder = self.folder(chat_id, mission_id)
             folder.mkdir(parents=True, exist_ok=True)
@@ -120,9 +245,12 @@ class EvidenceStore:
         if not isinstance(receipt_id, str) or not re.fullmatch(r"[0-9a-f]{32}", receipt_id):
             raise ValueError("Invalid evidence ID")
         record = json.loads((self.folder(chat_id, mission_id) / (receipt_id + ".json")).read_text(encoding="utf-8"))
+        if (record.get("record_sha256") and record["record_sha256"] != digest({k: v for k, v in record.items() if k != "record_sha256"})):
+            raise ValueError("Evidence metadata integrity check failed")
         if (record["chat_id"] != chat_id or record["mission_id"] != mission_id
                 or record["id"] != receipt_id or digest(record["result"]) != record["result_sha256"]):
             raise ValueError("Evidence integrity check failed")
+        record["state"] = response_state(record["result"])
         return record
 
     def coverage(self, chat_id, mission_id, limit=50, offset=0):
@@ -169,9 +297,9 @@ def compare_responses(records):
             "note": "Differences, identical bodies, and status codes do not by themselves prove or disprove a vulnerability. Raw responses remain in their evidence records."}
 
 
-def review_evidence(finding, records, challenge):
+def review_evidence(finding, records, challenge, control_record=None):
     """Check provenance and review completeness, never infer exploitability from prose."""
-    issues = []
+    issues = review_test_contract(records, control_record, challenge)
     by_id = {r["id"]: r for r in records}
     if len(by_id) < 2:
         issues.append("A separate reproduction observation is required.")
@@ -179,27 +307,24 @@ def review_evidence(finding, records, challenge):
         issues.append("Reproduction must come from a separate tool call.")
     if not finding.get("target") or not finding.get("description"):
         issues.append("Provide the exact target and the claim being evaluated.")
-    if any(r["target"] != finding.get("target") for r in records):
-        issues.append("Every supporting observation must match the exact finding target.")
+    finding_url = urlsplit(str(finding.get("target") or ""))
+    finding_endpoint = (finding_url.scheme, finding_url.netloc, finding_url.path or "/")
+    if any((urlsplit(r["target"]).scheme, urlsplit(r["target"]).netloc,
+            urlsplit(r["target"]).path or "/") != finding_endpoint for r in records):
+        issues.append("Every supporting observation must match the finding endpoint.")
     if any(r["state"] != "observed" for r in records):
         issues.append("Blocked, authentication-unavailable, or inconclusive observations cannot confirm the claim.")
-    bindings = challenge.get("observations") or []
-    bound = set()
-    for item in bindings:
+    for item in challenge.get("observations") or []:
         record = by_id.get(item.get("evidence_id")) if isinstance(item, dict) else None
         quote = item.get("quote", "") if isinstance(item, dict) else ""
-        if record and isinstance(quote, str) and len(quote.strip()) >= 12 and quote in encoded(record["result"]).decode("utf-8"):
-            bound.add(record["id"])
-        else:
-            issues.append("Each observation needs an exact quote from its recorded result (at least 12 characters).")
-    if bound != set(by_id):
-        issues.append("Bind every supporting evidence ID to an exact observation.")
+        if not record or (quote and (not isinstance(quote, str) or quote not in encoded(record["result"]).decode("utf-8"))):
+            issues.append("Optional observation notes must reference supporting evidence and quote it exactly when a quote is supplied.")
     for field in ("expected_boundary", "demonstrated_impact", "alternative_explanation", "disproof_check", "limitations"):
         if not isinstance(challenge.get(field), str) or len(challenge[field].strip()) < 12:
             issues.append(f"Explain {field.replace('_', ' ')}.")
     control = challenge.get("control")
-    if not isinstance(control, dict) or not control.get("evidence_id") or not control.get("quote"):
-        issues.append("Supply a separate control observation with its evidence ID and exact quote.")
+    if not isinstance(control, dict) or not control.get("evidence_id"):
+        issues.append("Supply a separate control evidence ID.")
     return {"eligible": not issues, "issues": issues, "finding_sha256": digest(finding),
             "evidence_ids": list(by_id), "challenge": challenge,
             "note": "Eligibility confirms evidence binding and review completeness, not independent proof of the model's interpretation. Report limitations and actual demonstrated impact."}

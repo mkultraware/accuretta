@@ -115,72 +115,79 @@
     const deck = $("#revealer-deck");
     if (!deck) return null;
 
-    if (key && _toasts.has(key)) {
-      const previous = _toasts.get(key);
-      clearTimeout(previous?._dismissTimer);
-      try { previous.remove(); } catch {}
-      _toasts.delete(key);
-    }
-
-    const row = document.createElement("div");
+    const previous = key ? _toasts.get(key) : null;
+    const row = previous?.isConnected ? previous : document.createElement("div");
+    clearTimeout(row._dismissTimer);
+    clearTimeout(row._removeTimer);
     row.className = `revealer-card notifications ${kind}`;
     row.dataset.cardType = "notifications";
 
-    const iconMap = {
-      info: '<i class="ph ph-info" style="color:var(--accent)"></i>',
-      ok: '<i class="ph ph-check-circle" style="color:var(--success)"></i>',
-      warn: '<i class="ph ph-warning" style="color:var(--warning)"></i>',
-      err: '<i class="ph ph-x-circle" style="color:var(--danger)"></i>'
-    };
-    const iconHtml = iconMap[kind] || iconMap.info;
-    const labelMap = { info: "Update", ok: "Done", warn: "Attention", err: "Could not complete" };
+    const dotKind = kind === "error" || kind === "err" ? "err"
+      : kind === "warn" ? "warn"
+      : kind === "ok" ? "ok" : "live";
+    const labelMap = { info: "Agent", ok: "Done", warn: "Attention", err: "Notice" };
+    const badgeText = labelMap[kind] || "Agent";
     const cleanMsg = html ? String(msg) : esc(String(msg));
 
     row.innerHTML = `
-      <span class="notification-icon">${iconHtml}</span>
-      <div class="notification-copy">
-        <span class="notification-label">${labelMap[kind] || labelMap.info}</span>
-        <div class="notification-text">${cleanMsg}</div>
+      <div class="status-tab-primary" style="width:100%;padding:0;">
+        <div class="status-tab-left">
+          <span class="status-dot ${dotKind}"></span>
+          <span class="status-env-badge env-agent">${badgeText}</span>
+          <span class="status-task-title" title="${cleanMsg.replace(/<[^>]*>/g, '')}">${cleanMsg}</span>
+        </div>
+        <div class="status-tab-right">
+          <button type="button" class="status-action-btn" data-act="dismiss">Dismiss</button>
+        </div>
       </div>
     `;
-    // Stacked-deck entrance: start collapsed + dropped, then let the
-    // transition settle it into place (transitions re-run smoothly when a
-    // newer card buries this one and its depth class changes).
-    row.classList.add("note-pre");
-    deck.appendChild(row);
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      row.classList.remove("note-pre");
-      _syncDeckStack();
-    }));
+
+    const dismissBtn = row.querySelector('[data-act="dismiss"]');
+    if (dismissBtn) {
+      dismissBtn.onclick = (e) => {
+        e.stopPropagation();
+        row.classList.add("fade-out");
+        setTimeout(() => {
+          row.remove();
+          if (key && _toasts.get(key) === row) _toasts.delete(key);
+          _syncDeckStack();
+          if (deck.children.length === 0) deck.innerHTML = "";
+        }, 150);
+      };
+    }
+
+    // Insert into deck
+    const firstDeckCard = [...deck.children].find((child) => !child.classList.contains("notifications"));
+    if (firstDeckCard) deck.insertBefore(row, firstDeckCard);
+    else deck.appendChild(row);
+    _syncDeckStack();
 
     row._dismissTimer = setTimeout(() => {
       row.classList.add("fade-out");
-      _syncDeckStack();
-      setTimeout(() => {
+      row._removeTimer = setTimeout(() => {
         row.remove();
         if (key && _toasts.get(key) === row) _toasts.delete(key);
         _syncDeckStack();
         if (deck.children.length === 0) deck.innerHTML = "";
-      }, 260);
+      }, 200);
     }, ms);
 
     if (key) _toasts.set(key, row);
     return row;
   }
 
-  // Tag each live notification with how deeply it is buried under newer
-  // ones (0 = front card). Drives the stacked-deck transforms in CSS; older
-  // cards visibly "settle back" as a new one lands on top of them.
+  // In the unified docked tab, avoid stacked floating card depth layers
   function _syncDeckStack() {
     const deck = $("#revealer-deck");
     if (!deck) return;
     const notes = [...deck.querySelectorAll(".revealer-card.notifications:not(.fade-out)")];
-    const total = notes.length;
+    // Keep only the front notice visible if multiple arrive; older ones hide without depth stacking
     notes.forEach((el, i) => {
-      const depth = Math.min(total - 1 - i, 3);
-      el.classList.toggle("depth-1", depth === 1);
-      el.classList.toggle("depth-2", depth === 2);
-      el.classList.toggle("depth-3", depth >= 3);
+      if (i === 0) {
+        el.style.display = "";
+      } else {
+        el.style.display = "none";
+      }
     });
   }
 
@@ -1145,8 +1152,6 @@
   function finalizeToolGroup(row) {
     if (!row) return;
     row._activityFinished = true;
-    clearInterval(row._statusTimer);
-    $("#revealer-deck")?.querySelector('[data-card-type="activity"]')?.remove();
     const stack = row.querySelector(".tool-stack");
     const bubble = row.querySelector(".bubble");
     if (!stack || !bubble) return;
@@ -1341,8 +1346,10 @@
     const line = findToolActivity(stack, toolCards, evt);
     if (!line) return null;
     const isErr = toolResultFailed(evt.result);
+    const unchecked = evt.name === "check_syntax" && evt.result?.check_status === "unchecked";
     line.classList.remove("running");
-    line.classList.add(isErr ? "err" : "done");
+    line.classList.add(unchecked ? "unchecked" : isErr ? "err" : "done");
+    if (unchecked && evt.result.reason) line.title = evt.result.reason;
     if (!isErr && evt.result?.code_check?.status === "issues_found") {
       line.classList.add("has-code-findings");
       const details = document.createElement("details");
@@ -1474,6 +1481,10 @@
       case "run_powershell": return `Running on host…`;
       case "run_tests":      return `Running project tests…`;
       case "check_syntax":   return `Checking ${shortPath(args.path)}…`;
+      case "research_plan": return "Planning the investigation…";
+      case "research_note": return "Saving an evidence note…";
+      case "research_notebook": return "Reading saved research…";
+      case "research_publish": return "Preparing the research presentation…";
       case "git_status":     return `Checking repository status…`;
       case "git_log":        return `Reading repository history…`;
       case "git_diff":       return `Reviewing repository changes…`;
@@ -1518,7 +1529,11 @@
       case "write_file":     return `Wrote ${shortPath(res.path)}`;
       case "edit_file":      return `Edited ${shortPath(res.path)} · ${res.edits_applied || 0} change${(res.edits_applied || 0) === 1 ? "" : "s"}`;
       case "delete_file":    return `Deleted ${shortPath(res.path)}`;
-      case "check_syntax":   return res.ok === false ? "Syntax check failed" : "Syntax check passed";
+      case "check_syntax":   return res.check_status === "unchecked" ? "Syntax not checked" : "Syntax check passed";
+      case "research_plan": return "Research questions saved";
+      case "research_note": return `Evidence note ${res.note_id || ""} saved`.replace(/\s+/g, " ");
+      case "research_notebook": return "Read saved research";
+      case "research_publish": return res.presentation_ready ? "Research presentation ready" : "Research publication checked";
       case "git_status":     return `Checked repository status`;
       case "git_log":        return `Read repository history`;
       case "git_diff":       return `Reviewed repository changes`;
@@ -1591,6 +1606,7 @@
   }
 
   function toolFailureLabel(name, result = {}) {
+    if (name === "check_syntax") return "Syntax check failed";
     if (result.expected_type === "directory" && result.actual_type === "file") return "Expected a folder, received a file";
     if (/not a directory:/i.test(String(result.error || ""))) return "Expected a folder path";
     if (/path outside workspace/i.test(String(result.error || ""))) return "Path is outside the selected workspace";
@@ -3108,6 +3124,7 @@
     reflectIdeToggles();
 
     wireEvents();
+    initWorkflowUI();
     subscribeSSE();
     initCostWidget();
     initAppUpdateCheck();
@@ -3297,6 +3314,7 @@
       document.body.classList.toggle("remote-client", remote);
       document.body.classList.toggle("client-macos", os === "macOS");
     }
+    renderWorkspaceIdentity();
   }
 
   async function loadClientContext() {
@@ -3347,6 +3365,7 @@
   }
 
   function renderTopbarContext(chat) {
+    renderWorkspaceIdentity(chat);
     const chatContext = $("#topbar-chat-context");
     const projectContext = $("#topbar-project-context");
     const branch = $("#topbar-branch");
@@ -3371,6 +3390,8 @@
   }
 
   async function selectChat(id) {
+    document.querySelector('#revealer-deck .research-rail')?.remove();
+    if (state.chatId) localStorage.setItem("accuretta:draft:" + state.chatId, $("#composer-input").value);
     state.chatId = id;
     let chat = state.chats.chats[id];
     if (!chat || chat._summary || !Array.isArray(chat.messages)) {
@@ -3494,6 +3515,7 @@
       if (!state.liveTurn.row.isConnected) {
         inner.appendChild(state.liveTurn.row);
       }
+      if (state.liveTurn.row._research) window.AccurettaResearch?.update(state.liveTurn.row, state.liveTurn.row._research);
       scrollToBottom(true);
     }
     state._versionsExpanded = false;
@@ -3818,6 +3840,10 @@
       const row = document.createElement("div");
       const isActive = id === state.chatId;
       row.className = "chatrow" + (isActive ? " active" : "");
+      const needsYou = [...state.approvals.values()].some(a => a.chat_id === id && a.status === "pending");
+      const sessionState = needsYou ? "needs-you" : state.liveTurn?.chatId === id && state.streaming ? "working" : (c.task_state || "ready");
+      const sessionLabels = { "needs-you": "Needs you", working: "Working", finished: "Finished", interrupted: "Interrupted", stopped: "Stopped", failed: "Failed", ready: "Ready" };
+      row.dataset.taskState = sessionState;
       // Mobile-born sessions get a phone glyph; everything else keeps the
       // chat-circle. The active row also shows the colored dot bullet via
       // the `.chatrow.active::before` rule in app.css — the icon is the
@@ -3834,7 +3860,7 @@
       row.innerHTML = `
         <i class="${iconClass}"></i>
         <span class="t">${esc(c.title)}</span>
-        <span class="d">${relTime(c.updated)}</span>
+        <span class="d" title="${esc(relTime(c.updated))}">${sessionLabels[sessionState] || "Ready"}</span>
         <button class="del" title="Delete"><i class="ph ph-trash"></i></button>`;
       row.addEventListener("click", (e) => {
         if (e.target.closest(".del")) return;
@@ -4015,11 +4041,11 @@
       row.className = "bubble-row task-update-message";
       row.dataset.updateId = m._steering_id;
       row.innerHTML = `
-        <article class="task-update-card" aria-label="Applied task update">
+        <article class="task-update-card" aria-label="Task update received by agent">
           <div class="task-update-heading">
             <svg class="task-update-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 3v6a4 4 0 0 0 4 4h8m-4-4 4 4-4 4"/></svg>
             <span>Your update</span>
-            <span class="task-update-status"><i class="ph ph-check" aria-hidden="true"></i>Applied</span>
+            <span class="task-update-status"><i class="ph ph-check" aria-hidden="true"></i>Received by agent</span>
           </div>
           <div class="task-update-text"></div>
         </article>`;
@@ -4142,6 +4168,7 @@
     }
     highlightMentionsInBubble(row.querySelector(".bubble"));
     enhanceCodeBlocks(row);
+    if (m._research) window.AccurettaResearch?.mount(row, m._research);
     return row;
   }
 
@@ -4271,6 +4298,7 @@
     } finally {
       state.streaming = false;
       state.abortCtl = null;
+      renderTaskHandoff(agentRow, state.liveTurn?.chatId || state.chatId);
       state.liveTurn = null;
       setStreamingUI(false, agentRow._notificationCancelled ? "stopped" : agentRow._notificationFailed ? "failed" : "completed");
       renderRegenerateChip();
@@ -4410,7 +4438,7 @@
   function queuedMessageMeta(item) {
     const parts = [];
     const mode = String(item.mode || "auto");
-    parts.push(mode === "ide" ? "IDE" : mode === "agent" ? "Agent" : "Auto");
+    parts.push(mode === "research" ? "Deep Research" : mode === "ide" ? "IDE" : "Agent");
     if (item.reasoningEffort && item.reasoningEffort !== "auto") {
       parts.push(item.reasoningEffort === "high"
         ? "Deep"
@@ -4492,7 +4520,8 @@
     const fromComposer = opts.prompt === undefined;
     const ta = $("#composer-input");
     const chatId = state.chatId;
-    const text = fromComposer ? ta.value.trim() : String(opts.prompt || "").trim();
+    const text = (opts.researchId ? String(opts.prompt || "").trim() : opts.researchBrief?.topic)
+      || (fromComposer ? ta.value.trim() : String(opts.prompt || "").trim());
     const images = Array.isArray(opts.images) ? opts.images.slice() : (fromComposer ? state.pendingImages.slice() : []);
     const files = Array.isArray(opts.files) ? opts.files.slice() : (fromComposer ? state.pendingFiles.slice() : []);
     if (!text && !images.length && !files.length) return false;
@@ -4529,12 +4558,14 @@
       clientContext: opts.clientContext || currentClientHint(),
       invisible: !!opts.invisible,
       mission: opts.mission || null,
+      researchBrief: opts.researchBrief || null,
+      researchId: opts.researchId || null,
       createdAt: Date.now(),
       status: "queued",
     };
     messageQueue(chatId, true).push(item);
     if (state.chatId === chatId) renderMessageQueue();
-    if (state.streaming && state.liveTurn?.chatId === chatId && !item.mission) {
+    if (state.streaming && state.liveTurn?.chatId === chatId && !item.mission && !item.researchBrief) {
       await submitTaskUpdate(item);
       return true;
     }
@@ -4574,6 +4605,8 @@
         files: item.uploadedFiles ? [] : item.files,
         mode: item.mode,
         reasoningEffort: item.reasoningEffort,
+        researchBrief: item.researchBrief,
+        researchId: item.researchId,
         clientContext: item.clientContext,
         invisible: item.invisible,
         mission: item.mission,
@@ -4642,7 +4675,21 @@
     if (icon) icon.className = "ph ph-stop-circle think-check-icon done";
   }
 
+  document.addEventListener('accuretta:resume-research', event => {
+    const notebook = event.detail;
+    if (!notebook || notebook.chat_id !== state.chatId) return;
+    setComposerMode('research', { persist: true });
+    send({ mode: 'research', researchId: notebook.id, researchBrief: notebook.brief,
+           prompt: 'Continue the saved research and prepare the presentation from the collected evidence.' });
+  });
+
   async function send(opts = {}) {
+    if (opts.mission && !opts.mode) opts = { ...opts, mode: "agent" };
+    if ((opts.mode || state.mode) === "research" && !opts.researchBrief) {
+      const researchBrief = await window.AccurettaResearch.requestBrief(opts.prompt ?? $("#composer-input").value);
+      if (!researchBrief) return false;
+      opts = { ...opts, researchBrief };
+    }
     if (state.streaming || (state.queueDispatching && !opts.fromQueue)) {
       if (opts.fromQueue) return false;
       return enqueueMessage(opts);
@@ -4650,6 +4697,7 @@
     const ta = $("#composer-input");
     const fromComposer = opts.prompt === undefined;
     let text = fromComposer ? ta.value.trim() : String(opts.prompt || "").trim();
+    if (opts.researchBrief && !opts.researchId) text = opts.researchBrief.topic;
     const images = Array.isArray(opts.images) ? opts.images.slice() : (fromComposer ? state.pendingImages.slice() : []);
     const files = Array.isArray(opts.files) ? opts.files.slice() : (fromComposer ? state.pendingFiles.slice() : []);
 
@@ -4780,8 +4828,10 @@
       }
     } finally {
       const finishedChatId = state.liveTurn?.chatId || state.chatId;
+      window.AccurettaResearch?.finish(agentRow);
       state.streaming = false;
       state.abortCtl = null;
+      renderTaskHandoff(agentRow, finishedChatId);
       state.liveTurn = null;   // turn committed; partial no longer needs restoring
       setStreamingUI(false, agentRow._notificationCancelled ? "stopped" : agentRow._notificationFailed ? "failed" : "completed");
       await loadChats();
@@ -4799,15 +4849,18 @@
   }
 
   function setStreamingUI(on, outcome = "completed") {
+    renderChatList();
+    $("#revealer-deck")?.classList.toggle("is-streaming", on);
     const sendButton = $("#btn-send");
     sendButton.classList.remove("hidden");
     sendButton.classList.remove("queue-mode");
-    sendButton.title = on ? "Send an update to the current task" : "Send (⌘⏎)";
+    sendButton.title = on ? "Send a correction. The agent receives it between actions." : "Send (⌘⏎)";
     sendButton.setAttribute("aria-label", on ? "Update current task" : "Send message");
     const sendIcon = sendButton.querySelector("i");
     if (sendIcon) sendIcon.className = "ph-bold ph-arrow-up";
     $("#btn-stop").classList.toggle("hidden", !on);
     $("#composer-input").disabled = false; // always allow typing next message
+    $("#composer-input").placeholder = on ? "Add a correction or more context…" : "ask, build, or instruct…";
     const comp = document.querySelector(".composer");
     if (comp) comp.classList.toggle("status-thinking", on);
     renderStatus(0, on ? "streaming" : "idle");
@@ -4888,6 +4941,8 @@
         regenerate,
         invisible: !!(opts && opts.invisible),
         mission: (opts && opts.mission) || undefined,
+        research_brief: opts?.researchBrief || undefined,
+        research_id: opts?.researchId || undefined,
         reasoning_effort: opts?.reasoningEffort || state.reasoningEffort || "auto",
         client_context: opts?.clientContext || currentClientHint(),
       }),
@@ -5410,15 +5465,11 @@
         // Evidence stays hidden until the backend observes a concrete FLAG.
         `<span class="ar-state"><span class="ar-state-dot"></span><span class="ar-state-text">In progress</span></span>` +
       `</div>` +
-      `<div class="ar-track">${nodesHtml}</div>` +
+      `<div class="ar-summary"><strong class="ar-phase">Recon</strong><span class="ar-elapsed">00:00:00</span></div>` +
       `<div class="ar-activity"><span class="ar-pulse live"></span><span class="ar-activity-text">Preparing scoped assessment</span></div>` +
-      `<div class="ar-foot">` +
-        `<span class="ar-meta">Elapsed <strong class="ar-elapsed">00:00:00</strong></span>` +
-        `<span class="ar-meta">Phase <strong class="ar-phase">Recon</strong></span>` +
+      `<details class="ar-details"><summary>Assessment details</summary><div class="ar-track">${nodesHtml}</div><div class="ar-foot">` +
         `<span class="ar-meta ar-flags" hidden>Evidence <strong class="ar-flag-count"></strong></span>` +
-      `</div>` +
-      `<div class="ar-banner"><span class="ar-banner-icon"><i class="ph ph-check"></i></span>` +
-        `<span><strong>Assessment complete</strong><small>Report generated and engagement closed</small></span></div>`;
+      `</div><p class="ar-phase-history"></p><p class="ar-coverage-note">Stages show activity, not verified coverage. Report generation closes the engagement.</p></details>`;
     
     const deck = document.getElementById("revealer-deck");
     if (deck) {
@@ -5445,20 +5496,21 @@
   function renderRail(rail) {
     const active = Math.max(0, ATTACK_NODES.findIndex(n => n.key === rail.dataset.phase));
     const closed = rail.dataset.status === "closed";
-    // A stage is complete only when the backend advances beyond it.
-    const done = ATTACK_NODES.map((_node, i) => closed || i < active);
+    const history = rail._phaseHistory || (rail._phaseHistory = []);
+    const phase = ATTACK_NODES[active]?.label || "Recon";
+    if (history.at(-1) !== phase) history.push(phase);
+    const historyEl = rail.querySelector(".ar-phase-history");
+    if (historyEl) historyEl.textContent = `Observed phases: ${history.join(" → ")}`;
     rail.querySelectorAll(".ar-node").forEach((el) => {
       const i = +el.dataset.i;
       el.classList.toggle("is-active", !closed && i === active);
-      el.classList.toggle("is-done", closed || (done[i] && i !== active));
-      el.classList.toggle("is-pending", !closed && !done[i] && i !== active);
+      el.classList.toggle("is-done", false);
+      el.classList.toggle("is-pending", closed || i !== active);
     });
     rail.querySelectorAll(".ar-seg").forEach((el) => {
       const s = +el.dataset.s;
-      el.classList.toggle("is-done", closed || done[s]);
-      // The segment leaving the active node lights up too, so progress reads as
-      // flowing into the next stage (dashed = still pending).
-      el.classList.toggle("is-active", !closed && !done[s] && active === s);
+      el.classList.toggle("is-done", false);
+      el.classList.toggle("is-active", !closed && active === s);
     });
     // Keep evidence counts hidden at zero.
     const flagsRaw = +(rail.dataset.flagsraw || 0);
@@ -5472,7 +5524,7 @@
     const phaseEl = rail.querySelector(".ar-phase");
     if (phaseEl) phaseEl.textContent = ATTACK_NODES[active]?.label || "Recon";
     const stateEl = rail.querySelector(".ar-state-text");
-    if (stateEl) stateEl.textContent = complete ? "Completed"
+    if (stateEl) stateEl.textContent = complete ? "Closed"
       : rail.dataset.state === "guarded" ? "Policy guarded"
       : live ? "In progress" : "Engagement active";
     rail.classList.toggle("has-flags", flagsRaw > 0);
@@ -6157,6 +6209,8 @@
           }
         }
       }
+      // Research progress is shown by the notebook rail; render its answer at completion.
+      if (row?._research) return;
       // Painting is frame-aligned and coalesced: at most one paint per
       // animation frame, still throttled to the cadence inside
       // paintStreamDelta. The buffer and counters above consume every delta;
@@ -6190,7 +6244,6 @@
       }
       appendAgentLog(`${target === "sandbox" ? "WSL GUEST" : "HOST"} command requested: ${evt.command || ""}`);
       setToolActivityLabel(toolStack, toolCards, evt, "Waiting for command approval…");
-      updateRevealerDeck(row);
     } else if (evt.type === "command_spawned") {
       const liveActivity = findToolActivity(toolStack, toolCards, evt);
       if (liveActivity) {
@@ -6215,7 +6268,6 @@
       appendAgentLog(`${target === "sandbox" ? "WSL GUEST" : "HOST"} command started: ${evt.command || ""}`);
       setToolActivityLabel(toolStack, toolCards, evt,
         evt.name === "run_tests" ? "Running project tests" : "Running command");
-      updateRevealerDeck(row);
     } else if (evt.type === "command_finished") {
       const target = executionTarget(evt);
       const exitCode = evt.exit_code ?? 0;
@@ -6230,7 +6282,6 @@
       const suffix = evt.killed ? " (killed)" : evt.timed_out ? " (timed out)" : "";
       appendExecutionText(target, `\nCommand finished with exit code ${exitCode}${suffix}\n`, failed, true);
       appendAgentLog(`${target === "sandbox" ? "WSL GUEST" : "HOST"} command finished: exit code ${exitCode}${suffix}`);
-      updateRevealerDeck(row);
     } else if (evt.type === "command_not_executed") {
       const target = executionTarget(evt);
       const item = executionActivity(row, evt);
@@ -6246,7 +6297,6 @@
         true,
       );
       appendAgentLog(`${target === "sandbox" ? "WSL GUEST" : "HOST"} command was not executed: ${reason}`);
-      updateRevealerDeck(row);
     } else if (evt.type === "tool_start") {
       secretRailToolStart(row, evt.name, evt.arguments);
       attackRailToolStart(row, evt.name, evt.arguments);
@@ -6302,7 +6352,6 @@
             duration: ""
           });
         }
-        updateRevealerDeck(row);
       }
       
       // Keep the turn visibly alive. The concrete action sits in the trail;
@@ -6397,7 +6446,6 @@
           const m = runningMcp.find(x => x.name === evt.name) || runningMcp[0];
           if (m) { m.status = st; m.duration = fmtToolDuration(m.t0); }
         }
-        updateRevealerDeck(row);
       }
       if (completedActivity) {
         const isErr = completedActivity.classList.contains("err");
@@ -6550,10 +6598,16 @@
       // and tool-heavy turns can blow past where the char-count estimate sits.
       renderCtxGauge();
     } else if (evt.type === "final") {
+      if (row && evt.message._research?.status === "complete"
+          && evt.message._research.presentation && !evt.message._failed && !row._notificationCancelled) {
+        row._notificationFailed = false;
+        row._notificationError = null;
+      }
       const full = evt.message.content || "";
       const msg = {
         role: "assistant",
         content: full,
+        _research: evt.message._research,
         t: Math.floor(Date.now() / 1000),
         tokens: state._lastMsgTokens || 0,
         prompt_tokens: state._lastMsgPromptTokens || 0,
@@ -6587,6 +6641,7 @@
         renderCostWidget();
       }
       state.messages.push(msg);
+      if (msg._research) window.AccurettaResearch?.update(row, msg._research);
       state._lastMsgTokens = 0;
       // Keep the real prompt-token count from this turn so the gauge holds the
       // true context fill between turns instead of flashing back to the char
@@ -6657,6 +6712,8 @@
       renderRegenerateChip();
       setTimeout(() => checkModelAdvisor({ notify: true }).catch(() => {}), 700);
       }
+    } else if (evt.type === "research_update") {
+      window.AccurettaResearch?.update(row, evt.research);
     } else if (evt.type === "notice") {
       if (!evt.quiet) toast(evt.note || "", "info", 3000, "ctx-notice");
     } else if (evt.type === "breach") {
@@ -6765,12 +6822,164 @@
     }
   }
 
+  function renderWorkspaceIdentity(chat = state.chats?.chats?.[state.chatId]) {
+    const host = $("#topbar-chat-context")?.parentElement;
+    if (!host) return;
+    let label = host.querySelector(".workflow-location");
+    if (!label) { label = document.createElement("div"); label.className = "workflow-location"; host.appendChild(label); }
+    const folder = chat?.github_worktree?.path || chat?.project_workspace?.path || state.workspace?.folders?.[0];
+    const device = $("#execution-target-select")?.selectedOptions[0]?.textContent || "Inference PC";
+    const name = folder ? String(folder).replace(/[\\/]+$/, "").split(/[\\/]/).pop() : "No workspace selected";
+    label.textContent = `${name} · ${device}`;
+    label.title = `${folder || "No workspace selected"} · Actions run on ${device}`;
+  }
+
+  function initWorkflowUI() {
+    initSettingsSections();
+    $("#btn-task-details")?.addEventListener("click", () => showTaskDetails());
+    const model = $('#settings-body [data-settings-section="model"] .settings-section-content');
+    const first = $("#set-gpu")?.closest(".form-row");
+    if (model && first?.parentElement === model) {
+      const details = document.createElement("details"); details.className = "workflow-advanced";
+      details.innerHTML = "<summary>Advanced model settings</summary>";
+      let node = first;
+      while (node) { const next = node.nextElementSibling; details.appendChild(node); node = next; }
+      model.appendChild(details);
+    }
+    const appearance = $('#settings-body [data-settings-section="appearance"] .settings-section-content');
+    if (appearance) {
+      const row = document.createElement("div"); row.className = "form-row";
+      row.innerHTML = '<label for="activity-detail">Activity detail</label><select id="activity-detail"><option value="concise">Concise</option><option value="detailed">Detailed</option></select>';
+      const select = row.querySelector("select");
+      select.value = localStorage.getItem("accuretta:activity-detail") === "detailed" ? "detailed" : "concise";
+      app.dataset.activityDetail = select.value;
+      select.onchange = () => { app.dataset.activityDetail=select.value; localStorage.setItem("accuretta:activity-detail",select.value); };
+      appearance.prepend(row);
+    }
+    renderWorkspaceIdentity();
+    let refreshing = false;
+    setInterval(async () => {
+      if (refreshing || document.visibilityState !== "visible") return;
+      refreshing = true;
+      try { await loadChats(); renderChatList(); } catch (_) {} finally { refreshing = false; }
+    }, 10000);
+  }
+
+  function controlFeedback(button, message = "Saved") {
+    if (!button) return;
+    if (button._feedbackOriginal === undefined) button._feedbackOriginal = button.innerHTML;
+    clearTimeout(button._feedbackTimer);
+    button.textContent = message;
+    button._feedbackTimer = setTimeout(() => {
+      if (button.isConnected) button.innerHTML = button._feedbackOriginal;
+      delete button._feedbackOriginal;
+    }, 1800);
+  }
+
+  function workflowDialog(title) {
+    const dialog = document.createElement("dialog");
+    dialog.className = "workflow-dialog";
+    dialog.setAttribute("aria-label", title);
+    dialog.innerHTML = `<header><h2>${esc(title)}</h2><button class="btn sm" type="button">Close</button></header><div class="workflow-body"></div>`;
+    dialog.querySelector("header button").onclick = () => dialog.close();
+    dialog.addEventListener("close", () => dialog.remove(), { once: true });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+    return dialog;
+  }
+
+  async function showTaskDetails(chatId = state.chatId) {
+    if (!chatId) return;
+    const dialog = workflowDialog("Task details");
+    const body = dialog.querySelector(".workflow-body");
+    body.innerHTML = '<p role="status">Loading task…</p>';
+    try {
+      const chat = await api(`/api/chats/${encodeURIComponent(chatId)}`);
+      if (chat.error) throw new Error(chat.error);
+      if (!dialog.isConnected) return;
+      const turns = [...(chat.undo_turns || [])].reverse();
+      const latest = turns[0];
+      const checks = latest?.verification || { status: "unchecked", checks: [] };
+      const debt = chat.verification_debt || [];
+      const outcome = {working:"Working", "needs-you":"Needs you", interrupted:"Interrupted", stopped:"Stopped", failed:"Failed", finished:"Finished", ready:"Ready"}[chat.task_state] || "Saved task";
+      body.innerHTML = `<p class="workflow-kicker">${esc(outcome)} · ${esc(chat.title || "Session")}</p>
+        <div class="workflow-sections">
+          <section><h3>Changes</h3><p>${latest ? `${latest.files.length} file(s) in the latest recorded task` : "No recorded file edits."}</p><div class="workflow-turns"></div></section>
+          <section><h3>Checks</h3><p>${esc({passed:"Recorded checks passed",failed:"Recorded checks failed",partial:"Some edits remain unchecked",unchecked:"No checks recorded for file edits"}[checks.status] || "No checks recorded")}</p><ul>${(checks.checks || []).map(c => `<li>${esc(c.label)}: ${esc(c.status)}${c.detail ? `<p>${esc(c.detail)}</p>` : ""}</li>`).join("")}</ul></section>
+          <section><h3>Needs attention</h3>${debt.length ? `<ul>${debt.map(d => `<li>${esc(d.path || d.file || d.reason || JSON.stringify(d))}</li>`).join("")}</ul>` : '<p>No outstanding verification items recorded. This is not a guarantee that everything was tested.</p>'}</section>
+        </div><div class="workflow-actions"></div>`;
+      const turnList = body.querySelector(".workflow-turns");
+      turns.forEach((turn, i) => {
+        const button = document.createElement("button"); button.type = "button"; button.className = "workflow-file-button";
+        button.textContent = `${i === 0 ? "Latest task" : `Earlier task ${i}`} · ${turn.files.length} file(s)${turn.undone ? " · undone" : ""}`;
+        button.onclick = () => { dialog.close(); reviewTaskChanges(turn, chatId); };
+        turnList.appendChild(button);
+      });
+      const actions = body.querySelector(".workflow-actions");
+      if (chat.mission) {
+        const button = document.createElement("button"); button.type = "button"; button.className = "btn sm"; button.textContent = "Investigation";
+        button.onclick = () => { dialog.close(); showInvestigation(chatId); }; actions.appendChild(button);
+      }
+      if (["interrupted", "stopped", "failed"].includes(chat.task_state)) {
+        const resume = document.createElement("button"); resume.type = "button"; resume.className = "btn sm"; resume.textContent = "Prepare to resume";
+        resume.onclick = async () => {
+          dialog.close();
+          if (state.chatId !== chatId) await selectChat(chatId);
+          const input = $("#composer-input");
+          if (!input.value.trim()) input.value = "Continue the interrupted task. Inspect the saved results first and avoid repeating completed actions.";
+          localStorage.setItem("accuretta:draft:" + chatId, input.value); autoResize(input); input.focus();
+        };
+        actions.appendChild(resume);
+      }
+    } catch (error) { body.textContent = error.message || "Could not load task details"; }
+  }
+
+  async function showInvestigation(chatId) {
+    const dialog = workflowDialog("Investigation");
+    const body = dialog.querySelector(".workflow-body");
+    body.innerHTML = '<p role="status">Loading saved evidence…</p>';
+    const read = async (extra = {}) => {
+      const data = await api("/api/investigation-review", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({chat_id:chatId,...extra}) });
+      if (data.error) throw new Error(data.error); return data;
+    };
+    try {
+      const data = await read(); if (!dialog.isConnected) return;
+      const mission = data.mission || {};
+      body.innerHTML = `<section><h3>Scope</h3><p>${esc(mission.target || "No target recorded")}</p><pre>${esc(typeof mission.scope === "string" ? mission.scope : JSON.stringify(mission.scope || {}, null, 2))}</pre><p>${esc(mission.objective || "")}</p></section>
+        <section><h3>Findings</h3>${data.findings.length ? data.findings.map(f => `<details><summary>${esc(f.title || f.claim || f.id)} · ${esc(f.status || "unreviewed")}</summary><p>${esc(f.description || f.impact || "")}</p><div class="finding-evidence" data-ids="${esc(JSON.stringify(f.evidence_ids || []))}"></div></details>`).join("") : "<p>No recorded findings.</p>"}</section>
+        <section><h3>Untested and limited checks</h3><p>Only explicitly recorded checks are listed. Missing entries do not mean tested.</p>${(data.planned_checks || []).filter(p => p.state !== "observed" || p.limitations).map(p => `<p><strong>${esc(p.feature || p.target)}</strong> · ${esc(p.state)}<br>${esc(p.limitations || "")}</p>`).join("") || "<p>No untested checks have been recorded.</p>"}</section>
+        <section><h3>Evidence</h3><p>${data.total} saved observations. Observations do not establish full vulnerability coverage.</p><div class="evidence-list"></div><button class="btn sm evidence-more" type="button" hidden>Load more</button></section>`;
+      const evidenceButton = (id, label) => {
+        const button = document.createElement("button"); button.type="button"; button.className="workflow-file-button"; button.textContent=label;
+        button.onclick=async()=>{
+          const detail=workflowDialog("Evidence"); const content=detail.querySelector(".workflow-body"); content.textContent="Loading…";
+          try { const result=await read({evidence_id:id}); const pre=document.createElement("pre"); pre.textContent=JSON.stringify(result.evidence,null,2); content.replaceChildren(pre); }
+          catch(error){content.textContent=error.message;}
+        }; return button;
+      };
+      body.querySelectorAll(".finding-evidence").forEach(host => JSON.parse(host.dataset.ids).forEach(id=>host.appendChild(evidenceButton(id,`Evidence ${id.slice(0,8)}`))));
+      const list=body.querySelector(".evidence-list"), more=body.querySelector(".evidence-more");
+      let offset=data.next_offset;
+      const append=(page)=>{ (page.observations || []).forEach(r=>list.appendChild(evidenceButton(r.id,`${r.target || r.tool || r.id} · ${r.state || "recorded"}`))); offset=page.next_offset; more.hidden=offset == null; };
+      append(data);
+      more.onclick=async()=>{more.disabled=true;try{append(await read({offset}));}catch(error){more.textContent=error.message;}finally{more.disabled=false;}};
+    } catch(error) {body.textContent=error.message || "Could not load investigation";}
+  }
+
+  function renderTaskHandoff(row, chatId) {
+    if (!row || row.querySelector(".task-handoff")) return;
+    const button = document.createElement("button"); button.type="button"; button.className="task-handoff";
+    button.textContent = row._notificationCancelled ? "Stopped · Review saved work" : row._notificationFailed ? "Task failed · Review saved work" : "Task details · Changes and checks";
+    button.onclick=()=>showTaskDetails(chatId);
+    (row.querySelector(".bubble-col") || row).appendChild(button);
+  }
+
   async function reviewTaskChanges(evt, chatId) {
     const dialog = document.createElement("dialog");
     dialog.className = "task-review-dialog";
     dialog.setAttribute("aria-label", "Review task changes");
     dialog.innerHTML = `<div class="task-review-head"><div><h2>Review changes</h2><p>Recorded edits from this task. Open actions show the current workspace file.</p></div><button type="button" class="btn sm task-review-close">Close</button></div>
-      <div class="task-review-toolbar"><label>File <select aria-label="Changed file"></select></label><button type="button" class="btn sm task-review-open" hidden></button></div>
+      <div class="task-review-toolbar"><label>Changed files <select size="6" aria-label="Changed file"></select></label><div class="task-review-file-actions"><button type="button" class="btn sm task-review-open" hidden></button><button type="button" class="btn sm task-review-undo" hidden>Undo selected file</button></div></div>
       <p class="task-review-status" role="status">Loading recorded changes…</p><pre class="task-review-diff" aria-label="Before and after diff"></pre>`;
     document.body.appendChild(dialog);
     dialog.querySelector(".task-review-close").onclick = () => dialog.close();
@@ -6778,6 +6987,7 @@
     dialog.showModal();
     const status = dialog.querySelector(".task-review-status"), select = dialog.querySelector("select");
     const diff = dialog.querySelector(".task-review-diff"), open = dialog.querySelector(".task-review-open");
+    const undo = dialog.querySelector(".task-review-undo");
     let request = 0;
     const read = async (fileIndex) => {
       const result = await api("/api/task-review", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
@@ -6790,9 +7000,10 @@
       const record = await read();
       if (!dialog.isConnected) return;
       record.files.forEach((file, index) => select.add(new Option(file.path, String(index))));
+      select.value = "0";
       const load = async () => {
         const id = ++request;
-        diff.replaceChildren(); open.hidden = true; status.textContent = "Loading recorded changes…";
+        diff.replaceChildren(); open.hidden = true; undo.hidden = true; status.textContent = "Loading recorded changes…";
         try {
           const file = await read(Number(select.value));
           if (id !== request || !dialog.isConnected) return;
@@ -6801,6 +7012,25 @@
           if (file.changed_since) notes.push("The workspace file has changed since this task. This diff is the saved record.");
           if (file.notice) notes.push(file.notice);
           if (file.truncated) notes.push("Large diff: only the first portion is shown.");
+          undo.hidden = !!evt.undone || evt.files[Number(select.value)]?.undone || file.changed_since || file.restorable === false;
+          undo.onclick = async () => {
+            const index = Number(select.value);
+            if (undo.dataset.confirm !== "yes") {
+              undo.dataset.confirm = "yes";
+              undo.textContent = "Confirm undo selected file";
+              status.textContent = `Restore ${file.name} to its state before this task? Later edits are protected.`;
+              return;
+            }
+            undo.disabled = true;
+            select.disabled = true;
+            try {
+              const result = await api("/api/undo", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({turn_id:evt.turn_id,chat_id:chatId,file_index:index})});
+              if (!result.ok) throw new Error(result.error || "Could not undo this file");
+              evt.files[index].undone = true; evt.files[index].restorable = false;
+              status.textContent = "File restored. Other files were left unchanged."; undo.hidden = true;
+              await loadChats(); renderChatList();
+            } catch(error) { status.textContent=error.message; } finally {undo.disabled=false; select.disabled=false; delete undo.dataset.confirm; undo.textContent="Undo selected file";}
+          };
           status.textContent = notes.join(" · ");
           (file.diff || []).forEach((line, index) => {
             const span = document.createElement("span");
@@ -6813,7 +7043,7 @@
           open.onclick = async () => { try { await openTaskFile(file); dialog.close(); } catch (error) { status.textContent = error.message; } };
         } catch (error) { if (id === request) status.textContent = error.message || "Could not load recorded changes"; }
       };
-      select.addEventListener("change", load);
+      select.addEventListener("change", () => {delete undo.dataset.confirm; undo.textContent="Undo selected file"; load();});
       if (record.files.length) await load(); else status.textContent = "No recorded file changes.";
     } catch (error) { status.textContent = error.message || "Could not load recorded changes"; }
   }
@@ -6843,7 +7073,8 @@
     const chatId = evt.chat_id || state.chatId;
     const verification = evt.verification || { status: "unchecked", checks: [] };
     const checkLabels = { passed: "Checks passed", failed: "Checks failed", partial: "Partially checked", unchecked: "Not checked" };
-    const checkRows = (verification.checks || []).map(check => `<li><span>${esc(check.label)} · ${check.status === "passed" ? "Passed" : "Failed"}</span>${check.detail ? `<p>${esc(check.detail)}</p>` : ""}</li>`).join("");
+    const checkStatusLabels = { passed: "Passed", failed: "Failed", unchecked: "Not checked" };
+    const checkRows = (verification.checks || []).map(check => `<li><span>${esc(check.label)} · ${checkStatusLabels[check.status] || "Not checked"}</span>${check.detail ? `<p>${esc(check.detail)}</p>` : ""}</li>`).join("");
     bar.innerHTML = `
       <div class="tc-head">
         <span class="tc-title">${n} file${n === 1 ? "" : "s"} changed</span>
@@ -9755,56 +9986,6 @@
     `;
   }
 
-  function updateRevealerDeck(row) {
-    const deck = $("#revealer-deck");
-    if (!deck || !row) return;
-    if (row._activityFinished) {
-      deck.querySelector('[data-card-type="activity"]')?.remove();
-      clearInterval(row._statusTimer);
-      return;
-    }
-    const allLines = [...row.querySelectorAll(".tool-line")];
-    // An earlier error remains in history once a later action starts.
-    // Moving on does not establish that the underlying issue was resolved.
-    const latest = allLines.at(-1);
-    const lines = allLines.filter(line => line.classList.contains("running")
-      || (line === latest && line.classList.contains("err")))
-      .filter(line => !line.dataset.statusDismissed);
-    const active = lines.filter(line => line.classList.contains("running"));
-    const failures = lines.filter(line => line.classList.contains("err"));
-    const current = active.at(-1) || failures.at(-1);
-    const old = deck.querySelector('[data-card-type="activity"]');
-    const expanded = old?.querySelector("details")?.open || false;
-    old?.remove();
-    clearInterval(row._statusTimer);
-    if (!current) return;
-    const label = current.querySelector(".tool-line-label")?.textContent || "Working";
-    const waiting = current.dataset.waiting === "true";
-    const title = waiting ? "Waiting for command approval" : active.length ? label
-      : "Action needs review";
-    const card = document.createElement("div");
-    card.className = "revealer-card task-activity";
-    card.dataset.cardType = "activity";
-    card.innerHTML = `<div class="task-activity-head"><div class="task-activity-copy"><strong>${esc(title)}</strong><span class="task-activity-meta"></span></div><button type="button" class="btn sm task-activity-action">${active.length ? "Stop task" : "Dismiss"}</button></div>
-      <details ${expanded ? "open" : ""}><summary>Activity details${failures.length ? ` · ${failures.length} failed` : ""}</summary><ul>${lines.map(line => `<li><strong>${esc(line.querySelector(".tool-line-label")?.textContent || line.dataset.name)}</strong><span>${line.classList.contains("err") ? "Failed" : line.dataset.waiting === "true" ? "Waiting for approval" : "Running"}</span>${line.title ? `<p>${esc(line.title)}</p>` : ""}</li>`).join("")}</ul></details>`;
-    deck.appendChild(card);
-    const updateTime = () => {
-      if (!card.isConnected || row._activityFinished) { clearInterval(row._statusTimer); return; }
-      const elapsed = Math.max(0, Math.floor((Date.now() - Number(current.dataset.t0 || Date.now())) / 1000));
-      const context = current.dataset.targetLabel || "Tool activity";
-      card.querySelector(".task-activity-meta").textContent = [context,
-        active.length ? `${elapsed}s elapsed` : "See error details",
-        active.length > 1 ? `${active.length} actions running` : "",
-        active.length && failures.length ? `${failures.length} failed` : ""].filter(Boolean).join(" · ");
-    };
-    updateTime();
-    if (active.length) row._statusTimer = setInterval(updateTime, 1000);
-    card.querySelector(".task-activity-action").onclick = () => {
-      if (active.length) stopStreaming();
-      else { failures.forEach(line => { line.dataset.statusDismissed = "true"; }); updateRevealerDeck(row); }
-    };
-  }
-
   function renderPermissionsChecklist(a) {
     const details = a.details || {};
     const kind = details.kind || "command";
@@ -10004,11 +10185,11 @@
       && (item.status === "running" || item.status === "requested"));
     if (write) {
       write.status = decision === "pending" ? "requested" : decision === "deny" ? "err" : "running";
-      updateRevealerDeck(row);
     }
   }
 
   function renderApprovals() {
+    renderChatList();
     const deck = $("#revealer-deck");
     if (!deck) return;
     
@@ -11916,7 +12097,7 @@
         renderModelPill();
       }
     }
-    closeSettings();
+    controlFeedback($("#btn-save-settings"));
   }
 
   // THEME_CYCLE is the source of truth for the selector and cycle controls.
@@ -12776,6 +12957,7 @@
   const COMPOSER_MODES = {
     agent: { label: "Agent", icon: "ph-terminal-window" },
     ide: { label: "IDE", icon: "ph-code" },
+    research: { label: "Deep Research", icon: "ph-books" },
   };
 
   function setComposerMode(mode, { announce = false, persist = false } = {}) {
@@ -12787,6 +12969,7 @@
       mode = "agent";
     }
     state.mode = mode;
+    $("#composer-input")?.setAttribute("placeholder", mode === "research" ? "What would you like to research?" : "ask, build, or instruct…");
     const meta = COMPOSER_MODES[mode];
     document.querySelectorAll("#composer-mode-menu .mode-option").forEach(option => {
       const active = option.dataset.composerMode === mode;
@@ -12872,6 +13055,7 @@
       setComposerMode(option.dataset.composerMode, { announce: true, persist: true });
       close();
       pill.focus({ preventScroll: true });
+      if (option.dataset.composerMode === "research") send({ mode: "research" });
     });
     menu.addEventListener("keydown", event => {
       if (event.key === "Tab") {
@@ -13999,7 +14183,7 @@
       e.currentTarget.classList.toggle("on");
       const on = e.currentTarget.classList.contains("on");
       saveSettings({ rt_force_exploit: on });
-      toast(on ? "exploit phase forced on" : "exploit phase gate restored", "ok", 1600);
+      toast(on ? "active tools enabled for Target Recon" : "Target Recon limited to discovery tools", "ok", 2000);
     });
     $("#sw-rt-spoof-xff")?.addEventListener("click", (e) => {
       e.currentTarget.classList.toggle("on");
@@ -14716,11 +14900,11 @@
         `1) RECON — recon_dns, recon_subdomains, recon_http_fingerprint, recon_tls_audit, recon_port_scan on ${target}.\n` +
         `2) MAP THE SURFACE — recon_content_discovery (quiet=true) + recon_check_exposure on the web root(s); recon_open_services on the host; recon_subdomain_takeover on subdomains. Run scan_js_secrets on the front-end pages with include_candidates=false so it inspects linked bundles, lazy chunks, and source maps. Treat only its returned findings as secrets; public_identifiers and hidden candidates are context, not vulnerabilities. Include each returned finding's exact value in the final report. Never send or use a value returned by scan_js_secrets in any HTTP, API, provider, authentication, or validation request. Run validate_finding before trusting other URL-based exposures — do NOT report decoys, catch-all, placeholder pages, or public client keys.\n` +
         `3) FIND WEAKNESSES — recon_cve_match on any component versions you see; recon_injection_probe on every URL that takes parameters (or batch_probe to fire one payload set at every parameterized endpoint at once); cors_probe any API endpoint for credentialed cross-origin reads; probe EACH parameter, not just the obvious one.\n` +
-        `4) EXPLOIT — breach each finding for real with http_request: decode+flip+re-encode an unsigned cookie and replay it, aim an SSRF param at an internal address, POST an SSTI/injection payload, tamper a header. Use encode_decode for base64/url/hex and jwt_tool to decode/forge/crack a JWT — don't compute crypto by hand. Read every response body, set_cookie, and header.\n` +
+        `4) EXPLOIT — candidate evidence is enough to choose the next permitted proof step; finding validation controls report labels, not tool access. For credible candidates, use the smallest non-destructive request that demonstrates behavior with http_request or rt_browser. Use encode_decode for base64/url/hex and jwt_tool to decode/forge/crack a JWT — don't compute crypto by hand. Read every response body, set_cookie, and header.\n` +
         `5) GO DEEPER (post-exploitation) — do NOT stop at "confirmed", loot it. On SQL injection, use sql_injection to enumerate the schema and dump the interesting tables (extract="name FROM sqlite_master", then the real data) — 'OR 1=1' only proves the bug, it doesn't extract the secrets. On file read or RCE, pull configs, source, environment variables, and known secret paths; hunt for keys and credentials. On gained access, enumerate what the new role/session unlocks and pivot from it. On an object/id endpoint, use fuzz to enumerate ids and read the outliers (IDOR). Feed each result into the next move.\n` +
         `6) PROVE IT — for every confirmed access or extracted secret, re-send the winning request with save_evidence set (archives request+response with a sha256), or use recon_capture_evidence.\n` +
         `STEALTH — a signature IDS matches the raw request text, so to stay quiet keep recon low-footprint (quiet=true) and obfuscate payloads (url-encode via encode_decode, vary keyword case, use alternate separators); the server still decodes and executes them while the signature misses.\n` +
-        `Only stop when you have genuinely exhausted the scope — every endpoint tested, every real finding taken to its depth. Then write a report: Executive summary (did you get in, how deep, what you reached), What's broken (each finding with severity + evidence), Loot (data, secrets, and credentials extracted), Recommendations. Never claim access or a finding you did not verify with a tool result or a captured artifact — but do not leave a real avenue unexplored. Be factual AND thorough. Once you deliver that report the engagement is CLOSED: treat any later message as a debrief — answer it directly and conversationally, and do NOT run recon or exploit tools again unless the user explicitly tells you to resume or keep testing.`;
+        `If a tool is blocked by scope or a constraint, record the gap and continue with other permitted work; do not hammer the same gate. Only stop when you have genuinely exhausted the permitted scope. Then write a report: Executive summary (did you get in, how deep, what you reached), What's broken (each finding with severity + evidence), Loot (data, secrets, and credentials extracted), Recommendations. Never claim access or a finding you did not verify with a tool result or a captured artifact — but do not leave a real avenue unexplored. Be factual AND thorough. Once you deliver that report the engagement is CLOSED: treat any later message as a debrief — answer it directly and conversationally, and do NOT run recon or exploit tools again unless the user explicitly tells you to resume or keep testing.`;
       send({ prompt: passive ? passiveTmpl : secretAudit ? secretTmpl : reconObjective === "gain_access" ? accessTmpl : reconTmpl, invisible: true, mission });
     };
     $("#quick-passive-osint")?.addEventListener("click", () => {
@@ -15052,6 +15236,9 @@
 
     // ----- command palette -----
     $("#btn-palette")?.addEventListener("click", openPalette);
+    $("#btn-search-sessions")?.addEventListener("click", openPalette);
+    const searchShortcut = $("#btn-search-sessions kbd");
+    if (searchShortcut && /Mac|iPhone|iPad/.test(navigator.platform)) searchShortcut.textContent = "⌘ K";
     const palInput = $("#palette-input");
     if (palInput) {
       palInput.addEventListener("input", (e) => refreshPaletteList(e.target.value));

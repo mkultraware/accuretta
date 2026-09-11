@@ -238,5 +238,31 @@
     "file": "fonts/intertight-OFL.txt",
     "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/intertight/OFL.txt",
     "sha256": "50240ab035cf1b6b3307940235481d515c4b6de3ab1fa843dbe59e7892cb9d58"
+  },
+  {
+    "file": "postcss/nanoid-LICENSE.txt",
+    "source": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.18.tgz",
+    "sha256": "da4db1480d9beea3483a2eda5c53b22238d0827d57da162b48f122e04d2d9987"
+  },
+  {
+    "file": "postcss/parse.cjs",
+    "source": "https://registry.npmjs.org/postcss/-/postcss-8.5.28.tgz",
+    "build": "tools/css-parser/build.cjs",
+    "sha256": "11e87e78f02d3fd6c74698ce2cd5f2e06e405e1838c7318d3a925b6082a6c303"
+  },
+  {
+    "file": "postcss/picocolors-LICENSE.txt",
+    "source": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
+    "sha256": "6582629e2979466878f6014313dcc2f3756c9616148682227ce3063dde310750"
+  },
+  {
+    "file": "postcss/postcss-LICENSE.txt",
+    "source": "https://registry.npmjs.org/postcss/-/postcss-8.5.28.tgz",
+    "sha256": "5be1f3465bba68a626777f984878814aaf35e7ef8e9fd314d469bcf887050fb8"
+  },
+  {
+    "file": "postcss/source-map-js-LICENSE.txt",
+    "source": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.1.tgz",
+    "sha256": "6cb0631f71c7749763fd3dd1d5bee52dd1070ec17f2edc1710079ad070bd2fbd"
   }
 ]

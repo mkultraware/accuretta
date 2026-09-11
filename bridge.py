@@ -51,7 +51,8 @@ from concurrent.futures import ThreadPoolExecutor
 from security_overview import SecurityOverviewService
 from task_state import UndoStore, file_revision
 from conversation_tools import SteeringInbox, search_conversations
-from agent_reliability import EvidenceStore, compare_responses, review_evidence, feedback, verification_advice
+from deep_research import ResearchStore, RESEARCH_TOOLS, RESEARCH_PROMPT, brief as research_brief, tool_specs as research_tool_specs
+from agent_reliability import EvidenceStore, compare_responses, review_evidence, response_state, identity_fingerprint, feedback, verification_advice
 
 _steering = SteeringInbox()
 from network_policy import install_offline_guard
@@ -248,6 +249,8 @@ _DESKTOP_SNAPSHOT_CACHE_MAX = 12
 
 ROOT = Path(__file__).parent.resolve()
 DATA = Path(os.environ.get("ACCURETTA_DATA_DIR") or ROOT / "data").resolve()
+_research_store = ResearchStore(DATA / "research")
+_research_runs: dict[str, str] = {}
 VERSIONS_DIR = DATA / "versions"
 PENDING_DIR = DATA / "pending"
 SNAPSHOTS_DIR = DATA / "snapshots"
@@ -536,7 +539,8 @@ def _chat_payload_digest(value: Any) -> str:
 
 def _normalize_composer_mode(value: Any) -> str:
     """Collapse the retired Auto composer mode to its real behavior: Agent."""
-    return "ide" if str(value or "").strip().lower() == "ide" else "agent"
+    mode = str(value or "").strip().lower()
+    return mode if mode in {"ide", "research"} else "agent"
 
 
 def _normalize_chats_data(value: Any) -> dict:
@@ -2706,8 +2710,26 @@ def get_chat_index() -> dict:
             continue
         summary = {key: value for key, value in record.items() if key != "messages"}
         summary["_summary"] = True
+        summary["task_state"] = _chat_task_state(chat_id, record)
         index[chat_id] = summary
     return {"chats": index, "order": list(snapshot["order"])}
+
+
+def _chat_task_state(chat_id: str, chat: dict) -> str:
+    if any(a.get("chat_id") == chat_id and a.get("status") == "pending" for a in list_approvals()):
+        return "needs-you"
+    if chat_id in _chat_emitters:
+        return "working"
+    messages = chat.get("messages", [])
+    latest = next((m for m in reversed(messages) if m.get("role") == "assistant" and not m.get("tool_calls")), {})
+    recovery = chat.get("turn_recovery") or {}
+    if recovery and recovery.get("recovered_at", 0) >= latest.get("t", 0):
+        return "interrupted"
+    if latest.get("_stopped"):
+        return "stopped"
+    if latest.get("_failed"):
+        return "failed"
+    return "finished" if latest else "ready"
 
 
 def _turn_journal_path(chat_id: str) -> Path:
@@ -4402,18 +4424,20 @@ def _review_finding_args(args):
     if not isinstance(challenge, dict):
         raise ValueError("challenge must be an object")
     claim = {key: args.get(key) for key in ("title", "target", "description", "severity")}
-    review = review_evidence(claim, records, challenge)
     control = challenge.get("control") or {}
+    control_record = (store.read(cid, mission_id, control["evidence_id"])
+                      if isinstance(control, dict) and control.get("evidence_id") else None)
+    review = review_evidence(claim, records, challenge, control_record)
     if isinstance(control, dict) and control.get("evidence_id"):
-        record = store.read(cid, mission_id, control["evidence_id"])
+        record = control_record
         quote = control.get("quote")
         raw = json.dumps(record["result"], ensure_ascii=False, sort_keys=True, default=str)
         expected_denial = (record["state"] == "authentication_unavailable"
                            and control.get("expected_status") == record["result"].get("status")
                            and isinstance(control.get("purpose"), str) and len(control["purpose"].strip()) >= 12)
-        if (record["id"] in ids or (record["state"] != "observed" and not expected_denial) or not isinstance(quote, str)
-                or len(quote.strip()) < 12 or quote not in raw):
-            review["issues"].append("The control must be a separate observed result with an exact quote of at least 12 characters.")
+        if (record["id"] in ids or (record["state"] != "observed" and not expected_denial)
+                or (quote and (not isinstance(quote, str) or quote not in raw))):
+            review["issues"].append("The control must be a separate conclusive result; an optional quote must match exactly.")
         target_origin = urllib.parse.urlsplit(str(args.get("target") or "")).netloc
         if target_origin and urllib.parse.urlsplit(record["target"]).netloc != target_origin:
             review["issues"].append("The control must belong to the same target origin.")
@@ -4466,8 +4490,11 @@ def tool_security_coverage(args):
         if not isinstance(ids, list) or len(ids) > 8:
             raise ValueError("evidence_ids must contain at most 8 IDs")
         observations = [store.read(cid, mission_id, value) for value in ids]
-        if any(r["target"] != target for r in observations):
-            raise ValueError("Coverage evidence must match its exact target")
+        wanted = urllib.parse.urlsplit(target)
+        if any((urllib.parse.urlsplit(r["target"]).scheme, urllib.parse.urlsplit(r["target"]).netloc,
+                urllib.parse.urlsplit(r["target"]).path or "/") !=
+               (wanted.scheme, wanted.netloc, wanted.path or "/") for r in observations):
+            raise ValueError("Coverage evidence must match the target endpoint")
         state = "untested" if not observations else "observed"
         if any(r["state"] != "observed" for r in observations):
             state = next(r["state"] for r in observations if r["state"] != "observed")
@@ -4539,6 +4566,7 @@ def tool_record_finding(args: dict) -> dict:
         "confidence": max(0, min(100, int(args.get("confidence") or 0))),
         "target": str(args.get("target") or row.get("target") or "")[:240],
         "description": str(args.get("description") or row.get("description") or "")[:2000],
+        "inferred_impact": str(args.get("inferred_impact") or "")[:2000],
         "evidence": str(args.get("evidence") or row.get("evidence") or "")[:3000],
         "source_tool": source_tool,
         "source_observed": bool(source_ok),
@@ -4564,6 +4592,11 @@ def tool_list_findings(args: dict) -> dict:
         return {"error": "no active chat"}
     chat = (get_chats().get("chats", {}) or {}).get(cid) or {}
     findings = [copy.deepcopy(x) for x in (chat.get("findings") or []) if isinstance(x, dict)]
+    for finding in findings:
+        if finding.get("status") in {"validated", "reproduced"}:
+            checked = tool_review_finding({**finding, "challenge": (finding.get("review") or {}).get("challenge") or {}})
+            if not checked.get("eligible"):
+                finding.update(status="candidate", source_observed=False, review=checked)
     status = str(args.get("status") or "").lower()
     if status:
         findings = [x for x in findings if str(x.get("status") or "").lower() == status]
@@ -4792,6 +4825,21 @@ def _rt_tok_matches(tok: str, host: str, port: int | None) -> bool:
             return (host == th or host.endswith("." + th)) and port == int(tp)
     tok = tok.lstrip("*.")
     return host == tok or host.endswith("." + tok)   # host / parent domain
+
+
+_RT_HOST_METADATA_TOOLS = {
+    "recon_dns", "recon_subdomains", "recon_rdap", "recon_web_archive",
+}
+
+
+def _rt_allow_matches(name: str, tok: str, host: str, port: int | None) -> bool:
+    """Let host metadata checks omit an authorized port without widening traffic scope."""
+    if _rt_tok_matches(tok, host, port):
+        return True
+    if name not in _RT_HOST_METADATA_TOOLS or port is not None or ":" not in tok:
+        return False
+    token_host, token_port = tok.rsplit(":", 1)
+    return token_port.isdigit() and _rt_tok_matches(token_host, host, None)
 
 
 def _rt_authorized_mission(chat: dict | None) -> dict | None:
@@ -5480,9 +5528,8 @@ def _rt_scope_block(name: str, args: dict) -> str | None:
             return ("refused: AXFR directly contacts the target's nameserver and is not "
                     "allowed in passive OSINT.")
     if name in _RT_EXPLOIT_TOOL_NAMES and not _rt_incl_exploit_for(chat, settings):
-        return ("refused: exploit tools are locked during recon. Use observe_response, compare_evidence, "
-                "and review_finding to collect and challenge evidence, then record_finding. "
-                "The user's explicit force-exploit setting is a separate override.")
+        return ("refused: this action is outside Target Recon mode. Start an authorized Red Team "
+                "assessment for active testing. Finding validation affects reporting, not tool access.")
 
     host, port = _rt_endpoint_from_args(args)
     if not host:
@@ -5498,7 +5545,7 @@ def _rt_scope_block(name: str, args: dict) -> str | None:
             return (f"refused: {where} is OUT OF SCOPE (you marked '{tok}' out of "
                     f"scope). Stay on the in-scope target.")
     allowed = _rt_scope_in_tokens(chat)
-    if not any(_rt_tok_matches(tok, host, port) for tok in allowed):
+    if not any(_rt_allow_matches(name, tok, host, port) for tok in allowed):
         where = f"{host}:{port}" if port else host
         return (f"refused: {where} is not in the user-authorized scope "
                 f"({', '.join(allowed) or 'no targets'}). Return to the confirmed target.")
@@ -5631,18 +5678,18 @@ def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
 def _rt_incl_exploit_for(chat: dict | None, settings: dict | None = None) -> bool:
     """Whether tools_for_llama should expose the exploit subset for `chat`.
 
-    The suite splits into an always-on recon set and a heavier exploit set
-    (_RT_EXPLOIT_TOOL_NAMES) that stays OUT of the spec until the mission reaches
-    the exploit phase — set by a validate_finding confirm or forced by the
-    rt_force_exploit override. When red-team mission tracking is off there is no
-    phase to reach, so nothing is gated (preserves pre-split behavior)."""
+    The suite splits into discovery tools and active testing tools. The user's
+    selected engagement mode controls availability. Evidence status controls
+    reporting only, so a finding never has to validate itself to unlock the tool
+    needed to reproduce it."""
     s = settings or get_settings()
     if not (s.get("red_team_enabled") and s.get("rt_mission_state", True)):
         return True
     if s.get("rt_force_exploit"):
         return True
     m = chat.get("mission") if isinstance(chat, dict) else None
-    return bool(isinstance(m, dict) and m.get("phase") == "exploit")
+    return bool(isinstance(m, dict)
+                and (m.get("engagement") == "pentest" or m.get("phase") == "exploit"))
 
 
 def _rt_mission_render(chat: dict, budget_chars: int | None = None) -> str:
@@ -5663,7 +5710,7 @@ def _rt_mission_render(chat: dict, budget_chars: int | None = None) -> str:
     if m.get("user_agent"):
         head.append(f"required user agent: {m['user_agent']}")
     if budget_chars is None:
-        head.append("Evidence workflow: plan feature/identity checks with security_coverage; preserve receipt IDs; compare baseline/test/control with compare_evidence; challenge claims with review_finding before record_finding. Observed does not mean secure. Load a relevant built-in rt-* skill for prerequisites and disproof checks.")
+        head.append("Authorization controls actions; evidence controls conclusions. In Red Team mode, continue any permitted in-scope, non-destructive test without waiting for a finding to be promoted. For validated claims, preserve two response receipts and a meaningful control, then use review_finding. Scanner output alone is a candidate. Keep observed and inferred impact separate, link completed coverage to receipts, and describe blocked or incomplete checks as gaps.")
         coverage = [p for p in chat.get("security_coverage", []) if p.get("mission_id") == m.get("authorization_id")]
         head.extend(f"coverage ({p.get('state', 'untested')}): {p.get('feature')} / {p.get('identity')} / {p.get('target')}" for p in coverage[-12:])
     facts = list(m.get("facts") or [])
@@ -6608,6 +6655,7 @@ def request_approval(title: str, command: str, details: dict | None = None, time
     ev = threading.Event()
     entry = {
         "id": aid,
+        "chat_id": _get_current_chat(),
         "title": title,
         "command": command,
         "details": details or {},
@@ -7177,14 +7225,17 @@ def _undo_commit_turn() -> dict | None:
     return _undo_store.commit()
 
 
-def _undo_restore(turn_id: str) -> dict:
-    result = _undo_store.restore(str(turn_id or "").strip())
+def _undo_restore(turn_id: str, *, chat_id: str = "", file_index: int | None = None) -> dict:
+    result = _undo_store.restore(str(turn_id or "").strip(), chat_id=chat_id, file_index=file_index)
     if result.get("ok"):
         snapshot = get_chats()
         for chat in snapshot.get("chats", {}).values():
             for item in chat.get("undo_turns", []):
                 if item.get("turn_id") == turn_id:
-                    item["undone"] = True
+                    item["undone"] = result.get("remaining", 0) == 0
+                    if file_index is not None and 0 <= file_index < len(item.get("files", [])):
+                        item["files"][file_index]["restorable"] = False
+                        item["files"][file_index]["undone"] = True
         save_json(CHATS_FILE, snapshot)
     broadcast_event({"type": "workspace:update"})
     return result
@@ -17620,6 +17671,7 @@ def tool_http_request(args: dict) -> dict:
         req_headers = _browser_headers(profile, accept_html=True)
         req_headers.update(headers)  # caller-supplied headers/cookies win
         req_headers = _rt_apply_mission_user_agent(req_headers)
+        attempt_started = time.monotonic()
         try:
             req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
             _request_handlers = [_ScopeCheckedRedirect()]
@@ -17630,7 +17682,7 @@ def tool_http_request(args: dict) -> dict:
             with opener.open(req, timeout=timeout) as resp:
                 status = getattr(resp, "status", 200) or 200
                 resp_headers, set_cookie = _headers_of(resp.headers)
-                raw = resp.read(1024 * 1024)
+                raw = resp.read(1024 * 1024 + 1)
                 final_url = resp.geturl()
             resp_body_text = raw.decode("utf-8", "replace")
             _absorb_cookies(set_cookie)
@@ -17641,6 +17693,10 @@ def tool_http_request(args: dict) -> dict:
                 "headers": resp_headers,
                 "set_cookie": set_cookie,  # every Set-Cookie the server sent
                 "body": resp_body_text,
+                "elapsed_ms": round((time.monotonic() - attempt_started) * 1000, 1),
+                "attempt": attempt + 1,
+                "potentially_truncated": len(raw) > 1024 * 1024,
+                "request_identity_fingerprint": identity_fingerprint(req_headers),
                 "user_agent": req_headers.get("User-Agent", ""),
             }
             if session:
@@ -17653,10 +17709,15 @@ def tool_http_request(args: dict) -> dict:
                     result.update(ev)
             return result
         except urllib.error.HTTPError as e:
+            # HTTP errors still have a response status; evidence capture below
+            # must use it instead of the success-path local.
+            status = e.code
             resp_headers, set_cookie = _headers_of(e.headers)
             try:
-                body_txt = e.read().decode("utf-8", "replace")
+                error_body = e.read(1024 * 1024 + 1)
+                body_txt = error_body.decode("utf-8", "replace")
             except Exception:
+                error_body = b""
                 body_txt = ""
             # Only 429/503 are worth rotating past; 401/403/404/405/5xx are the
             # finding itself and are returned immediately.
@@ -17671,6 +17732,10 @@ def tool_http_request(args: dict) -> dict:
                 "headers": resp_headers,
                 "set_cookie": set_cookie,
                 "body": body_txt,
+                "elapsed_ms": round((time.monotonic() - attempt_started) * 1000, 1),
+                "attempt": attempt + 1,
+                "potentially_truncated": len(error_body) > 1024 * 1024,
+                "request_identity_fingerprint": identity_fingerprint(req_headers),
                 "user_agent": req_headers.get("User-Agent", ""),
                 "note": f"HTTP {e.code}",
             }
@@ -19193,7 +19258,7 @@ def _tool_contract_row(name: str, visible: set[str], unavailable: dict[str, str]
     elif name in _DESKTOP_TOOL_NAMES:
         side_effect, scope, approval = "host UI/action", "desktop allowlist", "policy gated"
     elif name.startswith(("recon_", "rt_")):
-        side_effect, scope, approval = "target network traffic", "authorized mission allowlist", "mission/phase gated"
+        side_effect, scope, approval = "target network traffic", "authorized mission allowlist", "engagement-mode gated"
     elif name.startswith("sandbox_"):
         side_effect, scope, approval = "sandbox process/network", "authorized mission + guest", "policy gated"
     elif name.startswith("mcp_"):
@@ -19373,13 +19438,47 @@ def _check_html_syntax(file_path: str) -> dict:
                       "unclosed script/style. Browser-tolerated quirks are not flagged.)"}
 
 
+def _syntax_unchecked(reason: str) -> dict:
+    return {"check_status": "unchecked", "not_executed": True, "reason": reason,
+            "result": f"Syntax not checked: {reason}"}
+
+
+def _check_css_syntax(file_path: str) -> dict:
+    node_exe = _trusted_node_binary()
+    if not node_exe:
+        return _syntax_unchecked("A trusted Node.js executable is required for CSS parsing.")
+    checker = ROOT / "css-syntax-check.cjs"
+    if not checker.is_file() or not (ROOT / "assets/vendor/postcss/parse.cjs").is_file():
+        return _syntax_unchecked("The bundled CSS parser is missing.")
+    try:
+        source = Path(file_path).read_text(encoding="utf-8-sig")
+        environment = {key: value for key, value in os.environ.items()
+                       if key.upper() not in {"NODE_OPTIONS", "NODE_PATH"}}
+        completed = subprocess.run(
+            [node_exe, str(checker), file_path], input=source, capture_output=True,
+            text=True, encoding="utf-8", cwd=str(ROOT), env=environment,
+            creationflags=_NO_WINDOW, timeout=30)
+        if completed.returncode:
+            return _syntax_unchecked("The CSS parser could not complete its check.")
+        result = json.loads(completed.stdout)
+        if not isinstance(result, dict) or result.get("check_status") not in {"passed", "failed"}:
+            return _syntax_unchecked("The CSS parser returned an invalid result.")
+        return result
+    except subprocess.TimeoutExpired:
+        return _syntax_unchecked("CSS parsing timed out after 30 seconds.")
+    except (OSError, UnicodeError, ValueError) as error:
+        return _syntax_unchecked(f"CSS parsing could not run: {error}")
+
+
 def tool_check_syntax(args: dict) -> dict:
     path = normalize_path(args.get("path", ""))
     if not is_in_workspace(path):
         return {"error": "Path is outside workspace bounds."}
     before = file_revision(path)
     result = _check_syntax_impl(args)
-    if not result.get("error") and before and file_revision(path) == before:
+    if (not result.get("error") and not result.get("not_executed")
+            and result.get("check_status") != "unchecked"
+            and before and file_revision(path) == before):
         result["verification"] = {"sha256": before, "kind": "syntax"}
     return result
 
@@ -19392,6 +19491,8 @@ def _check_syntax_impl(args: dict) -> dict:
         return {"error": f"File not found: {file_path}"}
 
     ext = os.path.splitext(file_path)[1].lower()
+    if ext == '.css':
+        return _check_css_syntax(file_path)
     if ext in ('.html', '.htm', '.xhtml'):
         return _check_html_syntax(file_path)
     if ext == '.py':
@@ -19417,7 +19518,7 @@ def _check_syntax_impl(args: dict) -> dict:
         except subprocess.TimeoutExpired:
             return {"error": "Node.js syntax check timed out after 60 seconds."}
     else:
-        return {"error": f"Unsupported extension: {ext}"}
+        return _syntax_unchecked(f"Unsupported file type: {ext or '(no extension)'}.")
 
 
 def _full_test_run(command: str, output: str) -> bool:
@@ -20035,7 +20136,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_unpin_note,
     },
     "check_syntax": {
-        "description": "Check the syntax of a Python, JS/TS, or HTML file without executing it. Returns line numbers of any errors. HTML gets a lenient structural check (tag nesting, unclosed script/style) — browser-tolerated quirks are not flagged.",
+        "description": "Check the syntax of a Python, JS/TS, CSS, or HTML file without executing it. Returns error locations. CSS uses a bundled PostCSS parser; it does not validate property values or rendering. HTML gets a lenient structural check. Unsupported file types are reported as not checked, never passed.",
         "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Path to the file."}},
@@ -20175,7 +20276,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_http_request,
     },
     "rt_browser": {
-        "description": "AUTHORIZED PENTEST. Persistent scope-enforced Chromium for JavaScript-heavy validation after a real finding is confirmed. Every HTTP, WebSocket, iframe, popup, redirect, and subresource request is checked against the engagement allowlist before it leaves the browser. Use navigate, snapshot, click, fill, press, wait, requests, pages, select_page, screenshot, or close. Downloads and arbitrary JavaScript evaluation are intentionally unavailable.",
+        "description": "AUTHORIZED PENTEST. Persistent scope-enforced Chromium for JavaScript-heavy in-scope testing and reproduction. Every HTTP, WebSocket, iframe, popup, redirect, and subresource request is checked against the engagement allowlist before it leaves the browser. Use navigate, snapshot, click, fill, press, wait, requests, pages, select_page, screenshot, or close. Downloads and arbitrary JavaScript evaluation are intentionally unavailable.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -21718,19 +21819,31 @@ TOOLS: dict[str, dict] = {
 }
 
 
-_OBSERVATION_SCHEMA = {"type": "object", "properties": {"evidence_id": {"type": "string"}, "quote": {"type": "string"}, "expected_status": {"type": "integer", "description": "For an intentionally denied control, the expected HTTP status."}, "purpose": {"type": "string", "description": "Explain why a denied control is expected rather than an expired test session."}}, "required": ["evidence_id", "quote"]}
+_OBSERVATION_SCHEMA = {"type": "object", "properties": {"evidence_id": {"type": "string"}, "quote": {"type": "string", "description": "Optional exact excerpt for human review."}, "expected_status": {"type": "integer", "description": "For an intentionally denied control, the expected HTTP status."}, "purpose": {"type": "string", "description": "Why this is a meaningful control; required for an equivalent endpoint or expected denial."}}, "required": ["evidence_id"]}
 _CHALLENGE_SCHEMA = {"type": "object", "properties": {
     **{key: {"type": "string"} for key in ("expected_boundary", "demonstrated_impact", "alternative_explanation", "disproof_check", "limitations")},
+    "test": {"type": "object", "properties": {
+        "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "BROWSER"]},
+        "location": {"type": "string", "enum": ["query", "body", "header", "interaction", "none"]},
+        "parameter": {"type": "string", "description": "Exact tested parameter; empty only for location none."},
+        "control_strategy": {"type": "string", "enum": ["same_endpoint", "equivalent"], "description": "Default same_endpoint. Use equivalent with a control purpose when another path is the valid comparison."},
+        "assertion": {"type": "object", "properties": {
+            "path": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]}, "description": "Path into the recorded tool result, such as [body], [status], [elapsed_ms], or [text]."},
+            "operation": {"type": "string", "enum": ["contains", "equals", "greater_than", "less_than"]},
+            "value": {"description": "Expected string, number, or boolean. Must pass on both observations and fail on the control."}},
+            "required": ["path", "operation", "value"]}},
+        "required": ["method", "location", "parameter", "assertion"]},
     "observations": {"type": "array", "items": _OBSERVATION_SCHEMA}, "control": _OBSERVATION_SCHEMA},
-    "required": ["expected_boundary", "demonstrated_impact", "alternative_explanation", "disproof_check", "limitations", "observations", "control"]}
+    "required": ["expected_boundary", "demonstrated_impact", "alternative_explanation", "disproof_check", "limitations", "control", "test"]}
 TOOLS["record_finding"]["parameters"]["properties"]["challenge"] = _CHALLENGE_SCHEMA
+TOOLS["record_finding"]["parameters"]["properties"]["inferred_impact"] = {"type": "string", "description": "Potential impact not demonstrated by the response assertion. Never present this as verified access."}
 TOOLS.update({
     "observe_response": {
         "description": "Capture one scoped GET response for a baseline, test, control, or reproduction. Does not follow redirects. Returns status, headers, body and an evidence receipt; HTTP responses do not themselves prove vulnerabilities. Supports explicit approved account headers without session reuse.",
         "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "headers": {"type": "object", "additionalProperties": {"type": "string"}}}, "required": ["url"]},
         "fn": tool_observe_response},
     "review_finding": {
-        "description": "Challenge a finding before promotion. Supply exact target, claim, two independent supporting receipt IDs, and a separate control receipt. Quotes must occur in the raw recorded results. Completeness is checked; interpretation is not independently certified.",
+        "description": "Challenge a finding before promotion. Supply the finding endpoint, two independent supporting receipts, a control receipt, and one machine-checkable result assertion. HTTP, numeric/timing, and browser-result assertions are supported. The control may use the same endpoint or a justified equivalent endpoint on the authorized origin. Interpretation is not independently certified.",
         "parameters": {"type": "object", "properties": {
             **{key: {"type": "string"} for key in ("title", "target", "description", "severity")},
             "evidence_ids": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 8},
@@ -21955,6 +22068,9 @@ def _truncation_envelope(result: Any, cap: int, original_chars: int) -> str:
     keys = list(result.keys()) if isinstance(result, dict) else None
     return json.dumps({
         "_truncated": True,
+        **({"research_source_id": result["research_source_id"],
+            "research_recovery": "Read stored source text using research_notebook(source_id=research_source_id, offset=0); follow next_offset."}
+           if isinstance(result, dict) and result.get("research_source_id") else {}),
         **({"evidence_receipt": {"id": result["evidence_receipt"]["id"]},
             "evidence_recovery": "Read the recorded result with security_coverage(evidence_id=..., offset=0); do not repeat network requests to recover output."}
            if isinstance(result, dict) and isinstance(result.get("evidence_receipt"), dict) and result["evidence_receipt"].get("id") else {}),
@@ -22079,9 +22195,9 @@ def compress_tool_result(name: str, result: Any, cap: int) -> str:
 
 # Red-team recon suite — gated behind `red_team_enabled` so a normal coding
 # turn doesn't carry ~13 tools it will never call (real token cost every turn).
-# The heavier "break-in" primitives. Held OUT of the tools spec until a run
-# reaches the exploit phase (a validate_finding confirm, or the manual override
-# rt_force_exploit), so a recon turn never pays their token cost. See
+# The heavier active-testing primitives. Held out of Target Recon and exposed
+# from the start of an explicitly authorized Red Team assessment. This keeps
+# recon lean without making evidence promotion a capability gate. See
 # _rt_incl_exploit_for / _active_tools. Every name here must stay a real breach
 # tool — the recon set below is what's always on when red_team_enabled.
 _RT_EXPLOIT_TOOL_NAMES = {
@@ -22102,7 +22218,7 @@ _RT_EXPLOIT_TOOL_NAMES = {
     "tcp_send",
 }
 # Always-on recon/analysis set when red_team_enabled. Passive-to-benign probes,
-# the finding validator (which flips the phase), the Burp-Decoder encoder, and
+# the finding validator, the Burp-Decoder encoder, and
 # front-end/CORS scanners — the model needs these to FIND something worth the
 # exploit set, so they carry every red-team turn.
 _RT_RECON_TOOL_NAMES = {
@@ -22360,6 +22476,31 @@ _ANALYSIS_SUITE_TOOL_NAMES = {
 # needs; a loaded bundle joins the schema for the rest of that chat. Hiding is
 # about prompt tokens ONLY — invoke_tool still resolves and runs any TOOLS
 # name, so a tool the model somehow knows stays callable either way.
+def _research_context(chat_id: str = "") -> tuple[str, str]:
+    chat_id = chat_id or _get_current_chat()
+    if not chat_id:
+        return "", ""
+    if chat_id in _research_runs:
+        return chat_id, _research_runs[chat_id]
+    chat = (get_chats().get("chats") or {}).get(chat_id) or {}
+    return chat_id, str(chat.get("research_id") or "") if chat.get("last_mode") == "research" else ""
+
+
+def _research_action(name: str, args: dict) -> dict:
+    chat_id, research_id = _research_context()
+    if not research_id:
+        return {"error": "Start Deep Research from the mode menu and provide a brief first."}
+    try:
+        result = _research_store.apply(research_id, chat_id, name, args)
+        _emit_chat_event({"type": "research_update", "research": result["research"]})
+        return result["model_result"]
+    except (ValueError, OSError) as error:
+        return {"error": str(error)}
+
+
+TOOLS.update(research_tool_specs(_research_action))
+
+
 _CORE_TOOL_NAMES = {
     # file / workspace (always needed)
     "read_file", "write_file", "edit_file", "delete_file", "list_directory",
@@ -22866,6 +23007,9 @@ def _visible_tool_names(include_exploit: bool = True, chat_id: str = "") -> set[
     name that isn't actually registered (MCP tools disappear when their server
     dies between unlock and request)."""
     excluded = _excluded_tools(include_exploit, chat_id)
+    if _research_context(chat_id)[1]:
+        return {name for name in RESEARCH_TOOLS if name in TOOLS and name not in excluded
+                and _execution_target_allows_tool(name, chat_id)}
     visible: set[str] = set(_base_core_tool_names())
     visible.add("verification_guidance")
     if get_settings().get("red_team_enabled") and chat_id:
@@ -22878,8 +23022,8 @@ def _visible_tool_names(include_exploit: bool = True, chat_id: str = "") -> set[
         except Exception:
             _chat = None
         # An authorized gate launch is itself the user's request to use the
-        # suite. Auto-load recon for that mission; unlock exploit schemas when
-        # the phase gate opens. Requiring a small model to discover and call a
+        # suite. Auto-load discovery tools for any mission and active testing
+        # tools for Red Team mode. Requiring a small model to discover and call a
         # separate bundle-loader before following the one-click workflow made
         # the supposedly autonomous path unreliable.
         active_rt = bool(_rt_authorized_mission(_chat))
@@ -23613,13 +23757,14 @@ def _task_check_record(name: str, args: dict, result: Any) -> dict | None:
         return None
     failed = bool(result.get("error") or result.get("ok") is False
                   or result.get("not_executed") or result.get("exit_code") not in (None, 0))
+    unchecked = name == "check_syntax" and result.get("check_status") == "unchecked"
     proof = result.get("verification") or {}
     revisions = proof.get("revisions", {}) if name == "run_tests" else {
         _verification_key(args.get("path")): proof.get("sha256")}
     return {"name": name, "key": name + ":" + str(args.get("path") or args.get("command") or args.get("cwd") or ""),
-            "status": "failed" if failed else "passed",
+            "status": "unchecked" if unchecked else "failed" if failed else "passed",
             "label": "Project tests" if name == "run_tests" else "Syntax check",
-            "detail": str(result.get("error") or args.get("path") or args.get("command") or "")[:500],
+            "detail": str(result.get("error") or result.get("reason") or args.get("path") or args.get("command") or "")[:500],
             "full_tests": bool(name == "run_tests" and proof.get("tests_ran") and proof.get("target") == "host"),
             "revisions": revisions}
 
@@ -23641,7 +23786,8 @@ def _task_verification_summary(files: list[dict], checks: list[dict]) -> dict:
     keys = {_verification_key(item["path"]) for item in files}
     status = ("failed" if any(c["status"] == "failed" for c in latest.values())
               else "passed" if keys and keys <= covered
-              else "partial" if covered or syntax or checks else "unchecked")
+              else "partial" if covered or syntax or any(c["status"] == "passed" for c in latest.values())
+              else "unchecked")
     return {"status": status, "checked_files": len(covered), "total_files": len(files),
             "checks": [{k: v for k, v in check.items() if k not in {"revisions", "full_tests", "key"}}
                        for check in checks]}
@@ -23774,6 +23920,8 @@ def _call_serial_key(call: dict) -> str:
     the loop-breaker's raw path form), shared-store tools key on a constant so
     they serialize with each other; "" = no constraint (full parallelism)."""
     canon = _resolve_tool_name(call.get("name") or "")
+    if canon.startswith("research_"):
+        return "research-notebook"
     if canon in {"run_powershell", "run_tests"} or canon.startswith("sandbox_"):
         return "local-process"
     tgt = _call_write_target(call)
@@ -23942,7 +24090,15 @@ def _invoke_tool_with_context(name: str, args: dict, call_id: str) -> dict:
         if _steering.pending(_current_chat_id.get()):
             return {"error": "Action skipped because the user updated the current task.",
                     "not_executed": True, "superseded": True}
-        return feedback(canon, invoke_tool(canon, args))
+        result = feedback(canon, invoke_tool(canon, args))
+        chat_id, research_id = _research_context()
+        if research_id:
+            observed = _research_store.observe(research_id, chat_id, canon, args, result)
+            if observed:
+                if observed["source_id"]:
+                    result = {**result, "research_source_id": observed["source_id"]}
+                _emit_chat_event({"type": "research_update", "research": observed["research"]})
+        return result
     finally:
         _current_tool_call_id.reset(call_token)
         _current_tool_name.reset(name_token)
@@ -23950,6 +24106,8 @@ def _invoke_tool_with_context(name: str, args: dict, call_id: str) -> dict:
 
 def invoke_tool(name: str, args: dict) -> dict:
     canon = _resolve_tool_name(name)
+    if _research_context()[1] and canon not in RESEARCH_TOOLS:
+        return {"error": "Deep Research supports reading and evidence collection only.", "not_executed": True}
     if _offline_active and (canon.startswith(("web_", "recon_", "rt_", "browser_", "remote_", "mcp_", "sandbox_")) or canon in {"search_web", "fetch_url"}):
         return {"error": "This network integration is disabled in offline mode.", "not_executed": True}
     t = TOOLS.get(canon)
@@ -26066,6 +26224,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         max_tool_rounds = max(1, min(max_tool_rounds, 500))
         rounds = 0
         empty_retries = 0    # blank-reply-after-tools nudges used this turn
+        research_retries = 0
         auto_continues = 0   # mid-plan stall bumps used this turn (see _looks_unfinished)
         # Turn-level loop guard: consecutive rounds where EVERY call came back as
         # a loop-breaker refusal (the model keeps re-emitting a call the harness
@@ -26135,6 +26294,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             if settings.get("rt_mission_state", True) and isinstance(_c0.get("mission"), dict):
                 _rt_chat["mission"] = dict(_c0["mission"])
             _rt_on = bool(settings.get("red_team_enabled")
+                          and _c0.get("last_mode") != "research"
                           and settings.get("rt_mission_state", True)
                           and _rt_authorized_mission(_c0))
             _pins_tail = [str(p) for p in (_c0.get("pins") or [])]
@@ -26152,7 +26312,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             _roll_active = bool(_c0.get("rolling_summary"))
         except Exception:
             pass
-        _rt_chat_ctx_token = _current_rt_chat.set(_rt_chat if _rt_on else None)
+        _rt_chat_ctx_token = _current_rt_chat.set({} if _research_context(chat_id)[1] else _rt_chat if _rt_on else None)
         if _rt_on:
             _mission = _rt_chat.get("mission") or {}
             emit({
@@ -26290,9 +26450,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # server rejects with "exceeds context size". Use /tokenize for
             # an exact count (cached per spec) so the trimmer's budget reflects
             # what actually gets sent.
-            # Red-team phase gate, recomputed each round so a mid-turn
-            # validate_finding confirm (which flips _rt_chat's mission to the
-            # exploit phase below) widens the tools spec on the very next round.
+            # Red-team capability gate, recomputed each round from the user's
+            # selected engagement mode and current mission state.
             _rt_incl_exploit = _rt_incl_exploit_for(_rt_chat, settings)
             tools_overhead = 0
             if use_tools and native_tools:
@@ -27336,7 +27495,25 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 ]
 
             if not parsed_calls or rounds >= max_tool_rounds:
+                terminal_error = None
+                research_id = _research_context(chat_id)[1]
+                if research_id and not parsed_calls and use_tools and rounds < max_tool_rounds and research_retries < 2:
+                    notebook = _research_store.get(research_id, chat_id)
+                    if notebook["notes"] and notebook["status"] != "complete":
+                        research_retries += 1
+                        conversation.append({"role": "user", "content":
+                            "The research notebook has evidence but no published presentation. Call research_notebook, "
+                            "resolve uncovered questions or declare the gaps, then call research_publish. "
+                            "Do not claim the presentation exists before the tool succeeds."})
+                        rounds += 1
+                        continue
                 _final_text = _visible_final_answer(assistant_msg.get("content") or "")
+                if research_id and not parsed_calls and not _final_text:
+                    notebook = _research_store.get(research_id, chat_id)
+                    if notebook["status"] == "complete" and notebook.get("presentation"):
+                        assistant_msg["content"] = "Your research presentation is ready. Open it to review the findings and sources."
+                        _final_text = assistant_msg["content"]
+                        finish_reason = "stop"
                 if parsed_calls and rounds >= max_tool_rounds:
                     assistant_msg["tool_calls"] = []
                     assistant_msg["content"] = (
@@ -27344,7 +27521,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         "That call was not executed."
                     )
                     _final_text = assistant_msg["content"]
-                    emit({"type": "error", "error": assistant_msg["content"]})
+                    terminal_error = assistant_msg["content"]
                 elif not _final_text and empty_retries < 2:
                     empty_retries += 1
                     conversation.append({
@@ -27363,14 +27540,12 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     continue
                 elif not _final_text:
                     completed = any(item.get("ok") for item in turn_tool_outcomes)
-                    assistant_msg["content"] = (
+                    terminal_error = (
                         "The requested tool action completed, but the model did not produce a final response."
                         if completed else
                         "I could not complete the requested action because the model did not produce an "
                         "executable tool call after two retries. Nothing was changed."
                     )
-                    _final_text = assistant_msg["content"]
-                    emit({"type": "error", "error": assistant_msg["content"]})
                 # Token-limit truncation: the stream stopped because the reply
                 # hit max_tokens (finish_reason "length"). A long report (red-
                 # team summaries, big diffs) must not die dangling — continue
@@ -27440,6 +27615,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 assistant_msg["_stats"] = turn_stats
                 if _apply_task_updates(_steering.take(chat_id, close_if_empty=True)):
                     continue
+                if terminal_error:
+                    assistant_msg["content"] = terminal_error
+                    assistant_msg["_failed"] = True
+                    emit({"type": "error", "error": terminal_error})
                 # Lifetime savings: add this turn's tokens to the durable counters
                 # (summed per-round, as a cloud API would bill) and push the new
                 # totals to the widget. Fall back to a char estimate when the
@@ -27830,14 +28009,16 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         _t = _rt_target_from_args(name, args)
                         if _t and _rt_mission_note(_rt_chat, target=_t):
                             _rt_dirty = True
-                    # Harness-observed confirmation opens the exploit subset. The
-                    # live context makes the transition visible to the next worker
-                    # before the turn's single chats.json commit.
-                    if _rt_on and _rt_result_confirms_finding(name, result):
+                    # Phase is activity history for the rail. Tool availability
+                    # comes from the user-selected engagement mode, not evidence
+                    # status, so verification cannot deadlock its own capture.
+                    _rt_used_active_tool = _resolve_tool_name(name) in _RT_EXPLOIT_TOOL_NAMES
+                    if _rt_on and (_rt_used_active_tool or _rt_result_confirms_finding(name, result)):
                         if _rt_mission_set_phase(_rt_chat, "exploit"):
                             _rt_dirty = True
                             emit({"type": "rt_phase", "phase": "exploit",
-                                  "via": _resolve_tool_name(name)})
+                                  "via": _resolve_tool_name(name),
+                                  "reason": "active_test" if _rt_used_active_tool else "validated_finding"})
                     # analysis tools produce large structured output (string lists,
                     # grep hit lists, disasm listings). Cap looser so the model can
                     # actually reason over the output. Chatty tools stay tight.
@@ -27906,6 +28087,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         partial = {"role": "assistant", "content": "".join(content_buf) if 'content_buf' in locals() else ""}
         if cancel_ev.is_set():
             partial["_stopped"] = True
+        else:
+            partial["_failed"] = True
         partial["_appended_intermediate"] = list(conversation[_start_len:]) if 'conversation' in locals() else []
         partial["_build"] = (_BUILD_TAG if '_BUILD_TAG' in locals() else "")
         partial["_turn_id"] = _turn_id if '_turn_id' in locals() else ""
@@ -29421,8 +29604,15 @@ def tool_sandbox_sqlmap(args: dict) -> dict:
         return {"error": blk, "scope_blocked": True}
     level = max(1, min(int(args.get("level", 1)), 5))
     risk = max(1, min(int(args.get("risk", 1)), 3))
+    techniques = str(args.get("techniques") or "BEU").upper()
+    if techniques not in {"BEU", "BEUT"}:
+        return {"error": "techniques must be BEU or BEUT", "invalid_arguments": True,
+                "not_executed": True}
     parts = ["sqlmap", "-u", shlex.quote(url), "--batch", "--random-agent",
-             f"--level={level}", f"--risk={risk}", "--threads=4"]
+             f"--level={level}", f"--risk={risk}", "--threads=1", f"--technique={techniques}"]
+    if "T" in techniques:
+        time_sec = max(1, min(int(args.get("time_sec") or 2), 5))
+        parts.append(f"--time-sec={time_sec}")
     if args.get("forms"):
         parts.append("--forms")
     if args.get("tamper"):
@@ -29453,8 +29643,13 @@ def tool_sandbox_sqlmap(args: dict) -> dict:
                   or "sqlmap identified the following injection point" in out)
     params = sorted(set(re.findall(r"Parameter:\s*(\S+)", out)))
     m = re.search(r"back-end DBMS:\s*(.+)", out)
+    warnings = [line.strip() for line in out.splitlines()
+                if re.search(r"\[(WARNING|CRITICAL)\].*(timeout|timed out|recover|HTTP error|unable to connect)", line, re.I)]
     return {"ok": True, "url": url, "injectable": injectable,
             "parameters": params, "dbms": m.group(1).strip() if m else "",
+            "techniques": techniques,
+            "scan_warnings": warnings, "verification_status": "candidate" if injectable else "not_detected",
+            "limitations": "Scanner detection only. No independent reproduction, database dump, or write access was established. Negative results apply only to the checks performed.",
             "exit_code": res.get("exit_code"), "raw_tail": out[-3000:],
             "executed": True, "execution_target": "sandbox"}
 
@@ -29491,11 +29686,18 @@ def tool_rt_generate_report(args: dict) -> dict:
         return {"error": "no structured findings or findings markdown available"}
     ev_dir = DATA / "recon_evidence"
     evidence = []
+    observations = []
     try:
         receipt_folder = EvidenceStore(ev_dir / "receipts").folder(chat_id, mission_id)
         for f in sorted(receipt_folder.glob("*.json")):
             digest = hashlib.sha256(f.read_bytes()).hexdigest()
             evidence.append(f"| `{f.relative_to(ev_dir).as_posix()}` | {f.stat().st_size} bytes | `{digest}` |")
+            try:
+                receipt = EvidenceStore(ev_dir / "receipts").read(chat_id, mission_id, f.stem)
+                receipt["state"] = response_state(receipt["result"])
+                observations.append(receipt)
+            except (ValueError, OSError, KeyError):
+                observations.append({"id": f.stem, "state": "evidence_unavailable"})
     except Exception:
         pass
     lines = [f"# {title}", "",
@@ -29508,10 +29710,12 @@ def tool_rt_generate_report(args: dict) -> dict:
         lines.append("")
     lines += [
         "## Verification status", "",
-        "The narrative and interpretation are model-authored. Validated ledger entries require exact observed evidence, "
-        "a separate reproduction, and a control-bound challenge review. These checks establish provenance and review "
-        "completeness, not independent certification of exploitability. Expired or missing evidence leaves a claim "
+        "Validated means a specific recorded result assertion passed on two separate tests and failed on a meaningful control. "
+        "HTTP, browser, scalar, and timing observations are supported; a justified equivalent control may use another endpoint "
+        "on the authorized origin. This verifies that observation, not every "
+        "claim in the model's description, severity, or impact. Scanner detection alone stays a candidate. Missing evidence leaves a claim "
         "as a candidate. Only this engagement's findings and receipts are included.", "",
+        "Report generation closes the engagement; it does not establish exhaustive assessment coverage.", "",
     ]
     if ledger:
         def _md(value: Any, cap: int = 300) -> str:
@@ -29527,7 +29731,7 @@ def tool_rt_generate_report(args: dict) -> dict:
             elif item.get("source_observed"):
                 source = f"observed tool `{_md(item.get('source_tool'), 80)}`"
             else:
-                source = "model assertion only"
+                source = "unvalidated evidence references" if item.get("evidence_ids") else "model assertion only"
             lines.append(
                 f"| `{_md(item.get('id'), 70)}` | {_md(item.get('severity'), 20)} | "
                 f"{_md(item.get('status'), 30)} | {int(item.get('confidence') or 0)}% | "
@@ -29540,25 +29744,57 @@ def tool_rt_generate_report(args: dict) -> dict:
                       f"- Severity: **{_md(item.get('severity'), 20)}**",
                       f"- Harness-observed source: **{'yes' if item.get('source_observed') else 'no'}**"]
             if item.get("description"):
-                lines += ["", _md(item.get("description"), 2000)]
+                lines += ["", "Model-authored claim (interpretation, not a verified impact statement):", "", _md(item.get("description"), 2000)]
+            if item.get("inferred_impact"):
+                lines += ["", "Inferred impact, not demonstrated: " + _md(item["inferred_impact"], 2000)]
             if item.get("evidence"):
                 lines += ["", "Model-authored evidence note:", "", _md(item.get("evidence"), 3000)]
             review = item.get("review") or {}
+            if review.get("issues"):
+                lines += ["", "Verification gaps:"] + ["- " + _md(issue, 1000) for issue in review["issues"]]
+            if review.get("eligible"):
+                lines += ["", "Verified response assertion: `" + _md(json.dumps(review["challenge"]["test"], ensure_ascii=False), 3000).replace("`", "'") + "`",
+                          "", "Only the response assertion above was checked. The impact interpretation below remains model-authored."]
             if item.get("evidence_ids"):
                 lines += ["", "Evidence IDs: " + ", ".join(_md(value, 80) for value in item["evidence_ids"])]
             if review.get("control_id"):
                 lines += ["Control ID: " + _md(review["control_id"], 80)]
             for key, value in (review.get("challenge") or {}).items():
                 if isinstance(value, str):
-                    lines.append(f"- {_md(key.replace('_', ' '))}: {_md(value, 2000)}")
+                    label = "model-authored impact interpretation" if key == "demonstrated_impact" else key.replace('_', ' ')
+                    lines.append(f"- {_md(label)}: {_md(value, 2000)}")
             lines.append("")
-    coverage = [p for p in (chat or {}).get("security_coverage", []) if p.get("mission_id") == mission_id]
+    coverage = [copy.deepcopy(p) for p in (chat or {}).get("security_coverage", []) if p.get("mission_id") == mission_id]
+    by_id = {r["id"]: r for r in observations}
+    for planned in coverage:
+        linked = [by_id.get(value, {"state": "evidence_unavailable"}) for value in planned.get("evidence_ids", [])]
+        planned["state"] = (next((r["state"] for r in linked if r["state"] != "observed"), "observed")
+                            if linked else "untested")
     if coverage:
         lines += ["## Coverage and limitations", "", "Observed does not mean secure. Identity labels are declared test context.", ""]
         for item in coverage:
             lines.append("- " + re.sub(r"[\r\n]+", " ", f"{item.get('feature')} | {item.get('target')} | {item.get('identity')} | {item.get('state')} | {item.get('limitations', '')}"))
     if body:
-        lines += ["## Analyst narrative", "", body, ""]
+        lines += ["## Unverified analyst narrative", "",
+                  "The following is model-authored text. It cannot override the verified assertions or coverage gaps above. "
+                  "Claims of database access, write capability, clean endpoints, and exhaustive coverage are not certified by this section.", "", body, ""]
+    if observations:
+        lines += ["## Recorded checks", "", "These rows come from execution receipts. An observed response is not a clean security test. "
+                  "Planned checks without linked evidence remain untested even when another tool visited the same URL.", "",
+                  "| receipt | tool | target | outcome | limitations |", "|---|---|---|---|---|"]
+        for receipt in observations:
+            result = receipt.get("result") or {}
+            detail = result.get("error") or result.get("limitations") or result.get("fetch_errors") or result.get("scan_warnings") or ""
+            values = [receipt["id"], receipt.get("tool", "unknown"), receipt.get("target", "unknown"), receipt["state"], detail]
+            lines.append("| " + " | ".join(re.sub(r"\s+", " ", str(value)).replace("|", "\\|")[:1500] for value in values) + " |")
+        lines.append("")
+    unresolved = sum(p["state"] != "observed" for p in coverage)
+    incomplete = sum(r["state"] != "observed" for r in observations)
+    recorded_plan_complete = bool(coverage) and unresolved == 0
+    lines += ["## Assessment completeness", "",
+              f"{unresolved} planned checks unresolved; {incomplete} recorded checks blocked, inconclusive, or unavailable.",
+              ("Every check in the recorded coverage plan has linked observations. This does not certify that the plan was exhaustive."
+               if recorded_plan_complete else "The recorded coverage plan is incomplete. Report ready does not mean all phases passed."), ""]
     if evidence:
         lines += ["## Evidence artifacts", "", "| file | size | sha256 |", "|---|---:|---|"] + evidence + ["",
                  "_evidence files live in `data/recon_evidence/`._"]
@@ -29570,6 +29806,9 @@ def tool_rt_generate_report(args: dict) -> dict:
     # drift cannot silently resume recon/exploitation; a fresh gate launch is
     # required to create a new active authorization record.
     if isinstance(chat, dict) and isinstance(chat.get("mission"), dict):
+        reviewed = {item["id"]: item for item in ledger if item.get("id")}
+        chat["findings"] = [reviewed.get(item.get("id"), item) if item.get("mission_id") == mission_id else item
+                            for item in chat.get("findings", [])]
         chat["mission"]["status"] = "closed"
         chat["mission"]["closed_at"] = int(time.time())
         if isinstance(live_chat, dict):
@@ -29579,6 +29818,10 @@ def tool_rt_generate_report(args: dict) -> dict:
     return {"ok": True, "report": str(path), "evidence_count": len(evidence),
             "finding_count": len(ledger),
             "validated_findings": sum(1 for x in ledger if x.get("status") in ("validated", "reproduced")),
+            "assessment_complete": recorded_plan_complete,
+            "recorded_plan_complete": recorded_plan_complete,
+            "unresolved_planned_checks": unresolved,
+            "incomplete_recorded_checks": incomplete,
             "mission_status": "closed"}
 
 
@@ -29618,6 +29861,8 @@ TOOLS["sandbox_sqlmap"] = {
             "url": {"type": "string", "description": "target URL with query params"},
             "level": {"type": "integer", "description": "1-5, default 1"},
             "risk": {"type": "integer", "description": "1-3, default 1"},
+            "techniques": {"type": "string", "enum": ["BEU", "BEUT"], "description": "Default BEU. Use BEUT only when timing confirmation is necessary; T can slow or stress the target."},
+            "time_sec": {"type": "integer", "description": "Timing delay for BEUT, 1-5 seconds; default 2."},
             "forms": {"type": "boolean", "description": "crawl and test forms"},
             "tamper": {"type": "boolean", "description": "light WAF-evasion tamper scripts"},
             "flush_session": {"type": "boolean", "description": "ignore prior session state"},
@@ -29794,7 +30039,8 @@ MIME = {
 
 STATIC_WHITELIST = {
     "bridge-client.js", "preview-runtime.js",
-    "index.html", "app.js", "appearance.js", "app.css", "colors_and_type.css", "signal-field.js",
+    "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css", "signal-field.js",
+    "research-ui.js", "research-ui.css", "dropdown-menus.js",
     "security-scan-field.js",
     # brand assets — see index.html <link rel="..."> tags
     "assets/brand/logo-mark-dark.png", "assets/brand/logo-mark-light.png",
@@ -30085,7 +30331,8 @@ class Handler(BaseHTTPRequestHandler):
         if name == "index.html":
             source_etag += _REQUEST_TOKEN
         live_ui_asset = name in {
-            "index.html", "app.js", "appearance.js", "app.css", "colors_and_type.css",
+            "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css",
+            "research-ui.js", "research-ui.css", "dropdown-menus.js",
             "signal-field.js", "security-scan-field.js",
         }
         cache_control = ("no-cache, must-revalidate" if live_ui_asset
@@ -30394,7 +30641,8 @@ class Handler(BaseHTTPRequestHandler):
             cid = p.split("/")[3]
             chats = get_chats()
             if cid in chats["chats"]:
-                return self._send_json(200, chats["chats"][cid])
+                chat = chats["chats"][cid]
+                return self._send_json(200, {**chat, "task_state": _chat_task_state(cid, chat)})
             return self._send_json(404, {"error": "not found"})
         if p == "/api/snapshots":
             out = []
@@ -31115,7 +31363,7 @@ class Handler(BaseHTTPRequestHandler):
         if p.startswith("/api/chats/") and p.endswith("/mode"):
             cid = p.split("/")[3]
             raw_mode = str(body.get("mode") or "").strip().lower()
-            if raw_mode not in {"auto", "agent", "ide"}:
+            if raw_mode not in {"auto", "agent", "ide", "research"}:
                 return self._send_json(400, {"error": "invalid chat mode"})
             mode = _normalize_composer_mode(raw_mode)
             chats = get_chats()
@@ -31129,7 +31377,27 @@ class Handler(BaseHTTPRequestHandler):
                                  always=bool(body.get("always")))
             return self._send_json(200 if ok else 404, {"ok": ok})
         if p == "/api/undo":
-            return self._send_json(200, _undo_restore(body.get("turn_id") or ""))
+            return self._send_json(200, _undo_restore(body.get("turn_id") or "", chat_id=body.get("chat_id") or "", file_index=body.get("file_index")))
+        if p == "/api/investigation-review":
+            chat_id = str(body.get("chat_id") or "")
+            chat = get_chats().get("chats", {}).get(chat_id)
+            if not chat:
+                return self._send_json(404, {"error": "Session not found"})
+            mission = chat.get("mission") or {}
+            mission_id = str(mission.get("authorization_id") or "")
+            if not mission_id:
+                return self._send_json(200, {"mission": mission, "findings": [], "planned_checks": [], "observations": [], "total": 0})
+            store = EvidenceStore(DATA / "recon_evidence" / "receipts")
+            try:
+                if body.get("evidence_id"):
+                    return self._send_json(200, {"evidence": store.read(chat_id, mission_id, str(body["evidence_id"]))})
+                offset = max(0, int(body.get("offset") or 0))
+                return self._send_json(200, {"mission": mission,
+                    "findings": [f for f in chat.get("findings", []) if f.get("mission_id") == mission_id],
+                    "planned_checks": [p for p in chat.get("security_coverage", []) if p.get("mission_id") == mission_id],
+                    **store.coverage(chat_id, mission_id, offset=offset)})
+            except (ValueError, OSError) as exc:
+                return self._send_json(400, {"error": str(exc)})
         if p == "/api/task-review":
             result = _undo_store.review(body.get("turn_id"), body.get("chat_id"), body.get("file_index"))
             return self._send_json(404 if result.get("error") else 200, result)
@@ -31477,10 +31745,28 @@ class Handler(BaseHTTPRequestHandler):
         chat_id = body.get("chat_id") or uuid.uuid4().hex[:12]
         user_text = (body.get("message") or "").strip()
         raw_mode = str(body.get("mode") or "agent").strip().lower()
-        if raw_mode not in {"auto", "ide", "agent"}:
+        if raw_mode not in {"auto", "ide", "agent", "research"}:
             return self._send_json(400, {"error": "invalid chat mode"})
         mode = _normalize_composer_mode(raw_mode)
         images = body.get("images") or []  # list of base64 data URLs
+        research_request = None
+        resume_research_id = str(body.get("research_id") or "")
+        if mode == "research":
+            try:
+                previous_brief = None
+                if resume_research_id:
+                    if chat_id in _research_runs:
+                        return self._send_json(409, {"error": "This research is already running."})
+                    previous_brief = _research_store.get(resume_research_id, chat_id)["brief"]
+                if body.get("regenerate"):
+                    previous_chat = get_chats().get("chats", {}).get(chat_id, {})
+                    previous_user = next((m for m in reversed(previous_chat.get("messages", [])) if m.get("role") == "user"), {})
+                    previous_brief = previous_user.get("_research_brief") or {"topic": previous_user.get("content")}
+                research_request = research_brief(previous_brief or body.get("research_brief") or {"topic": user_text})
+            except (ValueError, OSError) as error:
+                return self._send_json(400, {"error": str(error)})
+            if body.get("mission"):
+                return self._send_json(400, {"error": "Research and red-team missions are separate modes."})
         regenerate = bool(body.get("regenerate"))
         reasoning_effort = _normalize_reasoning_effort(body.get("reasoning_effort"))
         client_ctx = _handler_client_context(self, body.get("client_context"))
@@ -31554,6 +31840,15 @@ class Handler(BaseHTTPRequestHandler):
         # remember the mode this chat was last used in so the client can
         # restore it on session switch
         chat["last_mode"] = mode
+        research_id = ""
+        if research_request:
+            try:
+                notebook = (_research_store.resume(resume_research_id, chat_id) if resume_research_id
+                            else _research_store.start(chat_id, research_request))
+            except (ValueError, OSError) as error:
+                return self._send_json(400, {"error": str(error)})
+            research_id = notebook["id"]
+            chat["research_id"] = research_id
         # regenerate: drop the last assistant turn so we re-run on the same
         # prior user message.  only valid if the most recent message is
         # actually an assistant reply.
@@ -31576,6 +31871,8 @@ class Handler(BaseHTTPRequestHandler):
                 chat["title"] = _title_from_prompt(user_text)
                 broadcast_event({"type": "chat:rename", "chat_id": chat_id, "title": chat["title"]})
             user_msg: dict = {"role": "user", "content": user_text, "t": int(time.time())}
+            if research_request:
+                user_msg["_research_brief"] = research_request
             if body.get("invisible"):
                 user_msg["invisible"] = True
             if vision_native:
@@ -31691,7 +31988,13 @@ class Handler(BaseHTTPRequestHandler):
         system_prompt = build_system_prompt(include_tools=use_tools, chat_mode=mode,
                                             include_tool_list=not native_tools)
         system_prompt += "\n\n" + _client_context_prompt(client_ctx)
-        system_prompt += _security_investigation_prompt(chat)
+        if not research_id:
+            system_prompt += _security_investigation_prompt(chat)
+        if research_id:
+            system_prompt += "\n\n" + RESEARCH_PROMPT
+            system_prompt += "\nRESEARCH BRIEF (user-provided context):\n" + json.dumps(research_request, ensure_ascii=False)
+            if resume_research_id:
+                system_prompt += "\nResume the saved notebook. Read research_notebook(), then page through its notes. Preserve existing evidence and question numbers; do not restart collection. Resolve gaps and publish the presentation."
         # Durable mission block + pins: NOT spliced here anymore — they change
         # mid-session and every change busted llama.cpp's cached prompt prefix.
         # run_chat_turn appends them as a tail message after the history instead
@@ -31762,6 +32065,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         def emit(evt: dict):
+            if research_id and evt.get("type") == "final":
+                evt["message"]["_research"] = _research_store.finish(research_id, chat_id)
             evt = {**evt, "chat_id": chat_id}
             try:
                 self.wfile.write(b"data: ")
@@ -31773,6 +32078,8 @@ class Handler(BaseHTTPRequestHandler):
             broadcast_event(evt)
 
         emit({"type": "chat_start", "chat_id": chat_id})
+        if research_id:
+            emit({"type": "research_update", "research": _research_store.get(research_id, chat_id)})
         if _pre_turn_compaction_failed:
             emit({"type": "error", "error": _COMPACTION_STOP_MESSAGE})
             emit({"type": "chat_end"})
@@ -31780,6 +32087,8 @@ class Handler(BaseHTTPRequestHandler):
         if tools_off_reason:
             emit({"type": "tools_unavailable", "message": tools_off_reason})
         tok = _current_chat_id.set(chat_id)
+        if research_id:
+            _research_runs[chat_id] = research_id
         try:
             final = run_chat_turn(chat_id, msgs, use_tools=use_tools, emit=emit,
                                   native_tools=native_tools,
@@ -31793,6 +32102,14 @@ class Handler(BaseHTTPRequestHandler):
             final = None
         finally:
             _current_chat_id.reset(tok)
+            _research_runs.pop(chat_id, None)
+
+        if research_id:
+            research_result = _research_store.finish(research_id, chat_id)
+            if final is None:
+                final = {"role": "assistant", "content": "Research ended before a presentation could be completed.", "_failed": True}
+            final["_research"] = research_result
+            emit({"type": "research_update", "research": research_result})
 
         if final:
             chats = get_chats()
@@ -31860,8 +32177,12 @@ class Handler(BaseHTTPRequestHandler):
                     msg["_build"] = final["_build"]
                 if final.get("_carry_diag"):
                     msg["_carry_diag"] = final["_carry_diag"]
+                if final.get("_research"):
+                    msg["_research"] = final["_research"]
                 if final.get("_stopped"):
                     msg["_stopped"] = True
+                if final.get("_failed"):
+                    msg["_failed"] = True
                 stats = final.get("_stats") or {}
                 if stats.get("eval_count") is not None:
                     msg["tokens"] = stats["eval_count"]

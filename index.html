@@ -27,7 +27,9 @@
   })();
 </script>
 <script src="/appearance.js?v=1"></script>
-<link rel="stylesheet" href="/app.css?v=73">
+<link rel="stylesheet" href="/app.css?v=75">
+<link rel="stylesheet" href="/workspace-shell.css?v=2">
+<link rel="stylesheet" href="/research-ui.css?v=2">
 <link rel="stylesheet" href="/assets/vendor/web/icons.css">
 <script src="/assets/vendor/html2canvas/dist/html2canvas.min.js" defer></script>
 <script src="/assets/vendor/jszip/dist/jszip.min.js" defer></script>
@@ -60,25 +62,28 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.8.5</span>
+        <span class="v" id="brand-v">v0.8.6</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
       <span class="brand-subtitle">Your model. Your machine.</span>
     </div>
 
+    <nav class="workspace-nav" aria-label="Session navigation">
+      <button class="workspace-nav-action workspace-nav-new" id="btn-new-chat" type="button"><i class="ph ph-plus" aria-hidden="true"></i><span>New session</span></button>
+      <button class="workspace-nav-action" id="btn-search-sessions" type="button"><i class="ph ph-magnifying-glass" aria-hidden="true"></i><span>Search sessions</span><kbd>Ctrl K</kbd></button>
+    </nav>
     <div class="sidebar-scroll">
       <div class="section-head">
-        <span>SESSIONS</span>
+        <span>Sessions</span>
         <span class="grow"></span>
-        <button class="iconbtn" id="btn-new-chat" title="New session"><i class="ph ph-plus"></i></button>
       </div>
       <div class="chatlist" id="chatlist"></div>
 
       <div class="sidebar-divider" id="sidebar-resizer" role="separator" aria-orientation="horizontal" title="Drag to resize · double-click to reset"></div>
 
       <div class="section-head ws-section-head">
-        <span>WORKSPACE</span>
+        <span>Workspace</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-ws-add-toggle" title="Add folder"><i class="ph ph-plus"></i></button>
       </div>
@@ -206,6 +211,7 @@
         </span>
       </div>
       <div class="actions">
+        <button class="iconbtn" id="btn-task-details" title="Task details" aria-label="Task details"><i class="ph ph-clipboard-text" aria-hidden="true"></i></button>
         <div class="client-context-control" title="Browser device and command target">
           <span class="client-context-badge" id="client-context-badge"><i class="ph ph-device-mobile"></i><span>this PC</span></span>
           <select id="execution-target-select" aria-label="Command and file target">
@@ -288,6 +294,7 @@
                 <div class="mode-menu" id="composer-mode-menu" role="menu" aria-label="Composer mode">
                   <button type="button" class="mode-option active" role="menuitemradio" aria-checked="true" data-composer-mode="agent"><i class="ph ph-terminal-window" aria-hidden="true"></i><span>Agent</span><i class="ph ph-check mode-check" aria-hidden="true"></i></button>
                   <button type="button" class="mode-option" role="menuitemradio" aria-checked="false" data-composer-mode="ide"><i class="ph ph-code" aria-hidden="true"></i><span>IDE<small class="mode-option-note">Wide layout</small></span><i class="ph ph-check mode-check" aria-hidden="true"></i></button>
+                  <button type="button" class="mode-option" role="menuitemradio" aria-checked="false" data-composer-mode="research"><i class="ph ph-books" aria-hidden="true"></i><span>Deep Research<small class="mode-option-note">Investigate, connect, present</small></span><i class="ph ph-check mode-check" aria-hidden="true"></i></button>
                 </div>
               </div>
             </div>
@@ -1410,11 +1417,11 @@
       <div class="sw" id="sw-red-team-enabled"></div>
     </div>
     <div class="form-row inline">
-      <label>Force exploit phase</label>
+      <label>Active tools in Target Recon</label>
       <div class="sw" id="sw-rt-force-exploit"></div>
     </div>
     <div class="form-row">
-      <span class="hint">Offers exploit tools from the first turn instead of waiting for an evidence-reviewed finding. This overrides the normal phase gate; it does not validate findings or expand the authorized scope.</span>
+      <span class="hint">Red Team assessments already include active testing tools. This switch also exposes them in the narrower Target Recon workflow. It does not validate findings or expand the authorized scope.</span>
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
@@ -1697,7 +1704,9 @@
 
 <script src="/assets/vendor/highlight.js/highlight.min.js"></script>
   <script src="/security-scan-field.js?v=6"></script>
-<script src="/app.js?v=2026090501"></script>
+<script src="/research-ui.js?v=2"></script>
+<script src="/dropdown-menus.js?v=1"></script>
+<script src="/app.js?v=2026091007"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {
