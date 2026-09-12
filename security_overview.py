@@ -127,6 +127,14 @@ class SecurityOverviewService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_scans_created ON scans(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_investigations_created ON investigations(created_at DESC);
+                CREATE TABLE IF NOT EXISTS alert_filters (
+                    id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    match_key TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(mode, match_key)
+                );
                 """
             )
             columns = {row[1] for row in db.execute("PRAGMA table_info(whitelist)").fetchall()}
@@ -177,6 +185,44 @@ class SecurityOverviewService:
             except Exception:
                 continue
         return out
+
+    @staticmethod
+    def _action_key(row: dict, occurrence: bool = False) -> str:
+        fields = [row.get(key) for key in ("tool", "status", "target", "args_sha256", "result_sha256")]
+        if occurrence:
+            fields.append(row.get("t"))
+        return _fingerprint(*fields)
+
+    def _alert_filters(self) -> list[dict]:
+        with self._db() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM alert_filters ORDER BY created_at DESC, id"
+            ).fetchall()]
+
+    def filter_alert(self, alert_id: str, mode: str) -> dict:
+        if mode not in {"dismiss", "ignore"}:
+            return {"ok": False, "error": "Choose dismiss or ignore."}
+        alert = next((item for item in self.get_overview().get("alerts", [])
+                      if item.get("id") == alert_id), None)
+        if not alert or alert.get("source") != "accuretta" or alert.get("kind") != "action_failures":
+            return {"ok": False, "error": "Only recorded Accuretta tool errors can be dismissed here."}
+        with self._db() as db:
+            for row in alert.get("evidence", []):
+                key = self._action_key(row, occurrence=mode == "dismiss")
+                label = _bounded(f"{row.get('tool') or 'Tool'}: {row.get('status') or 'error'}"
+                                 f" · {row.get('target') or 'local action'}", 350)
+                db.execute("INSERT OR IGNORE INTO alert_filters VALUES (?, ?, ?, ?, ?)",
+                           (f"filter-{mode}-{key}", mode, key, label, _now()))
+        self.emit({"type": "security:update", "status": "ready"})
+        return {"ok": True, "overview": self.get_overview()}
+
+    def remove_alert_filter(self, filter_id: str) -> dict:
+        with self._db() as db:
+            removed = db.execute("DELETE FROM alert_filters WHERE id = ?", (filter_id,)).rowcount
+        if not removed:
+            return {"ok": False, "error": "Filter not found."}
+        self.emit({"type": "security:update", "status": "ready"})
+        return {"ok": True, "overview": self.get_overview()}
 
     def scan_state(self) -> dict:
         with self._state_lock:
@@ -279,7 +325,7 @@ class SecurityOverviewService:
         evidence: list[dict] | None = None,
         first_seen: str = "",
     ) -> dict:
-        evidence = list(evidence or [])[:12]
+        evidence = list(evidence or [])[:200 if kind == "action_failures" else 12]
         stable = _fingerprint(source, kind, entity_key, title)
         normalized_entity = _normalize_entity(entity_key) or f"alert:{stable}"
         return {
@@ -435,12 +481,16 @@ class SecurityOverviewService:
             if str(row.get("status") or "").lower() in {"error", "failed", "timeout"}
         ]
         if len(failures) >= 3:
-            alerts.append(self._alert(
-                "accuretta", "action_failures", "low",
-                f"{len(failures)} recent Accuretta actions did not complete",
-                "Denied, blocked, and failed actions remain local and may indicate a configuration or scope problem.",
-                "accuretta:action-failures", "Accuretta action history", failures[:10],
-            ))
+            groups: dict[str, list[dict]] = {}
+            for row in failures:
+                groups.setdefault(self._action_key(row), []).append(row)
+            for key, rows in groups.items():
+                tool = str(rows[0].get("tool") or "Tool")
+                alerts.append(self._alert(
+                    "accuretta", "action_failures", "low", f"{tool} did not complete",
+                    f"{len(rows)} recorded occurrence(s). Review the error, or quiet it if it is expected.",
+                    f"accuretta:action:{key}", str(rows[0].get("target") or tool), rows,
+                ))
 
         unique: dict[str, dict] = {}
         for alert in alerts:
@@ -487,6 +537,24 @@ class SecurityOverviewService:
         whitelist = self._whitelist_rows()
         allowed = {row["entity_key"]: set(row.get("behaviors") or []) for row in whitelist}
         all_alerts = public.pop("alerts_all", [])
+        filters = self._alert_filters()
+        ignored = {row["match_key"] for row in filters if row["mode"] == "ignore"}
+        dismissed = {row["match_key"] for row in filters if row["mode"] == "dismiss"}
+        filtered_alerts = []
+        for item in all_alerts:
+            if item.get("source") == "accuretta" and item.get("kind") == "action_failures":
+                evidence = [row for row in item.get("evidence", [])
+                            if self._action_key(row) not in ignored
+                            and self._action_key(row, occurrence=True) not in dismissed]
+                if not evidence:
+                    continue
+                item["evidence"] = evidence
+                item["dismissible"] = True
+                item["detail"] = (f"{len(evidence)} recorded occurrence(s). Dismiss hides these occurrences. "
+                                  "Ignore repeats hides matching tool, target and failure records in future scans.")
+            filtered_alerts.append(item)
+        all_alerts = filtered_alerts
+        public["alert_filters"] = filters
         def is_allowed(item: dict) -> bool:
             behaviors = allowed.get(item.get("entity_key"))
             return bool(behaviors and item.get("kind") in behaviors)
@@ -588,6 +656,7 @@ class SecurityOverviewService:
             "alerts": [],
             "whitelisted_activity": [],
             "whitelist": self._whitelist_rows(),
+            "alert_filters": self._alert_filters(),
             "investigations": self._investigation_rows(12),
             "metrics": {"open_alerts": 0, "hidden_alerts": 0, "coverage_available": 0, "coverage_total": 0},
             "risk": {"state": "quiet", "headline": "No scan has run yet", "detail": "Run a local scan to establish the current situation."},

@@ -1112,7 +1112,7 @@
   const _LOGO_SLAB_D = "M164 6 L226 6 Q240 6 233.7 18.5 L111.3 261.5 Q105 274 91 274 L24 274 Q10 274 16.5 261.6 L143.5 18.4 Q150 6 164 6 Z";
   const _LOGO_PURPLE_D = "M225 135 L260 135 Q272 135 277.2 145.8 L332.8 261.2 Q338 272 326 272 L269 272 Q257 272 253.3 260.6 L216.7 146.4 Q213 135 225 135 Z";
   const _LOGO_SVG = (cls) => `<svg class="avatar-mark ${cls}" viewBox="0 0 348 282" aria-hidden="true" draggable="false"><g class="logo-slab"><path d="${_LOGO_SLAB_D}"/></g><g class="logo-purple"><path d="${_LOGO_PURPLE_D}"/></g></svg>`;
-  const AGENT_AVATAR_HTML = `<div class="avatar">${_LOGO_SVG("")}</div>`;
+  const AGENT_AVATAR_HTML = '<div class="avatar agent-avatar" role="img" aria-label="Agent" title="Agent"><canvas class="agent-orb" width="80" height="80" data-state="idle" aria-hidden="true"></canvas></div>';
 
   // Render web-search chips into the head's chip strip. New searches REPLACE
   // the chip set with a fade-in animation — gives the "rotating sources" feel
@@ -3126,6 +3126,7 @@
     wireEvents();
     initWorkflowUI();
     subscribeSSE();
+    startApprovalSync();
     initCostWidget();
     initAppUpdateCheck();
     loadClientContext().catch(() => {});
@@ -4277,6 +4278,7 @@
         <div class="bubble-meta streaming">streaming<span class="typing"><span></span><span></span><span></span></span></div>
       </div>`;
     $("#chat-inner").appendChild(agentRow);
+    window.AccurettaOrb?.setState(agentRow, "thinking");
     scrollToBottom(true);
 
     state.streaming = true;
@@ -4796,6 +4798,7 @@
         <div class="bubble-meta streaming">streaming<span class="typing"><span></span><span></span><span></span></span></div>
       </div>`;
     $("#chat-inner").appendChild(agentRow);
+    window.AccurettaOrb?.setState(agentRow, "thinking");
     scrollToBottom(true);
 
     state.streaming = true;
@@ -5290,6 +5293,7 @@
   }
 
   function updateThinkLine(row, running, label) {
+    window.AccurettaOrb?.setState(row, running ? (label === "Writing response" ? "composing" : "thinking") : "idle");
     const container = row.querySelector(".think-container");
     if (!container) return;
     const span = container.querySelector(".think-title");
@@ -6071,6 +6075,8 @@
       }
       bubble.classList.remove("hidden");
       const interimHtml = interim.trim() ? renderWorkingNotesBlock(interim) : "";
+      let didRender = false;
+      let usedPlainCode = false;
 
       // Incremental rendering: blocks before the last safe cut are frozen —
       // their HTML is cached and reused verbatim; only the volatile tail
@@ -6096,6 +6102,7 @@
       if (fence.inFence && fence.bodyLen > 4000
           && fenceLang !== "tool_code" && fenceLang !== "tool_call"
           && fenceBodyLooksLikeCode(answer.slice(fence.bodyStart), fence.infoStr)) {
+        usedPlainCode = true;
         const now = Date.now();
         if (now - (bubble._lastPlainAt || 0) >= 250) {
           bubble._lastPlainAt = now;
@@ -6107,6 +6114,7 @@
           bubble.innerHTML = interimHtml + inc.html + headHtml +
             `<div class="stream-code-hint"><i class="ph ph-code"></i><span>writing <strong>${esc(lang)}</strong> — ${lines} lines, ${kb} KB · syntax colors land when the block closes</span></div>` +
             `<pre class="code-card streaming-plain"><code>${esc(answer.slice(fence.bodyStart))}</code></pre>`;
+          didRender = true;
         }
       } else {
         bubble._lastPlainAt = 0;
@@ -6117,6 +6125,13 @@
           ? renderMarkdown(answer.slice(tailStart), { streaming: true }) : "";
         bubble.innerHTML = interimHtml + inc.html + tailHtml;
         enhanceCodeBlocks(bubble);
+        didRender = true;
+      }
+      // The completion event normally carries the same text as the final
+      // streamed paint. Retain this exact snapshot so it can settle metadata
+      // without replacing an already-stable prose node and nudging the chat.
+      if (didRender) {
+        bubble._streamSnapshot = { content, answer, usedPlainCode, openFence: fence.inFence };
       }
       // NB: no updateThinkLine(false) here — the status line stays a live
       // shimmering indicator; the finally block finalizes it once at turn end.
@@ -6313,6 +6328,11 @@
         surfaceShell(evt.arguments?.session_id || evt.arguments?.id || "");
       }
       startToolActivity(toolStack, toolCards, evt);
+      const orbPhase = evt.name === "update_plan" ? "planning"
+        : /search|find|grep|project_map/.test(evt.name) ? "searching"
+        : /web|http|fetch|remote|mcp_|connect/.test(evt.name) ? "connecting"
+        : "working";
+      window.AccurettaOrb?.setState(row, orbPhase);
       if (!["run_powershell", "run_tests", "sandbox_run", "sandbox_nmap", "sandbox_sqlmap"].includes(evt.name)) {
         const lbl = toolLabel(evt.name, evt.arguments);
         appendAgentLog(`Tool started: ${evt.name} -> ${lbl}`);
@@ -6681,21 +6701,36 @@
             answerText = finalContent.slice(interimText.length);
           }
           if (finalContent.trim()) {
-            const rendered = renderMarkdown(answerText);
-            if ((rendered && rendered.trim()) || interimHtml) {
-              if (finalBubble._collapsing) {
-                clearTimeout(finalBubble._collapseTimer);
-                finalBubble._collapsing = false;
-                finalBubble.classList.remove("collapsing");
-              }
-              finalBubble.classList.remove("hidden");
-              finalBubble.innerHTML = interimHtml + rendered;
-              enhanceCodeBlocks(finalBubble);
+            const snapshot = finalBubble._streamSnapshot;
+            const keepLiveProse = snapshot
+              && snapshot.content === finalContent
+              && snapshot.answer === answerText
+              && !snapshot.usedPlainCode
+              && !snapshot.openFence
+              && !finalBubble.classList.contains("hidden")
+              && !!finalBubble.innerHTML.trim()
+              && !finalBubble.querySelector("pre.code-card, .code-card-tabs-container");
+            if (keepLiveProse) {
+              // Nothing changed except that the transport has finished. Keep
+              // the live DOM rather than reflowing the same response again.
               setTimeout(() => scrollToBottom(true), 50);
             } else {
-              // All content was tool-call-stripped. Keep the bubble hidden.
-              finalBubble.innerHTML = "";
-              finalBubble.classList.add("hidden");
+              const rendered = renderMarkdown(answerText);
+              if ((rendered && rendered.trim()) || interimHtml) {
+                if (finalBubble._collapsing) {
+                  clearTimeout(finalBubble._collapseTimer);
+                  finalBubble._collapsing = false;
+                  finalBubble.classList.remove("collapsing");
+                }
+                finalBubble.classList.remove("hidden");
+                finalBubble.innerHTML = interimHtml + rendered;
+                enhanceCodeBlocks(finalBubble);
+                setTimeout(() => scrollToBottom(true), 50);
+              } else {
+                // All content was tool-call-stripped. Keep the bubble hidden.
+                finalBubble.innerHTML = "";
+                finalBubble.classList.add("hidden");
+              }
             }
           }
           updateThinkLine(lastRow, false);
@@ -7973,6 +8008,73 @@
     usageMarkFrame = requestAnimationFrame(paint);
   }
 
+  let usageHeatmapMetric = "turns";
+
+  function renderUsageHeatmap(activity) {
+    const days = Array.isArray(activity?.days) ? activity.days : [];
+    if (!days.length) return '<section class="usage-panel"><p class="usage-empty">Activity history is unavailable. Restart the bridge to load the calendar.</p></section>';
+    const first = new Date(`${days[0].day}T12:00:00`);
+    const padding = (first.getDay() + 6) % 7;
+    const columns = Math.ceil((padding + days.length) / 7);
+    const peak = Math.max(1, ...days.map(day => Number(day[usageHeatmapMetric]) || 0));
+    const activeDays = days.filter(day => day.turns > 0).length;
+    let streak = 0;
+    let end = days.length - 1;
+    if (!days[end].turns) end--;
+    for (let i = end; i >= 0 && days[i].turns > 0; i--) streak++;
+    const months = [];
+    let lastMonth = "";
+    const cells = days.map((day, index) => {
+      const date = new Date(`${day.day}T12:00:00`);
+      const col = Math.floor((padding + index) / 7) + 1;
+      const month = `${date.getFullYear()}-${date.getMonth()}`;
+      if (month !== lastMonth) {
+        if (!months.length || col - months.at(-1).col >= 3) months.push({ col, text: date.toLocaleDateString(undefined, { month: "short" }) });
+        lastMonth = month;
+      }
+      const value = Number(day[usageHeatmapMetric]) || 0;
+      const level = value ? Math.max(1, Math.ceil(Math.sqrt(value / peak) * 4)) : 0;
+      const detail = `${date.toLocaleDateString(undefined, { dateStyle: "medium" })} · ${Number(day.turns).toLocaleString()} turns · ${usageCompactNumber(day.tokens)} tokens · ${usageDuration(day.elapsed_ms)}`;
+      return `<button type="button" class="usage-day" data-level="${level}" data-day-index="${index}" data-detail="${esc(detail)}" style="grid-column:${col};grid-row:${(padding + index) % 7 + 1}" tabindex="${index === days.length - 1 ? 0 : -1}" aria-label="${esc(detail)}" title="${esc(detail)}"></button>`;
+    }).join("");
+    return `<section class="usage-panel usage-calendar-panel">
+      <div class="usage-section-head"><div><span class="usage-eyebrow">Past year</span><h2>Your activity</h2></div><div class="usage-calendar-switch" role="group" aria-label="Activity measure"><button type="button" data-activity-metric="turns" aria-pressed="${usageHeatmapMetric === "turns"}">Turns</button><button type="button" data-activity-metric="tokens" aria-pressed="${usageHeatmapMetric === "tokens"}">Tokens</button></div></div>
+      <div class="usage-calendar-summary"><span><strong>${activeDays}</strong> active days</span><span><strong>${streak}</strong> day current streak</span><span>${usageCompactNumber(days.reduce((sum, day) => sum + day.turns, 0))} recorded turns</span></div>
+      <div class="usage-calendar-scroll"><div class="usage-calendar" style="--weeks:${columns}"><div class="usage-months">${months.map(month => `<span style="grid-column:${month.col}/span 3">${esc(month.text)}</span>`).join("")}</div><div class="usage-weekdays" aria-hidden="true"><span>Mon</span><span>Wed</span><span>Fri</span></div><div class="usage-days" role="group" aria-label="Daily activity. Use arrow keys to explore days.">${cells}</div></div></div>
+      <div class="usage-calendar-footer"><span id="usage-day-detail" aria-live="polite">Select a day to see its activity.</span><div class="usage-calendar-legend" aria-label="Activity intensity, less to more"><span>Less</span>${[0, 1, 2, 3, 4].map(level => `<i class="usage-day" data-level="${level}"></i>`).join("")}<span>More</span></div></div>
+      <p class="usage-footnote">Recorded model turns in this computer’s local time. Blank days have no recorded activity.</p>
+    </section>`;
+  }
+
+  function wireUsageHeatmap(data) {
+    const panel = document.querySelector(".usage-calendar-panel");
+    if (!panel) return;
+    panel.querySelectorAll("[data-activity-metric]").forEach(button => button.addEventListener("click", () => {
+      usageHeatmapMetric = button.dataset.activityMetric;
+      renderUsageStats(data);
+      document.querySelector(`[data-activity-metric="${usageHeatmapMetric}"]`)?.focus();
+    }));
+    const cells = [...panel.querySelectorAll("button.usage-day")];
+    function describe(cell) {
+      panel.querySelector("#usage-day-detail").textContent = cell.dataset.detail;
+      cells.forEach(item => { item.tabIndex = item === cell ? 0 : -1; item.classList.toggle("is-selected", item === cell); });
+    }
+    for (const cell of cells) {
+      cell.addEventListener("pointerenter", () => { panel.querySelector("#usage-day-detail").textContent = cell.dataset.detail; });
+      cell.addEventListener("focus", () => describe(cell));
+      cell.addEventListener("click", () => describe(cell));
+      cell.addEventListener("keydown", event => {
+        const index = Number(cell.dataset.dayIndex);
+        const delta = { ArrowLeft: -7, ArrowRight: 7, ArrowUp: -1, ArrowDown: 1 }[event.key];
+        if (delta === undefined && event.key !== "Home" && event.key !== "End") return;
+        event.preventDefault();
+        const next = event.key === "Home" ? 0 : event.key === "End" ? cells.length - 1 : Math.max(0, Math.min(cells.length - 1, index + delta));
+        cells[next]?.focus();
+      });
+    }
+    if (cells.length) describe(cells.at(-1));
+  }
+
   function renderUsageStats(data) {
     const content = $("#usage-content");
     if (!content) return;
@@ -7986,8 +8088,10 @@
     const best = ranked[0] || null;
     const attention = ranked.length > 1 ? ranked[ranked.length - 1] : null;
     const provider = CLOUD_PRICING[state.costProvider] || CLOUD_PRICING.openai;
-    const inputTokens = Number(data.savings?.tok_in ?? totals.input_tokens) || 0;
-    const outputTokens = Number(data.savings?.tok_out ?? totals.output_tokens) || 0;
+    const inputTokens = Number(totals.input_tokens ?? data.savings?.tok_in) || 0;
+    const outputTokens = Number(totals.output_tokens ?? data.savings?.tok_out) || 0;
+    const tokenTotal = document.getElementById("usage-token-total");
+    if (tokenTotal) tokenTotal.textContent = usageCompactNumber(inputTokens + outputTokens);
     const inputCost = inputTokens / 1e6 * provider.input;
     const outputCost = outputTokens / 1e6 * provider.output;
     const money = value => `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -8024,10 +8128,7 @@
         <article><i class="ph ph-arrows-in-line-vertical"></i><span>Successful compactions</span><strong>${Number(compression.successful || 0).toLocaleString()}</strong><small>${usageCompactNumber(compression.folded_tokens)} tokens folded</small></article>
       </section>
 
-      <section class="usage-panel usage-trend-panel">
-        <div class="usage-section-head"><div><span class="usage-eyebrow">Last 30 days</span><h2>Local model activity</h2></div><strong>${usageCompactNumber((data.daily || []).reduce((sum, day) => sum + Number(day.tokens || 0), 0))} tokens</strong></div>
-        ${usageAreaChart(data.daily || [], "tokens", usageCompactNumber)}
-      </section>
+      ${renderUsageHeatmap(data.activity)}
 
       <section class="usage-two-col">
         <article class="usage-panel usage-saving-panel">
@@ -8045,9 +8146,9 @@
       </section>
 
       <section class="usage-panel usage-model-panel">
-        <div class="usage-section-head"><div><span class="usage-eyebrow">Observed model health</span><h2>Model performance</h2></div><span class="usage-method">Reliability = finished turns + tool success</span></div>
-        <div class="usage-model-list">${modelRows || '<div class="usage-empty">No model telemetry yet.</div>'}</div>
-        <p class="usage-footnote">Ranking starts after five observed turns. Small samples are shown but left unranked.</p>
+        <div class="usage-section-head"><div><span class="usage-eyebrow">On this computer</span><h2>Model performance</h2></div><span class="usage-method">Reliability = finished turns + tool success</span></div>
+        <div class="usage-model-list">${modelRows || '<div class="usage-empty">No recorded usage for models currently on this computer.</div>'}</div>
+        <p class="usage-footnote">Only models with a verified local file appear here. Ranking starts after five turns. Historical activity remains in your totals.</p>
       </section>
 
       <section class="usage-panel usage-interventions-panel">
@@ -8072,6 +8173,7 @@
           <div class="usage-repo-list">${(repos.names || []).map(name => `<span><i class="ph ph-git-branch"></i>${esc(name)}</span>`).join("") || '<span class="usage-empty">No repo sessions recorded yet.</span>'}</div>
         </article>
       </section>`;
+    wireUsageHeatmap(data);
     $("#usage-provider")?.addEventListener("change", event => {
       state.costProvider = event.target.value;
       try { localStorage.setItem("accuretta:cost-provider", state.costProvider); } catch {}
@@ -8282,6 +8384,7 @@
     renderSecurityCoverage(data?.coverage || []);
     renderSecurityTimeline(data?.timeline || []);
     renderSecurityWhitelist(data?.whitelist || []);
+    renderSecurityAlertFilters(data?.alert_filters || []);
   }
 
   function renderSecurityAlerts() {
@@ -8294,7 +8397,7 @@
     const alerts = [...active, ...hidden];
     if (!alerts.length) {
       const scanned = !!securityOverviewData?.generated_at;
-      list.innerHTML = `<div class="security-empty"><i class="ph ${scanned ? "ph-shield-check" : "ph-radar"}"></i><strong>${scanned ? "Nothing currently needs attention" : "No scan data yet"}</strong><span>${scanned ? "Whitelist filtering and deterministic checks produced an empty queue." : "Run a scan to inspect the current machine state."}</span></div>`;
+      list.innerHTML = `<div class="security-empty"><i class="ph ${scanned ? "ph-shield-check" : "ph-radar"}"></i><strong>${scanned ? "Nothing currently needs attention" : "No scan data yet"}</strong><span>${scanned ? "No open alerts from the latest scan. Quieted items remain available below." : "Run a scan to inspect the current machine state."}</span></div>`;
       return;
     }
     list.innerHTML = alerts.map(alert => `
@@ -8308,13 +8411,53 @@
         <div class="security-alert-actions">
           <button type="button" data-security-action="investigate">Investigate</button>
           ${alert._whitelisted || alert.whitelistable === false ? "" : '<button type="button" data-security-action="whitelist">Whitelist</button>'}
+          ${alert.dismissible ? '<button type="button" data-security-action="dismiss" title="Hide these recorded occurrences">Dismiss</button><button type="button" data-security-action="ignore" title="Hide matching failures in future scans. You can restore them below.">Ignore repeats</button>' : ""}
         </div>
       </article>`).join("");
     list.querySelectorAll("[data-security-action]").forEach(button => button.addEventListener("click", event => {
       const row = event.currentTarget.closest("[data-alert-id]");
       const alertId = row?.dataset.alertId || "";
       if (event.currentTarget.dataset.securityAction === "investigate") openSecurityInvestigation(alertId, event.currentTarget);
+      else if (["dismiss", "ignore"].includes(event.currentTarget.dataset.securityAction)) quietSecurityAlert(alertId, event.currentTarget.dataset.securityAction, event.currentTarget);
       else openSecurityWhitelist(alertId);
+    }));
+  }
+
+  async function quietSecurityAlert(alertId, mode, button) {
+    button.disabled = true;
+    try {
+      const result = await api("/api/security/alerts/filter", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ alert_id: alertId, mode }),
+      });
+      if (!result?.ok) throw new Error(result?.error || "Could not quiet this alert.");
+      renderSecurityOverview(result.overview);
+      toast(mode === "ignore" ? "Matching errors will stay quiet. Restore them below at any time." : "Recorded errors dismissed. New occurrences can still appear.", "ok", 3000);
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message || String(error), "warn", 3500);
+    }
+  }
+
+  function renderSecurityAlertFilters(rows) {
+    const list = document.getElementById("security-alert-filters");
+    if (!list) return;
+    const count = document.getElementById("security-filter-count");
+    if (count) count.textContent = String(rows.length);
+    list.innerHTML = rows.map(row => `<div class="security-whitelist-row"><div class="security-whitelist-main"><strong title="${esc(row.label)}">${esc(row.label)}</strong><span>${row.mode === "ignore" ? "Matching repeats ignored" : "Recorded occurrence dismissed"} · ${esc(securityWhen(row.created_at))}</span></div><button type="button" data-restore-filter="${esc(row.id)}">Restore</button></div>`).join("") || '<div class="security-empty compact"><span>No tool errors have been quieted.</span></div>';
+    list.querySelectorAll("[data-restore-filter]").forEach(button => button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        const result = await api("/api/security/alerts/restore", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: button.dataset.restoreFilter }),
+        });
+        if (!result?.ok) throw new Error(result?.error || "Could not restore this alert.");
+        renderSecurityOverview(result.overview);
+        toast("Filter removed. Matching errors can appear again.", "ok", 2200);
+      } catch (error) {
+        button.disabled = false;
+        toast(error.message || String(error), "warn", 3500);
+      }
     }));
   }
 
@@ -10159,6 +10302,8 @@
   function reflectApprovalInLiveTurn(approval, decision = "pending") {
     const row = state.liveTurn?.row;
     if (!row || !approval) return;
+    if (approval.chat_id && approval.chat_id !== state.liveTurn?.chatId) return;
+    window.AccurettaOrb?.setState(row, decision === "pending" ? "waiting" : "working");
     const details = approval.details || {};
     const kind = String(details.kind || "");
     const path = String(details.path || "");
@@ -10314,11 +10459,48 @@
     });
   }
 
-  async function loadApprovals() {
-    const r = await api("/api/approvals");
-    state.approvals.clear();
-    for (const a of r.pending || []) state.approvals.set(a.id, a);
-    renderApprovals();
+  let approvalLoadPromise = null;
+  async function loadApprovals({ announceNew = false } = {}) {
+    if (approvalLoadPromise) return approvalLoadPromise;
+    approvalLoadPromise = (async () => {
+      const r = await api("/api/approvals");
+      const pending = Array.isArray(r.pending) ? r.pending : [];
+      const known = new Set(state.approvals.keys());
+      state.approvals.clear();
+      for (const approval of pending) state.approvals.set(approval.id, approval);
+      renderApprovals();
+      if (announceNew) {
+        for (const approval of pending) {
+          if (known.has(approval.id)) continue;
+          reflectApprovalInLiveTurn(approval, "pending");
+          notifyApproval();
+        }
+      }
+    })();
+    try {
+      return await approvalLoadPromise;
+    } finally {
+      approvalLoadPromise = null;
+    }
+  }
+
+  let approvalSyncTimer = null;
+  function startApprovalSync() {
+    if (approvalSyncTimer) return;
+    const sync = () => {
+      if (document.visibilityState !== "visible") return;
+      if (!state.streaming && state.approvals.size === 0) return;
+      loadApprovals({ announceNew: true }).catch(error => console.warn("approval sync failed", error));
+    };
+    approvalSyncTimer = setInterval(sync, 2000);
+    window.addEventListener("focus", () => {
+      loadApprovals({ announceNew: true }).catch(error => console.warn("approval sync failed", error));
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        loadApprovals({ announceNew: true }).catch(error => console.warn("approval sync failed", error));
+      }
+    });
   }
 
   // ---------- SSE ----------

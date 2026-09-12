@@ -1262,19 +1262,23 @@ def _usage_stats() -> dict:
     telemetry_enabled = bool(settings.get("passive_model_telemetry", True))
     profiles = _model_runtime_profiles().get("models") or {}
     models_dir = str(settings.get("models_dir") or "").strip()
-    installed_models: set[str] | None = None
+    installed_models: set[str] = set()
+    known_paths = set(_models_config())
+    known_paths.add(str(settings.get("model_path") or ""))
     if models_dir and safe_exists(models_dir) and safe_is_dir(models_dir):
-        installed_models = set()
         for item in scan_gguf_dir(models_dir):
-            filename = str(item.get("name") or "")
-            if filename:
-                installed_models.add(filename.casefold())
-                installed_models.add(Path(filename).stem.casefold())
+            known_paths.add(str(item.get("path") or ""))
+    for model_path in known_paths:
+        path = Path(model_path)
+        if (model_path and path.suffix.lower() == ".gguf" and safe_exists(path)
+                and not safe_is_dir(path) and not _is_mmproj_name(path.name)):
+            installed_models.add(path.name.casefold())
+            installed_models.add(path.stem.casefold())
     models = []
     for name, row in profiles.items():
         if not isinstance(row, dict):
             continue
-        if installed_models is not None and str(name).casefold() not in installed_models:
+        if str(name).casefold() not in installed_models:
             continue
         turns = max(0, int(row.get("turns", 0) or 0))
         if turns < 1:
@@ -1354,8 +1358,7 @@ def _usage_stats() -> dict:
                     bucket["tokens"] += prompt + output
                     bucket["elapsed_ms"] += elapsed
                 item_model = str(item.get("model") or "Unknown model")[:180]
-                model_is_installed = (installed_models is None
-                                      or item_model.casefold() in installed_models)
+                model_is_installed = item_model.casefold() in installed_models
                 if model_is_installed and (longest is None or elapsed > longest["elapsed_ms"]):
                     session = str(item.get("session") or "")[:16]
                     longest = {
@@ -1374,6 +1377,12 @@ def _usage_stats() -> dict:
         day = (today - datetime.timedelta(days=offset)).isoformat()
         bucket = daily.get(day) or {"day": day, "turns": 0, "tokens": 0, "elapsed_ms": 0.0}
         chart_days.append({**bucket, "elapsed_ms": round(float(bucket["elapsed_ms"]), 1)})
+
+    activity_days = []
+    for offset in range(364, -1, -1):
+        day = (today - datetime.timedelta(days=offset)).isoformat()
+        bucket = daily.get(day) or {"day": day, "turns": 0, "tokens": 0, "elapsed_ms": 0.0}
+        activity_days.append({**bucket, "elapsed_ms": round(float(bucket["elapsed_ms"]), 1)})
 
     fold = {"attempts": 0, "successful": 0, "failed": 0, "skipped": 0,
             "folded_messages": 0, "folded_tokens": 0}
@@ -1406,6 +1415,7 @@ def _usage_stats() -> dict:
         "privacy": "Local aggregate counters only. Prompts, replies, paths and tool results are not included.",
         "models": models,
         "daily": chart_days,
+        "activity": {"days": activity_days, "timezone": "host local time"},
         "totals": {
             "turns": max(dataset_turns, max(0, int(savings.get("turns", 0) or 0))),
             "input_tokens": max(dataset_input, max(0, int(savings.get("tok_in", 0) or 0))),
@@ -29915,6 +29925,8 @@ def _security_collect_actions() -> dict:
                         "tool": str(row.get("tool") or "")[:100],
                         "status": str(row.get("status") or "")[:40],
                         "target": str(row.get("target") or "")[:240],
+                        "args_sha256": str(row.get("args_sha256") or "")[:64],
+                        "result_sha256": str(row.get("result_sha256") or "")[:64],
                     })
             except Exception:
                 continue
@@ -30041,7 +30053,7 @@ STATIC_WHITELIST = {
     "bridge-client.js", "preview-runtime.js",
     "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css", "signal-field.js",
     "research-ui.js", "research-ui.css", "dropdown-menus.js",
-    "security-scan-field.js",
+    "security-scan-field.js", "agent-orb.js", "ui-refresh.css",
     # brand assets — see index.html <link rel="..."> tags
     "assets/brand/logo-mark-dark.png", "assets/brand/logo-mark-light.png",
     "assets/icons/favicon.png", "assets/icons/favicon-32.png",
@@ -30333,7 +30345,7 @@ class Handler(BaseHTTPRequestHandler):
         live_ui_asset = name in {
             "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css",
             "research-ui.js", "research-ui.css", "dropdown-menus.js",
-            "signal-field.js", "security-scan-field.js",
+            "signal-field.js", "security-scan-field.js", "agent-orb.js", "ui-refresh.css",
         }
         cache_control = ("no-cache, must-revalidate" if live_ui_asset
                          else ("public, max-age=31536000, immutable" if versioned
@@ -30890,6 +30902,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200 if result.get("ok") else 400, result)
         if p == "/api/security/whitelist/remove":
             result = _security_overview.remove_whitelist(str(body.get("id") or ""))
+            return self._send_json(200 if result.get("ok") else 404, result)
+        if p == "/api/security/alerts/filter":
+            result = _security_overview.filter_alert(
+                str(body.get("alert_id") or ""), str(body.get("mode") or ""))
+            return self._send_json(200 if result.get("ok") else 400, result)
+        if p == "/api/security/alerts/restore":
+            result = _security_overview.remove_alert_filter(str(body.get("id") or ""))
             return self._send_json(200 if result.get("ok") else 404, result)
         if p == "/api/security/investigate":
             result = _security_overview.investigate(str(body.get("alert_id") or ""))

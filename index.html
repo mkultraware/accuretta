@@ -27,7 +27,8 @@
   })();
 </script>
 <script src="/appearance.js?v=1"></script>
-<link rel="stylesheet" href="/app.css?v=75">
+<link rel="stylesheet" href="/app.css?v=76">
+<link rel="stylesheet" href="/ui-refresh.css?v=1">
 <link rel="stylesheet" href="/workspace-shell.css?v=2">
 <link rel="stylesheet" href="/research-ui.css?v=2">
 <link rel="stylesheet" href="/assets/vendor/web/icons.css">
@@ -62,7 +63,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.8.6</span>
+        <span class="v" id="brand-v">v0.8.7</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -507,9 +508,9 @@
   </header>
   <div class="usage-page-scroll">
     <div class="usage-shell">
-      <section class="usage-hero" aria-label="Accuretta usage mark">
-        <canvas id="usage-mark" width="696" height="360" aria-hidden="true"></canvas>
-        <p>What your local models have actually done.</p>
+      <section class="usage-hero" aria-label="Total local usage">
+        <span class="usage-eyebrow">Tokens processed locally</span>
+        <strong id="usage-token-total">0</strong>
         <span id="usage-range">Loading local counters…</span>
       </section>
       <div id="usage-content" class="usage-content" aria-live="polite">
@@ -642,7 +643,12 @@
         </div>
       </section>
 
-      <footer class="security-privacy"><i class="ph ph-lock-key"></i><span>Evidence, investigation context, and whitelist decisions stay on this machine. Scans are read-only.</span></footer>
+      <details class="security-panel security-quieted-panel">
+        <summary>Quieted tool errors <span id="security-filter-count">0</span><i class="ph ph-caret-down"></i></summary>
+        <p>Dismissed occurrences and ignored repeats stay recorded. Restore a filter to show matching errors again.</p>
+        <div id="security-alert-filters" class="security-whitelist-list"></div>
+      </details>
+      <footer class="security-privacy"><i class="ph ph-lock-key"></i><span>Evidence, investigation context, and alert preferences stay on this machine. Scans are read-only.</span></footer>
     </div>
   </div>
 
@@ -1706,7 +1712,8 @@
   <script src="/security-scan-field.js?v=6"></script>
 <script src="/research-ui.js?v=2"></script>
 <script src="/dropdown-menus.js?v=1"></script>
-<script src="/app.js?v=2026091007"></script>
+<script src="/agent-orb.js?v=1"></script>
+<script src="/app.js?v=2026091201"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {

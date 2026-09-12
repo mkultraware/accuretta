@@ -17,6 +17,7 @@ Package it into a single windowed .exe (no console) with PyInstaller:
         --add-data "index.html;." --add-data "app.js;." --add-data "app.css;." ^
         --add-data "bridge-client.js;." --add-data "preview-runtime.js;." --add-data "appearance.js;." ^
         --add-data "signal-field.js;." --add-data "security-scan-field.js;." ^
+        --add-data "agent-orb.js;." --add-data "ui-refresh.css;." ^
         --add-data "assets;assets" ^
         --add-data "colors_and_type.css;." --add-data "manifest.webmanifest;." ^
         --icon assets/icons/accuretta.ico accuretta_app.py
