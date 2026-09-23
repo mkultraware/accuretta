@@ -288,6 +288,7 @@ button {
 .usage-model-tag-slot { min-width: 104px; display: flex; justify-content: flex-end; }
 .usage-model-tag { padding: 5px 8px; border-radius: 999px; font-size: 9px; font-weight: 750; text-transform: uppercase; letter-spacing: .06em; }
 .usage-model-tag.best { color: var(--accent); background: var(--accent-subtle); }
+.usage-model-tag.best .usage-model-star { width: 10px; height: 10px; margin-right: 4px; vertical-align: -1px; fill: #d9a93f; }
 .usage-model-tag.watch { color: var(--amber, #d19a43); background: color-mix(in srgb, var(--amber, #d19a43) 12%, var(--bg-raised)); }
 .usage-model-meter { height: 5px; overflow: hidden; border-radius: 999px; background: var(--border-subtle); }
 .usage-model-meter span { display: block; height: 100%; border-radius: inherit; background: var(--accent); box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 38%, transparent); }
@@ -5726,7 +5727,7 @@ body.remote-client .chat-scroll {
   box-sizing: border-box;
 }
 .tool-group-body .tool-line.err::before {
-  background: var(--fg-faint);
+  background: color-mix(in srgb, var(--amber, #d19a43) 55%, var(--fg-faint));
   box-shadow: none;
 }
 .tool-group-body .tool-line.stopped::before {
@@ -6893,7 +6894,9 @@ body.remote-client .chat-scroll {
   position: fixed;
   inset: 0;
   background: rgba(20, 20, 18, 0.5);
-  backdrop-filter: blur(4px);
+  /* No backdrop blur here: it smears the revealer-deck notifications
+     (auto-tune confirmations, etc.) into unreadability while a drawer is
+     open. The dim alone signals the modal state. */
   z-index: var(--z-modal);
   opacity: 0;
   pointer-events: none;
@@ -11219,6 +11222,87 @@ body,
   white-space: nowrap;
 }
 
+/* Context breakdown hover: same card chrome as the link preview, with quiet
+   per-category rows. Single-hue bars (share of window) — no rainbow. */
+.chat-link-popover.ctx-breakdown {
+  width: 300px;
+}
+.ctxbd-body {
+  padding: 10px 12px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.ctxbd-head {
+  font-size: 10.5px;
+  font-weight: 750;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+}
+.ctxbd-rows {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.ctxbd-row {
+  display: grid;
+  grid-template-columns: 82px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 12px;
+}
+.ctxbd-row dt {
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ctxbd-row dd {
+  margin: 0;
+}
+.ctxbd-bar {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--border-subtle);
+  overflow: hidden;
+}
+.ctxbd-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--accent) 70%, transparent);
+}
+.ctxbd-val {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+  font-size: 10.5px;
+  color: var(--fg);
+  text-align: right;
+  white-space: nowrap;
+}
+.ctxbd-empty {
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.ctxbd-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 7px;
+  margin-top: 1px;
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+.ctxbd-foot span:last-child {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--fg-faint);
+}
+
 /* ============================================================
 
    Smart Setup Wizard UI Extensions
@@ -12569,6 +12653,33 @@ body,
   mask-image: radial-gradient(ellipse 80% 50% at 50% 0%, #000 80%, transparent 100%);
 }
 
+/* Welcome quote backdrop: a giant opening "..." glyph behind the New Session
+   content, uniform across all themes. A real text glyph (not drawn slabs) so
+   it reads as a quote mark everywhere. Tinted by mixing --accent toward
+   --bg — both defined per theme — so vivid accents can't scream and muted
+   ones don't vanish: every theme lands at the same whisper. Static on
+   purpose — no drift, no motion — and pointer-transparent. */
+.welcome-quote {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  display: flex;
+  justify-content: flex-end;
+  align-items: flex-start;
+  padding-right: 5%;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(320px, 62vmin, 700px);
+  line-height: 0.9;
+  color: color-mix(in srgb, var(--accent) 16%, var(--bg));
+  user-select: none;
+}
+.welcome-quote span {
+  display: block;
+  transform: translateY(-12%);
+}
+
 /* SEKURA AbstractWave-style backdrop (markup from buildWelcomeBars()):
    three drifting colour blobs UNDER 28 sharp pleated pillars, then a
    backdrop-blur softening pass, an overlay pillar pass for edge definition,
@@ -12904,13 +13015,15 @@ body,
 /* "Sent to the Ether" transition animations */
 .welcome-logo-wrap,
 .welcome-title,
-.welcome-subtitle {
+.welcome-subtitle,
+.welcome-quote {
   transition: opacity 0.55s cubic-bezier(0.16, 1, 0.3, 1), transform 0.55s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .welcome-screen.welcome-disintegrating .welcome-logo-wrap,
 .welcome-screen.welcome-disintegrating .welcome-title,
-.welcome-screen.welcome-disintegrating .welcome-subtitle {
+.welcome-screen.welcome-disintegrating .welcome-subtitle,
+.welcome-screen.welcome-disintegrating .welcome-quote {
   opacity: 0;
   transform: translateY(-24px);
   pointer-events: none;

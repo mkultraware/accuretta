@@ -57,6 +57,7 @@
     _versionsExpanded: false,
     _lastMsgTokens: 0,
     _lastMsgPromptTokens: 0,
+    _ctxBreakdown: null, // live per-category tokens from ctx_fill/stats (bridge _ctx_breakdown)
     _ctxPoll: null,
     touchedFiles: new Set(),
     imageUrlToSourceMap: new Map(),
@@ -1316,8 +1317,18 @@
     const body = group.querySelector(".tool-group-body");
     if (!body) return;
     const rows = [...body.children].filter(el => el.classList.contains("tool-line"));
-    const hiddenCount = Math.max(0, rows.length - 3);
-    rows.forEach((line, index) => line.classList.toggle("activity-older", index < hiddenCount));
+    // Failed rows are never folded: successes collapse to the newest three,
+    // but a failure buried in "N earlier actions" is invisible. Keyed on the
+    // structural .err class from finishToolActivity, not on text.
+    const failed = new Set(rows.filter(line => line.classList.contains("err")));
+    const foldable = rows.filter(line => !failed.has(line));
+    const visibleFoldable = new Set(foldable.slice(-3));
+    let hiddenCount = 0;
+    rows.forEach(line => {
+      const hide = !failed.has(line) && !visibleFoldable.has(line);
+      line.classList.toggle("activity-older", hide);
+      if (hide) hiddenCount++;
+    });
     let overflow = body.querySelector(".activity-overflow");
     if (hiddenCount === 0) {
       overflow?.remove();
@@ -3616,6 +3627,7 @@
     // crude char estimate until the next poll/turn. Walk newest-first for the
     // most recent message that carries a real count.
     state._lastMsgPromptTokens = 0;
+    state._ctxBreakdown = null;
     state._ctxSource = "";
     if (chat && chat.messages) {
       for (let i = chat.messages.length - 1; i >= 0; i--) {
@@ -4031,7 +4043,7 @@
     if (!state.messages.length) {
       inner.innerHTML = `
         <div class="welcome-screen">
-          <div class="welcome-blobs"></div>
+          <div class="welcome-quote" aria-hidden="true"><span>&ldquo;</span></div>
           <div class="welcome-content">
             <div class="welcome-logo-wrap">
               <div class="welcome-logo welcome-logo-accent" aria-hidden="true"></div>
@@ -6166,6 +6178,26 @@
     row._paintNext = null;
   }
 
+  // ---- finish batch ----
+  // The final SSE event, the turn_changes card, and the think-line flip all
+  // land within milliseconds of each other. Writing each synchronously costs
+  // one layout + scroll chase per write — the finish-time judder. Collect a
+  // row's finish writes and flush them in a single frame, then scroll once
+  // (follow-respecting; the ResizeObserver backstops late height changes).
+  function scheduleFinishBatch(row, fn) {
+    if (!row || !row.isConnected) { try { fn(); } catch (e) { console.error("finish batch failed", e); } return; }
+    (row._finishBatch ||= []).push(fn);
+    if (row._finishRaf) return;
+    row._finishRaf = requestAnimationFrame(() => {
+      row._finishRaf = null;
+      const fns = row._finishBatch;
+      row._finishBatch = null;
+      if (!row.isConnected || !fns) return;
+      try { for (const f of fns) f(); } catch (e) { console.error("finish batch failed", e); }
+      scrollToBottom();
+    });
+  }
+
   // splitThinking memo — the base-split below re-parses the SAME prefix
   // every paint (buf only grows at the tail), so cache by input identity.
   function splitThinkingMemo(row, buf) {
@@ -6816,6 +6848,7 @@
       // prompt_eval_count is measured truth from llama-server, not an
       // estimate — mark it so the tooltip stops claiming otherwise.
       state._ctxSource = "live";
+      if (evt.ctx_breakdown && typeof evt.ctx_breakdown === "object") state._ctxBreakdown = evt.ctx_breakdown;
       // refresh gauge live — prompt_eval_count is the truth from llama-server,
       // and tool-heavy turns can blow past where the char-count estimate sits.
       renderCtxGauge();
@@ -6902,7 +6935,16 @@
             interimHtml = renderWorkingNotesBlock(interimText);
             answerText = finalContent.slice(interimText.length);
           }
+          // Decide synchronously (reads live DOM), apply in the finish batch
+          // so bubble rewrite + think-line flip land in one frame.
+          // mode: "keep" = live DOM already correct, "show" = rewrite,
+          // "hide" = nothing renderable. Empty finals skip everything, as
+          // before (pure tool-call turns leave streaming state untouched).
+          let mode = "hide";
+          let rendered = "";
+          let hasFinal = false;
           if (finalContent.trim()) {
+            hasFinal = true;
             const snapshot = finalBubble._streamSnapshot;
             const keepLiveProse = snapshot
               && snapshot.content === finalContent
@@ -6913,12 +6955,16 @@
               && !!finalBubble.innerHTML.trim()
               && !finalBubble.querySelector("pre.code-card, .code-card-tabs-container");
             if (keepLiveProse) {
-              // Nothing changed except that the transport has finished. Keep
-              // the live DOM rather than reflowing the same response again.
-              setTimeout(() => scrollToBottom(true), 50);
+              mode = "keep";
             } else {
-              const rendered = renderMarkdown(answerText);
-              if ((rendered && rendered.trim()) || interimHtml) {
+              rendered = renderMarkdown(answerText);
+              if ((rendered && rendered.trim()) || interimHtml) mode = "show";
+            }
+          }
+          if (hasFinal) {
+            scheduleFinishBatch(lastRow, () => {
+              if (!finalBubble.isConnected) return;
+              if (mode === "show") {
                 if (finalBubble._collapsing) {
                   clearTimeout(finalBubble._collapseTimer);
                   finalBubble._collapsing = false;
@@ -6927,15 +6973,14 @@
                 finalBubble.classList.remove("hidden");
                 finalBubble.innerHTML = interimHtml + rendered;
                 enhanceCodeBlocks(finalBubble);
-                setTimeout(() => scrollToBottom(true), 50);
-              } else {
+              } else if (mode === "hide") {
                 // All content was tool-call-stripped. Keep the bubble hidden.
                 finalBubble.innerHTML = "";
                 finalBubble.classList.add("hidden");
               }
-            }
+              updateThinkLine(lastRow, false);
+            });
           }
-          updateThinkLine(lastRow, false);
         }
       }
       // parse companion files emitted alongside the primary html block
@@ -7289,7 +7334,6 @@
     if (!row || !evt || !Array.isArray(evt.files) || !evt.files.length) return;
     const col = row.querySelector(".bubble-col");
     if (!col) return;
-    col.querySelector(".turn-changes")?.remove();
     const n = evt.files.length;
     const files = evt.files.map(f => {
       const tag = f.created ? `<span class="tc-tag tc-new">new</span>`
@@ -7325,7 +7369,15 @@
         <button class="tc-undo" type="button" ${evt.undone || evt.files.every(f => f.restorable === false) ? "hidden" : ""}><i class="ph ph-arrow-counter-clockwise"></i><span>Undo file edits</span></button>
       </div>
       <p class="tc-coverage">Undo covers recorded text file edits. Commands, external actions, and files edited again are preserved.</p>`;
-    col.appendChild(bar);
+    // Same finish batch as the final bubble render: the card lands in the
+    // same frame as the think-line flip instead of costing its own layout +
+    // scroll chase a frame later. The batch flush scrolls once.
+    scheduleFinishBatch(row, () => {
+      if (!col.isConnected) return;
+      col.querySelector(".turn-changes")?.remove();
+      col.appendChild(bar);
+      requestAnimationFrame(syncFade);
+    });
     bar.querySelector(".tc-review").onclick = () => reviewTaskChanges(evt, chatId);
     bar.querySelectorAll(".tc-file-open").forEach(button => button.addEventListener("click", async () => {
       try { await openTaskFile(evt.files[Number(button.dataset.fileIndex)]); }
@@ -7341,7 +7393,6 @@
       bar.classList.toggle("tc-at-end", atEnd);
     };
     filesEl.addEventListener("scroll", syncFade, { passive: true });
-    requestAnimationFrame(syncFade);
     const openBtn = bar.querySelector(".tc-openfolder");
     openBtn.addEventListener("click", async () => {
       const dir = openDir || wsRoots[0] || "";
@@ -7391,7 +7442,8 @@
         btn.innerHTML = `<i class="ph ph-arrow-counter-clockwise"></i><span>Undo</span>`;
       }
     });
-    scrollToBottom();
+    // No explicit scroll here: the finish-batch flush scrolls once (follow-
+    // respecting) after the card lands, instead of chasing it a frame later.
   }
 
   // ---------- docked task-progress panel ----------
@@ -8307,7 +8359,7 @@
     const modelRows = models.slice(0, 10).map(model => {
       const score = Math.round((Number(model.reliability) || 0) * 100);
       const rank = model.ranked ? String(++rankedPosition).padStart(2, "0") : "--";
-      const tag = best && model.model === best.model ? '<span class="usage-model-tag best">Best observed</span>'
+      const tag = best && model.model === best.model ? '<span class="usage-model-tag best"><svg class="usage-model-star" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.6l2.9 6 6.6.9-4.8 4.6 1.2 6.5L12 17.5l-5.9 3.1 1.2-6.5L2.5 9.5l6.6-.9z"/></svg>Best observed</span>'
         : attention && model.model === attention.model ? '<span class="usage-model-tag watch">Watch</span>' : "";
       return `<div class="usage-model-row">
         <span class="usage-model-rank">${rank}</span>
@@ -8361,9 +8413,9 @@
       </section>
 
       <section class="usage-panel usage-model-panel">
-        <div class="usage-section-head"><div><span class="usage-eyebrow">On this computer</span><h2>Model performance</h2></div><span class="usage-method">Reliability = finished turns + tool success</span></div>
+        <div class="usage-section-head"><div><span class="usage-eyebrow">On this computer</span><h2>Model performance</h2></div><span class="usage-method">Score = tool success + finished turns + speed + track record</span></div>
         <div class="usage-model-list">${modelRows || '<div class="usage-empty">No recorded usage for models currently on this computer.</div>'}</div>
-        <p class="usage-footnote">Only models with a verified local file appear here. Ranking starts after five turns. Historical activity remains in your totals.</p>
+        <p class="usage-footnote">Only models with a verified local file appear here. Ranking starts after five turns; short runs are weighted toward the fleet average so proven workhorses outrank lucky streaks. Historical activity remains in your totals.</p>
       </section>
 
       <section class="usage-panel usage-interventions-panel">
@@ -10833,8 +10885,17 @@
         // the gauge always lagged one round behind the real fill.
         if (evt.chat_id && evt.chat_id !== state.chatId) return;
         if (typeof evt.prompt_tokens === "number") {
+          // Same rule as the poll: while streaming, a stale ctx_fill (e.g. an
+          // SSE replay of a previous round's value) must not pull the gauge
+          // backwards. The round-end stats event is authoritative and still
+          // lands; a genuine shrink (compaction) is reported by the next
+          // round's stats, not by a replayed estimate.
+          if (state.streaming && evt.prompt_tokens < Number(state._lastMsgPromptTokens || 0)) {
+            return;
+          }
           state._lastMsgPromptTokens = evt.prompt_tokens;
           state._ctxSource = evt.source || "estimate";
+          if (evt.breakdown && typeof evt.breakdown === "object") state._ctxBreakdown = evt.breakdown;
           if (Number.isFinite(evt.capacity) && evt.capacity > 0) state._ctxCapacity = evt.capacity;
           renderCtxGauge();
         }
@@ -11972,8 +12033,8 @@
       lines.push("applied to settings — the new flags take effect on the next model load.");
       if (notes) notes.textContent = lines.join("\n");
       const toastMsg = sug.quant_downshift
-        ? "auto-tune applied — but consider the quant suggestion in the notes"
-        : "auto-tune applied — see the notes below";
+        ? "auto-tune applied — quant downshift suggested"
+        : "auto-tune applied";
       toast(toastMsg, sug.quant_downshift ? "warn" : "ok", 4000);
     } catch (e) {
       if (notes) notes.textContent = `auto-tune failed: ${e.message || e}`;
@@ -12325,6 +12386,10 @@
   }
 
   function renderSpecDraftStatus(data) {
+    if ((state.settings?.spec_draft_mode || "auto") === "off") {
+      setSpecDraftStatus("", "decoder unloaded — auto-pairing disabled, VRAM back to context");
+      return;
+    }
     if (!specStrategyWantsDraft()) { setSpecDraftStatus("", ""); return; }
     const input = ($("#set-spec-draft-model")?.value || "").trim();
     const selected = data && data.selected_match;
@@ -12597,7 +12662,7 @@
   const LOAD_TIME_KEYS = [
     "num_ctx", "num_gpu", "num_batch", "num_thread", "kv_cache_type", "kv_cache_type_v", "model_path", "vision_model",
     "n_cpu_moe", "n_ubatch", "n_parallel", "flash_attn",
-    "spec_strategy", "spec_draft_model", "no_warmup", "enable_metrics", "llama_extra_args",
+    "spec_strategy", "spec_draft_model", "spec_draft_mode", "no_warmup", "enable_metrics", "llama_extra_args",
     // mmproj_path changes how the server is launched (--mmproj <path>) so it
     // also requires a relaunch to take effect.
     "mmproj_mode", "mmproj_auto", "mmproj_path",
@@ -12632,6 +12697,13 @@
       spec_strategy: ($("#set-spec-strategy")?.value || "ngram-mod"),
       spec_strategy_source: "manual",
       spec_draft_model: ($("#set-spec-draft-model")?.value || "").trim(),
+      // Explicit draft intent re-arms auto-pairing; otherwise the saved
+      // mode stands — so an unloaded decoder stays unloaded across saves
+      // instead of being silently re-paired on the next reload.
+      spec_draft_mode: ((($("#set-spec-draft-model")?.value || "").trim()
+        || (($("#set-spec-strategy")?.value || "").toLowerCase() === "dflash")
+        || (($("#set-spec-strategy")?.value || "").toLowerCase() === "dspark"))
+        ? "auto" : (state.settings?.spec_draft_mode || "auto")),
       enable_speculative: ($("#set-spec-strategy")?.value || "ngram-mod") !== "off",
       no_warmup: !!$("#sw-nowarmup")?.classList.contains("on"),
       enable_metrics: !!$("#sw-metrics")?.classList.contains("on"),
@@ -13201,9 +13273,143 @@
     if (!gauge) return;
     gauge.classList.toggle("warn", pct >= 0.7 && pct < 0.9);
     gauge.classList.toggle("crit", pct >= 0.9);
-    const gaugeTitle = `${used.toLocaleString()} / ${capacity.toLocaleString()} tokens (~${Math.round(pct * 100)}%)\nsource: ${source}`;
-    if (gauge.title !== gaugeTitle) gauge.title = gaugeTitle;
+    // No native title: the hover card below carries the breakdown, and a
+    // native tooltip would double up behind it.
+    if (gauge.hasAttribute("title")) gauge.removeAttribute("title");
   }
+  // ---------- context breakdown hover ----------
+  // llama.cpp-style ring tooltip: where the window went (system, tool specs,
+  // user/assistant turns, tool results). Live per-category tokens ride along
+  // on ctx_fill / stats events; before the first round, estimate locally in
+  // the same shape. Card reuses the chat-link-popover chrome so it matches
+  // the other hover menus in every theme.
+  let _ctxPopoverEl = null;
+  let _ctxPopoverHideTimer = null;
+  const _CTXBD_ORDER = [
+    ["system", "System"],
+    ["tools", "Tool specs"],
+    ["user", "User"],
+    ["assistant", "Assistant"],
+    ["tool", "Tool results"],
+  ];
+  function _ctxBreakdownData() {
+    const use = computeCtxUsage();
+    const live = state._ctxBreakdown;
+    if (live && typeof live === "object") {
+      const rows = [];
+      for (const [key, label] of _CTXBD_ORDER) {
+        const t = Math.max(0, Math.round(Number(live[key]) || 0));
+        if (t > 0) rows.push({ label, tokens: t });
+      }
+      if (rows.length) return { rows, used: use.used, capacity: use.capacity, live: true };
+    }
+    // Cold start: estimate from visible bubbles (chars/3, tool traffic 1.5x),
+    // mirroring the estimate path in computeCtxUsage.
+    const msgs = state.messages || [];
+    const acc = { system: Math.round(2500 / 3), user: 0, assistant: 0, tool: 0 };
+    for (const m of msgs) {
+      const role = m && (m.role === "user" || m.role === "assistant" || m.role === "tool") ? m.role : "assistant";
+      const mult = role === "tool" ? 1.5 : 1.0;
+      acc[role] += Math.round(String((m && m.content) || "").length * mult / 3);
+    }
+    const rows = [
+      { label: "System", tokens: acc.system },
+      { label: "User", tokens: acc.user },
+      { label: "Assistant", tokens: acc.assistant },
+      { label: "Tool results", tokens: acc.tool },
+    ].filter(r => r.tokens > 0);
+    if (!rows.length) return null;
+    return { rows, used: use.used, capacity: use.capacity, live: false };
+  }
+  function ensureCtxPopover() {
+    if (_ctxPopoverEl) return _ctxPopoverEl;
+    const el = document.createElement("div");
+    el.className = "chat-link-popover ctx-breakdown";
+    el.setAttribute("hidden", "");
+    el.innerHTML = `<div class="ctxbd-body">
+      <div class="ctxbd-head">Context usage</div>
+      <dl class="ctxbd-rows"></dl>
+      <div class="ctxbd-foot"></div>
+    </div>`;
+    el.addEventListener("mouseenter", () => {
+      if (_ctxPopoverHideTimer) { clearTimeout(_ctxPopoverHideTimer); _ctxPopoverHideTimer = null; }
+    });
+    el.addEventListener("mouseleave", scheduleHideCtxPopover);
+    document.body.appendChild(el);
+    _ctxPopoverEl = el;
+    return el;
+  }
+  function renderCtxBreakdown() {
+    const el = ensureCtxPopover();
+    const data = _ctxBreakdownData();
+    const rowsEl = el.querySelector(".ctxbd-rows");
+    const footEl = el.querySelector(".ctxbd-foot");
+    if (!data) {
+      rowsEl.innerHTML = `<div class="ctxbd-empty">No context data yet — run a turn first.</div>`;
+      footEl.textContent = "";
+      return;
+    }
+    const cap = Math.max(1, data.capacity);
+    rowsEl.innerHTML = data.rows.map(r => {
+      const pct = Math.min(100, (r.tokens / cap) * 100);
+      return `<div class="ctxbd-row"><dt>${esc(r.label)}</dt>`
+        + `<dd class="ctxbd-bar"><span style="width:${pct.toFixed(1)}%"></span></dd>`
+        + `<dd class="ctxbd-val">${r.tokens.toLocaleString()} · ${pct.toFixed(1)}%</dd></div>`;
+    }).join("");
+    const free = Math.max(0, cap - data.used);
+    footEl.innerHTML = `<span>${data.used.toLocaleString()} of ${cap.toLocaleString()} used · ${free.toLocaleString()} free</span>`
+      + `<span>${data.live ? "live" : "estimate"}</span>`;
+  }
+  function positionCtxPopover() {
+    if (!_ctxPopoverEl) return;
+    const anchor = document.getElementById("ctx-gauge");
+    if (!anchor) return;
+    const r = anchor.getBoundingClientRect();
+    const pw = _ctxPopoverEl.offsetWidth || 300;
+    const ph = _ctxPopoverEl.offsetHeight || 200;
+    // Sidebar sits left: prefer right of the gauge, flip if it would clip.
+    let left = r.right + 8;
+    if (left + pw > window.innerWidth - 8) left = Math.max(8, r.left - pw - 8);
+    if (left < 8) left = 8;
+    const top = Math.max(8, Math.min(r.top, window.innerHeight - ph - 8));
+    _ctxPopoverEl.style.left = left + "px";
+    _ctxPopoverEl.style.top = top + "px";
+  }
+  function showCtxPopover() {
+    const el = ensureCtxPopover();
+    if (_ctxPopoverHideTimer) { clearTimeout(_ctxPopoverHideTimer); _ctxPopoverHideTimer = null; }
+    renderCtxBreakdown();
+    el.removeAttribute("hidden");
+    requestAnimationFrame(() => {
+      el.classList.add("visible");
+      positionCtxPopover();
+    });
+  }
+  function scheduleHideCtxPopover() {
+    if (_ctxPopoverHideTimer) clearTimeout(_ctxPopoverHideTimer);
+    _ctxPopoverHideTimer = setTimeout(() => {
+      if (_ctxPopoverEl) {
+        _ctxPopoverEl.classList.remove("visible");
+        _ctxPopoverEl.setAttribute("hidden", "");
+      }
+      _ctxPopoverHideTimer = null;
+    }, 220);
+  }
+  // Global delegated hover — the gauge is static chrome, same pattern as the
+  // chat-link preview. Moving within the gauge or onto the card keeps it open.
+  document.addEventListener("mouseover", (ev) => {
+    const g = ev.target && ev.target.closest && ev.target.closest("#ctx-gauge");
+    if (!g) return;
+    if (g.contains(ev.relatedTarget)) return;
+    showCtxPopover();
+  });
+  document.addEventListener("mouseout", (ev) => {
+    const g = ev.target && ev.target.closest && ev.target.closest("#ctx-gauge");
+    if (!g) return;
+    if (g.contains(ev.relatedTarget)) return;
+    if (_ctxPopoverEl && _ctxPopoverEl.contains(ev.relatedTarget)) return;
+    scheduleHideCtxPopover();
+  });
   function renderTokTotal() {
     const el = $("#tok-total");
     if (!el) return;
@@ -15127,6 +15333,49 @@
       syncSpecDraftSelection();
       clearTimeout(window._specDraftInputTimer);
       window._specDraftInputTimer = setTimeout(() => refreshSpecDrafts(), 350);
+    });
+    $("#btn-spec-draft-unload")?.addEventListener("click", async () => {
+      const btn = $("#btn-spec-draft-unload");
+      const modelPath = ($("#set-model")?.value || state.loadedModel || state.settings?.model_path || "").trim();
+      if (!modelPath) { toast("pick a model first — unload needs to know its size", "warn", 3000); return; }
+      btn.disabled = true;
+      try {
+        const r = await api("/api/models/unload-draft", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model_path: modelPath }),
+        });
+        if (!r || !r.ok) throw new Error(r?.error || "unload failed");
+        await loadSettings();
+        // Mirror the retune into the form via the shared applier (no-op
+        // save when everything already matches the file).
+        await applyAutoTune({ ...(r.suggested || {}), spec_strategy: r.spec_strategy }, {});
+        const draftInput = $("#set-spec-draft-model");
+        if (draftInput) draftInput.value = "";
+        await refreshSpecDrafts();
+        const ctxTxt = r.tune_applied
+          ? `ctx ${Number(r.num_ctx || 0).toLocaleString()}`
+          : "ctx unchanged for now — next load retunes it";
+        toast(`draft unloaded — ${r.spec_strategy} auto-applied, ${ctxTxt}. reloading model…`, "ok", 6000);
+        state._reloading = true;
+        const rname = String(modelPath).split(/[\\/]/).pop();
+        const hint = $("#set-model-hint");
+        if (hint) hint.textContent = `reloading ${rname} (decoder unloaded)…`;
+        renderStatus();
+        renderModelPill();
+        try {
+          await requestModelLoad(modelPath);
+          toast("model reloaded without the draft decoder", "ok", 2500);
+        } catch (e) {
+          toast("reload failed: " + (e.message || e), "error", 6000);
+          if (hint) hint.textContent = `reload failed — ${rname}`;
+        } finally {
+          state._reloading = false;
+          renderStatus();
+          renderModelPill();
+        }
+      } catch (e) {
+        toast("draft unload failed: " + (e.message || e), "error", 5000);
+      } finally { btn.disabled = false; }
     });
     $("#btn-spec-draft-browse")?.addEventListener("click", async () => {
       const btn = $("#btn-spec-draft-browse");

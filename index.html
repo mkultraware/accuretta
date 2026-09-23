@@ -63,7 +63,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.8.9</span>
+        <span class="v" id="brand-v">v0.9.0</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -124,7 +124,7 @@
             </button>
           </div>
         </div>
-        <div class="ctx-gauge" id="ctx-gauge" title="working memory used">
+        <div class="ctx-gauge" id="ctx-gauge">
           <div class="ctx-gauge-title">Context memory
             <button type="button" class="ctx-compact-btn" id="btn-compact"
                     title="Fold older turns into the session summary now — frees context on long chats without losing detail">compact</button>
@@ -881,7 +881,7 @@
           <div class="faq-list">
             <details class="faq-item">
               <summary><span>What does the context ring show?</span><i class="ph ph-plus"></i></summary>
-              <div><p>It estimates how much of the loaded model's context window the current prompt uses. The ring is a safety gauge, not a perfect tokenizer reading, so it intentionally leans conservative.</p></div>
+              <div><p>It estimates how much of the loaded model's context window the current prompt uses. The ring is a safety gauge, not a perfect tokenizer reading, so it intentionally leans conservative. Hover the ring for a per-category breakdown: system prompt, tool specs, user and assistant turns, and tool results.</p></div>
             </details>
             <details class="faq-item">
               <summary><span>What happens when a chat becomes too long?</span><i class="ph ph-plus"></i></summary>
@@ -1252,8 +1252,9 @@
       <div style="display:flex;gap:6px;">
         <input type="text" id="set-spec-draft-model" placeholder="DFlash / DSpark draft .gguf path" style="flex:1;">
         <button class="btn sm" id="btn-spec-draft-browse" title="Choose a matching speculative draft model"><i class="ph ph-folder-open"></i></button>
+        <button class="btn sm" id="btn-spec-draft-unload" title="Unload the draft decoder: frees its VRAM, auto-applies the best draft-less strategy, and regrows context on reload"><i class="ph ph-eject"></i><span>Unload</span></button>
       </div>
-      <span class="hint">only needed for DFlash or DSpark. the draft is validated against the model's tokenizer and base-model metadata before launch.</span>
+      <span class="hint">only needed for DFlash or DSpark. the draft is validated against the model's tokenizer and base-model metadata before launch. Unload drops the decoder, picks the best draft-less strategy automatically (you can change it after), and retunes context to use the freed VRAM.</span>
     </div>
     <div class="form-row inline">
       <label>Skip warmup <i class="ph ph-info" title="--no-warmup. Saves a few seconds at startup. First reply may be slightly slower."></i></label>
