@@ -484,12 +484,13 @@ function toggleTaskPanel() {
     "  border-radius: 99px; background-clip: padding-box;",
     "}",
     ".island ::-webkit-scrollbar-thumb:hover { background-color: rgba(255,255,255,.24); }",
-    // The reply gets the FULL width of the widest pill (the same 540px as the
-    // "Approval needed" bar) and grows vertically to fit the answer, rather
-    // than the old fixed 560x318 box or a shrink-to-fit sliver.
+    // The reply gets the FULL width of the card (600px, a step past the
+    // 540px pills so a reading reply has room) and grows vertically to fit
+    // the answer, rather than the old fixed 560x318 box or a shrink-to-fit
+    // sliver.
     ".island[data-state='prompt'] .view.v-prompt { position: relative; inset: auto; }",
     ".island[data-state='prompt'] {",
-    "  width: 540px;",
+    "  width: 600px;",
     "  height: auto; max-height: 460px;",
     "}",
     ".island[data-state='prompt'][data-thread] { height: auto; }",
