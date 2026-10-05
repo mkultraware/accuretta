@@ -14,6 +14,7 @@ import ast
 from memory_store import MemoryStore, memory_kind
 import ctypes
 import difflib
+import http.client
 import json
 import copy
 import getpass
@@ -28689,6 +28690,30 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 except Exception:
                     pass
                 return None
+            except (ConnectionError, TimeoutError, http.client.HTTPException, ssl.SSLError) as e:
+                # llama-server died mid-generation (process killed, slot wedged,
+                # crashed and never came back): the response stream is cut. Unlike
+                # the stall above, tokens WERE flowing — the owner watched a real
+                # partial answer appear. Drop nothing: return the partial marked
+                # failed so the caller persists it and both surfaces show where
+                # the turn stopped, instead of leaving a dangling user message
+                # with no reply in the record.
+                _dead_txt = "".join(content_buf)
+                print(f"[chat] llama-server stream cut mid-generation: {type(e).__name__} "
+                      f"(streamed {len(_dead_txt)} chars)", flush=True)
+                try:
+                    emit({"type": "error",
+                          "error": ("llama-server stopped mid-generation — the stream was cut. "
+                                    "The partial reply is saved below marked as failed. "
+                                    "Restart the server (Settings → Restart server), then retry the turn.")})
+                except Exception:
+                    pass
+                partial = {"role": "assistant", "content": _dead_txt}
+                partial["_failed"] = True
+                partial["_appended_intermediate"] = list(conversation[_start_len:])
+                partial["_build"] = _BUILD_TAG
+                partial["_turn_id"] = _turn_id
+                return partial
             finally:
                 try:
                     resp.close()
