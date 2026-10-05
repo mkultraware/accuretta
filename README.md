@@ -34,6 +34,7 @@ The model weights, prompts, history, settings, and workspace live on the compute
 | Agent workspace | Reads and edits files, maps projects, finds symbols and references, checks syntax, runs tests, and works with Git. |
 | Live building | Renders HTML beside the chat, saves preview versions, exposes the source, and keeps the terminal and agent log visible. |
 | Long tasks | Compacts old conversation history, preserves structured task state, tracks unfinished verification, and can recover an interrupted turn. |
+| Notch overlay (beta) | Shows what the agent is doing and handles approvals and prompts from a small always-on-top Windows island. |
 | Remote work | Serves the UI over Tailscale HTTPS and can run commands or transfer files to an allowlisted Mac over SSH. |
 | Security work | Provides an authorization-gated recon, validation, exploitation, evidence, and reporting flow for targets you are allowed to test. |
 | Local analysis | Inspects Windows events, network connections, PCAPs, APKs, native binaries, firmware, archives, and YARA matches. |
@@ -136,6 +137,16 @@ Approved actions write a bounded record to `data/action_audit.jsonl`. It stores 
 
 The approval layer is part of the bridge, not a promise in the system prompt. The model cannot make a direct tool call around it.
 
+Approval notifications stay quiet while you are actually at the computer. A focused browser window on any device, or recent local input, marks you present and holds the external DM; it arrives when presence lapses or ten minutes pass, whichever comes first. A held notification is never dropped, only late.
+
+## The notch overlay (Windows, beta)
+
+A separate small window lives under the top edge of the screen. It shows what the agent is doing, presents approvals, and takes prompts while the main Accuretta window is minimized or on another monitor. It runs no tools itself; every action still goes through the bridge's approval layer, and protected actions keep their hold-to-approve gesture there too. Enable it in Settings. **Ctrl+Alt+Space** brings the island down from the bezel or tucks it back up.
+
+Approval gates in the notch show the command and, for file writes and edits, the line-level change the bridge attached. Writing while a task runs works the same way it does in the main window: the correction reaches the active run at its next safe stopping point. After a turn that touched the machine, an **Open in main app** button opens the main window on that session.
+
+A chat started in the notch is an ordinary session. It appears in the main window's sidebar as soon as it exists, and both surfaces read and write the same history. Double-clicking the empty space in the notch's conversation pulls that full history into the island; double-click again to fold back to the latest turn.
+
 ## Remote work over Tailscale
 
 Accuretta can expose its interface through Tailscale Serve. The resulting `https://...ts.net` address works from a MacBook or phone without public port forwarding. HTTPS also restores browser clipboard access that is blocked on plain remote HTTP.
@@ -233,6 +244,8 @@ budget: 2000
 
 Type `#` in the composer to pick one (the built-in picker also lists them). A skill loads into the current chat, one skill per chat, and loading another one replaces it. The model reads the procedure until you unload it with the × button next to the skill pill. Bodies over 16,000 characters refuse to load. `skills/` is per-machine user content, so it is gitignored; the format above is all a new user needs.
 
+One built-in skill ships with the app: `code-driven-motion-graphics`, a toolkit for building motion graphics in code. Its render engine lives under `skill_assets/` and is copied into your first workspace folder on launch when it is not already there, so each project can copy and adjust its own copy.
+
 You can also ask the agent to “save this as a skill” and paste Markdown or point it at a workspace `.md` file. Accuretta writes the finished file into `skills/`, adds or repairs the frontmatter, and calculates `budget` with the active model's tokenizer. If the model server is unavailable, it uses the same conservative token estimate as the rest of the app. Existing skills are never replaced unless you explicitly ask for that.
 
 ## Context, recovery, and model health
@@ -302,6 +315,11 @@ accuretta/
   app.js                 interface logic
   app.css                layout and component styles
   colors_and_type.css    theme tokens
+  presence_notify.py     presence-aware delivery for approval DMs
+  notch_host.py          Win32 host window for the notch island
+  accuretta-notch.html   notch island interface
+  notch-wire.js          notch wiring to the bridge event stream
+  notch-markdown.js      notch reply renderer
   requirements.txt       optional Python packages
   assets/
     vendor/               pinned local UI libraries, fonts, and licences

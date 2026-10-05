@@ -25,6 +25,8 @@
     currentFiles: {},      // { "style.css": "...", "script.js": "...", ... } parsed from the current assistant turn
     streaming: false,
     abortCtl: null,
+    editingTurn: null,       // { index } while a user turn is being edited
+    _comparePair: null,      // { before, beforeLabel } captured for the Compare chip
     approvals: new Map(),
     skills: null,            // [ {name, description, budget, body_chars, lines} ] catalog
     skillsAt: 0,
@@ -904,6 +906,47 @@
         Notification.requestPermission();
       }
     }
+  }
+
+  // ---------- presence heartbeat (notification routing) ----------
+  // One of the bridge's two "is the user active?" signals (the other is host
+  // input idle, checked on its end). Held external notifications (Discord
+  // approval DMs, security alerts) are released the moment this says the
+  // user is no longer active — or via escalation deadline, so nothing is
+  // ever silently dropped. Cost: only sent on focus changes or once per 30s
+  // while the tab is visible.
+  const PRESENCE_ID = (() => {
+    try {
+      let id = sessionStorage.getItem("accuretta:presence-id");
+      if (!id) {
+        id = "web-" + (crypto.randomUUID ? crypto.randomUUID() : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`);
+        sessionStorage.setItem("accuretta:presence-id", id);
+      }
+      return id;
+    } catch (_) {
+      return "web-" + Math.random().toString(36).slice(2);
+    }
+  })();
+  function sendPresence(keepalive) {
+    const focused = document.visibilityState === "visible" && document.hasFocus();
+    try {
+      fetch("/api/ui/presence", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        ...(keepalive ? { keepalive: true } : {}),
+        body: JSON.stringify({ id: PRESENCE_ID, focused }),
+      }).catch(() => {});
+    } catch (_) {}
+  }
+  sendPresence();
+  document.addEventListener("visibilitychange", () => sendPresence(true));
+  window.addEventListener("focus", () => sendPresence());
+  window.addEventListener("blur", () => sendPresence());
+  window.addEventListener("pagehide", () => sendPresence(true));
+  if (!window._presenceKeepalive) {
+    window._presenceKeepalive = setInterval(() => {
+      if (document.visibilityState === "visible") sendPresence();
+    }, 30000);
   }
 
   // ---------- tool icons (inlined so no extra HTTP / static-whitelist changes) ----------
@@ -3247,8 +3290,13 @@
       loadModels(),
     ]);
 
-    // pick or create current chat
-    if (state.chats.order.length) {
+    // pick or create current chat. A ?chat= deep link (the notch's
+    // "Open in main app" button) wins over the most-recent default, but only
+    // when the chat actually exists.
+    const deepChatId = new URLSearchParams(location.search).get("chat");
+    if (deepChatId && state.chats.order.includes(deepChatId)) {
+      await selectChat(deepChatId);
+    } else if (state.chats.order.length) {
       await selectChat(state.chats.order[0]);
     } else {
       await newChat();
@@ -3541,6 +3589,12 @@
     document.querySelector('#revealer-deck .research-rail')?.remove();
     if (state.chatId) localStorage.setItem("accuretta:draft:" + state.chatId, $("#composer-input").value);
     state.chatId = id;
+    // A chat switch ends any in-progress edit: the banner belongs to one chat.
+    if (state.editingTurn) {
+      state.editingTurn = null;
+      $("#composer-input")?.classList.remove("is-editing");
+      renderEditBanner();
+    }
     let chat = state.chats.chats[id];
     if (!chat || chat._summary || !Array.isArray(chat.messages)) {
       try {
@@ -3713,9 +3767,6 @@
     btn.title = state.sessionDesktopDisabled
       ? "Desktop automation OFF for this chat — click to re-enable"
       : "Desktop automation ON for this chat — click to disable";
-    btn.innerHTML = state.sessionDesktopDisabled
-      ? '<i class="ph ph-desktop"></i>'
-      : '<i class="ph ph-desktop"></i>';
   }
 
   async function toggleSessionDesktop() {
@@ -3914,7 +3965,7 @@
       { kind: "cmd", icon: "ph-gear-six", label: "Open Settings", action: () => { closePalette(); openSettings(); } },
       { kind: "cmd", icon: "ph-brain", label: "Open Long-term memory", action: () => { closePalette(); openSettings(); setTimeout(() => revealSettingsControl("#btn-mem-refresh"), 80); } },
       { kind: "cmd", icon: "ph-arrow-counter-clockwise", label: "Regenerate last reply", action: () => { closePalette(); regenerateLast(); } },
-      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / amaranth / aperture / aperture-dark / soft / pastel / velvet / cartograph / folio / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
+      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / aurora / nebula / operator / neumorphic / amaranth / aperture / aperture-dark / atelier / soft / pastel / velvet / cartograph / folio / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
       { kind: "cmd", icon: "ph-browser", label: "Toggle preview pane", action: () => { closePalette(); app.classList.toggle("preview-collapsed"); } },
       { kind: "cmd", icon: "ph-camera", label: "Screenshot preview", action: () => { closePalette(); screenshotPreview(); } },
       { kind: "cmd", icon: "ph-package", label: "Export project", action: () => { closePalette(); exportProjectZip(); } },
@@ -3984,6 +4035,7 @@
     const wrap = $("#chatlist");
     wrap.innerHTML = "";
     const seen = new Set();
+    const groupSeen = new Set();
     for (const id of state.chats.order) {
       if (seen.has(id)) continue;
       seen.add(id);
@@ -4020,10 +4072,33 @@
             : (isSecurityChat ? "ph ph-magnifying-glass" : "ph ph-chat-circle")));
       if (isGitHubChat) row.classList.add("gh-branch");
       if (isProjectChat) row.classList.add("project-session");
+      // Group sessions by their workspace/project so related work reads as
+      // one unit. Only sessions with an explicit workspace get a header.
+      const groupName = isGitHubChat
+        ? `GitHub · ${String(c.github_worktree?.repo || c.github_worktree?.name || "worktree").trim()}`
+        : isProjectChat
+          ? String(c.project_workspace?.name || c.project_workspace?.repo || "").trim()
+          : "";
+      if (groupName && !groupSeen.has(groupName)) {
+        groupSeen.add(groupName);
+        const head = document.createElement("div");
+        head.className = "session-group-head";
+        head.innerHTML = `<i class="${isGitHubChat ? "ph ph-git-branch" : "ph ph-folder-simple"}" aria-hidden="true"></i><span>${esc(groupName)}</span><span class="grow"></span>`;
+        wrap.appendChild(head);
+      }
+      // Supervision badge: states that need attention get a visible text
+      // pill; quiet states stay icon-only so the list stays calm.
+      const loudStates = { working: 1, "needs-you": 1, failed: 1, stopped: 1, interrupted: 1 };
+      const loud = !!loudStates[sessionState];
+      const statePill = loud ? `<span class="state-pill" data-state="${esc(sessionState)}" title="${esc(sessionHint)}">${esc(sessionLabel)}</span>` : "";
+      // The pill and the status glyph say the same thing — show one or the
+      // other, never both (glyph only for quiet states like ready/finished).
+      const statusGlyph = loud ? "" : `<span class="d" role="img" aria-label="${esc(sessionLabel)}" title="${esc(sessionHint)}">${sessionIcons[sessionState] || sessionIcons.ready}<span class="sr-only">${esc(sessionLabel)}</span></span>`;
       row.innerHTML = `
         <i class="${iconClass}"></i>
         <span class="t">${esc(c.title || "new session")}</span>
-        <span class="d" role="img" aria-label="${esc(sessionLabel)}" title="${esc(sessionHint)}">${sessionIcons[sessionState] || sessionIcons.ready}<span class="sr-only">${esc(sessionLabel)}</span></span>
+        ${statePill}
+        ${statusGlyph}
         <button class="del" title="Delete"><i class="ph ph-trash"></i></button>`;
       row.addEventListener("click", (e) => {
         if (e.target.closest(".del")) return;
@@ -4043,6 +4118,7 @@
     if (!state.messages.length) {
       inner.innerHTML = `
         <div class="welcome-screen">
+          <canvas class="flow-lines-canvas" aria-hidden="true"></canvas>
           <div class="welcome-quote" aria-hidden="true"><span>&ldquo;</span></div>
           <div class="welcome-content">
             <div class="welcome-logo-wrap">
@@ -4283,7 +4359,16 @@
       }
     }
 
-    const tokTip = m.tokens ? ` title="${m.tokens.toLocaleString()} tokens"` : "";
+    // Per-message meta: time plus the measured generation size when the
+    // turn recorded one, so "how big was this reply" is visible without
+    // opening the palette.
+    const tokTipParts = [];
+    if (m.tokens) tokTipParts.push(`${m.tokens.toLocaleString()} reply tokens`);
+    if (m.prompt_tokens) tokTipParts.push(`${m.prompt_tokens.toLocaleString()} prompt tokens`);
+    const tokTip = tokTipParts.length ? ` title="${tokTipParts.join(" · ")}"` : "";
+    const tokLabel = m.tokens
+      ? ` · ${m.tokens >= 1000 ? `${(m.tokens / 1000).toFixed(1)}k` : m.tokens} tok`
+      : "";
     row.innerHTML = `
       ${avatar}
       <div class="bubble-col">
@@ -4291,7 +4376,7 @@
         <div class="bubble ${m.role === "user" ? "user" : "agent"}${m._stopped && !visible.trim() ? " hidden" : ""}">${renderMarkdown(visible)}</div>
         ${cascadeChips}
         ${stoppedMarker}
-        <div class="bubble-meta"${tokTip}>${m.role === "user" ? `you · ${relTime(m.t)}` : relTime(m.t)}</div>
+        <div class="bubble-meta"${tokTip}>${m.role === "user" ? `you · ${relTime(m.t)}` : relTime(m.t)}${tokLabel}</div>
       </div>`;
     const savedThinkContent = row.querySelector(".think-content");
     if (savedThinkContent) savedThinkContent._fullText = thinkingText;
@@ -4327,6 +4412,26 @@
           toast("Clipboard blocked", "warn", 2000);
         }
       });
+      // Edit & resend on user turns. Only the last user turn can be edited:
+      // editing an older turn would have to silently discard everything the
+      // agent did after it, so those stay copy-only (honest UI beats fake
+      // branching without server support).
+      if (m.role === "user") {
+        const lastUserIdx = state.messages.reduce((acc, mm, i) => mm.role === "user" ? i : acc, -1);
+        const editable = state.messages[lastUserIdx] === m && !state.streaming;
+        const editBtn = document.createElement("button");
+        editBtn.type = "button";
+        editBtn.className = "bubble-action";
+        editBtn.dataset.act = "edit";
+        editBtn.title = editable ? "Edit this message and resend" : "Only your latest message can be edited";
+        editBtn.innerHTML = '<i class="ph ph-pencil-simple-line"></i>';
+        editBtn.disabled = !editable;
+        editBtn.addEventListener("click", () => {
+          if (!editable) return;
+          startEditTurn(lastUserIdx);
+        });
+        actions.appendChild(editBtn);
+      }
       row.querySelector(".bubble-col").appendChild(actions);
     }
     highlightMentionsInBubble(row.querySelector(".bubble"));
@@ -4414,6 +4519,11 @@
       toast("Nothing to regenerate yet.", "warn", 2200);
       return;
     }
+    // Capture the previous reply for the Compare affordance before dropping
+    // it — a re-run is only reviewable if the old text stays reachable.
+    const prevAssistant = [...state.messages].reverse().find(m => m.role === "assistant");
+    state._comparePair = prevAssistant && (prevAssistant.content || "").trim()
+      ? { before: prevAssistant.content, beforeLabel: "Previous reply" } : null;
     // drop the last assistant bubble visually before re-streaming
     while (state.messages.length && state.messages[state.messages.length - 1].role === "assistant") {
       state.messages.pop();
@@ -4466,9 +4576,212 @@
       state.liveTurn = null;
       setStreamingUI(false, agentRow._notificationCancelled ? "stopped" : agentRow._notificationFailed ? "failed" : "completed");
       renderRegenerateChip();
+      attachCompareChip(agentRow);
       if (agentRow._notificationFailed) notifyFailure(agentRow._notificationError, agentRow._workStart ? Date.now() - agentRow._workStart : 0);
       scheduleMessageQueueDrain(state.chatId);
     }
+  }
+
+  // ===== Edit & resend + Compare (client-side turn surgery) =====
+  // Editing only targets the last user turn; the bridge's regenerate path
+  // swaps the stored message content, so no new turn is appended and no
+  // history beyond the edit survives.
+  function startEditTurn(index) {
+    if (state.streaming) return;
+    const m = state.messages[index];
+    if (!m || m.role !== "user") return;
+    state.editingTurn = { index };
+    const ta = $("#composer-input");
+    if (ta) {
+      ta.value = m.content || "";
+      ta.classList.add("is-editing");
+      autoResize(ta);
+      ta.focus();
+    }
+    renderEditBanner();
+  }
+
+  function cancelEditTurn() {
+    state.editingTurn = null;
+    const ta = $("#composer-input");
+    if (ta) ta.classList.remove("is-editing");
+    renderEditBanner();
+  }
+
+  function renderEditBanner() {
+    const wrap = document.querySelector(".composer-wrap");
+    if (!wrap) return;
+    let banner = wrap.querySelector(".bubble-editing-banner");
+    if (!state.editingTurn) {
+      banner?.remove();
+      return;
+    }
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.className = "bubble-editing-banner";
+      banner.setAttribute("role", "status");
+      const deck = document.getElementById("revealer-deck");
+      wrap.insertBefore(banner, deck?.nextSibling || wrap.firstChild);
+    }
+    banner.innerHTML = `<strong>Editing your last message</strong><span>— sending replaces the turn and everything after it.</span><button type="button" class="bubble-editing-cancel" title="Cancel edit"><i class="ph ph-x"></i></button>`;
+    banner.querySelector(".bubble-editing-cancel").addEventListener("click", cancelEditTurn);
+  }
+
+  async function sendEditTurn(opts = {}) {
+    if (state.streaming) return false;
+    const edit = state.editingTurn;
+    if (!edit) return false;
+    const ta = $("#composer-input");
+    const text = (ta?.value || "").trim();
+    if (!text) return false;
+    if (!state.settings.model) {
+      toast("Pick a model in Settings first.", "warn", 3200, "no-model");
+      openSettings();
+      return false;
+    }
+    const m = state.messages[edit.index];
+    if (!m || m.role !== "user") { cancelEditTurn(); return false; }
+    // Files attached while editing are ignored — the replaced turn keeps its
+    // original attachments, and a mid-edit upload would silently vanish.
+    if (state.pendingFiles?.length) {
+      toast("Files can't be attached while editing — send the edit first, then attach files.", "warn", 4200);
+    }
+    if ((opts.mode || state.mode) === "research") {
+      toast("Editing is disabled in Deep Research mode.", "warn", 3600);
+      return false;
+    }
+    // Capture the reply this edit replaces so Compare can show both sides.
+    const prevAssistant = state.messages.slice(edit.index + 1).findLast?.(mm => mm.role === "assistant")
+      ?? [...state.messages.slice(edit.index + 1)].reverse().find(mm => mm.role === "assistant");
+    state._comparePair = prevAssistant && (prevAssistant.content || "").trim()
+      ? { before: prevAssistant.content, beforeLabel: "Reply to the original message" } : null;
+    state.editingTurn = null;
+    if (ta) { ta.value = ""; ta.classList.remove("is-editing"); autoResize(ta); }
+    renderEditBanner();
+    try { localStorage.removeItem("accuretta:draft:" + state.chatId); } catch (_) {}
+    // Visual truncation: drop everything after the edited turn, then re-add it
+    // with the new content. The bridge mirrors this server-side.
+    state.messages = state.messages.slice(0, edit.index);
+    const userMsg = { role: "user", content: text, t: Math.floor(Date.now() / 1000) };
+    state.messages.push(userMsg);
+    renderPlanPanel([]);
+    renderMessages();
+
+    const agentRow = document.createElement("div");
+    agentRow.className = "bubble-row";
+    agentRow._attackRailEnabled = opts?.mission?.engagement === "pentest";
+    agentRow._rtEngagement = opts?.mission?.engagement || "";
+    agentRow.innerHTML = `
+      ${AGENT_AVATAR_HTML}
+      <div class="bubble-col">
+        <div class="think-container think-line">
+          <div class="think-header" style="cursor: pointer;">
+            <i class="ph ph-caret-right think-caret"></i>
+            <i class="ph ph-brain think-check-icon"></i>
+            <span class="think-title shimmer">Resending your edit…</span>
+          </div>
+          <div class="think-content hidden"></div>
+        </div>
+        <div class="tool-stack" id="tool-stack"></div>
+        <div class="bubble agent hidden" id="stream-bubble"></div>
+        <div class="bubble-meta streaming">streaming<span class="typing"><span></span><span></span><span></span></span></div>
+      </div>`;
+    $("#chat-inner").appendChild(agentRow);
+    window.AccurettaOrb?.setState(agentRow, "thinking");
+    scrollToBottom(true);
+
+    state.streaming = true;
+    state.abortCtl = new AbortController();
+    setStreamingUI(true);
+    state.liveTurn = { chatId: state.chatId, row: agentRow, userMsg };
+    try {
+      await streamChat(text, agentRow, state.abortCtl.signal, [], { regenerate: true });
+    } catch (e) {
+      if (e.name === "AbortError") {
+        renderStoppedTurn(agentRow);
+      } else {
+        agentRow._notificationFailed = true;
+        agentRow._notificationError = e.message;
+        toast("edit resend failed: " + e.message, "err");
+      }
+    } finally {
+      const finishedChatId = state.liveTurn?.chatId || state.chatId;
+      window.AccurettaResearch?.finish(agentRow);
+      state.streaming = false;
+      state.abortCtl = null;
+      renderTaskHandoff(agentRow, finishedChatId);
+      state.liveTurn = null;
+      setStreamingUI(false, agentRow._notificationCancelled ? "stopped" : agentRow._notificationFailed ? "failed" : "completed");
+      await loadChats();
+      const finishedChat = state.chats.chats[finishedChatId];
+      if (finishedChat) {
+        delete finishedChat.messages;
+        finishedChat._summary = true;
+      }
+      renderChatList();
+      renderRegenerateChip();
+      attachCompareChip(agentRow);
+      if (agentRow._notificationFailed) notifyFailure(agentRow._notificationError, agentRow._workStart ? Date.now() - agentRow._workStart : 0);
+      else if (!agentRow._notificationCancelled) notifyCompletion(agentRow._workStart ? Date.now() - agentRow._workStart : 0);
+      scheduleMessageQueueDrain(finishedChatId);
+    }
+    return true;
+  }
+
+  // Attach the Compare affordance to a finished reply when a previous
+  // version was captured (regenerate or edit-resend).
+  function attachCompareChip(agentRow) {
+    const pair = state._comparePair;
+    state._comparePair = null;
+    if (!pair || !agentRow?.isConnected) return;
+    const bubble = agentRow.querySelector("#stream-bubble, .bubble.agent");
+    if (!bubble || bubble.classList.contains("hidden") || !(bubble.textContent || "").trim()) return;
+    const actions = agentRow.querySelector(".bubble-actions");
+    if (!actions || actions.querySelector('[data-act="compare"]')) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "bubble-action";
+    btn.dataset.act = "compare";
+    btn.title = "Compare with the previous reply";
+    btn.setAttribute("aria-label", "Compare with the previous reply");
+    btn.innerHTML = '<i class="ph ph-scales"></i>';
+    btn.addEventListener("click", () => openCompareDialog({
+      ...pair,
+      after: state.messages.length ? state.messages[state.messages.length - 1].content : "",
+      afterLabel: "New reply",
+    }));
+    actions.appendChild(btn);
+  }
+
+  function openCompareDialog(pair) {
+    if (!pair) return;
+    const dialog = document.createElement("dialog");
+    dialog.className = "compare-dialog";
+    dialog.setAttribute("aria-label", "Compare replies");
+    dialog.innerHTML = `
+      <header class="dw-head">
+        <div class="dw-title">
+          <h2>Compare replies</h2>
+          <p class="dw-sub">Both versions were produced by the model you had loaded. Nothing was sent anywhere.</p>
+        </div>
+        <div class="dw-head-actions">
+          <button type="button" class="btn sm compare-close">Close</button>
+        </div>
+      </header>
+      <div class="dw-body">
+        <section class="compare-pane">
+          <div class="compare-pane-head"><i class="ph ph-arrow-counter-clockwise" aria-hidden="true"></i><span>${esc(pair.beforeLabel || "Before")}</span></div>
+          <div class="compare-pane-body">${renderMarkdown(pair.before || "*(empty reply)*")}</div>
+        </section>
+        <section class="compare-pane">
+          <div class="compare-pane-head"><i class="ph ph-arrow-clockwise" aria-hidden="true"></i><span>${esc(pair.afterLabel || "After")}</span></div>
+          <div class="compare-pane-body">${renderMarkdown(pair.after || "*(empty reply)*")}</div>
+        </section>
+      </div>`;
+    document.body.appendChild(dialog);
+    dialog.querySelector(".compare-close").onclick = () => dialog.close();
+    dialog.addEventListener("close", () => dialog.remove(), { once: true });
+    dialog.showModal();
   }
 
   // show an action row (regenerate + copy) under the last assistant bubble.
@@ -4897,6 +5210,12 @@
   });
 
   async function send(opts = {}) {
+    // Edit & resend intercept: only composer-originated sends become edits.
+    // Queued messages and suggestion-card prompts keep their own meaning —
+    // they must not silently replace an edited turn.
+    if (state.editingTurn && !opts.fromEdit && opts.prompt === undefined && !opts.fromQueue) {
+      return sendEditTurn(opts);
+    }
     if (opts.mission && !opts.mode) opts = { ...opts, mode: "agent" };
     if ((opts.mode || state.mode) === "research" && !opts.researchBrief) {
       const researchBrief = await window.AccurettaResearch.requestBrief(opts.prompt ?? $("#composer-input").value);
@@ -7257,20 +7576,68 @@
   }
 
   async function reviewTaskChanges(evt, chatId) {
+    // Diff review workspace: a persistent two-pane reviewer for this task's
+    // recorded edits. Left rail = changed files with per-file verdicts;
+    // right = hunk-annotated unified diff with line numbers and hunk nav.
     const dialog = document.createElement("dialog");
-    dialog.className = "task-review-dialog";
+    dialog.className = "task-review-dialog diff-workspace";
     dialog.setAttribute("aria-label", "Review task changes");
-    dialog.innerHTML = `<div class="task-review-head"><div><h2>Review changes</h2><p>Recorded edits from this task. Open actions show the current workspace file.</p></div><button type="button" class="btn sm task-review-close">Close</button></div>
-      <div class="task-review-toolbar"><label>Changed files <select size="6" aria-label="Changed file"></select></label><div class="task-review-file-actions"><button type="button" class="btn sm task-review-open" hidden></button><button type="button" class="btn sm task-review-undo" hidden>Undo selected file</button></div></div>
-      <p class="task-review-status" role="status">Loading recorded changes…</p><pre class="task-review-diff" aria-label="Before and after diff"></pre>`;
+    dialog.innerHTML = `
+      <header class="dw-head">
+        <div class="dw-title">
+          <h2>Review changes</h2>
+          <p class="dw-sub">Loading recorded changes…</p>
+        </div>
+        <div class="dw-head-actions">
+          <button type="button" class="btn sm dw-copy" title="Copy the diff for the selected file"><i class="ph ph-copy"></i><span>Copy diff</span></button>
+          <button type="button" class="btn sm task-review-close">Close</button>
+        </div>
+      </header>
+      <div class="dw-body">
+        <aside class="dw-files" role="listbox" aria-label="Changed files" tabindex="0"></aside>
+        <section class="dw-detail">
+          <div class="dw-filebar">
+            <span class="dw-filebar-name">—</span>
+            <span class="grow"></span>
+            <div class="dw-hunknav" hidden>
+              <button type="button" class="dw-hunk-prev" title="Previous change group" aria-label="Previous change group"><i class="ph ph-caret-up"></i></button>
+              <span class="dw-hunkpos">0/0</span>
+              <button type="button" class="dw-hunk-next" title="Next change group" aria-label="Next change group"><i class="ph ph-caret-down"></i></button>
+            </div>
+            <button type="button" class="btn sm dw-open" hidden></button>
+            <button type="button" class="btn sm dw-undo" hidden>Undo file</button>
+          </div>
+          <p class="dw-status" role="status">Loading recorded changes…</p>
+          <div class="dw-diff" aria-label="Before and after diff"></div>
+        </section>
+      </div>`;
     document.body.appendChild(dialog);
     dialog.querySelector(".task-review-close").onclick = () => dialog.close();
     dialog.addEventListener("close", () => dialog.remove(), { once: true });
     dialog.showModal();
-    const status = dialog.querySelector(".task-review-status"), select = dialog.querySelector("select");
-    const diff = dialog.querySelector(".task-review-diff"), open = dialog.querySelector(".task-review-open");
-    const undo = dialog.querySelector(".task-review-undo");
+
+    const status = dialog.querySelector(".dw-status");
+    const sub = dialog.querySelector(".dw-sub");
+    const filesRail = dialog.querySelector(".dw-files");
+    const diffHost = dialog.querySelector(".dw-diff");
+    const nameEl = dialog.querySelector(".dw-filebar-name");
+    const openBtn = dialog.querySelector(".dw-open");
+    const undoBtn = dialog.querySelector(".dw-undo");
+    const hunkNav = dialog.querySelector(".dw-hunknav");
+    const hunkPrev = dialog.querySelector(".dw-hunk-prev");
+    const hunkNext = dialog.querySelector(".dw-hunk-next");
+    const hunkPos = dialog.querySelector(".dw-hunkpos");
+    const copyBtn = dialog.querySelector(".dw-copy");
+
+    const evtFiles = Array.isArray(evt?.files) ? evt.files : [];
     let request = 0;
+    let selected = 0;
+    let fileCount = 0;
+    let hunks = [];
+    let hunkIdx = -1;
+    let currentFile = null;
+    let rawDiffText = "";
+
     const read = async (fileIndex) => {
       const result = await api("/api/task-review", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
         turn_id: evt.turn_id, chat_id: chatId, ...(fileIndex === undefined ? {} : { file_index: fileIndex }),
@@ -7278,55 +7645,230 @@
       if (result.error) throw new Error(result.error);
       return result;
     };
+
+    // ---------- unified diff renderer ----------
+    // difflib.unified_diff with n=3: two file headers, then @@ hunks with
+    // context / -old / +new lines. We parse instead of pattern-guessing so
+    // line numbers stay exact even around hunks that share context.
+    function renderDiff(lines) {
+      diffHost.replaceChildren();
+      hunks = []; hunkIdx = -1; rawDiffText = "";
+      let oldNo = 0, newNo = 0;
+      let oldStart = 0, newStart = 0;
+      const fileHead = [];
+      for (const line of lines) {
+        if (line.startsWith("---") || line.startsWith("+++")) { fileHead.push(line); continue; }
+        const hunk = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+        if (hunk) {
+          oldStart = parseInt(hunk[1], 10); newStart = parseInt(hunk[3], 10);
+          oldNo = oldStart; newNo = newStart;
+          const row = document.createElement("div");
+          row.className = "dwl dwl-hunk";
+          const c = document.createElement("span"); c.className = "dwl-c"; c.textContent = line;
+          row.appendChild(c);
+          diffHost.appendChild(row);
+          hunks.push(row);
+          continue;
+        }
+        const mark = line[0];
+        const body = line.slice(1);
+        const row = document.createElement("div");
+        const g1 = document.createElement("span"); g1.className = "dwl-g dwl-old";
+        const g2 = document.createElement("span"); g2.className = "dwl-g dwl-new";
+        const m = document.createElement("span"); m.className = "dwl-m";
+        const c = document.createElement("span"); c.className = "dwl-c"; c.textContent = body;
+        if (mark === "+") { row.className = "dwl dwl-add"; m.textContent = "+"; g1.textContent = ""; g2.textContent = String(newNo++); }
+        else if (mark === "-") { row.className = "dwl dwl-del"; m.textContent = "−"; g1.textContent = String(oldNo++); g2.textContent = ""; }
+        else { row.className = "dwl dwl-ctx"; m.textContent = " "; g1.textContent = String(oldNo++); g2.textContent = String(newNo++); c.textContent = line; }
+        row.append(g1, g2, m, c);
+        diffHost.appendChild(row);
+      }
+      if (fileHead.length) {
+        const headRow = document.createElement("div");
+        headRow.className = "dwl dwl-filehead";
+        const c = document.createElement("span"); c.className = "dwl-c";
+        c.textContent = fileHead.map(h => h.replace(/^---\s+|^(\+\+\+)\s+/, "")).join("  →  ");
+        headRow.appendChild(c);
+        diffHost.prepend(headRow);
+      }
+      // hunk nav visibility
+      hunkNav.hidden = hunks.length < 2;
+      if (hunks.length) setHunk(0, "auto");
+      else { hunkPos.textContent = "0/0"; }
+    }
+
+    function setHunk(index, align) {
+      if (!hunks.length) return;
+      hunkIdx = Math.max(0, Math.min(hunks.length - 1, index));
+      hunks[hunkIdx].scrollIntoView({ block: "start", behavior: align === "smooth" ? "smooth" : "auto" });
+      hunkPos.textContent = `${hunkIdx + 1}/${hunks.length}`;
+      hunkPrev.disabled = hunkIdx === 0;
+      hunkNext.disabled = hunkIdx === hunks.length - 1;
+    }
+    hunkPrev.addEventListener("click", () => setHunk(hunkIdx - 1, "smooth"));
+    hunkNext.addEventListener("click", () => setHunk(hunkIdx + 1, "smooth"));
+    diffHost.addEventListener("keydown", (e) => {
+      if (e.key === "[" ) { e.preventDefault(); setHunk(hunkIdx - 1, "smooth"); }
+      if (e.key === "]" ) { e.preventDefault(); setHunk(hunkIdx + 1, "smooth"); }
+    });
+
+    // ---------- file rail ----------
+    function renderRail(record) {
+      const files = record.files || [];
+      fileCount = files.length;
+      filesRail.replaceChildren();
+      files.forEach((file, index) => {
+        const meta = evtFiles[index] || {};
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "dw-file";
+        btn.setAttribute("role", "option");
+        btn.dataset.index = String(index);
+        const tags = [
+          file.created ? '<span class="tc-tag tc-new">new</span>' : "",
+          file.removed ? '<span class="tc-tag tc-del-tag">deleted</span>' : "",
+          meta.undone || evt.undone ? '<span class="tc-tag">undone</span>' : "",
+        ].filter(Boolean).join("");
+        const stats = file.text_diff === false
+          ? "File changed"
+          : `<span class="tc-add">+${file.added | 0}</span> <span class="tc-del">−${file.deleted | 0}</span>`;
+        btn.innerHTML = `
+          <span class="dw-file-row">
+            <i class="ph ${file.created ? "ph-file-plus" : file.removed ? "ph-file-x" : "ph-file-text"}" aria-hidden="true"></i>
+            <span class="dw-file-name">${esc(file.name)}</span>
+            ${tags}
+            ${file.changed_since ? '<span class="dw-stale-dot" title="The workspace file changed after this task"></span>' : ""}
+          </span>
+          <span class="dw-dir">${esc(shortDir(file.path, file.name))}</span>
+          <span class="dw-file-foot"><span class="dw-file-stats">${stats}</span></span>`;
+        btn.addEventListener("click", () => selectFile(index));
+        filesRail.appendChild(btn);
+      });
+      const totalAdd = files.reduce((s, f) => s + (f.added | 0), 0);
+      const totalDel = files.reduce((s, f) => s + (f.deleted | 0), 0);
+      sub.innerHTML = `${files.length} file${files.length === 1 ? "" : "s"} · <span class="dw-stat-add">+${totalAdd}</span> <span class="dw-stat-del">−${totalDel}</span> · from this task`;
+      syncRailSelection();
+    }
+    function shortDir(path, name) {
+      const dir = String(path || "");
+      const cut = dir.slice(0, Math.max(0, dir.length - name.length - 1));
+      return cut.replace(/^.*[\\/](?=[^\\/]*$)/, "").slice(0, 60) || dir.slice(0, 60) || "workspace";
+    }
+    function syncRailSelection() {
+      filesRail.querySelectorAll(".dw-file").forEach(btn => {
+        const index = Number(btn.dataset.index);
+        btn.setAttribute("aria-selected", String(index === selected));
+        const meta = evtFiles[index] || {};
+        btn.classList.toggle("is-undone", !!meta.undone || !!evt.undone);
+      });
+    }
+    filesRail.addEventListener("keydown", (e) => {
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+      e.preventDefault();
+      selectFile(selected + (e.key === "ArrowDown" ? 1 : -1));
+    });
+
+    function selectFile(index) {
+      selected = Math.max(0, Math.min(fileCount - 1, index));
+      syncRailSelection();
+      const id = ++request;
+      diffHost.replaceChildren();
+      openBtn.hidden = true; undoBtn.hidden = true;
+      status.textContent = "Loading recorded changes…";
+      nameEl.textContent = "…";
+      read(selected).then((file) => {
+        if (id !== request || !dialog.isConnected) return;
+        renderFile(file);
+      }).catch((error) => {
+        if (id === request) status.textContent = error.message || "Could not load recorded changes";
+      });
+    }
+
+    function renderFile(file) {
+      currentFile = file;
+      nameEl.textContent = file.path || file.name;
+      const notes = [file.created ? "Created" : file.removed ? "Deleted" : "Modified"];
+      if (file.before_size != null && file.after_size != null) notes.push(`${humanBytes(file.before_size)} → ${humanBytes(file.after_size)}`);
+      if (file.changed_since) notes.push("The workspace file changed after this task — this diff is the saved record.");
+      if (file.notice) notes.push(file.notice);
+      if (file.truncated) notes.push("Large diff: only the first portion is shown.");
+      status.textContent = notes.join(" · ");
+
+      const meta = evtFiles[selected] || {};
+      const restorable = !evt.undone && !meta.undone && !file.changed_since && file.restorable !== false;
+      undoBtn.hidden = !restorable || !evt.turn_id;
+      undoBtn.onclick = async () => {
+        if (undoBtn.dataset.confirm !== "yes") {
+          undoBtn.dataset.confirm = "yes";
+          undoBtn.textContent = "Confirm undo";
+          status.textContent = `Restore ${file.name} to its state before this task? Later edits are protected.`;
+          return;
+        }
+        undoBtn.disabled = true;
+        try {
+          const result = await api("/api/undo", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ turn_id: evt.turn_id, chat_id: chatId, file_index: selected }) });
+          if (!result.ok) throw new Error(result.error || "Could not undo this file");
+          if (evt.files?.[selected]) { evt.files[selected].undone = true; evt.files[selected].restorable = false; }
+          status.textContent = "File restored. Other files were left unchanged.";
+          undoBtn.hidden = true;
+          const railBtn = filesRail.querySelector(`.dw-file[data-index="${selected}"]`);
+          if (railBtn) {
+            const tag = document.createElement("span");
+            tag.className = "tc-tag";
+            tag.textContent = "undone";
+            railBtn.querySelector(".dw-file-row").appendChild(tag);
+          }
+          syncRailSelection();
+          await loadChats();
+          renderChatList();
+        } catch (error) {
+          status.textContent = error.message;
+        } finally {
+          undoBtn.disabled = false;
+          delete undoBtn.dataset.confirm;
+          undoBtn.textContent = "Undo file";
+        }
+      };
+
+      if (Array.isArray(file.diff)) {
+        renderDiff(file.diff);
+        rawDiffText = (file.diff || []).join("\n");
+      } else {
+        rawDiffText = "";
+        diffHost.replaceChildren();
+        const empty = document.createElement("div");
+        empty.className = "dw-empty";
+        empty.innerHTML = `<i class="ph ph-file-x" aria-hidden="true"></i><div class="h">No text diff for this file</div><div class="s">Binary, oversized, or unreadable content keeps no recorded text.</div>`;
+        diffHost.appendChild(empty);
+      }
+
+      const action = taskFileAction(file);
+      openBtn.hidden = !action;
+      openBtn.textContent = action === "Open file" ? "Open current file" : action;
+      openBtn.onclick = async () => { try { await openTaskFile(file); dialog.close(); } catch (error) { status.textContent = error.message; } };
+    }
+
+    copyBtn.addEventListener("click", async () => {
+      try {
+        await copyText(rawDiffText || "");
+        toast("Diff copied", "ok", 1600);
+      } catch { toast("Clipboard blocked", "warn", 2000); }
+    });
+
     try {
       const record = await read();
       if (!dialog.isConnected) return;
-      record.files.forEach((file, index) => select.add(new Option(file.path, String(index))));
-      select.value = "0";
-      const load = async () => {
-        const id = ++request;
-        diff.replaceChildren(); open.hidden = true; undo.hidden = true; status.textContent = "Loading recorded changes…";
-        try {
-          const file = await read(Number(select.value));
-          if (id !== request || !dialog.isConnected) return;
-          const notes = [file.created ? "Created" : file.removed ? "Deleted" : "Modified"];
-          if (file.before_size != null && file.after_size != null) notes.push(`${humanBytes(file.before_size)} → ${humanBytes(file.after_size)}`);
-          if (file.changed_since) notes.push("The workspace file has changed since this task. This diff is the saved record.");
-          if (file.notice) notes.push(file.notice);
-          if (file.truncated) notes.push("Large diff: only the first portion is shown.");
-          undo.hidden = !!evt.undone || evt.files[Number(select.value)]?.undone || file.changed_since || file.restorable === false;
-          undo.onclick = async () => {
-            const index = Number(select.value);
-            if (undo.dataset.confirm !== "yes") {
-              undo.dataset.confirm = "yes";
-              undo.textContent = "Confirm undo selected file";
-              status.textContent = `Restore ${file.name} to its state before this task? Later edits are protected.`;
-              return;
-            }
-            undo.disabled = true;
-            select.disabled = true;
-            try {
-              const result = await api("/api/undo", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({turn_id:evt.turn_id,chat_id:chatId,file_index:index})});
-              if (!result.ok) throw new Error(result.error || "Could not undo this file");
-              evt.files[index].undone = true; evt.files[index].restorable = false;
-              status.textContent = "File restored. Other files were left unchanged."; undo.hidden = true;
-              await loadChats(); renderChatList();
-            } catch(error) { status.textContent=error.message; } finally {undo.disabled=false; select.disabled=false; delete undo.dataset.confirm; undo.textContent="Undo selected file";}
-          };
-          status.textContent = notes.join(" · ");
-          (file.diff || []).forEach((line, index) => {
-            const span = document.createElement("span");
-            span.className = line.startsWith("@@") ? "diff-context" : index >= 2 && line.startsWith("+") ? "diff-add" : index >= 2 && line.startsWith("-") ? "diff-remove" : "";
-            span.textContent = line || " "; diff.appendChild(span);
-          });
-          const action = taskFileAction(file);
-          open.hidden = !action;
-          open.textContent = action === "Open file" ? "Open current file" : action;
-          open.onclick = async () => { try { await openTaskFile(file); dialog.close(); } catch (error) { status.textContent = error.message; } };
-        } catch (error) { if (id === request) status.textContent = error.message || "Could not load recorded changes"; }
-      };
-      select.addEventListener("change", () => {delete undo.dataset.confirm; undo.textContent="Undo selected file"; load();});
-      if (record.files.length) await load(); else status.textContent = "No recorded file changes.";
+      renderRail(record);
+      if (record.files.length) await selectFile(0);
+      else {
+        status.textContent = "No recorded file changes.";
+        diffHost.replaceChildren();
+        const empty = document.createElement("div");
+        empty.className = "dw-empty";
+        empty.innerHTML = `<i class="ph ph-file" aria-hidden="true"></i><div class="h">No recorded file changes</div><div class="s">This task only ran commands, reads, or checks.</div>`;
+        diffHost.appendChild(empty);
+        sub.textContent = "0 files · from this task";
+      }
     } catch (error) { status.textContent = error.message || "Could not load recorded changes"; }
   }
 
@@ -8527,15 +9069,18 @@
   let securityIntroFinishing = false;
 
   const SECURITY_INTRO_STAGES = [
-    { key: "network", match: "network", percent: 14 },
-    { key: "system", match: "system", percent: 27 },
-    { key: "application", match: "application", percent: 40 },
-    { key: "security", match: "security", percent: 53 },
-    { key: "persistence", match: "persistence", percent: 66 },
-    { key: "actions", match: "action history", percent: 78 },
-    { key: "correlate", match: "correlating", percent: 89 },
+    { key: "network", match: "network", percent: 10 },
+    { key: "system", match: "system", percent: 20 },
+    { key: "application", match: "application", percent: 30 },
+    { key: "security", match: "security", percent: 40 },
+    { key: "persistence", match: "persistence", percent: 50 },
+    { key: "processes", match: "process", percent: 58 },
+    { key: "commands", match: "command", percent: 66 },
+    { key: "actions", match: "action history", percent: 74 },
+    { key: "correlate", match: "correlating", percent: 85 },
     { key: "summary", match: "summary", percent: 96 },
   ];
+  const SECURITY_STAGE_COUNT = String(SECURITY_INTRO_STAGES.length).padStart(2, "0");
 
   function securityIntroStage(stage = "") {
     const value = String(stage).toLowerCase();
@@ -8563,7 +9108,7 @@
   function updateSecurityScanIntro(stage = "Preparing local collectors") {
     const current = securityIntroStage(stage);
     if ($("#security-intro-stage")) $("#security-intro-stage").textContent = stage;
-    if ($("#security-intro-index")) $("#security-intro-index").textContent = `${String(current.index + 1).padStart(2, "0")} / 08`;
+    if ($("#security-intro-index")) $("#security-intro-index").textContent = `${String(current.index + 1).padStart(2, "0")} / ${SECURITY_STAGE_COUNT}`;
     if ($("#security-intro-percent")) $("#security-intro-percent").textContent = `${current.percent}%`;
     if ($("#security-intro-progress")) $("#security-intro-progress").style.width = `${current.percent}%`;
     securityIntroVisual?.setProgress(current.percent / 100, current.index);
@@ -8615,7 +9160,7 @@
     securityIntroFinishTimer = setTimeout(() => {
       overlay.dataset.state = failed ? "error" : "complete";
       securityIntroVisual?.setState(failed ? "error" : "complete");
-      if ($("#security-intro-index")) $("#security-intro-index").textContent = failed ? "SCAN STOPPED" : "08 / 08";
+      if ($("#security-intro-index")) $("#security-intro-index").textContent = failed ? "SCAN STOPPED" : `${SECURITY_STAGE_COUNT} / ${SECURITY_STAGE_COUNT}`;
       if ($("#security-intro-stage")) $("#security-intro-stage").textContent = failed ? "Scan stopped before completion" : "Local snapshot complete";
       if ($("#security-intro-percent")) $("#security-intro-percent").textContent = failed ? "--" : "100%";
       if ($("#security-intro-progress")) $("#security-intro-progress").style.width = "100%";
@@ -8690,6 +9235,8 @@
     renderSecurityTimeline(data?.timeline || []);
     renderSecurityWhitelist(data?.whitelist || []);
     renderSecurityAlertFilters(data?.alert_filters || []);
+    renderSecurityWatchlist(data?.watchlist || []);
+    renderSecurityAttention(data?.attention || {}, data?.environment || {});
   }
 
   function renderSecurityAlerts() {
@@ -8824,6 +9371,205 @@
         toast(error.message || String(error), "warn", 3500);
       }
     }));
+  }
+
+  function renderSecurityWatchCondition(conditions = {}) {
+    const when = conditions.when || ["running"];
+    const labels = {
+      running: "any run",
+      network: "network activity",
+      new_listener: "new UDP listener",
+      unsigned: "unsigned binary",
+      outside_hours: "outside hours",
+    };
+    let text = when.map(w => labels[w] || w).join(" · ");
+    if (when.includes("outside_hours") && conditions.hours) {
+      text += ` (allowed ${String(Number(conditions.hours.start)).padStart(2, "0")}:00–${String(Number(conditions.hours.end)).padStart(2, "0")}:00)`;
+    }
+    return text;
+  }
+
+  function renderSecurityWatchlist(rows) {
+    const list = $("#security-watchlist-list");
+    if (!list) return;
+    if (!rows.length) {
+      list.innerHTML = '<div class="security-empty compact"><span>No processes are being watched.</span></div>';
+      return;
+    }
+    list.innerHTML = rows.map(row => `
+      <div class="security-whitelist-row" data-watch-id="${esc(row.id || "")}">
+        <div class="security-whitelist-main"><strong title="${esc(row.process_key || "")}">${esc(row.label || row.process_key || "Watched process")}</strong><span>Alerts when: ${esc(renderSecurityWatchCondition(row.conditions))} · added ${esc(securityWhen(row.created_at))}</span></div>
+        <button type="button">Stop watching</button>
+      </div>`).join("");
+    list.querySelectorAll("button").forEach(button => button.addEventListener("click", async event => {
+      const id = event.currentTarget.closest("[data-watch-id]")?.dataset.watchId || "";
+      event.currentTarget.disabled = true;
+      try {
+        const result = await api("/api/security/watchlist/remove", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }),
+        });
+        if (!result?.ok) throw new Error(result?.error || "Could not stop watching this process.");
+        renderSecurityOverview(result.overview);
+        toast("Stopped watching this process.", "ok", 1800);
+      } catch (error) {
+        event.currentTarget.disabled = false;
+        toast(error.message || String(error), "warn", 3500);
+      }
+    }));
+  }
+
+  function renderSecurityAttention(attention, environment = {}) {
+    const popup = $("#security-attention");
+    const body = $("#security-attention-body");
+    if (!popup || !body) return;
+    const alerts = Array.isArray(attention?.alerts) ? attention.alerts : [];
+    const elevated = environment?.elevated === true
+      ? "Administrator rights: elevated collectors available."
+      : "Running without admin — elevated sources (Security log, some services) stay limited.";
+    if (!alerts.length) {
+      popup.hidden = true;
+      body.innerHTML = "";
+      return;
+    }
+    body.innerHTML = alerts.map(alert => `
+      <div class="security-attention-item" data-alert-id="${esc(alert.id || "")}" data-severity="${esc(alert.severity || "info")}">
+        <span class="security-alert-severity">${esc(alert.severity || "info")}${Number.isFinite(Number(alert.confidence)) ? ` · ${Number(alert.confidence)}% confidence` : ""}</span>
+        <div class="security-attention-copy">
+          <strong>${esc(alert.title || "Security event")}</strong>
+          <p>${esc(alert.detail || "")}</p>
+          ${alert.injection ? '<span class="security-attention-tag">possible prompt injection</span>' : ""}
+        </div>
+        <div class="security-attention-item-actions">
+          <button type="button" class="btn sm accent" data-attention-investigate>Ask agent</button>
+        </div>
+      </div>`).join("") + `<div class="security-attention-env">${esc(elevated)}</div>`;
+    body.querySelectorAll("[data-attention-investigate]").forEach(button => button.addEventListener("click", event => {
+      const alertId = event.currentTarget.closest("[data-alert-id]")?.dataset.alertId || "";
+      popup.hidden = true;
+      ackSecurityAttention(true);
+      openSecurityInvestigation(alertId, event.currentTarget);
+    }));
+    popup.hidden = false;
+  }
+
+  async function ackSecurityAttention(silent = false) {
+    try {
+      const result = await api("/api/security/attention/ack", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}),
+      });
+      if (result?.overview) renderSecurityOverview(result.overview);
+      if (!silent) toast("Alert acknowledged. The finding stays in the overview list.", "ok", 2400);
+    } catch (_) { /* non-fatal */ }
+  }
+
+  let securityWatchProcesses = [];
+  let pendingWatchProcess = null;
+
+  function closeSecurityWatchDialog() {
+    pendingWatchProcess = null;
+    if ($("#security-watch-scrim")) $("#security-watch-scrim").hidden = true;
+  }
+
+  function syncSecurityWatchConfirm() {
+    const confirm = $("#security-watch-confirm");
+    if (!confirm) return;
+    const hasProcess = !!pendingWatchProcess;
+    const hasAck = !!$("#security-watch-ack")?.checked;
+    const hasCondition = ["watch-cond-running", "watch-cond-network", "watch-cond-listener", "watch-cond-unsigned", "watch-cond-hours"]
+      .some(id => $(`#${id}`)?.checked);
+    confirm.disabled = !(hasProcess && hasAck && hasCondition);
+  }
+
+  function renderSecurityWatchOptions() {
+    const list = $("#security-watch-options");
+    if (!list) return;
+    const query = ($("#security-watch-search")?.value || "").trim().toLowerCase();
+    const rows = securityWatchProcesses.filter(process =>
+      !query || `${process.name} ${process.path}`.toLowerCase().includes(query));
+    if (!rows.length) {
+      list.innerHTML = `<div class="security-empty compact"><span>${securityWatchProcesses.length ? "No running process matches that search." : "Could not list running processes."}</span></div>`;
+      syncSecurityWatchConfirm();
+      return;
+    }
+    list.innerHTML = rows.slice(0, 250).map(process => `
+      <button type="button" class="security-watch-option${pendingWatchProcess?.key === `name:${String(process.name).toLowerCase()}` ? " selected" : ""}" data-process-name="${esc(process.name)}" data-process-path="${esc(process.path || "")}">
+        <strong>${esc(process.name)}</strong>
+        <span>${esc(process.path || "system process")}<em> · pid ${esc(process.pid || "?")}</em></span>
+      </button>`).join("");
+    list.querySelectorAll("[data-process-name]").forEach(button => button.addEventListener("click", () => {
+      const name = button.dataset.processName || "";
+      pendingWatchProcess = {
+        key: `name:${String(name).toLowerCase()}`,
+        label: name,
+        path: button.dataset.processPath || "",
+      };
+      renderSecurityWatchOptions();
+      syncSecurityWatchConfirm();
+    }));
+  }
+
+  async function openSecurityWatchDialog() {
+    const scrim = $("#security-watch-scrim");
+    if (!scrim) return;
+    pendingWatchProcess = null;
+    $("#security-watch-search").value = "";
+    $("#security-watch-ack").checked = false;
+    $("#watch-cond-running").checked = true;
+    ["watch-cond-network", "watch-cond-listener", "watch-cond-unsigned", "watch-cond-hours"].forEach(id => {
+      const node = $(`#${id}`);
+      if (node) node.checked = false;
+    });
+    scrim.hidden = false;
+    syncSecurityWatchConfirm();
+    $("#security-watch-options").innerHTML = '<div class="security-empty compact"><span>Loading running processes…</span></div>';
+    try {
+      const result = await api("/api/security/processes");
+      securityWatchProcesses = Array.isArray(result?.processes) ? result.processes : [];
+      if (result?.error) toast(`Process list limited: ${result.error}`, "info", 3200);
+    } catch (error) {
+      securityWatchProcesses = [];
+      toast(error.message || String(error), "warn", 3200);
+    }
+    renderSecurityWatchOptions();
+    $("#security-watch-search")?.focus();
+  }
+
+  async function submitSecurityWatch() {
+    if (!pendingWatchProcess) return;
+    const when = [];
+    if ($("#watch-cond-running")?.checked) when.push("running");
+    if ($("#watch-cond-network")?.checked) when.push("network");
+    if ($("#watch-cond-listener")?.checked) when.push("new_listener");
+    if ($("#watch-cond-unsigned")?.checked) when.push("unsigned");
+    if ($("#watch-cond-hours")?.checked) {
+      when.push("outside_hours");
+      var hours = {
+        start: Math.max(0, Math.min(23, Number($("#watch-hours-start")?.value || 0))),
+        end: Math.max(0, Math.min(23, Number($("#watch-hours-end")?.value || 0))),
+      };
+    }
+    if (!when.length) return;
+    const button = $("#security-watch-confirm");
+    if (button) button.disabled = true;
+    try {
+      const result = await api("/api/security/watchlist", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          process_key: pendingWatchProcess.key,
+          label: pendingWatchProcess.label,
+          conditions: { when, ...(hours ? { hours } : {}) },
+          acknowledge_compute: true,
+        }),
+      });
+      if (!result?.ok) throw new Error(result?.error || "Could not start watching this process.");
+      closeSecurityWatchDialog();
+      renderSecurityOverview(result.overview);
+      toast("Watching this process in the background. Alerts follow the conditions you set.", "ok", 3200);
+    } catch (error) {
+      toast(error.message || String(error), "warn", 4200);
+    } finally {
+      syncSecurityWatchConfirm();
+    }
   }
 
   async function loadSecurityOverview() {
@@ -8969,6 +9715,8 @@
     const data = await loadSecurityOverview();
     const stale = !data?.generated_at || (Date.now() / 1000 - Number(data.generated_at)) > 90;
     if (stale && data?.scan?.status !== "scanning") refreshSecurityOverview();
+    // Opening the overview counts as seeing the alert — clear the popup.
+    if (data?.attention?.alerts?.length) ackSecurityAttention(true);
   }
 
   function closeSecurityOverview() {
@@ -10230,6 +10978,13 @@
     state.workspace = r;
     inp.value = "";
     $("#ws-add").classList.add("hidden");
+    const wsToggle = $("#btn-ws-add-toggle");
+    if (wsToggle) {
+      wsToggle.setAttribute("aria-expanded", "false");
+      wsToggle.title = "Add folder";
+      const icon = wsToggle.querySelector("i");
+      if (icon) icon.className = "ph ph-plus";
+    }
     renderWorkspace();
   }
 
@@ -10861,6 +11616,10 @@
         loadSettings().then(renderStatus).then(renderModelPill);
       } else if (evt.type === "security:update") {
         if ($("#security-page")?.classList.contains("open")) loadSecurityOverview();
+      } else if (evt.type === "security:attention") {
+        // Notable scheduled-scan finding: refresh regardless of page state so
+        // the popup near the security button appears while the user is active.
+        loadSecurityOverview();
       } else if (evt.type === "workspace:update") {
         loadWorkspace().then(renderWorkspace);
       } else if (evt.type === "skills:update") {
@@ -10879,6 +11638,15 @@
           c.title = evt.title;
           renderChatList();
         }
+      } else if (evt.type === "chat_start") {
+        // A chat started on another surface (the notch). The bridge persists
+        // the chat — title included — before this event broadcasts, so a
+        // reload here sees it fully. Only refresh when it is genuinely
+        // unknown: main-app turns re-firing this every round would rebuild
+        // the sidebar mid-stream for nothing.
+        const cid = evt.chat_id;
+        const known = !cid || state.chats?.chats?.[cid] || state.chats?.order?.includes(cid);
+        if (!known) loadChats().then(renderChatList).catch(() => {});
       } else if (evt.type === "ctx_fill") {
         // Per-round assembled-prompt size, pushed BEFORE the round streams.
         // The 2s poll only reports the last completed round, so without this
@@ -11238,7 +12006,9 @@
             if (other !== section) other.open = false;
           });
         }
-        rememberSettingsSections();
+        // Search-forced opens aren't the user's accordion state — the search
+        // block below sets this flag while it drives sections.
+        if (!settingsSearchDriving) rememberSettingsSections();
       });
       fragment.appendChild(section);
     });
@@ -11248,6 +12018,145 @@
       saveRow.classList.add("settings-savebar");
       body.after(saveRow);
     }
+    initSettingsNav();
+  }
+
+  // ===== Settings section rail + search =====
+  // The drawer holds ~20 sections; a sticky rail gives one-jump access and a
+  // search field filters rows live instead of making the user scroll-hunt.
+  function initSettingsNav() {
+    const body = $("#settings-body");
+    const drawer = $("#settings-drawer");
+    if (!body || !drawer || body.dataset.navReady === "1") return;
+    body.dataset.navReady = "1";
+
+    const head = drawer.querySelector(".drawer-head");
+    const tools = document.createElement("div");
+    tools.className = "settings-tools";
+    tools.innerHTML = `
+      <label class="settings-search">
+        <i class="ph ph-magnifying-glass" aria-hidden="true"></i>
+        <input type="search" id="settings-search-input" placeholder="Search settings…" autocomplete="off" spellcheck="false" aria-label="Search settings">
+        <button type="button" class="settings-search-clear" title="Clear search" aria-label="Clear search"><i class="ph ph-x"></i></button>
+      </label>
+      <nav class="settings-nav" aria-label="Settings sections"></nav>
+      <p class="settings-search-note" id="settings-search-note" aria-live="polite"></p>`;
+
+    const nav = tools.querySelector(".settings-nav");
+    const input = tools.querySelector("#settings-search-input");
+    const clearBtn = tools.querySelector(".settings-search-clear");
+    const note = tools.querySelector("#settings-search-note");
+
+    const sections = () => [...body.querySelectorAll("details.settings-section")];
+
+    // Rail chips: one per section. Clicking jumps and opens (the accordion
+    // exclusivity in the section toggle handler closes the others).
+    sections().forEach(section => {
+      const title = section.querySelector(".settings-section-title")?.textContent || section.dataset.settingsSection;
+      const icon = SETTINGS_SECTION_ICONS[section.dataset.settingsSection] || "ph-gear";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.dataset.settingsSection = section.dataset.settingsSection;
+      btn.innerHTML = `<i class="ph ${icon}" aria-hidden="true"></i><span>${esc(title)}</span>`;
+      btn.addEventListener("click", () => {
+        section.open = true;
+        section.scrollIntoView({ behavior: "smooth", block: "start" });
+        nav.querySelectorAll("button").forEach(b => b.classList.toggle("is-current", b === btn));
+      });
+      nav.appendChild(btn);
+    });
+
+    // Track which section is in view so the rail follows scroll.
+    const railObserver = new IntersectionObserver(entries => {
+      if (input.value.trim()) return;
+      const visible = entries.filter(e => e.isIntersecting)
+        .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+      if (!visible) return;
+      nav.querySelectorAll("button").forEach(b =>
+        b.classList.toggle("is-current", b.dataset.settingsSection === visible.target.dataset.settingsSection));
+    }, { root: body, threshold: [0.05, 0.3] });
+    sections().forEach(section => railObserver.observe(section));
+
+    // Search: hide non-matching rows, auto-open matching sections, and
+    // collapse to a count note. Esc clears; empty restores the accordion.
+    let searchTimer = null;
+    // Text search alone misses controls: placeholders ("What should
+    // Accuretta remember?"), titles, aria-labels, select options and typed
+    // values never appear in textContent. Row match uses them all.
+    const rowHaystack = (row) => {
+      const parts = [
+        row.textContent || "",
+        row.title || "",
+        row.getAttribute?.("aria-label") || "",
+        ...[...row.querySelectorAll("input, select, textarea")].map(c => [
+          c.placeholder || "",
+          c.title || "",
+          c.getAttribute?.("aria-label") || "",
+          typeof c.value === "string" ? c.value : "",
+          ...[...(c.querySelectorAll?.("option") || [])].map(o => o.textContent || ""),
+        ].join(" ")),
+      ];
+      return parts.join(" ").toLowerCase();
+    };
+    const applySearch = () => {
+      const q = input.value.trim().toLowerCase();
+      tools.querySelector(".settings-search").classList.toggle("has-value", !!q);
+      const searching = !!q;
+      drawer.classList.toggle("is-searching", searching);
+      let hitRows = 0;
+      let hitSections = 0;
+      settingsSearchDriving = true;
+      try {
+      sections().forEach(section => {
+        const content = section.querySelector(".settings-section-content");
+        const rows = content ? [...content.children] : [];
+        let sectionHits = 0;
+        rows.forEach(row => {
+          const match = !searching || rowHaystack(row).includes(q);
+          row.hidden = searching && !match;
+          if (searching && match) sectionHits++;
+        });
+        const titleHit = searching && (section.querySelector(".settings-section-title")?.textContent || "").toLowerCase().includes(q);
+        if (searching) {
+          section.open = sectionHits > 0 || !!titleHit;
+          if (sectionHits > 0) hitSections++;
+          hitRows += sectionHits;
+          section.toggleAttribute("data-no-matches", sectionHits === 0 && !titleHit);
+        } else {
+          // Back to the user's own accordion state so a cleared search
+          // leaves the drawer exactly as they'd find it manually.
+          const saved = readSettingsSectionState();
+          if (section.dataset.settingsSection in saved) {
+            section.open = !!saved[section.dataset.settingsSection];
+          }
+          section.removeAttribute("data-no-matches");
+        }
+        section.hidden = searching && sectionHits === 0 && !titleHit;
+      });
+      } finally {
+        settingsSearchDriving = false;
+      }
+      if (searching) {
+        note.textContent = hitRows
+          ? `${hitRows} setting${hitRows === 1 ? "" : "s"} in ${hitSections} section${hitSections === 1 ? "" : "s"}`
+          : "No settings match. Check the spelling or try a shorter word.";
+        note.classList.add("has-hits");
+      } else {
+        note.textContent = "";
+        note.classList.remove("has-hits");
+      }
+    };
+    input.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(applySearch, 120);
+    });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { input.value = ""; applySearch(); input.blur(); }
+    });
+    clearBtn.addEventListener("click", () => { input.value = ""; applySearch(); input.focus(); });
+
+    // The tools block mounts between the head and the scrollable body.
+    head.after(tools);
   }
 
   function revealSettingsControl(selector) {
@@ -11621,6 +12530,9 @@
   }
 
   let settingsReturnFocus = null;
+  // While a settings search drives sections open/closed, the toggle handler
+  // must not persist those forced moves as the user's accordion preference.
+  let settingsSearchDriving = false;
   async function openSettings() {
     closeSecurityOverview();
     closeFaq();
@@ -12197,6 +13109,12 @@
     $("#settings-drawer").classList.remove("open");
     settingsReturnFocus?.focus();
     $("#settings-drawer").setAttribute("aria-hidden", "true");
+    // Reset the section search so reopening starts clean.
+    const searchInput = $("#settings-search-input");
+    if (searchInput && searchInput.value) {
+      searchInput.value = "";
+      searchInput.dispatchEvent(new Event("input", { bubbles: true }));
+    }
   }
 
   // ---------- Command history drawer ----------
@@ -12612,6 +13530,7 @@
     // desktop automation
     $("#sw-desktop-enabled")?.classList.toggle("on", !!s.desktop_enabled);
     $("#sw-sound-notifications")?.classList.toggle("on", s.sound_notifications !== false);
+    $("#sw-notch-enabled")?.classList.toggle("on", !!s.notch_enabled);
     $("#sw-red-team-enabled")?.classList.toggle("on", !!s.red_team_enabled);
     $("#sw-analysis-tools-enabled")?.classList.toggle("on", !!s.analysis_tools_enabled);
     $("#sw-passive-model-telemetry")?.classList.toggle("on", s.passive_model_telemetry !== false);
@@ -12625,6 +13544,10 @@
     $("#sw-discord-enabled")?.classList.toggle("on", !!s.discord_enabled);
     fill("#set-discord-token", s.discord_bot_token || "");
     fill("#set-discord-owner", s.discord_owner_id || "");
+    $("#sw-security-scheduled")?.classList.toggle("on", s.security_scheduled !== false);
+    fill("#set-security-interval", s.security_interval_minutes || 30);
+    if ($("#set-security-threshold")) $("#set-security-threshold").value = s.security_notify_threshold || "medium";
+    $("#sw-security-discord")?.classList.toggle("on", s.security_discord_notify !== false);
     $("#sw-remote-enabled")?.classList.toggle("on", s.remote_access_enabled !== false);
     fill("#set-remote-timeout", s.remote_command_timeout || 120);
     fill("#set-remote-file-mb", s.remote_file_max_mb || 100);
@@ -12727,6 +13650,7 @@
       allow_web_preview: $("#sw-web").classList.contains("on"),
       desktop_enabled: $("#sw-desktop-enabled")?.classList.contains("on") || false,
       sound_notifications: $("#sw-sound-notifications")?.classList.contains("on") ?? true,
+      notch_enabled: $("#sw-notch-enabled")?.classList.contains("on") || false,
       red_team_enabled: $("#sw-red-team-enabled")?.classList.contains("on") || false,
       analysis_tools_enabled: $("#sw-analysis-tools-enabled")?.classList.contains("on") || false,
       passive_model_telemetry: $("#sw-passive-model-telemetry")
@@ -12740,6 +13664,10 @@
       discord_enabled: $("#sw-discord-enabled")?.classList.contains("on") || false,
       discord_bot_token: ($("#set-discord-token")?.value || "").trim(),
       discord_owner_id: ($("#set-discord-owner")?.value || "").trim(),
+      security_scheduled: $("#sw-security-scheduled")?.classList.contains("on") !== false,
+      security_interval_minutes: Math.max(5, Math.min(720, n("#set-security-interval") || 30)),
+      security_notify_threshold: ($("#set-security-threshold")?.value || "medium"),
+      security_discord_notify: $("#sw-security-discord")?.classList.contains("on") !== false,
       remote_access_enabled: $("#sw-remote-enabled")?.classList.contains("on") !== false,
       remote_command_timeout: Math.max(10, Math.min(3600, n("#set-remote-timeout") || 120)),
       remote_file_max_mb: Math.max(1, Math.min(1024, n("#set-remote-file-mb") || 100)),
@@ -12796,7 +13724,7 @@
     "neobrutalism-dark": "amaranth",
     kinetic: "aperture",
   });
-  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "amaranth", "aperture", "aperture-dark", "soft", "pastel", "velvet", "cartograph", "folio", "light"];
+  const THEME_CYCLE = ["dark", "dim", "retro", "aurora", "nebula", "operator", "neumorphic", "amaranth", "aperture", "aperture-dark", "atelier", "soft", "pastel", "velvet", "cartograph", "folio", "light"];
   const THEME_ICONS = {
     dark:              "ph ph-moon",
     dim:               "ph ph-moon-stars",
@@ -12808,6 +13736,7 @@
     amaranth:          "ph ph-circle-half",
     aperture:          "ph ph-aperture",
     "aperture-dark":   "ph ph-moon",
+    atelier:           "ph ph-pen-nib",
     soft:              "ph ph-cloud",
     pastel:            "ph ph-flower-tulip",
     velvet:            "ph ph-crown",
@@ -14744,7 +15673,7 @@
   }
   // Keep mode selection visible as one compact button. Less-used attachment
   // and access controls move into the overflow menu on narrow screens.
-  const _MOBILE_TOOLBAR_IDS = ["btn-attach-image", "btn-attach-file", "btn-perms"];
+  const _MOBILE_TOOLBAR_IDS = ["btn-attach-image", "btn-attach-file", "composer-perms-control"];
   function applyMobileToolbarLayout() {
     const tools = document.querySelector(".composer-tools");
     const menu = document.getElementById("toolbar-overflow-menu");
@@ -14787,7 +15716,62 @@
   function initMobileToolbarOverflow() {
     wireOverflow("#btn-toolbar-overflow", "#toolbar-overflow-menu");
     wireOverflow("#btn-preview-overflow", "#preview-overflow-menu");
+    wireTopbarMore();
     applyMobileToolbarLayout();
+  }
+
+  // ===== TOPBAR MORE-MENU =====
+  // Consolidates the low-frequency topbar buttons into one labeled menu.
+  // github/cmd-history/session-desktop keep their original ids (their click
+  // listeners and the mobile menu's .click() dispatch keep working); the
+  // task-details entry just proxies the always-visible topbar button.
+  function wireTopbarMore() {
+    const btn = document.getElementById("btn-topbar-more");
+    const menu = document.getElementById("topbar-more-menu");
+    if (!btn || !menu || btn.dataset.moreWired === "1") return;
+    btn.dataset.moreWired = "1";
+    if (menu.parentNode !== document.body) document.body.appendChild(menu);
+    const positionMenu = () => {
+      const r = btn.getBoundingClientRect();
+      const mw = menu.offsetWidth || 230;
+      const mh = menu.offsetHeight || 200;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      let top = r.bottom + 6;
+      if (top + mh > vh - 8) top = Math.max(8, r.top - mh - 6);
+      let left = r.right - mw;
+      if (left < 8) left = 8;
+      if (left + mw > vw - 8) left = vw - mw - 8;
+      menu.style.top = `${Math.round(top)}px`;
+      menu.style.left = `${Math.round(left)}px`;
+    };
+    const close = () => {
+      menu.classList.remove("open");
+      btn.setAttribute("aria-expanded", "false");
+    };
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const willOpen = !menu.classList.contains("open");
+      menu.classList.toggle("open", willOpen);
+      btn.setAttribute("aria-expanded", String(willOpen));
+      if (willOpen) {
+        positionMenu();
+        requestAnimationFrame(positionMenu);
+      }
+    });
+    menu.addEventListener("click", (e) => {
+      const item = e.target.closest(".mm-item");
+      if (!item) return;
+      if (item.dataset.more === "task-details") $("#btn-task-details")?.click();
+      close();
+    });
+    document.addEventListener("click", (e) => {
+      if (!menu.contains(e.target) && !btn.contains(e.target)) close();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && menu.classList.contains("open")) { close(); btn.focus(); }
+    });
+    window.addEventListener("resize", () => { if (menu.classList.contains("open")) positionMenu(); });
   }
 
   function initTooltips() {
@@ -14956,6 +15940,21 @@
     $("#security-whitelist-scrim")?.addEventListener("click", event => {
       if (event.target === event.currentTarget) closeSecurityWhitelist();
     });
+    $("#btn-watch-add")?.addEventListener("click", openSecurityWatchDialog);
+    $("#security-watch-close")?.addEventListener("click", closeSecurityWatchDialog);
+    $("#security-watch-cancel")?.addEventListener("click", closeSecurityWatchDialog);
+    $("#security-watch-confirm")?.addEventListener("click", submitSecurityWatch);
+    $("#security-watch-scrim")?.addEventListener("click", event => {
+      if (event.target === event.currentTarget) closeSecurityWatchDialog();
+    });
+    $("#security-watch-search")?.addEventListener("input", renderSecurityWatchOptions);
+    $("#security-watch-ack")?.addEventListener("change", syncSecurityWatchConfirm);
+    ["watch-cond-running", "watch-cond-network", "watch-cond-listener", "watch-cond-unsigned", "watch-cond-hours"]
+      .forEach(id => $(`#${id}`)?.addEventListener("change", syncSecurityWatchConfirm));
+    $("#security-attention-close")?.addEventListener("click", () => {
+      $("#security-attention") && ($("#security-attention").hidden = true);
+      ackSecurityAttention(true);
+    });
     $("#btn-close-cmd-history")?.addEventListener("click", closeCmdHistory);
     $("#cmd-history-scrim")?.addEventListener("click", closeCmdHistory);
     $("#btn-cmd-history-refresh")?.addEventListener("click", loadCmdHistory);
@@ -15053,7 +16052,7 @@
             <div style="display:grid;place-items:center;color:var(--accent);margin-bottom:0.5rem;">
               <canvas class="agent-orb shutdown-orb" width="80" height="80" data-state="working" aria-hidden="true"></canvas>
             </div>
-            <p style='color: var(--success); font-weight: 600; font-size: 1.1em; animation: fade-in-up 0.4s ease both;'>Saved. Closing Accuretta…</p>
+            <p style='color: var(--accent); font-weight: 600; font-size: 1.1em; animation: fade-in-up 0.4s ease both;'>Saved. Closing Accuretta…</p>
           `;
           loader.style.opacity = "1";
           if (window.AccurettaOrb) {
@@ -15135,6 +16134,11 @@
       saveSettings({ sound_notifications: on });
       if (on) { _lastSound = 0; playApprovalSound(); }   // preview the chime when turning on
       toast(on ? "sound notifications on" : "sound notifications off", "ok", 1500);
+    });
+    $("#sw-notch-enabled")?.addEventListener("click", (e) => {
+      const on = e.currentTarget.classList.toggle("on");
+      saveSettings({ notch_enabled: on });
+      toast(on ? "notch overlay on" : "notch overlay off", "ok", 1500);
     });
     $("#sw-red-team-enabled")?.addEventListener("click", (e) => {
       e.currentTarget.classList.toggle("on");
@@ -15252,6 +16256,24 @@
     });
     $("#set-discord-token")?.addEventListener("change", _saveDiscord);
     $("#set-discord-owner")?.addEventListener("change", _saveDiscord);
+    // Scheduled security overview — persists eagerly like the Discord controls
+    // so toggles survive a reload; the bridge applies the cadence live.
+    const _saveSecuritySchedule = () => saveSettings({
+      security_scheduled: $("#sw-security-scheduled")?.classList.contains("on") !== false,
+      security_interval_minutes: Math.max(5, Math.min(720, Number($("#set-security-interval")?.value) || 30)),
+      security_notify_threshold: ($("#set-security-threshold")?.value || "medium"),
+      security_discord_notify: $("#sw-security-discord")?.classList.contains("on") !== false,
+    });
+    $("#sw-security-scheduled")?.addEventListener("click", (e) => {
+      e.currentTarget.classList.toggle("on");
+      _saveSecuritySchedule();
+    });
+    $("#set-security-interval")?.addEventListener("change", _saveSecuritySchedule);
+    $("#set-security-threshold")?.addEventListener("change", _saveSecuritySchedule);
+    $("#sw-security-discord")?.addEventListener("click", (e) => {
+      e.currentTarget.classList.toggle("on");
+      _saveSecuritySchedule();
+    });
     // GitHub integration — the PAT goes straight to the bridge for validation
     // and storage; it is never echoed back into this page.
     $("#btn-github-connect")?.addEventListener("click", async () => {
@@ -15551,25 +16573,56 @@
     $("#btn-attach-image")?.addEventListener("click", () => $("#file-image").click());
     $("#btn-attach-file")?.addEventListener("click", () => $("#file-client").click());
 
-    // Access toggle: cycles approval mode soft -> medium -> hard, mirroring
-    // Settings -> Approvals. Short synonym for "permissions" on purpose.
+    // Permissions popover on the composer chip. Replaces the old blind
+    // soft -> medium -> hard cycle: the chip now opens an explicit menu that
+    // shows the current mode and what each mode permits, mirroring
+    // Settings -> Approvals.
     const permsBtn = $("#btn-perms");
     if (permsBtn) {
-      const permsToast = {
-        soft:   ["Soft mode runs routine project work and non-destructive commands without asking. Risky actions stay gated.", "warn", 5000],
-        medium: ["Medium mode: workspace file writes save without asking; other actions ask.", "info", 3000],
-        hard:   ["Hard mode: every action asks for approval.", "info", 3000],
+      const permsPopover = $("#perms-popover");
+      const permsMenu = $("#perms-menu");
+      const permsControl = $("#composer-perms-control");
+      const closePerms = () => {
+        permsPopover?.classList.remove("open");
+        permsBtn.setAttribute("aria-expanded", "false");
       };
-      permsBtn.addEventListener("click", async () => {
-        const cur = (state.settings && state.settings.approval_mode) ||
-          ((state.settings && state.settings.auto_approve_write) ? "medium" : "hard");
-        const next = cur === "soft" ? "medium" : cur === "medium" ? "hard" : "soft";
-        try { await saveSettings({ approval_mode: next, auto_approve_write: next !== "hard" }); } catch (_) {}
+      permsBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const open = !permsPopover?.classList.contains("open");
+        permsPopover?.classList.toggle("open", open);
+        permsBtn.setAttribute("aria-expanded", String(open));
+        if (open) permsMenu?.querySelector(".perms-option.active")?.focus({ preventScroll: true });
+      });
+      permsMenu?.addEventListener("click", async (e) => {
+        const opt = e.target.closest(".perms-option");
+        if (!opt) return;
+        const mode = opt.dataset.permMode;
+        try { await saveSettings({ approval_mode: mode, auto_approve_write: mode !== "hard" }); }
+        catch (error) { toast("Could not change permission mode: " + (error.message || error), "err", 4000); return; }
         syncApprovalMode();
-        toast(...permsToast[next]);
+        closePerms();
+        permsBtn.focus({ preventScroll: true });
+        toast(mode === "soft" ? "Soft mode: routine project work and non-destructive commands run on their own. Risky actions stay gated."
+          : mode === "medium" ? "Medium mode: workspace file writes save without asking; everything else asks."
+          : "Hard mode: every action asks for approval.",
+          mode === "soft" ? "warn" : "info", 4200);
+      });
+      permsMenu?.addEventListener("keydown", (e) => {
+        if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+        e.preventDefault();
+        const opts = [...permsMenu.querySelectorAll(".perms-option")];
+        const cur = opts.indexOf(document.activeElement);
+        const next = e.key === "ArrowDown" ? Math.min(opts.length - 1, cur + 1) : Math.max(0, cur - 1);
+        opts[next]?.focus({ preventScroll: true });
+      });
+      document.addEventListener("click", (e) => {
+        if (permsControl && !permsControl.contains(e.target)) closePerms();
+      });
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && permsPopover?.classList.contains("open")) { closePerms(); permsBtn.focus(); }
       });
     }
-    // Approval mode: soft | medium | hard (Settings -> Approvals)
+    // Approval mode: soft | medium | hard (Settings -> Approvals + composer popover)
     const syncApprovalMode = () => {
       const mode = (state.settings && state.settings.approval_mode) ||
         ((state.settings && state.settings.auto_approve_write) ? "medium" : "hard");
@@ -15580,13 +16633,24 @@
       });
       const tb = $("#btn-perms");
       if (tb) {
+        tb.dataset.mode = mode;
         tb.classList.toggle("on", mode !== "hard");
         tb.title = mode === "soft"
-          ? "Access · Soft. Routine work runs on its own; risky actions still ask. Click for Medium."
+          ? "Permissions · Soft. Routine work runs on its own; risky actions still ask."
           : mode === "medium"
-            ? "Access · Medium. File writes save on their own; everything else asks. Click for Hard."
-            : "Access · Hard. Every action asks first. Click for Soft.";
+            ? "Permissions · Medium. File writes save on their own; everything else asks."
+            : "Permissions · Hard. Every action asks first.";
+        tb.setAttribute("aria-label", `Permissions: ${mode}`);
+        const label = tb.querySelector(".perms-chip-label");
+        if (label) label.textContent = mode.charAt(0).toUpperCase() + mode.slice(1);
       }
+      const popValue = $("#perms-popover-value");
+      if (popValue) popValue.textContent = mode;
+      document.querySelectorAll("#perms-menu .perms-option").forEach(opt => {
+        const active = opt.dataset.permMode === mode;
+        opt.classList.toggle("active", active);
+        opt.setAttribute("aria-checked", String(active));
+      });
     };
     syncApprovalMode();
     document.querySelectorAll("#seg-approval-mode .chip").forEach(c =>
@@ -15595,8 +16659,8 @@
         try { await saveSettings({ approval_mode: mode, auto_approve_write: mode !== "hard" }); }
         catch (error) { toast("Could not save approval mode: " + (error.message || error), "err", 4000); return; }
         syncApprovalMode();
-        toast(mode === "soft" ? "Soft mode runs routine project work and non-destructive commands without asking. Risky actions stay gated."
-          : mode === "medium" ? "Medium mode: workspace file writes save without asking; other actions ask."
+        toast(mode === "soft" ? "Soft mode: routine project work and non-destructive commands run on their own. Risky actions stay gated."
+          : mode === "medium" ? "Medium mode: workspace file writes save without asking; everything else asks."
           : "Hard mode: every action asks for approval.",
           mode === "soft" ? "warn" : "info", 4500);
       }));
@@ -16104,10 +17168,24 @@
       }
     });
     // workspace add
-    $("#btn-ws-add-toggle").addEventListener("click", () => {
-      $("#ws-add").classList.toggle("hidden");
-      $("#ws-input").focus();
+    // Add-mode is a mode, not a dialog: it needs an explicit way out.
+    // Escape, the × toggle, and a successful add all close it.
+    const wsAddPanel = $("#ws-add");
+    const wsAddToggle = $("#btn-ws-add-toggle");
+    const setWsAddOpen = (open) => {
+      if (!wsAddPanel || !wsAddToggle) return;
+      wsAddPanel.classList.toggle("hidden", !open);
+      wsAddToggle.setAttribute("aria-expanded", String(open));
+      wsAddToggle.title = open ? "Cancel — close without adding" : "Add folder";
+      const icon = wsAddToggle.querySelector("i");
+      if (icon) icon.className = open ? "ph ph-x" : "ph ph-plus";
+      if (open) $("#ws-input").focus();
+      else $("#ws-input").value = "";
+    };
+    wsAddToggle.addEventListener("click", () => {
+      setWsAddOpen(wsAddPanel.classList.contains("hidden"));
     });
+    $("#ws-add-cancel")?.addEventListener("click", () => setWsAddOpen(false));
     $("#ws-add-btn").addEventListener("click", addWorkspaceFolder);
     $("#ws-browse-btn").addEventListener("click", async () => {
       const btn = $("#ws-browse-btn");
@@ -16122,6 +17200,7 @@
     });
     $("#ws-input").addEventListener("keydown", e => {
       if (e.key === "Enter") { e.preventDefault(); addWorkspaceFolder(); }
+      if (e.key === "Escape") { e.preventDefault(); setWsAddOpen(false); }
     });
 
     // sessions/workspace split — drag the divider to trade sidebar space
@@ -16192,7 +17271,7 @@
       // user knows what the tap will do, mirroring the desktop cycle.
       const cur = document.documentElement.getAttribute("data-theme") || "light";
       const next = nextTheme(cur);
-      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", neumorphic: "Neumorphic", amaranth: "Amaranth", aperture: "Aperture", "aperture-dark": "Aperture Dark", soft: "Soft", pastel: "Pastel", velvet: "Velvet", cartograph: "Cartograph", light: "Light" }[next] || next;
+      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", aurora: "Aurora", nebula: "Nebula", operator: "Operator", neumorphic: "Neumorphic", amaranth: "Amaranth", aperture: "Aperture", "aperture-dark": "Aperture Dark", atelier: "Atelier", soft: "Soft", pastel: "Pastel", velvet: "Velvet", cartograph: "Cartograph", folio: "Folio", light: "Light" }[next] || next;
       const lbl = $("#mm-theme-label");
       if (lbl) lbl.textContent = `Switch to ${niceName.toLowerCase()}`;
       const targetSelect = $("#execution-target-select");

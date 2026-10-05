@@ -12,6 +12,20 @@ REM ============================================================
 REM The bridge reserves its port before loading a model. Never kill a process
 REM merely because it listens on a port used by Accuretta or llama.cpp.
 
+REM ---- optional: run elevated for enhanced security monitoring ---------------
+REM `start.bat --admin` self-elevates via UAC. Elevated mode lets the
+REM read-only Security Overview collectors read the Security event log and
+REM elevated-process details (4688 process creation, service installs) that a
+REM normal session cannot see. Launch without the flag to keep standard rights.
+if /i "%~1"=="--admin" (
+    net session >nul 2>&1
+    if errorlevel 1 (
+        echo Requesting administrator rights for enhanced security monitoring...
+        powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '--admin-elevated' -Verb RunAs"
+        exit /b 0
+    )
+)
+
 REM ---- find console python (for pip) --------------------------
 set "PYEXE="
 where py >nul 2>&1 && set "PYEXE=py -3"

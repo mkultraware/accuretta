@@ -27,10 +27,11 @@
   })();
 </script>
 <script src="/appearance.js?v=1"></script>
-<link rel="stylesheet" href="/app.css?v=79">
+<link rel="stylesheet" href="/app.css?v=81">
 <link rel="stylesheet" href="/ui-refresh.css?v=2">
 <link rel="stylesheet" href="/workspace-shell.css?v=7">
 <link rel="stylesheet" href="/research-ui.css?v=2">
+<link rel="stylesheet" href="/ui-pass.css?v=4">
 <link rel="stylesheet" href="/assets/vendor/web/icons.css">
 <script src="/assets/vendor/html2canvas/dist/html2canvas.min.js" defer></script>
 <script src="/assets/vendor/jszip/dist/jszip.min.js" defer></script>
@@ -63,7 +64,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.9.0</span>
+        <span class="v" id="brand-v">v0.9.1</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -86,14 +87,17 @@
       <div class="section-head ws-section-head">
         <span>Workspace</span>
         <span class="grow"></span>
-        <button class="iconbtn" id="btn-ws-add-toggle" title="Add folder"><i class="ph ph-plus"></i></button>
+        <button class="iconbtn" id="btn-ws-add-toggle" title="Add folder" aria-expanded="false"><i class="ph ph-plus"></i></button>
       </div>
       <div class="workspace" id="workspace">
         <div id="ws-list"></div>
         <div class="ws-add hidden" id="ws-add">
           <input id="ws-input" placeholder="C:\path\to\folder" autocomplete="off">
-          <button class="btn sm" id="ws-browse-btn" title="Browse for folder"><i class="ph ph-folder-open"></i></button>
-          <button class="btn accent sm" id="ws-add-btn">Add</button>
+          <div class="ws-add-actions">
+            <button class="btn sm" id="ws-browse-btn" title="Browse for folder"><i class="ph ph-folder-open"></i></button>
+            <button class="btn accent sm" id="ws-add-btn">Add</button>
+            <button class="iconbtn ws-add-cancel" id="ws-add-cancel" type="button" title="Cancel — close without adding" aria-label="Cancel adding a folder"><i class="ph ph-x"></i></button>
+          </div>
         </div>
       </div>
 
@@ -194,6 +198,20 @@
     </a>
   </section>
 
+  <!-- ====== SECURITY ATTENTION POPUP ====== -->
+  <div class="security-attention" id="security-attention" hidden role="alert" aria-live="polite">
+    <div class="security-attention-head">
+      <svg class="security-signal-mark" viewBox="0 0 24 24" aria-hidden="true">
+        <path class="security-signal-frame" d="M8 4H4v4M16 4h4v4M20 16v4h-4M8 20H4v-4"></path>
+        <g class="security-signal-dots"><circle cx="9" cy="9" r="1"></circle><circle cx="12" cy="9" r="1"></circle><circle cx="15" cy="9" r="1"></circle><circle cx="9" cy="12" r="1"></circle><circle cx="15" cy="12" r="1"></circle><circle cx="9" cy="15" r="1"></circle><circle cx="12" cy="15" r="1"></circle><circle cx="15" cy="15" r="1"></circle></g>
+        <circle class="security-signal-focus" cx="12" cy="12" r="2.15"></circle>
+      </svg>
+      <strong>An event on this computer may need your attention</strong>
+      <button class="security-attention-close" id="security-attention-close" type="button" aria-label="Dismiss"><i class="ph ph-x"></i></button>
+    </div>
+    <div class="security-attention-body" id="security-attention-body"></div>
+  </div>
+
   <!-- ====== CENTER ====== -->
   <div class="center">
     <div class="topbar">
@@ -220,12 +238,21 @@
           </select>
         </div>
         <button class="iconbtn" id="btn-toggle-plan" title="Plan" aria-pressed="false"><i class="ph ph-list-checks"></i></button>
-        <button class="iconbtn" id="btn-github-activity" title="GitHub Activity"><i class="ph ph-git-branch"></i></button>
-        <button class="iconbtn" id="btn-session-desktop" title="Desktop automation for this chat only" hidden><i class="ph ph-desktop"></i></button>
-        <button class="iconbtn" id="btn-cmd-history" title="Host and WSL command history"><i class="ph ph-terminal-window"></i></button>
         <button class="iconbtn" id="btn-palette" title="Switch session (⌘K / Ctrl+K)"><i class="ph ph-magnifying-glass"></i></button>
         <button class="iconbtn" id="btn-theme" title="Theme"><i class="ph ph-moon"></i></button>
         <button class="iconbtn" id="btn-toggle-preview" title="Toggle preview"><i class="ph ph-browser"></i></button>
+        <div class="topbar-more-wrap">
+          <button class="iconbtn topbar-more" id="btn-topbar-more" title="More tools" aria-haspopup="menu" aria-expanded="false" aria-controls="topbar-more-menu"><i class="ph ph-dots-three-vertical"></i></button>
+          <div class="topbar-more-menu" id="topbar-more-menu" role="menu" aria-label="More tools">
+            <span class="mm-label">Monitor</span>
+            <button class="mm-item" type="button" role="menuitem" data-more="task-details"><i class="ph ph-clipboard-text"></i><span>Task details</span></button>
+            <button class="mm-item" type="button" role="menuitem" id="btn-cmd-history"><i class="ph ph-terminal-window"></i><span>Host and WSL command history</span></button>
+            <button class="mm-item" type="button" role="menuitem" id="btn-session-desktop" hidden><i class="ph ph-desktop"></i><span>Desktop automation for this chat</span></button>
+            <div class="mm-sep"></div>
+            <span class="mm-label">Integrations</span>
+            <button class="mm-item" type="button" role="menuitem" id="btn-github-activity"><i class="ph ph-git-branch"></i><span>GitHub activity</span></button>
+          </div>
+        </div>
         <button class="iconbtn mobile-only" id="btn-mobile-menu" type="button" title="Menu" aria-label="Open menu" aria-haspopup="menu" aria-controls="mobile-menu" aria-expanded="false"><i class="ph ph-dots-three-vertical"></i></button>
       </div>
     </div>
@@ -301,7 +328,17 @@
             </div>
             <button class="chip" id="btn-attach-image" title="Attach image — the vision model reads it and hands a description to the main model"><i class="ph ph-image"></i>Image</button>
             <button class="chip" id="btn-attach-file" title="Upload files from this browser into the PC workspace"><i class="ph ph-paperclip"></i>File</button>
-            <button class="chip" id="btn-perms" title="Access. Controls what the agent may do on its own. Click to cycle Soft → Medium → Hard."><i class="ph ph-keyhole"></i>Access</button>
+            <div class="perms-control" id="composer-perms-control">
+              <button class="chip" id="btn-perms" title="Permissions — what the agent may do on its own" aria-haspopup="menu" aria-expanded="false" aria-controls="perms-popover"><i class="ph ph-keyhole"></i><span class="perms-chip-label">Access</span><span class="btn-perms-dot" aria-hidden="true"></span></button>
+              <div class="perms-popover" id="perms-popover" role="menu" aria-label="Permissions">
+                <div class="perms-popover-head"><span>Permissions</span><strong id="perms-popover-value">—</strong></div>
+                <div class="perms-menu" id="perms-menu">
+                  <button type="button" class="perms-option" role="menuitemradio" aria-checked="false" data-perm-mode="soft"><i class="ph ph-hand-coins" aria-hidden="true"></i><span class="perms-text"><span class="perms-name">Soft</span><span class="perms-desc">Routine project work and non-destructive commands run on their own. Risky actions still ask.</span></span><i class="ph ph-check perms-check" aria-hidden="true"></i></button>
+                  <button type="button" class="perms-option" role="menuitemradio" aria-checked="false" data-perm-mode="medium"><i class="ph ph-note-pencil" aria-hidden="true"></i><span class="perms-text"><span class="perms-name">Medium</span><span class="perms-desc">Workspace file writes save on their own; everything else asks first.</span></span><i class="ph ph-check perms-check" aria-hidden="true"></i></button>
+                  <button type="button" class="perms-option" role="menuitemradio" aria-checked="false" data-perm-mode="hard"><i class="ph ph-hand-palm" aria-hidden="true"></i><span class="perms-text"><span class="perms-name">Hard</span><span class="perms-desc">Every action asks for approval before it runs.</span></span><i class="ph ph-check perms-check" aria-hidden="true"></i></button>
+                </div>
+              </div>
+            </div>
             <input type="file" id="file-image" accept="image/*" multiple hidden>
             <input type="file" id="file-client" multiple hidden>
             <div class="toolbar-overflow-wrap">
@@ -333,7 +370,7 @@
           </div>
           <div class="mention-menu hidden" id="mention-menu" role="listbox" aria-label="Files and skills"></div>
           <div class="composer-foot">
-            <span class="composer-hint">⌘⏎ send · Shift⏎ newline</span>
+            <span class="composer-hint">Enter to send · Shift+Enter for a new line</span>
             <div class="composer-foot-actions">
               <div class="effort-control hidden" id="reasoning-effort-control">
                 <button class="effort-pill" id="reasoning-effort-pill" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Reasoning effort: Default" title="Reasoning effort for the next message">
@@ -356,7 +393,7 @@
               <button class="model-pill" id="model-pill" title="Click to change model"><span class="model-pill-name">select model</span><i class="ph ph-caret-down model-pill-caret"></i></button>
               <div class="model-pill-menu" id="model-pill-menu" role="listbox" aria-label="Pick a model"></div>
               <button class="btn accent hidden" id="btn-stop" title="Stop streaming"><i class="ph-fill ph-stop"></i></button>
-              <button class="btn accent" id="btn-send" title="Send (⌘⏎)"><i class="ph-bold ph-arrow-up"></i></button>
+              <button class="btn accent" id="btn-send" title="Send (Enter)"><i class="ph-bold ph-arrow-up"></i></button>
             </div>
           </div>
         </div>
@@ -371,7 +408,7 @@
     <div class="preview-head">
       <div class="title">
         <i class="ph ph-browser"></i>
-        <span>Prerender</span>
+        <span>Preview</span>
         <span class="url-pill" id="preview-url">—</span>
       </div>
       <span class="grow"></span>
@@ -540,7 +577,7 @@
         <span class="security-intro-controls"><span class="security-intro-clock" id="security-intro-clock">00:00.0</span><button type="button" id="btn-security-intro-skip">Continue in background</button></span>
       </header>
       <div class="security-intro-copy">
-        <span class="security-intro-index" id="security-intro-index">00 / 08</span>
+        <span class="security-intro-index" id="security-intro-index">00 / 10</span>
         <h2>Mapping this machine</h2>
         <p id="security-intro-stage">Preparing local collectors</p>
       </div>
@@ -550,6 +587,8 @@
         <span data-security-source="application">Application</span>
         <span data-security-source="security">Security</span>
         <span data-security-source="persistence">Persistence</span>
+        <span data-security-source="processes">Processes</span>
+        <span data-security-source="commands">Commands</span>
         <span data-security-source="actions">Actions</span>
         <span data-security-source="correlate">Correlate</span>
         <span data-security-source="summary">Summary</span>
@@ -643,6 +682,17 @@
         </div>
       </section>
 
+      <section class="security-panel security-watchlist-panel">
+        <header class="security-panel-head">
+          <div><span class="security-eyebrow">Background watch</span><h3>Process watchlist</h3></div>
+          <button class="security-refresh sm" id="btn-watch-add" type="button" title="Watch a running process"><span>Add process</span><i class="ph ph-plus"></i></button>
+        </header>
+        <p class="security-watch-hint">Pick a process (like Task Manager) and Accuretta keeps an eye on it in the background while the app is open — alerting only on the conditions you set.</p>
+        <div class="security-whitelist-list" id="security-watchlist-list">
+          <div class="security-empty compact"><span>No processes are being watched.</span></div>
+        </div>
+      </section>
+
       <details class="security-panel security-quieted-panel">
         <summary>Quieted tool errors <span id="security-filter-count">0</span><i class="ph ph-caret-down"></i></summary>
         <p>Dismissed occurrences and ignored repeats stay recorded. Restore a filter to show matching errors again.</p>
@@ -663,6 +713,39 @@
       <div class="security-dialog-actions">
         <button type="button" class="btn" id="security-whitelist-cancel">Cancel</button>
         <button type="button" class="btn accent" id="security-whitelist-confirm">Whitelist</button>
+      </div>
+    </aside>
+  </div>
+
+  <div class="security-dialog-scrim" id="security-watch-scrim" hidden>
+    <aside class="security-dialog security-dialog-wide" role="dialog" aria-modal="true" aria-labelledby="security-watch-title">
+      <button class="security-dialog-close" id="security-watch-close" type="button" aria-label="Close"><i class="ph ph-x"></i></button>
+      <span class="security-eyebrow">Process watch</span>
+      <h2 id="security-watch-title">Watch a process</h2>
+      <p>Pick a running process, then choose what should raise an alert.</p>
+      <input id="security-watch-search" class="security-reason-input" type="text" placeholder="Search processes…" autocomplete="off" spellcheck="false">
+      <div class="security-watch-options" id="security-watch-options">
+        <div class="security-empty compact"><span>Loading running processes…</span></div>
+      </div>
+      <div class="security-watch-conditions">
+        <label class="security-watch-cond"><input type="checkbox" id="watch-cond-running" checked><span>Any time it runs</span></label>
+        <label class="security-watch-cond"><input type="checkbox" id="watch-cond-network"><span>When it has active network connections</span></label>
+        <label class="security-watch-cond"><input type="checkbox" id="watch-cond-listener"><span>When it opens a new UDP listener</span></label>
+        <label class="security-watch-cond"><input type="checkbox" id="watch-cond-unsigned"><span>When its binary is unsigned</span></label>
+        <label class="security-watch-cond"><input type="checkbox" id="watch-cond-hours"><span>Only when it runs outside hours</span>
+          <input type="number" id="watch-hours-start" min="0" max="23" value="23" aria-label="Allowed from hour">
+          <span>to</span>
+          <input type="number" id="watch-hours-end" min="0" max="23" value="7" aria-label="Allowed until hour">
+        </label>
+      </div>
+      <div class="security-watch-disclaimer">
+        <i class="ph ph-warning"></i>
+        <span>Background monitoring runs while Accuretta is open. Concurrent tasks (chats, scans, model loads) can become slower, and a heavy pass can momentarily tax this PC.</span>
+      </div>
+      <label class="security-watch-ack"><input type="checkbox" id="security-watch-ack"><span>I understand the performance impact</span></label>
+      <div class="security-dialog-actions">
+        <button type="button" class="btn" id="security-watch-cancel">Cancel</button>
+        <button type="button" class="btn accent" id="security-watch-confirm" disabled>Watch process</button>
       </div>
     </aside>
   </div>
@@ -1345,6 +1428,7 @@
         <option value="amaranth">Amaranth</option>
         <option value="aperture">Aperture</option>
         <option value="aperture-dark">Aperture Dark</option>
+        <option value="atelier">Atelier</option>
         <option value="soft">Soft</option>
         <option value="pastel">Pastel</option>
         <option value="velvet">Velvet</option>
@@ -1376,6 +1460,17 @@
     <div class="form-row inline">
       <label>Sound notifications</label>
       <div class="sw" id="sw-sound-notifications"></div>
+    </div>
+
+    <div class="form-row">
+      <span class="hint">a small always-on-top island at the top of the screen. shows what the agent is doing, gates approvals, and takes prompts while this window is minimized. press <b>Ctrl+Alt+Space</b> to bring it down or tuck it away.</span>
+    </div>
+    <div class="form-row inline">
+      <label>Notch overlay <span class="hint">(Windows)</span> <span class="beta-badge">beta</span></label>
+      <div class="sw" id="sw-notch-enabled"></div>
+    </div>
+    <div class="form-row">
+      <span class="hint">beta: this surface is new and still getting polished — approvals, reply rendering and animations may have rough edges. switch it off if anything odd happens; the full window stays unaffected.</span>
     </div>
 
     <div class="form-group">Keyboard shortcuts</div>
@@ -1576,6 +1671,31 @@
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+      <span>Scheduled security overview</span>
+    </div>
+    <div class="form-row">
+      <span class="hint">runs the read-only security scan in the background while accuretta is open, so suspicious activity reaches you without opening the page. alerts at or above the threshold pop up next to the security button (and DM you on discord when you're away, if the bridge is on).</span>
+    </div>
+    <div class="form-row inline">
+      <label>Run scheduled scans</label>
+      <div class="sw" id="sw-security-scheduled"></div>
+    </div>
+    <div class="form-row inline">
+      <label>Scan interval (minutes)</label>
+      <input type="number" id="set-security-interval" min="5" max="720" step="5" value="30" style="width:100px;">
+    </div>
+    <div class="form-row inline">
+      <label>Notify threshold</label>
+      <select id="set-security-threshold" style="width:150px;">
+        <option value="low">low — everything</option>
+        <option value="medium">medium (recommended)</option>
+        <option value="high">high — only serious</option>
+      </select>
+      <label style="margin-left:18px;">Discord DMs for alerts</label>
+      <div class="sw" id="sw-security-discord"></div>
+    </div>
+
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
       <span>GitHub integration</span>
       <span class="grow" style="flex:1;"></span>
       <span id="github-conn-status" class="hint" style="font-size:10px;">not connected</span>
@@ -1719,8 +1839,9 @@
   <script src="/security-scan-field.js?v=6"></script>
 <script src="/research-ui.js?v=2"></script>
 <script src="/dropdown-menus.js?v=1"></script>
-<script src="/agent-orb.js?v=3"></script>
-<script src="/app.js?v=2026091604"></script>
+<script src="/agent-orb.js?v=4"></script>
+<script src="/theme-flowlines.js?v=2" defer></script>
+<script src="/app.js?v=2026092904"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {

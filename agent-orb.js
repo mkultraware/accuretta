@@ -201,6 +201,15 @@
       context.globalAlpha = 1;
       return;
     }
+    // While morphing into "done", the particles converge onto the check path
+    // while the stroke draws itself underneath them — the dots dissolve into
+    // the line instead of snapping from cloud to vector at the end.
+    const morphing = info.phase === "done" && info.from;
+    let drawAmount = 0;
+    if (morphing) {
+      const k = clamp((time - info.transitionStarted) / MORPH_DURATION, 0, 1);
+      drawAmount = ease(clamp((k - 0.22) / 0.78, 0, 1));
+    }
     const points = visiblePose(info, time).map(point => ({ ...point, x: 20 + point.x * 15, y: 20 + point.y * 15 }))
       .sort((a, b) => a.z - b.z);
 
@@ -221,10 +230,28 @@
     }
     for (const point of points) {
       const depth = (point.z + 1) / 2;
-      context.globalAlpha = (0.16 + depth * 0.52) * point.alpha;
+      let alpha = (0.16 + depth * 0.52) * point.alpha;
+      if (morphing) alpha *= 1 - 0.82 * drawAmount;   // dots hand off to the stroke
+      context.globalAlpha = alpha;
       context.beginPath();
       context.arc(point.x, point.y, (0.42 + depth * 0.34) * point.size, 0, Math.PI * 2);
       context.fill();
+    }
+    if (morphing && drawAmount > 0) {
+      const stroke = checkStroke();
+      let length = 0;
+      for (let i = 1; i < stroke.length; i++) length += Math.hypot(stroke[i].x - stroke[i - 1].x, stroke[i].y - stroke[i - 1].y);
+      context.strokeStyle = context.fillStyle;
+      context.lineWidth = 1.7;
+      context.lineCap = "round";
+      context.lineJoin = "round";
+      context.setLineDash([length, length]);
+      context.lineDashOffset = length * (1 - drawAmount);
+      context.globalAlpha = 0.35 + 0.65 * drawAmount;
+      context.beginPath();
+      for (const p of stroke) context.lineTo(p.x, p.y);
+      context.stroke();
+      context.setLineDash([]);
     }
     context.globalAlpha = 1;
   }
@@ -236,7 +263,9 @@
     for (const [canvas, info] of orbs) {
       if (!canvas.isConnected) { observer.unobserve(canvas); orbs.delete(canvas); continue; }
       if (!info.visible || !canvas.getClientRects().length) continue;
-      if (info.phase === "idle" && !info.from) continue;
+      // Settled states don't repaint frame-by-frame; the theme observer
+      // repaints them on palette changes.
+      if ((info.phase === "idle" || info.phase === "done") && !info.from) continue;
       active = true;
       if (time - lastPaint > 32) paint(canvas, info, time);
     }

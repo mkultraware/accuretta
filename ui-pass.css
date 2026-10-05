@@ -1,0 +1,976 @@
+/* ============================================================
+   ACCURETTA — UI pass (2026 audit fixes)
+   Diff review workspace · IA consolidation · settings nav/search
+   Session supervision badges · message actions · popover perms
+   Layered AFTER ui-refresh.css so it wins the cascade without
+   !important. Everything theme-token driven; no raw colors.
+   ============================================================ */
+
+/* ------------------------------------------------------------
+   Z-LAYER TOKENS
+   One source of truth for stacking. app.css keeps its legacy raw
+   values where they are load-bearing, but every new surface in
+   this file composes from these.
+   ------------------------------------------------------------ */
+:root {
+  --z-diff-dialog: var(--z-modal);          /* above drawer, below toasts */
+  --z-topbar-menu: var(--z-overlay);        /* overflow menus in the topbar */
+  --z-composer-pop: 260;                    /* composer popovers (effort/perms) */
+}
+
+/* ============================================================
+   1. DIFF REVIEW WORKSPACE
+   Two-pane review: file rail on the left, hunk-annotated unified
+   diff on the right. Replaces the old select+scroll dialog.
+   ============================================================ */
+.task-review-dialog.diff-workspace {
+  width: min(1080px, calc(100vw - 24px));
+  height: min(720px, calc(100dvh - 32px));
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+:is(.task-review-dialog.diff-workspace, .compare-dialog) .dw-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 20px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+:is(.task-review-dialog.diff-workspace, .compare-dialog) .dw-title h2 {
+  margin: 0 0 3px;
+  font-size: 17px;
+  letter-spacing: -0.015em;
+}
+
+:is(.task-review-dialog.diff-workspace, .compare-dialog) .dw-sub {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+:is(.task-review-dialog.diff-workspace, .compare-dialog) .dw-sub .dw-stat-add { color: var(--success); }
+:is(.task-review-dialog.diff-workspace, .compare-dialog) .dw-sub .dw-stat-del { color: var(--danger); }
+
+:is(.task-review-dialog.diff-workspace, .compare-dialog) .dw-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.task-review-dialog.diff-workspace .dw-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr);
+}
+
+/* --- file rail ------------------------------------------------ */
+.task-review-dialog.diff-workspace .dw-files {
+  border-right: 1px solid var(--border-subtle);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px 8px 14px;
+  background: color-mix(in srgb, var(--bg-sunken) 55%, var(--bg-raised));
+}
+
+.task-review-dialog.diff-workspace .dw-file {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  font: inherit;
+}
+
+.task-review-dialog.diff-workspace .dw-file:hover {
+  background: color-mix(in srgb, var(--bg-inset) 55%, transparent);
+}
+
+.task-review-dialog.diff-workspace .dw-file[aria-selected="true"] {
+  background: var(--accent-subtle, color-mix(in srgb, var(--accent) 14%, transparent));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+.task-review-dialog.diff-workspace .dw-file-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.task-review-dialog.diff-workspace .dw-file-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 600 12.5px/1.35 var(--font-sans);
+}
+
+.task-review-dialog.diff-workspace .dw-file-tags {
+  display: inline-flex;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.task-review-dialog.diff-workspace .dw-dir {
+  color: var(--fg-faint);
+  font-size: 10.5px;
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-review-dialog.diff-workspace .dw-file-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+  font: 11px/1.3 var(--font-mono);
+  color: var(--fg-faint);
+}
+
+.task-review-dialog.diff-workspace .dw-file-foot .tc-add { color: var(--success); }
+.task-review-dialog.diff-workspace .dw-file-foot .tc-del { color: var(--danger); }
+
+/* status tags reused from the turn-changes card, styled outside that scope */
+.task-review-dialog .tc-tag {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  padding: 1px 5px;
+  border-radius: 5px;
+  flex-shrink: 0;
+  color: var(--fg-muted);
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+}
+
+.task-review-dialog .tc-new { color: var(--success); background: var(--success-subtle); }
+.task-review-dialog .tc-del-tag { color: var(--danger); background: var(--danger-subtle); }
+
+.task-review-dialog.diff-workspace .dw-file.is-undone { opacity: .55; }
+.task-review-dialog.diff-workspace .dw-file.is-undone .dw-file-name { text-decoration: line-through; }
+
+.task-review-dialog.diff-workspace .dw-stale-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--warning, var(--lemon-3, #C9AE3A));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--lemon-3, #C9AE3A) 18%, transparent);
+}
+
+/* --- detail pane ---------------------------------------------- */
+.task-review-dialog.diff-workspace .dw-detail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.task-review-dialog.diff-workspace .dw-filebar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.task-review-dialog.diff-workspace .dw-filebar-name {
+  font: 600 12.5px/1.4 var(--font-mono);
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+
+.task-review-dialog.diff-workspace .dw-filebar-notes {
+  flex: 1 1 100%;
+  color: var(--fg-muted);
+  font-size: 11.5px;
+}
+
+.task-review-dialog.diff-workspace .dw-hunknav {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.task-review-dialog.diff-workspace .dw-hunknav[hidden] { display: none; }
+
+.task-review-dialog.diff-workspace .dw-hunknav button {
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  padding: 5px 8px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.task-review-dialog.diff-workspace .dw-hunknav button:hover:not(:disabled) {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--bg-inset) 60%, transparent);
+}
+
+.task-review-dialog.diff-workspace .dw-hunknav button:disabled {
+  opacity: .35;
+  cursor: default;
+}
+
+.task-review-dialog.diff-workspace .dw-hunknav .dw-hunkpos {
+  font: 11px/1 var(--font-mono);
+  color: var(--fg-muted);
+  padding: 0 4px;
+  min-width: 34px;
+  text-align: center;
+}
+
+.task-review-dialog.diff-workspace .dw-status {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 8px 16px 6px;
+  color: var(--fg-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  min-height: 1.2em;
+}
+
+/* --- diff body ------------------------------------------------ */
+.task-review-dialog.diff-workspace .dw-diff {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 6px 0 18px;
+  background: var(--bg-sunken);
+  font: 12px/1.6 var(--font-mono);
+  tab-size: 4;
+  scrollbar-gutter: stable;
+}
+
+.dwl {
+  display: flex;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.dwl-g {
+  flex: 0 0 auto;
+  min-width: 3.4ch;
+  padding: 0 6px;
+  text-align: right;
+  color: var(--fg-faint);
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.dwl-m {
+  flex: 0 0 auto;
+  width: 1.4ch;
+  text-align: center;
+  user-select: none;
+  color: var(--fg-faint);
+}
+
+.dwl-c {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: pre;
+  padding-right: 18px;
+  color: var(--fg);
+}
+
+.dwl-add { background: color-mix(in srgb, var(--success) 11%, transparent); }
+.dwl-add .dwl-m { color: var(--success); }
+.dwl-add .dwl-c { color: color-mix(in srgb, var(--success) 62%, var(--fg)); }
+
+.dwl-del { background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.dwl-del .dwl-m { color: var(--danger); }
+.dwl-del .dwl-c { color: color-mix(in srgb, var(--danger) 58%, var(--fg)); }
+
+.dwl-hunk {
+  margin: 10px 0 4px;
+  background: var(--bg-inset);
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.dwl-hunk .dwl-c {
+  white-space: pre-wrap;
+  color: var(--accent);
+  font-weight: 600;
+  padding: 3px 0 3px 10px;
+}
+
+.dwl-filehead .dwl-c {
+  color: var(--fg-faint);
+  white-space: pre;
+}
+
+.dwl-empty { background: repeating-linear-gradient(45deg, var(--bg-inset), var(--bg-inset) 6px, transparent 6px, transparent 12px); }
+
+.task-review-dialog.diff-workspace .dw-empty {
+  padding: 40px 24px;
+  text-align: center;
+  color: var(--fg-muted);
+}
+
+.task-review-dialog.diff-workspace .dw-empty .ph { font-size: 26px; opacity: .5; }
+.task-review-dialog.diff-workspace .dw-empty .h { margin-top: 8px; font-weight: 600; color: var(--fg); }
+.task-review-dialog.diff-workspace .dw-empty .s { font-size: 12px; margin-top: 4px; }
+
+@media (max-width: 760px) {
+  .task-review-dialog.diff-workspace .dw-body { grid-template-columns: 1fr; }
+  .task-review-dialog.diff-workspace .dw-files {
+    border-right: 0;
+    border-bottom: 1px solid var(--border-subtle);
+    max-height: 32dvh;
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    align-items: stretch;
+  }
+  .task-review-dialog.diff-workspace .dw-file { flex: 0 0 auto; width: 200px; }
+  .task-review-dialog.diff-workspace .dw-file .dw-dir { display: none; }
+  .task-review-dialog.diff-workspace .dw-hunknav { order: 3; }
+}
+
+/* ============================================================
+   2. TOPBAR MORE-MENU
+   Consolidates github / command-history / session-desktop into
+   one labeled menu so the topbar keeps its signal density.
+   ============================================================ */
+.topbar-more-wrap { position: relative; }
+
+@media (max-width: 600px) {
+  /* the mobile dots-menu covers everything this offers; avoid two menus */
+  .topbar-more-wrap { display: none; }
+}
+
+.topbar-more-menu {
+  position: fixed;
+  min-width: 230px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-raised);
+  color: var(--fg);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.2);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(-4px);
+  transition: opacity 140ms var(--ease-out), transform 160ms var(--ease-out),
+    visibility 0s linear 160ms;
+  z-index: var(--z-topbar-menu);
+}
+
+.topbar-more-menu.open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateY(0);
+  transition-delay: 0s;
+}
+
+.topbar-more-menu .mm-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg);
+  font: 500 12.5px/1.3 var(--font-sans);
+  cursor: pointer;
+  text-align: left;
+}
+
+.topbar-more-menu .mm-item:hover { background: color-mix(in srgb, var(--bg-inset) 65%, transparent); }
+.topbar-more-menu .mm-item .ph { font-size: 16px; color: var(--fg-muted); }
+.topbar-more-menu .mm-item .ph-check { display: none; }
+.topbar-more-menu .mm-sep { height: 1px; margin: 5px 6px; background: var(--border-subtle); }
+.topbar-more-menu .mm-label {
+  padding: 6px 10px 4px;
+  font: 650 10px/1 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+/* [hidden] must beat the display:flex above (specificity) */
+.topbar-more-menu .mm-item[hidden] { display: none; }
+
+/* ============================================================
+   3. PERMISSIONS POPOVER (composer "Access")
+   Replaces blind soft→medium→hard cycling with an explicit
+   menu that shows the current mode and what each mode does.
+   ============================================================ */
+.perms-control { position: relative; display: inline-flex; }
+
+.perms-popover {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 10px);
+  z-index: var(--z-composer-pop);
+  width: min(268px, calc(100vw - 24px));
+  padding: 11px 12px 10px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--bg-raised);
+  color: var(--fg);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(6px);
+  transform-origin: 18% 100%;
+  transition: opacity 180ms var(--ease-out), transform 240ms var(--ease-spring),
+    visibility 0s linear 240ms;
+}
+
+.perms-popover.open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateY(0);
+  transition-delay: 0s;
+}
+
+.perms-popover-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.perms-popover-head strong {
+  color: var(--accent);
+  font: 650 11px/1 var(--font-mono);
+  text-transform: capitalize;
+}
+
+.perms-menu { display: flex; flex-direction: column; gap: 2px; margin: 2px -4px -4px; }
+
+.perms-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  text-align: left;
+}
+
+.perms-option:hover { background: color-mix(in srgb, var(--bg-inset) 55%, transparent); }
+.perms-option .perms-check { visibility: hidden; margin-left: auto; color: var(--accent); flex: 0 0 auto; margin-top: 2px; }
+.perms-option.active .perms-check { visibility: visible; }
+.perms-option .perms-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.perms-option .perms-name { font: 600 12.5px/1.3 var(--font-sans); display: flex; align-items: center; gap: 7px; }
+.perms-option .perms-name .ph { font-size: 14px; color: var(--fg-muted); }
+.perms-option .perms-desc { font-size: 11px; color: var(--fg-muted); line-height: 1.45; }
+.perms-option.active .perms-name .ph { color: var(--accent); }
+
+/* mode-tinted dot on the Access chip so the state is readable at a glance */
+.btn-perms-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--fg-faint);
+}
+
+#btn-perms[data-mode="soft"] .btn-perms-dot { background: var(--warning, var(--lemon-3, #C9AE3A)); }
+#btn-perms[data-mode="medium"] .btn-perms-dot { background: var(--accent); }
+#btn-perms[data-mode="hard"] .btn-perms-dot { background: var(--danger); }
+
+/* ============================================================
+   4. SESSION SUPERVISION BADGES (chat list)
+   Working / Needs you / Failed states become visible text pills
+   so the sidebar reads like a job monitor, not a link farm.
+   ============================================================ */
+.chatlist { position: relative; }
+
+/* Titles must not push the new pill out of the row */
+.chatrow .t {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chatrow .state-pill {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font: 600 9.5px/1.5 var(--font-mono);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.chatrow .state-pill[data-state="working"] {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  animation: state-pulse 2.2s ease-in-out infinite;
+}
+
+.chatrow .state-pill[data-state="needs-you"] {
+  color: var(--warning, var(--lemon-3, #C9AE3A));
+  background: color-mix(in srgb, var(--lemon-3, #C9AE3A) 16%, transparent);
+}
+
+.chatrow .state-pill[data-state="failed"] {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 13%, transparent);
+}
+
+.chatrow .state-pill[data-state="stopped"],
+.chatrow .state-pill[data-state="interrupted"] {
+  color: var(--fg-muted);
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+}
+
+@keyframes state-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .55; }
+}
+
+/* add-folder toggle reads as "open mode" while the path input is showing */
+#btn-ws-add-toggle[aria-expanded="true"] {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+/* The add-row lives in a ~230px sidebar. Two-line layout: full-width path
+   input, then [browse][Add][cancel] — every exit visible, nothing clipped
+   (min-width:auto on the old single-row input pushed Add past the edge). */
+.ws-add {
+  padding: 8px 10px;
+  gap: 6px;
+  flex-direction: column;
+}
+
+.ws-add input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ws-add-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.ws-add-actions .btn.sm {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  min-height: 24px;
+}
+
+.ws-add-actions #ws-add-btn {
+  flex: 1 1 auto;
+}
+
+.ws-add-cancel {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  color: var(--fg-muted);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: transparent;
+}
+
+.ws-add-cancel:hover {
+  color: var(--fg);
+  border-color: var(--border-strong);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chatrow .state-pill[data-state="working"] { animation: none; }
+}
+
+/* workspace grouping header inside the session list */
+.chatlist .session-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 10px 4px;
+  font: 650 9.5px/1.4 var(--font-mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+.chatlist .session-group-head .ph { font-size: 11px; }
+
+.chatlist .session-group-head .grow {
+  flex: 1;
+  height: 1px;
+  background: var(--border-subtle);
+}
+
+/* ============================================================
+   5. SETTINGS: SECTION RAIL + SEARCH
+   Sticky rail of section chips under the drawer head, plus a
+   search field that filters rows without hiding whole sections.
+   ============================================================ */
+.settings-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 20px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  flex: 0 0 auto;
+}
+
+.settings-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-raised);
+  color: var(--fg-muted);
+}
+
+.settings-search:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  color: var(--fg);
+}
+
+.settings-search .ph { font-size: 14px; flex: 0 0 auto; }
+
+.settings-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font: 400 12.5px/1.4 var(--font-sans);
+  outline: none;
+}
+
+.settings-search input::placeholder { color: var(--fg-faint); }
+
+/* Hide the native blue search-cancel glyph: the theme's own thin clear
+   button already does that job, and two × glyphs read as broken. */
+.settings-search input[type="search"]::-webkit-search-cancel-button,
+.settings-search input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
+}
+
+.settings-search .settings-search-clear {
+  border: 0;
+  background: transparent;
+  color: var(--fg-faint);
+  cursor: pointer;
+  padding: 2px;
+  line-height: 1;
+  display: none;
+}
+
+.settings-search.has-value .settings-search-clear { display: inline-flex; }
+
+.settings-nav {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding-bottom: 2px;
+}
+
+.settings-nav::-webkit-scrollbar { display: none; }
+
+.settings-nav button {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: var(--bg-raised);
+  color: var(--fg-muted);
+  font: 500 11px/1.5 var(--font-sans);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.settings-nav button:hover { color: var(--fg); border-color: var(--border-strong); }
+.settings-nav button .ph { font-size: 12px; }
+
+.settings-nav button.is-current {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.settings-search-note {
+  display: none;
+  color: var(--fg-muted);
+  font: 11px/1.4 var(--font-sans);
+}
+
+.settings-search-note.has-hits { display: block; }
+.settings-search-note.no-hits { color: var(--fg-muted); }
+
+/* dimmed state while searching */
+#settings-drawer.is-searching details.settings-section { opacity: .85; }
+#settings-drawer.is-searching details.settings-section[data-no-matches] { display: none; }
+#settings-drawer.is-searching .settings-section-summary { cursor: default; }
+
+/* display rules on rows must not defeat the [hidden] attribute */
+#settings-body [hidden] { display: none !important; }
+
+/* ============================================================
+   6. MESSAGE ACTIONS
+   Edit + resend on user turns, per-message token meta.
+   ============================================================ */
+.bubble-actions { display: flex; align-items: center; gap: 4px; }
+
+.bubble-action[data-act="edit"]:disabled {
+  opacity: .32;
+  cursor: default;
+}
+
+.bubble-editing-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px auto 0;
+  max-width: min(720px, calc(100% - 32px));
+  padding: 6px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, transparent);
+  border-bottom: 0;
+  border-radius: 10px 10px 0 0;
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-raised));
+  color: var(--fg-muted);
+  font: 500 11.5px/1.4 var(--font-sans);
+}
+
+.bubble-editing-banner strong { color: var(--accent); font-weight: 640; }
+
+.bubble-editing-banner .bubble-editing-cancel {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+  padding: 3px 6px;
+  border-radius: 6px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.bubble-editing-banner .bubble-editing-cancel:hover { color: var(--fg); background: color-mix(in srgb, var(--bg-inset) 60%, transparent); }
+
+/* regenerate compare chip */
+.bubble-action[data-act="compare"] {
+  color: var(--fg-muted);
+}
+
+.bubble-action[data-act="compare"]:hover { color: var(--accent); }
+
+/* ============================================================
+   7. COMPARE DIALOG (side-by-side, this machine only)
+   ============================================================ */
+.compare-dialog {
+  width: min(1080px, calc(100vw - 24px));
+  height: min(720px, calc(100dvh - 32px));
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-raised);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
+  box-shadow: var(--shadow-lg);
+}
+
+.compare-dialog::backdrop { background: rgba(0, 0, 0, .6); }
+
+.compare-dialog .dw-head { flex: 0 0 auto; }
+.compare-dialog .dw-body { display: grid; grid-template-columns: 1fr 1fr; flex: 1 1 auto; min-height: 0; overflow: hidden; }
+
+.compare-dialog .compare-pane {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border-subtle);
+}
+
+.compare-dialog .compare-pane:last-child { border-right: 0; }
+
+.compare-dialog .compare-pane-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  font: 650 10px/1.4 var(--font-mono);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+.compare-dialog .compare-pane-head .ph { font-size: 12px; }
+
+.compare-dialog .compare-pane-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 14px 16px 20px;
+  font: 13px/1.6 var(--font-sans);
+  color: var(--fg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+  .compare-dialog .dw-body { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; overflow-y: auto; }
+  .compare-dialog .compare-pane { border-right: 0; border-bottom: 1px solid var(--border-subtle); }
+}
+
+/* ============================================================
+   8. Composer editing state — wire the input to the banner
+   ============================================================ */
+#composer-input.is-editing {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border-strong));
+}
+
+/* small polish: topbar more button rotation when open */
+.topbar-more[aria-expanded="true"] .ph-dots-three {
+  color: var(--accent);
+}
+
+/* ============================================================
+   ATELIER — theme-specific presentation
+   The token block (colors_and_type.css) recolors everything;
+   this section only does what tokens can't: the flow-line field
+   on the blank chat, serif display tuning, and the editorial
+   scrim that keeps the welcome legible over the lines.
+   ============================================================ */
+
+/* --- flow-line field ------------------------------------------ */
+[data-theme="atelier"] .welcome-screen {
+  position: relative;
+  overflow: hidden;
+}
+
+[data-theme="atelier"] .flow-lines-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Soft vignette so lines never compete with the wordmark. */
+[data-theme="atelier"] .welcome-screen::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  pointer-events: none;
+  z-index: 1;
+  background:
+    radial-gradient(ellipse 62% 52% at 50% 46%, transparent 0%, color-mix(in srgb, var(--bg) 72%, transparent) 78%, color-mix(in srgb, var(--bg) 94%, transparent) 100%),
+    linear-gradient(to top, var(--bg) 0%, transparent 22%);
+}
+
+[data-theme="atelier"] .welcome-content { position: relative; z-index: 2; }
+
+/* Atelier replaces the blob/pillar backdrop and the quote glyph with
+   the line field — one idea per theme. */
+[data-theme="atelier"] .welcome-blobs,
+[data-theme="atelier"] .welcome-quote {
+  display: none;
+}
+
+/* --- serif display tuning (Newsreader is optical-size aware) --- */
+[data-theme="atelier"] .welcome-title {
+  font-weight: 460;
+  letter-spacing: -0.015em;
+  font-optical-sizing: auto;
+  line-height: 0.98;
+}
+
+[data-theme="atelier"] .welcome-title::first-letter {
+  color: var(--accent);
+}
+
+[data-theme="atelier"] .welcome-subtitle {
+  font-weight: 400;
+  letter-spacing: 0.001em;
+  color: var(--fg-muted);
+}
+
+/* Suggestion index numerals in the drafting-room mono, brass on hover */
+[data-theme="atelier"] .welcome-suggest-btn::before {
+  color: color-mix(in srgb, var(--accent) 72%, var(--fg-muted));
+}
+
+[data-theme="atelier"] .welcome-suggest-btn:hover::before {
+  color: var(--accent);
+}
+
+/* Hairline rules lean warmer to sit inside the ink room */
+[data-theme="atelier"] .welcome-screen {
+  --welcome-rule: color-mix(in srgb, var(--fg) 16%, transparent);
+  --welcome-rule-soft: color-mix(in srgb, var(--fg) 11%, transparent);
+}
+
+/* --- display headings across pages (FAQ / Usage / Security) ----- */
+[data-theme="atelier"] :is(.faq-title, #usage-title, #security-title, .drawer-head h3, .modal-head h3) {
+  font-family: var(--font-display);
+  font-weight: 480;
+  letter-spacing: -0.01em;
+}
+
+[data-theme="atelier"] .faq-intro h2,
+[data-theme="atelier"] .faq-rail-label,
+[data-theme="atelier"] .welcome-suggest-label {
+  font-optical-sizing: auto;
+}

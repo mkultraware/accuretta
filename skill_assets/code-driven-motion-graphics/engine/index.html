@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>motion</title><link rel="icon" href="data:,">
+<style>
+html,body{margin:0;height:100%;background:#050506;overflow:hidden;font:13px ui-monospace,monospace;color:#ddd}
+#stage{position:fixed;inset:0;display:grid;place-items:center}
+#c{max-height:calc(100vh - 20px);max-width:calc(100vw - 20px);display:block;background:#000}
+#ui{position:fixed;left:16px;bottom:16px;display:flex;gap:10px;align-items:center;background:#111;border:1px solid #2a2a30;padding:10px 12px}
+#ui.hidden{display:none} #scrub{width:320px} button{font:inherit;padding:6px 12px;cursor:pointer}
+</style></head>
+<body><div id="stage"><canvas id="c"></canvas></div>
+<div id="ui"><button id="play">play / pause (space)</button><input id="scrub" type="range" min="0" value="0"><span id="lab"></span></div>
+<script type="module" src="src/main.js"></script></body></html>

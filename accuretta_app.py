@@ -115,7 +115,7 @@ def _acquire_single_instance(lock_port: int = 8799) -> bool:
 _LIGHT_THEMES = {"", "light", "soft", "pastel", "retro", "neumorphic", "neobrutalism", "aperture", "folio"}
 _KNOWN_THEMES = {
     "light", "dark", "dim", "retro", "aurora", "nebula", "operator",
-    "neumorphic", "neobrutalism", "aperture", "aperture-dark", "soft",
+    "neumorphic", "neobrutalism", "aperture", "aperture-dark", "atelier", "soft",
     "pastel", "velvet", "cartograph", "amaranth", "folio",
 }
 _THEME_ALIASES = {
@@ -559,47 +559,20 @@ def _watch_bridge(win) -> None:
         time.sleep(1)
 
 
-def _set_app_icon() -> None:
-    """Windows: replace the inherited Python icon with Accuretta's icon on the live
-    window (titlebar + taskbar). Packaged builds get this from PyInstaller
-    --icon; this covers running from source via pythonw."""
+_APP_ICON = str(bridge.ROOT / "assets" / "icons" / "accuretta.ico")
+
+
+def _set_app_identity() -> None:
+    """Windows: give the process its own taskbar identity so it doesn't group
+    under python/pythonw (which also shows Python's icon). Must run before the
+    first window is created or the taskbar has already bound it to python."""
     if sys.platform != "win32":
-        return
-    ico = os.path.abspath(os.path.join("assets", "icons", "accuretta.ico"))
-    if not os.path.exists(ico):
         return
     try:
         import ctypes
-        # Give the process its own taskbar identity so it doesn't ride under python.
-        try:
-            aumid = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
-            aumid.argtypes = [ctypes.c_wchar_p]
-            aumid("Accuretta.Desktop")
-        except Exception:
-            pass
-        u = ctypes.windll.user32
-        u.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
-        u.FindWindowW.restype = ctypes.c_void_p
-        u.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
-                                 ctypes.c_int, ctypes.c_int, ctypes.c_uint]
-        u.LoadImageW.restype = ctypes.c_void_p
-        u.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
-        IMAGE_ICON, LR_LOADFROMFILE = 1, 0x0010
-        WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
-        hwnd = None
-        for _ in range(80):  # wait up to ~8s for the window to exist
-            hwnd = u.FindWindowW(None, "Accuretta")
-            if hwnd:
-                break
-            time.sleep(0.1)
-        if not hwnd:
-            return
-        big = u.LoadImageW(None, ico, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
-        small = u.LoadImageW(None, ico, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
-        if big:
-            u.SendMessageW(hwnd, WM_SETICON, ICON_BIG, big)
-        if small:
-            u.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small)
+        aumid = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+        aumid.argtypes = [ctypes.c_wchar_p]
+        aumid("Accuretta.Desktop")
     except Exception:
         pass
 
@@ -626,6 +599,7 @@ def main() -> int:
     # (only the whole message via the copy button). Turning it on restores normal
     # selection + Ctrl+C + right-click copy. UI chrome stays unselectable via the
     # `user-select: none` CSS on buttons, the sidebar, and code line numbers.
+    _set_app_identity()
     splash_created_at = time.monotonic()
     desktop_api = DesktopWindowApi()
     win = webview.create_window("Accuretta", html=_build_splash_html(), js_api=desktop_api,
@@ -668,9 +642,6 @@ def main() -> int:
         else:
             win.load_html(_FAILED_HTML)
 
-    # Swap the Python icon for Accuretta's icon once the window exists.
-    threading.Thread(target=_set_app_icon, daemon=True).start()
-
     # gui='edgechromium' forces WebView2 on Windows for identical Chromium rendering.
     # private_mode=False + a stable storage_path: pywebview defaults to private
     # mode, which tells WebView2 to DISCARD localStorage/cookies between launches
@@ -683,7 +654,9 @@ def main() -> int:
     except Exception:
         _storage = None
     webview.start(_boot, gui="edgechromium" if sys.platform == "win32" else None,
-                  private_mode=False, storage_path=_storage)
+                  private_mode=False, storage_path=_storage,
+                  # Without this pywebview stamps python.exe's icon on the window.
+                  icon=_APP_ICON if os.path.isfile(_APP_ICON) else None)
     return 0
 
 

@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="150 280 980 720" width="980" height="720">
+  <title>Accuretta</title>
+  <defs>
+    <!-- Tall slab: cyan at the foot, violet body, lavender at the top -->
+    <linearGradient id="slabBase" gradientUnits="userSpaceOnUse" x1="170" y1="990" x2="760" y2="300">
+      <stop offset="0" stop-color="#3fb4ff"/>
+      <stop offset="0.35" stop-color="#4a4ee8"/>
+      <stop offset="0.75" stop-color="#6f52ee"/>
+      <stop offset="1" stop-color="#9c8ef7"/>
+    </linearGradient>
+    <!-- Dark navy core running through the middle of the slab -->
+    <radialGradient id="slabCore" gradientUnits="userSpaceOnUse" cx="500" cy="640" r="420"
+                    gradientTransform="translate(500 640) rotate(-56) scale(1.05 0.42) translate(-500 -640)">
+      <stop offset="0" stop-color="#0b0a3c" stop-opacity="0.95"/>
+      <stop offset="0.55" stop-color="#1a1872" stop-opacity="0.6"/>
+      <stop offset="1" stop-color="#1a1872" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Magenta rim along the right edge (runs across the slab's width) -->
+    <linearGradient id="slabRim" gradientUnits="userSpaceOnUse" x1="386" y1="660" x2="560" y2="778">
+      <stop offset="0" stop-color="#e070ff" stop-opacity="0"/>
+      <stop offset="0.75" stop-color="#c04cf5" stop-opacity="0.1"/>
+      <stop offset="1" stop-color="#f08aff" stop-opacity="0.85"/>
+    </linearGradient>
+    <linearGradient id="slabSheen" gradientUnits="userSpaceOnUse" x1="640" y1="300" x2="560" y2="520">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.2"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.04"/>
+    </linearGradient>
+    <linearGradient id="slabEdge" gradientUnits="userSpaceOnUse" x1="386" y1="660" x2="560" y2="778">
+      <stop offset="0" stop-color="#7cc4ff"/>
+      <stop offset="0.5" stop-color="#9a7cff"/>
+      <stop offset="1" stop-color="#f09aff"/>
+    </linearGradient>
+
+    <!-- Short foot: violet shell, near-black core, pink lower rim -->
+    <linearGradient id="footBase" gradientUnits="userSpaceOnUse" x1="760" y1="646" x2="960" y2="975">
+      <stop offset="0" stop-color="#3a2fd8"/>
+      <stop offset="0.6" stop-color="#5a24e0"/>
+      <stop offset="1" stop-color="#b44cff"/>
+    </linearGradient>
+    <radialGradient id="footCore" gradientUnits="userSpaceOnUse" cx="855" cy="785" r="190">
+      <stop offset="0" stop-color="#05041e" stop-opacity="0.95"/>
+      <stop offset="0.6" stop-color="#0f0b4a" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#0f0b4a" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="footEdge" gradientUnits="userSpaceOnUse" x1="672" y1="650" x2="1110" y2="975">
+      <stop offset="0" stop-color="#8a6cff"/>
+      <stop offset="0.45" stop-color="#7fa8ff"/>
+      <stop offset="1" stop-color="#e79bff"/>
+    </linearGradient>
+
+    <path id="slab" d="M610 330 Q632 298 670 298 L858 298 Q874 298 865 312 L512 860 Q499 879 478 886 L174 986 Q160 991 168 980 Z"/>
+    <path id="foot" d="M673 657 Q667 646 682 646 L872 646 Q900 646 916 669 L1106 960 Q1117 977 1098 975 L870 944 Q846 940 833 919 Z"/>
+    <clipPath id="slabClip"><use href="#slab"/></clipPath>
+  </defs>
+
+  <use href="#slab" fill="url(#slabBase)"/>
+  <use href="#slab" fill="url(#slabCore)"/>
+  <use href="#slab" fill="url(#slabRim)"/>
+  <polygon points="560,280 900,280 900,360 440,615 400,615" fill="url(#slabSheen)" clip-path="url(#slabClip)"/>
+  <use href="#slab" fill="none" stroke="url(#slabEdge)" stroke-width="4" stroke-linejoin="round"/>
+
+  <use href="#foot" fill="url(#footBase)"/>
+  <use href="#foot" fill="url(#footCore)"/>
+  <use href="#foot" fill="none" stroke="url(#footEdge)" stroke-width="4" stroke-linejoin="round"/>
+</svg>

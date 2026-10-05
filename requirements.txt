@@ -64,6 +64,13 @@ dpkt>=1.9.8                # Lightweight PCAP/PCAPNG packet capture parser
 cryptography>=41.0.0       # Certificate parsing for the authorized recon TLS audit (self-signed / unverified chains)
 
 # ------------------------------------------------------------------------------
+# Desktop app + Notch overlay (Optional)
+# ------------------------------------------------------------------------------
+pywebview>=5.0              # Desktop app window; also supplies the bundled
+                            # WebView2 .NET assemblies the notch overlay host
+                            # (notch_host.py) uses for its transparent window
+
+# ------------------------------------------------------------------------------
 # Remote bridge (Optional)
 # ------------------------------------------------------------------------------
 discord.py>=2.3.0          # Discord remote bridge: DM accuretta from your phone + reaction approvals

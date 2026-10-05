@@ -89,7 +89,7 @@ button {
 .usage-page {
   position: fixed;
   inset: 0;
-  z-index: 1800;
+  z-index: var(--z-fullpage);
   display: flex;
   flex-direction: column;
   color: var(--fg);
@@ -365,10 +365,10 @@ button {
 .mm-item[data-mm="security"] .security-signal-mark { color: var(--fg-muted); }
 .mm-item[data-mm="security"]:hover .security-signal-mark { color: var(--fg); }
 
-.security-page {
-  position: fixed;
-  inset: 0;
-  z-index: 1802;
+  .security-page {
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-fullpage) + 2);
   display: flex;
   flex-direction: column;
   color: var(--fg);
@@ -758,6 +758,52 @@ button {
 .security-reason-input:focus { border-color: var(--accent); }
 .security-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; }
 
+/* Process watchlist + watch dialog */
+.security-watch-hint { margin: 10px 4px 18px; color: var(--muted); font-size: 10px; line-height: 1.6; }
+.security-refresh.sm { width: auto; min-height: 30px; padding: 0 10px; }
+.security-dialog-wide { width: min(680px, 100%); }
+.security-watch-options { max-height: 240px; margin-top: 14px; overflow-y: auto; border-top: 1px solid var(--border-strong); border-bottom: 1px solid var(--border-subtle); }
+.security-watch-option { display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px; width: 100%; padding: 10px 11px; border: 0; border-bottom: 1px solid var(--border-subtle); color: var(--fg); background: transparent; text-align: left; cursor: pointer; }
+.security-watch-option:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.security-watch-option.selected { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.security-watch-option strong { font-size: 11px; }
+.security-watch-option span { color: var(--muted); font-size: 9px; overflow-wrap: anywhere; }
+.security-watch-option span em { font-style: normal; color: var(--fg-faint, var(--muted)); }
+.security-watch-conditions { display: flex; flex-direction: column; gap: 9px; margin-top: 18px; }
+.security-watch-cond { display: flex; align-items: center; gap: 8px; color: var(--fg-muted); font-size: 10.5px; }
+.security-watch-cond input[type="number"] { width: 58px; min-height: 30px; padding: 0 8px; border: 1px solid var(--border-subtle); border-radius: 4px; color: var(--fg); background: var(--bg); font-size: 11px; }
+.security-watch-disclaimer { display: flex; gap: 9px; align-items: flex-start; margin-top: 16px; padding: 11px 12px; border: 1px solid color-mix(in srgb, var(--fg) 14%, transparent); border-radius: 5px; color: var(--fg-muted); font-size: 9.5px; line-height: 1.55; }
+.security-watch-disclaimer i { color: var(--fg); font-size: 14px; margin-top: 1px; }
+.security-watch-ack { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--fg); font-size: 10.5px; cursor: pointer; }
+
+/* Attention popup (notable security event, near the security button) */
+.security-attention { position: fixed; left: 16px; bottom: 16px; z-index: calc(var(--z-fullpage) + 6); width: min(430px, calc(100vw - 32px)); max-height: min(72vh, 560px); overflow-y: auto; padding: 16px 16px 14px; border: 1px solid var(--border-strong); border-radius: 7px; color: var(--fg); background-color: var(--bg-raised); background-image: radial-gradient(color-mix(in srgb, var(--border) 20%, transparent) 1px, transparent 1px); background-size: 16px 16px; box-shadow: 0 24px 70px color-mix(in srgb, #000 30%, transparent); }
+.security-attention-item[data-severity="low"] { --alert-color: var(--accent); }
+.security-attention-item[data-severity="medium"] { --alert-color: var(--warning); }
+.security-attention-item[data-severity="high"],
+.security-attention-item[data-severity="critical"] { --alert-color: var(--danger); }
+.security-attention[hidden] { display: none; }
+.security-attention-head { display: flex; align-items: center; gap: 10px; }
+.security-attention-head .security-signal-mark { width: 19px; height: 19px; color: var(--accent); }
+.security-attention-head strong { flex: 1; min-width: 0; font-size: 11.5px; letter-spacing: -.01em; line-height: 1.35; }
+.security-attention-close { display: grid; place-items: center; width: 30px; height: 30px; padding: 0; border: 1px solid var(--border-subtle); border-radius: 4px; color: var(--fg-muted); background: transparent; cursor: pointer; }
+.security-attention-close:hover { border-color: var(--accent); color: var(--accent); }
+.security-attention-body { margin-top: 12px; display: flex; flex-direction: column; gap: 12px; }
+.security-attention-item { display: grid; grid-template-columns: 84px minmax(0, 1fr) auto; gap: 12px; align-items: start; padding-top: 10px; border-top: 1px solid var(--border-subtle); }
+.security-attention-item:first-child { border-top: 0; padding-top: 0; }
+.security-attention-copy { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.security-attention-copy strong { font-size: 11px; line-height: 1.35; }
+.security-attention-copy p { margin: 0; color: var(--fg-muted); font-size: 9.5px; line-height: 1.55; overflow-wrap: anywhere; }
+.security-attention-tag { color: var(--accent); font-size: 9px; font-weight: 650; }
+.security-attention-item-actions { display: flex; align-items: center; }
+.security-attention-env { padding-top: 10px; border-top: 1px solid var(--border-subtle); color: var(--muted); font-size: 8.5px; }
+
+@media (max-width: 600px) {
+  .security-attention { left: 10px; right: 10px; bottom: 10px; width: auto; }
+  .security-attention-item { grid-template-columns: 1fr; }
+  .security-attention-item-actions { justify-self: start; }
+}
+
 
 @media (max-width: 860px) {
   .security-grid { grid-template-columns: 1fr; }
@@ -828,11 +874,11 @@ button {
   .security-briefing-mark .security-signal-focus { animation: none; }
 }
 
-/* ---- FAQ field guide --------------------------------------------------- */
-.faq-page {
-  position: fixed;
-  inset: 0;
-  z-index: 1801;
+  /* ---- FAQ field guide --------------------------------------------------- */
+  .faq-page {
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-fullpage) + 1);
   display: flex;
   flex-direction: column;
   color: var(--fg);
@@ -2990,18 +3036,18 @@ button {
 
 
 
-/* FAQ modal (reuses drawer semantics but centered) */
-.modal-scrim {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.6);
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.2s;
+  /* FAQ modal (reuses drawer semantics but centered) */
+  .modal-scrim {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s;
 
-  z-index: 4000 !important;
+    z-index: var(--z-modal-fixed) !important;
 
-}
+  }
 
 .modal-scrim.open {
   opacity: 1;
@@ -3026,7 +3072,7 @@ button {
   pointer-events: none;
   transition: opacity 0.2s, transform 0.2s;
 
-  z-index: 4001 !important;
+  z-index: calc(var(--z-modal-fixed) + 1) !important;
 
   overflow: hidden;
 }
@@ -5525,6 +5571,23 @@ body.remote-client .chat-scroll {
 }
 .tool-mcp-badge[hidden] { display: none; }
 
+/* Tiny experimental-feature marker used next to settings labels ("Notch overlay beta"). */
+.beta-badge {
+  display: inline-block;
+  vertical-align: 1px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1;
+  padding: 2px 5px;
+  margin-left: 6px;
+  border-radius: 5px;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, transparent);
+}
+
 /* Final summary pill text once all tools finished ("3 tools · 1 command"). */
 .tool-group-summary {
   font-size: 12px;
@@ -6010,7 +6073,7 @@ body.remote-client .chat-scroll {
   /* top/left set by JS at open time so the menu can never clip */
   top: 0;
   left: 0;
-  z-index: 200;
+  z-index: calc(var(--z-overlay) + 1);
   min-width: 180px;
   max-width: calc(100vw - 16px);
   max-height: calc(100vh - 16px);
@@ -6191,7 +6254,7 @@ body.remote-client .chat-scroll {
   position: fixed;
   top: 0;
   left: 0;
-  z-index: 200;
+  z-index: calc(var(--z-overlay) + 1);
   min-width: 240px;
   max-width: min(360px, calc(100vw - 16px));
   max-height: min(420px, calc(100vh - 32px));
@@ -6843,22 +6906,22 @@ body.remote-client .chat-scroll {
   background: var(--bg-raised);
 }
 
-/* pull tab when preview collapsed — small pill, top-right */
-.pull-tab {
-  position: fixed;
-  right: 10px;
-  top: 8px;
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  color: var(--fg-muted);
-  border-radius: 4px;
-  padding: 4px 8px;
-  display: none;
-  align-items: center;
-  gap: 5px;
-  cursor: pointer;
-  box-shadow: var(--shadow-xs);
-  z-index: 900;
+  /* pull tab when preview collapsed — small pill, top-right */
+  .pull-tab {
+    position: fixed;
+    right: 10px;
+    top: 8px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    color: var(--fg-muted);
+    border-radius: 4px;
+    padding: 4px 8px;
+    display: none;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    box-shadow: var(--shadow-xs);
+    z-index: var(--z-sticky);
   font-family: var(--font-sans);
   font-size: 10px;
   letter-spacing: 0.08em;
@@ -6916,7 +6979,7 @@ body.remote-client .chat-scroll {
   inset: 0;
   background: rgba(20, 20, 18, 0.7);
   backdrop-filter: blur(8px);
-  z-index: 9999;
+  z-index: calc(var(--z-modal-fixed) + 50);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -8441,7 +8504,7 @@ body.is-mobile {
 .mobile-menu-scrim {
   position: fixed;
   inset: 0;
-  z-index: 900;
+  z-index: var(--z-overlay);
   background: rgba(0, 0, 0, 0.25);
   opacity: 0;
   pointer-events: none;
@@ -8457,7 +8520,7 @@ body.is-mobile {
   position: fixed;
   top: calc(env(safe-area-inset-top, 0px) + 56px);
   right: 8px;
-  z-index: 901;
+  z-index: calc(var(--z-overlay) + 1);
   min-width: 200px;
   background: var(--bg-raised);
   border: 1px solid var(--border-strong);
@@ -8730,7 +8793,7 @@ body.is-mobile {
     inset: 0 0 64px 0;
     width: 100%;
     max-width: none;
-    z-index: 600;
+    z-index: calc(var(--z-overlay) - 400);
     display: none;
   }
 
@@ -8765,7 +8828,7 @@ body.is-mobile {
     font-size: 12px;
     letter-spacing: 0.14em;
     text-transform: uppercase;
-    z-index: 500;
+    z-index: calc(var(--z-overlay) - 500);
     background: var(--bg);
   }
 
@@ -10434,20 +10497,20 @@ body,
 
   .modal-scrim {
 
-    z-index: 4000 !important;
+    z-index: var(--z-modal-fixed) !important;
   }
 
   .modal {
-    z-index: 4001 !important;
+    z-index: calc(var(--z-modal-fixed) + 1) !important;
 
   }
 
   .drawer-scrim {
-    z-index: 2999 !important;
+    z-index: calc(var(--z-drawer) - 1) !important;
   }
 
   .drawer {
-    z-index: 3000 !important;
+    z-index: var(--z-drawer) !important;
   }
 
   #chat-meta,
@@ -11119,7 +11182,7 @@ body,
 
 .chat-link-popover {
   position: fixed;
-  z-index: 9999;
+  z-index: calc(var(--z-modal-fixed) + 50);
   width: 360px;
   max-width: calc(100vw - 16px);
   background: color-mix(in srgb, var(--bg-raised) 90%, transparent);
@@ -12082,7 +12145,7 @@ body,
   position: absolute;
   left: 0;
   bottom: calc(100% + 10px);
-  z-index: 260;
+  z-index: var(--z-composer-pop);
   width: min(224px, calc(100vw - 24px));
   padding: 11px 12px 10px;
   border: 1px solid var(--border);
@@ -12265,7 +12328,7 @@ body,
   position: absolute;
   right: 0;
   bottom: calc(100% + 10px);
-  z-index: 260;
+  z-index: var(--z-composer-pop);
   width: min(224px, calc(100vw - 24px));
   padding: 11px 12px 10px;
   border: 1px solid var(--border);
@@ -16635,6 +16698,40 @@ body,
   box-shadow: inset 0 -2px 0 var(--accent);
 }
 
+/* The Access/permissions chip lives inside a .perms-control wrapper, so the
+   direct-child rules above miss it and themes' --btn-shadow-hover (Neumorphic
+   emboss, Cartograph offset, Retro drop) makes it read as a physical button.
+   Flatten it to the same ghost/underline style in every theme and state. */
+[data-theme] .composer-tools .perms-control > #btn-perms,
+[data-theme] .composer-tools .perms-control > #btn-perms:hover,
+[data-theme] .composer-tools .perms-control > #btn-perms:active,
+[data-theme] .composer-tools .perms-control > #btn-perms.on {
+  min-height: 30px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 0;
+  color: var(--fg-subtle);
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+[data-theme] .composer-tools .perms-control > #btn-perms:hover {
+  color: var(--fg);
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--fg) 18%, transparent);
+}
+
+[data-theme] .composer-tools .perms-control > #btn-perms.on {
+  color: var(--accent);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+[data-theme] .composer-tools .perms-control > #btn-perms:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 [data-theme] :is(.mode-pill, .effort-pill, .model-pill) {
   min-height: 32px;
   border-radius: 10px 3px 10px 10px;
@@ -17046,9 +17143,9 @@ body,
 }
 
 /* ===== New project ===== */
-.gh-project-scrim { z-index: 4100 !important; }
+.gh-project-scrim { z-index: calc(var(--z-modal-fixed) + 100) !important; }
 .gh-project-modal {
-  z-index: 4101 !important;
+  z-index: calc(var(--z-modal-fixed) + 101) !important;
   width: min(560px, calc(100vw - 32px));
 }
 .gh-project-form { padding-top: 14px; }
@@ -17369,7 +17466,7 @@ pre.code-card.streaming-plain code {
 
   [data-theme] .sidebar {
     position: fixed;
-    z-index: 1200;
+    z-index: calc(var(--z-overlay) + 200);
     inset: 7px auto 7px 7px;
     width: min(320px, calc(100vw - 14px));
     height: calc(100dvh - 14px);
@@ -18202,7 +18299,7 @@ pre.code-card.streaming-plain code {
   position: fixed;
   left: 18px;
   bottom: var(--app-update-bottom);
-  z-index: 1700;
+  z-index: calc(var(--z-fullpage) - 100);
   width: min(238px, calc(100vw - 36px));
   padding: 13px 13px 12px 16px;
   overflow: hidden;

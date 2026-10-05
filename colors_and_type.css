@@ -12,6 +12,9 @@
    Please provide licensed fonts if a specific family is desired.
 -------------------------------------------------------------- */
 @import url("/assets/vendor/fonts/fonts.css");
+/* Atelier's own faces (Schibsted Grotesk / Newsreader / Fragment Mono).
+   The woff2 files only download when the Atelier theme renders text. */
+@import url("/assets/vendor/fonts/atelier/atelier-fonts.css");
 
 :root {
   /* ---- TYPE FAMILIES ---- */
@@ -208,6 +211,11 @@
   --z-overlay: 1000;
   --z-modal: 2000;
   --z-toast: 3000;
+  /* Full-page overlays (Usage / Security / FAQ) and the fixed dialogs that
+     stack above them. Everything above --z-toast is reserved for the dither. */
+  --z-fullpage: 1800;
+  --z-drawer: 3000;
+  --z-modal-fixed: 4000;
 }
 
 /* ============================================================
@@ -427,11 +435,83 @@
 [data-theme="amaranth"] body,
 [data-theme="aperture"] body,
 [data-theme="aperture-dark"] body,
+[data-theme="atelier"] body,
 [data-theme="pastel"] body,
 [data-theme="velvet"] body,
 .dark body {
   background: var(--bg-gradient, var(--bg)) fixed;
 }
+
+/* ============================================================
+   ATELIER — warm ink surfaces, bone text, burnished brass.
+   A studio-dark theme: near-black umber room, editorial serif
+   display (Newsreader), quiet grotesk UI (Schibsted Grotesk),
+   drafting-room mono (Fragment Mono). Its own font bundle lives
+   at assets/vendor/fonts/atelier/. The blank "New session" chat
+   carries a slow flow-line field (theme-flowlines.js).
+   ============================================================ */
+[data-theme="atelier"] {
+  --bg:        #121009;
+  --bg-raised: #1A1712;
+  --bg-sunken: #0B0A07;
+  --bg-inset:  #221E16;
+
+  --glass-bg:       rgba(26, 23, 18, 0.92);
+  --glass-border:   rgba(234, 227, 214, 0.07);
+  --glass-blur:     20px;
+
+  --bg-gradient:    radial-gradient(120% 90% at 50% 0%, #171410 0%, #121009 55%, #0C0A07 100%);
+
+  --fg:        #EAE3D4;
+  --fg-muted:  #B1A893;
+  --fg-subtle: #857C69;
+  --fg-faint:  #57503F;
+  --fg-invert: #14110C;
+
+  --border:        #2D2820;
+  --border-strong: #3B3428;
+  --border-subtle: #1F1B14;
+
+  --accent:        #C9A15F;
+  --accent-hover:  #DAB46E;
+  --accent-subtle: rgba(201, 161, 95, 0.13);
+  --accent-fg:     #161209;
+
+  --success: #9DB89A;
+  --warning: #D6B46B;
+  --danger:  #CD7B6D;
+  --info:    #9AA6A8;
+  --success-subtle: rgba(157, 184, 154, 0.14);
+  --warning-subtle: rgba(214, 180, 107, 0.15);
+  --danger-subtle:  rgba(205, 123, 109, 0.14);
+  --info-subtle:    rgba(154, 166, 168, 0.15);
+
+  --font-mono:    "Fragment Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --font-display: "Newsreader", "Iowan Old Style", Georgia, serif;
+  --font-sans:    "Schibsted Grotesk", -apple-system, "Segoe UI", system-ui, sans-serif;
+
+  --r-xs: 3px;
+  --r-sm: 7px;
+  --r-md: 11px;
+  --r-lg: 16px;
+  --r-xl: 22px;
+  --r-2xl: 30px;
+
+  --shadow-xs: 0 1px 0 rgba(0, 0, 0, 0.5);
+  --shadow-sm: 0 4px 14px -10px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(0, 0, 0, 0.32);
+  --shadow-md: 0 14px 34px -24px rgba(0, 0, 0, 0.72), 0 0 0 1px rgba(0, 0, 0, 0.34);
+  --shadow-lg: 0 28px 64px -38px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(0, 0, 0, 0.36);
+  --shadow-pop: 0 36px 90px -42px rgba(0, 0, 0, 0.84), 0 0 0 1px rgba(0, 0, 0, 0.38);
+  --shadow-inset: inset 0 1px 0 rgba(234, 227, 214, 0.05), inset 0 0 0 1px rgba(0, 0, 0, 0.28);
+
+  --btn-shadow-rest: inset 0 1px 0 rgba(234, 227, 214, 0.06), 0 5px 14px -10px rgba(0, 0, 0, 0.62), 0 0 0 1px rgba(0, 0, 0, 0.3);
+  --btn-shadow-hover: inset 0 1px 0 rgba(234, 227, 214, 0.09), 0 10px 24px -14px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(0, 0, 0, 0.34);
+  --btn-shadow-active: inset 0 1px 2px rgba(0, 0, 0, 0.52), 0 0 0 1px rgba(0, 0, 0, 0.32);
+
+  --btn-send-gradient: linear-gradient(145deg, #D9B571 0%, #BE9250 100%);
+  --btn-send-glow: 0 11px 24px -13px rgba(201, 161, 95, 0.38);
+}
+
 
 /* ============================================================
    NEUMORPHIC — A distinctive soft, embossed UI.

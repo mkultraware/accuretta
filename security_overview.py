@@ -1,8 +1,10 @@
 """Local, read-only security overview service.
 
-The service owns persistence, deterministic triage, whitelisting, and bounded
-investigations. Host collection and model inference are injected by bridge.py
-so this module never imports the agent runtime or gains access to its tools.
+The service owns persistence, deterministic triage, whitelisting, bounded
+investigations, the scheduled scan loop, the process watchlist, and the
+notable-alert notification ledger. Host collection and model inference are
+injected by bridge.py so this module never imports the agent runtime or gains
+access to its tools.
 """
 
 from __future__ import annotations
@@ -27,6 +29,40 @@ _RISK_COPY = {
     "elevated": ("Security activity needs review", "One or more evidence-backed changes may require investigation."),
     "critical": ("High-risk activity detected", "Accuretta found strongly suspicious or high-impact activity."),
 }
+
+# Deterministic pre-filter for agent-command review: candidates that match any
+# of these reach the (injected) model for a confidence-scored verdict, which is
+# the "deeper than regex" layer. The pre-filter exists only to bound model
+# usage — its misses never hide anything from the LLM review of *later* scans,
+# and every recorded command stays visible in source_counts.
+_CMD_SUSPICION_PATTERNS = tuple(compiled for compiled in (
+    re.compile(pattern, re.I) for pattern in (
+        r"\b(?:invoke-expression|iex|invoke-command)\b",
+        r"(?:^|\s)-enc(?:odedcommand)?\b",
+        r"(?:^|\s)-(?:w|windowstyle)\s+(?:hidden|h)\b",
+        r"\b(?:certutil|bitsadmin)\b.*\b(?:urlcache|transfer|download)\b",
+        r"(?:invoke-webrequest|invoke-restmethod|\bcurl\b|\bwget\b)[^\n]{0,200}\|\s*(?:iex|invoke-expression)",
+        r"\bfrombase64string\b",
+        r"\brundll32\b[^\n]{0,120}\b(?:shell32|url\.dll|javascript|mshtml)\b",
+        r"\breg(?:\.exe)?\s+add\b[^\n]{0,200}currentversion\\run",
+        r"\bschtasks\b[^\n|]{0,200}\b/create\b",
+        r"\bnetsh\b[^\n]{0,120}\bportproxy\b",
+        r"discord(?:app)?\.com/api/webhooks",
+        r"\bstart-process\b[^\n]{0,120}-verb\s+runas\b",
+        r"\b(?:vssadmin|wbadmin|bcdedit)\b[^\n]{0,120}\b(?:delete|shadow|recovery)\b",
+        r"\bset-mppreference\b[^\n]{0,160}\b(?:disable|exclusion)\b",
+        r"\bmshta\b|\bcsc\.exe\b|\binstallutil\b",
+        r"\bnet(?:.exe)?\s+(?:user|localgroup)\b[^\n]{0,80}\b/add\b",
+        r"\bwevtutil\b[^\n]{0,80}\bcl\b",
+        r"\btaskkill\b[^\n]{0,80}(?:/f|/im)",
+        r"\bbcdedit\b[^\n]{0,80}bootstatuspolicy",
+        r"\bmd5sum\b|\bsha256sum\b",
+    )
+))
+
+# Lowest model confidence that becomes a user-visible alert (0-100).
+_CMD_ALERT_MIN_CONFIDENCE = 65
+_WATCH_WHEN_VALUES = {"running", "network", "new_listener", "unsigned", "outside_hours"}
 
 
 def _now() -> int:
@@ -73,15 +109,25 @@ class SecurityOverviewService:
         summarizer: Callable[[str, dict], dict | None] | None = None,
         model_busy: Callable[[], bool] | None = None,
         emit: Callable[[dict], None] | None = None,
+        notifier: Callable[[dict], None] | None = None,
+        env_info: Callable[[], dict] | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.collectors = dict(collectors)
         self.summarizer = summarizer
         self.model_busy = model_busy or (lambda: False)
         self.emit = emit or (lambda _event: None)
+        self.notifier = notifier
+        self.env_info = env_info or (lambda: {})
+        self._notify_threshold = "medium"
         self._state_lock = threading.RLock()
         self._scan_thread: threading.Thread | None = None
         self._scan_state = {"status": "idle", "stage": "", "started_at": None, "error": ""}
+        self._attention = {"updated": None, "alerts": []}
+        self._schedule_seconds = 0
+        self._next_scheduled: int | None = None
+        self._scheduler_thread: threading.Thread | None = None
+        self._scheduler_stop = threading.Event()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -134,6 +180,20 @@ class SecurityOverviewService:
                     label TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
                     UNIQUE(mode, match_key)
+                );
+                CREATE TABLE IF NOT EXISTS process_watchlist (
+                    id TEXT PRIMARY KEY,
+                    process_key TEXT NOT NULL UNIQUE,
+                    label TEXT NOT NULL,
+                    conditions_json TEXT NOT NULL DEFAULT '{}',
+                    created_at INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_id TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL
                 );
                 """
             )
@@ -252,6 +312,58 @@ class SecurityOverviewService:
             self._scan_state["stage"] = stage
         self.emit({"type": "security:update", "status": "scanning", "stage": stage})
 
+    # ---- scheduled scans ---------------------------------------------------
+
+    def set_schedule(self, seconds: int) -> None:
+        """Set the scheduled-scan cadence. 0 disables scheduled scans."""
+        try:
+            seconds = int(seconds)
+        except (TypeError, ValueError):
+            seconds = 0
+        with self._state_lock:
+            self._schedule_seconds = max(0, seconds)
+            self._next_scheduled = _now() + self._schedule_seconds if self._schedule_seconds > 0 else None
+
+    def schedule_seconds(self) -> int:
+        with self._state_lock:
+            return int(self._schedule_seconds)
+
+    def start_scheduler(self) -> None:
+        if self._scheduler_thread and self._scheduler_thread.is_alive():
+            return
+        self._scheduler_stop.clear()
+        with self._state_lock:
+            if self._schedule_seconds > 0 and self._next_scheduled is None:
+                self._next_scheduled = _now() + self._schedule_seconds
+        self._scheduler_thread = threading.Thread(
+            target=self._scheduler_loop,
+            name="security-overview-scheduler",
+            daemon=True,
+        )
+        self._scheduler_thread.start()
+
+    def stop_scheduler(self) -> None:
+        self._scheduler_stop.set()
+
+    def _scheduler_loop(self) -> None:
+        while not self._scheduler_stop.wait(timeout=5.0):
+            with self._state_lock:
+                interval = int(self._schedule_seconds)
+                due = self._next_scheduled
+            if interval <= 0 or due is None:
+                continue
+            if _now() < due:
+                continue
+            with self._state_lock:
+                if self._scan_thread and self._scan_thread.is_alive():
+                    self._next_scheduled = _now() + interval
+                    continue
+                self._next_scheduled = _now() + interval
+            try:
+                self.refresh()
+            except Exception:
+                continue
+
     def _scan_worker(self) -> None:
         sources: dict[str, dict] = {}
         try:
@@ -261,6 +373,8 @@ class SecurityOverviewService:
                 "application": "Reading application events",
                 "security": "Checking security events",
                 "persistence": "Checking startup and persistence",
+                "processes": "Checking watched processes",
+                "commands": "Reviewing recent agent commands",
                 "actions": "Reading Accuretta action history",
             }
             for name, collector in self.collectors.items():
@@ -277,6 +391,14 @@ class SecurityOverviewService:
 
             self._set_stage("Correlating evidence")
             snapshot = self._build_snapshot(sources)
+
+            if self.summarizer and not self.model_busy() and self._command_candidates(sources):
+                self._set_stage("Scoring recent agent commands")
+                command_alerts = self._score_commands(sources)
+                if command_alerts:
+                    snapshot["alerts_all"] = self._dedupe_alerts(
+                        [*snapshot.get("alerts_all", []), *command_alerts])
+
             public = self._public_snapshot(snapshot)
             if self.summarizer and not self.model_busy():
                 self._set_stage("Writing situation summary")
@@ -303,6 +425,10 @@ class SecurityOverviewService:
                     "error": "",
                 }
             self.emit({"type": "security:update", "status": "ready"})
+            # Recompute after the model summary landed so the attention payload
+            # carries the LLM's final overview, not the fallback summary.
+            public = self._public_snapshot(snapshot)
+            self._notify_notable(public)
         except Exception as exc:
             with self._state_lock:
                 self._scan_state = {
@@ -325,7 +451,7 @@ class SecurityOverviewService:
         evidence: list[dict] | None = None,
         first_seen: str = "",
     ) -> dict:
-        evidence = list(evidence or [])[:200 if kind == "action_failures" else 12]
+        evidence = list(evidence or [])[:12]
         stable = _fingerprint(source, kind, entity_key, title)
         normalized_entity = _normalize_entity(entity_key) or f"alert:{stable}"
         return {
@@ -341,6 +467,344 @@ class SecurityOverviewService:
             "first_seen": _bounded(first_seen, 40),
             "evidence": evidence,
         }
+
+    @staticmethod
+    def _dedupe_alerts(alerts: list[dict]) -> list[dict]:
+        unique: dict[str, dict] = {}
+        for alert in alerts:
+            current = unique.get(alert["id"])
+            if not current or _SEVERITY_RANK[alert["severity"]] > _SEVERITY_RANK[current["severity"]]:
+                unique[alert["id"]] = alert
+        return sorted(
+            unique.values(),
+            key=lambda item: (_SEVERITY_RANK[item["severity"]], item.get("first_seen", "")),
+            reverse=True,
+        )
+
+    # ---- process watchlist ---------------------------------------------------
+
+    def _watchlist_rows(self) -> list[dict]:
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT id, process_key, label, conditions_json, created_at, last_seen, enabled "
+                "FROM process_watchlist ORDER BY created_at DESC"
+            ).fetchall()
+        out = []
+        for row in rows:
+            value = dict(row)
+            try:
+                value["conditions"] = json.loads(value.pop("conditions_json") or "{}")
+            except Exception:
+                value["conditions"] = {}
+            if not isinstance(value["conditions"], dict):
+                value["conditions"] = {}
+            value["enabled"] = bool(value.get("enabled", 1))
+            out.append(value)
+        return out
+
+    def add_process_watch(
+        self,
+        process_key: str,
+        label: str = "",
+        conditions: dict | None = None,
+        acknowledge_compute: bool = False,
+    ) -> dict:
+        """Watch one specific process (Task-Manager-style pick).
+
+        process_key is "name:<exe name>" or "path:<full path>". conditions:
+        {"when": ["running"|"network"|"new_listener"|"unsigned"|"outside_hours"],
+         "hours": {"start": 0-23, "end": 0-23}, "severity": "low|medium|high"}
+        """
+        key = _bounded(process_key, 520).strip().lower()
+        if not key or ":" not in key:
+            return {"ok": False, "error": "Pick a process name or path to watch."}
+        kind, _, target = key.partition(":")
+        if kind not in {"name", "path"} or not target.strip():
+            return {"ok": False, "error": "Watch keys must be name: or path: based."}
+        if not acknowledge_compute:
+            return {"ok": False, "error": "Confirm the performance disclaimer to enable background monitoring."}
+        conds = conditions if isinstance(conditions, dict) else {}
+        when = [w for w in (conds.get("when") or ["running"]) if w in _WATCH_WHEN_VALUES] or ["running"]
+        hours = conds.get("hours") if isinstance(conds.get("hours"), dict) else None
+        severity = str(conds.get("severity") or "medium").lower()
+        clean = {"when": when, "severity": severity if severity in _SEVERITY_RANK and severity != "info" else "medium"}
+        if "outside_hours" in when and hours:
+            try:
+                clean["hours"] = {"start": max(0, min(23, int(hours.get("start")))),
+                                  "end": max(0, min(23, int(hours.get("end"))))}
+            except (TypeError, ValueError):
+                clean.pop("hours", None)
+                when = [w for w in when if w != "outside_hours"] or ["running"]
+                clean["when"] = when
+        watch_id = f"watch-{_fingerprint(key)}"
+        now = _now()
+        with self._db() as db:
+            db.execute(
+                "INSERT INTO process_watchlist(id, process_key, label, conditions_json, created_at, last_seen, enabled) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1) "
+                "ON CONFLICT(process_key) DO UPDATE SET label=excluded.label, "
+                "conditions_json=excluded.conditions_json, last_seen=excluded.last_seen, enabled=1",
+                (
+                    watch_id,
+                    key,
+                    _bounded(label or target, 180),
+                    json.dumps(clean, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        self.emit({"type": "security:update", "status": "ready"})
+        return {"ok": True, "watch_id": watch_id, "overview": self.get_overview()}
+
+    def remove_process_watch(self, watch_id: str) -> dict:
+        with self._db() as db:
+            removed = db.execute(
+                "DELETE FROM process_watchlist WHERE id = ?", (str(watch_id),)
+            ).rowcount
+        if not removed:
+            return {"ok": False, "error": "Watchlist entry not found."}
+        self.emit({"type": "security:update", "status": "ready"})
+        return {"ok": True, "overview": self.get_overview()}
+
+    @staticmethod
+    def _hour_outside_window(hours: dict) -> bool:
+        try:
+            start = int(hours.get("start"))
+            end = int(hours.get("end"))
+        except (TypeError, ValueError, AttributeError):
+            return False
+        if not (0 <= start <= 23 and 0 <= end <= 23) or start == end:
+            return False
+        hour = time.localtime().tm_hour
+        if start < end:                      # allowed window [start, end)
+            return hour < start or hour >= end
+        return hour < start and hour >= end  # wrap-around window, e.g. 23 -> 07
+
+    def _watchlist_alerts(self, sources: dict) -> list[dict]:
+        rows = [row for row in self._watchlist_rows() if row.get("enabled")]
+        if not rows:
+            return []
+        processes = (sources.get("processes") or {}).get("processes") or []
+        net_by_name: dict[str, dict] = {}
+        for item in (sources.get("network") or {}).get("process_details") or []:
+            if isinstance(item, dict) and item.get("process"):
+                net_by_name[str(item.get("process")).lower()] = item
+        added_udp = [str(sig) for sig in ((sources.get("network") or {}).get("comparison") or {}).get("added_udp") or []]
+        alerts: list[dict] = []
+        now_stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        for row in rows:
+            key = str(row.get("process_key") or "")
+            kind, _, target = key.partition(":")
+            target = target.strip().lower()
+            if not target:
+                continue
+            matches = []
+            for process in processes:
+                if not isinstance(process, dict):
+                    continue
+                name = str(process.get("name") or "").strip().lower()
+                path = str(process.get("path") or "").strip().lower()
+                if (kind == "name" and name == target) or (kind == "path" and path == target):
+                    matches.append(process)
+            if not matches:
+                continue
+            name = str(matches[0].get("name") or target)
+            conds = row.get("conditions") or {}
+            when = conds.get("when") or ["running"]
+            triggered: list[str] = []
+            evidence: list[dict] = []
+            if "running" in when:
+                triggered.append("it is running")
+            for match in matches[:2]:
+                evidence.append({
+                    "pid": match.get("pid"),
+                    "name": name,
+                    "path": _bounded(match.get("path"), 260),
+                    "cmdline": _bounded(match.get("cmdline"), 300),
+                })
+            net = net_by_name.get(name.lower())
+            if "network" in when and net and int(net.get("connections") or 0) > 0:
+                triggered.append(f"it has {int(net.get('connections') or 0)} active network connection(s)")
+                evidence.append({
+                    "name": name,
+                    "connections": int(net.get("connections") or 0),
+                    "signed": net.get("signed"),
+                    "path": _bounded(net.get("path"), 260),
+                })
+            if "unsigned" in when and net and net.get("signed") is False:
+                triggered.append("its binary has no valid signature")
+            if "new_listener" in when and any(sig.split("|")[0].strip().lower() == name.lower() for sig in added_udp):
+                triggered.append("it opened a new UDP listener since the previous scan")
+            if "outside_hours" in when and conds.get("hours") and self._hour_outside_window(conds["hours"]):
+                start = conds["hours"].get("start")
+                end = conds["hours"].get("end")
+                triggered.append(f"it is running outside the allowed {int(start):02d}:00–{int(end):02d}:00 window")
+            if not triggered:
+                continue
+            severity = str(conds.get("severity") or "medium").lower()
+            alerts.append(self._alert(
+                "watchlist", "watched_process",
+                severity if severity in _SEVERITY_RANK else "medium",
+                f"Watched process: {name}",
+                "Triggered because " + " and ".join(triggered) + ". You asked Accuretta to keep an eye on this process.",
+                f"watch:{key}", name or target, evidence, now_stamp,
+            ))
+        return alerts
+
+    # ---- LLM-scored agent command review --------------------------------------
+
+    @staticmethod
+    def _command_looks_suspicious(text: str) -> bool:
+        value = str(text or "")
+        return any(pattern.search(value) for pattern in _CMD_SUSPICION_PATTERNS)
+
+    @staticmethod
+    def _confidence_score(value: Any) -> int:
+        """Map a model-provided confidence to 0-100."""
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return max(0, min(100, int(float(value) if float(value) <= 100 else float(value) / 10)))
+        word = str(value or "").strip().lower()
+        if word in {"high", "certain", "very_likely"}:
+            return 85
+        if word in {"medium", "moderate", "likely"}:
+            return 65
+        if word in {"low", "unlikely"}:
+            return 35
+        return 0
+
+    def _command_candidates(self, sources: dict) -> list[dict]:
+        entries = (sources.get("commands") or {}).get("entries") or []
+        return [entry for entry in entries if self._command_looks_suspicious(entry.get("command"))][:6]
+
+    def _score_commands(self, sources: dict) -> list[dict]:
+        """Ask the injected summarizer to verdict suspicious agent commands.
+
+        Returns alerts with a numeric `confidence` plus an `injection` flag —
+        the model review is the deeper-than-regex layer; the deterministic
+        pre-filter only decides who gets reviewed.
+        """
+        if not self.summarizer or self.model_busy():
+            return []
+        candidates = self._command_candidates(sources)
+        if not candidates:
+            return []
+        digest = [
+            {
+                "id": f"cmd-{index:02d}",
+                "tool": str(candidate.get("tool") or "")[:60],
+                "command": str(candidate.get("command") or "")[:420],
+            }
+            for index, candidate in enumerate(candidates)
+        ]
+        value = self.summarizer("command_review", {"window_hours": 24, "commands": digest})
+        verdicts = value.get("verdicts") if isinstance(value, dict) else None
+        if not isinstance(verdicts, list):
+            return []
+        alerts: list[dict] = []
+        for index, verdict in enumerate(verdicts[:6]):
+            if not isinstance(verdict, dict) or index >= len(candidates):
+                continue
+            score = self._confidence_score(verdict.get("confidence"))
+            if score < _CMD_ALERT_MIN_CONFIDENCE:
+                continue
+            malicious = verdict.get("malicious") is True or str(
+                verdict.get("verdict") or "").lower() in {"suspicious", "malicious", "critical"}
+            injection = verdict.get("injection") is True
+            if not (malicious or injection):
+                continue
+            reason = str(verdict.get("reason") or verdict.get("summary")
+                         or "The local model judged this command worth review.")[:400]
+            command_text = str(candidates[index].get("command") or "")[:360]
+            alert = self._alert(
+                "commands", "malicious_command",
+                "high" if score >= 80 else "medium",
+                f"Agent command flagged ({score}% confidence)",
+                f"{reason} Command: {command_text}",
+                f"command:{_fingerprint(command_text)}",
+                f"agent command cmd-{index:02d}",
+                [{
+                    "id": digest[index]["id"],
+                    "confidence": score,
+                    "injection": injection,
+                    "command": command_text[:280],
+                }],
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            alert["confidence"] = score
+            alert["injection"] = injection
+            alerts.append(alert)
+        return alerts
+
+    # ---- notable-alert notifications -------------------------------------------
+
+    @staticmethod
+    def _attention_view(alert: dict) -> dict:
+        return {
+            "id": alert.get("id"),
+            "severity": alert.get("severity"),
+            "title": alert.get("title"),
+            "detail": alert.get("detail"),
+            "entity_label": alert.get("entity_label"),
+            "confidence": alert.get("confidence"),
+            "injection": alert.get("injection"),
+            "source": alert.get("source"),
+        }
+
+    def attention_open(self, alert_id: str) -> bool:
+        with self._state_lock:
+            return any(item.get("id") == alert_id for item in (self._attention or {}).get("alerts", []))
+
+    def acknowledge_attention(self) -> dict:
+        with self._state_lock:
+            had = bool((self._attention or {}).get("alerts"))
+            self._attention = {"updated": _now(), "alerts": []}
+        if had:
+            self.emit({"type": "security:update", "status": "ready"})
+        return {"ok": True, "overview": self.get_overview()}
+
+    def _notify_notable(self, public: dict) -> None:
+        """Persist + route NEW alerts that cross the notification threshold.
+
+        Deduped by alert id in the notifications ledger so re-scans never
+        spam the user about the same finding twice.
+        """
+        threshold = _SEVERITY_RANK.get(str(self._notify_threshold or "medium").lower(), 2)
+        notable = [
+            item for item in public.get("alerts", [])
+            if _SEVERITY_RANK.get(item.get("severity"), 0) >= threshold
+        ]
+        if not notable:
+            return
+        fresh: list[dict] = []
+        with self._db() as db:
+            for alert in notable:
+                seen = db.execute(
+                    "SELECT 1 FROM notifications WHERE alert_id = ?", (alert["id"],)
+                ).fetchone()
+                if not seen:
+                    db.execute(
+                        "INSERT OR IGNORE INTO notifications(alert_id, created_at) VALUES (?, ?)",
+                        (alert["id"], _now()),
+                    )
+                    fresh.append(alert)
+            db.execute("DELETE FROM notifications WHERE id NOT IN (SELECT id FROM notifications ORDER BY id DESC LIMIT 500)")
+        if not fresh:
+            return
+        with self._state_lock:
+            self._attention = {
+                "updated": _now(),
+                "alerts": [self._attention_view(alert) for alert in fresh[:6]],
+            }
+        self.emit({"type": "security:attention", "status": "attention"})
+        if self.notifier:
+            try:
+                self.notifier({"alerts": fresh, "summary": public.get("summary") or {}, "risk": public.get("risk") or {}})
+            except Exception:
+                pass
+
+    def set_notify_threshold(self, value: str) -> None:
+        word = str(value or "").strip().lower()
+        self._notify_threshold = word if word in _SEVERITY_RANK else "medium"
 
     def _build_snapshot(self, sources: dict[str, dict]) -> dict:
         alerts: list[dict] = []
@@ -475,33 +939,16 @@ class SecurityOverviewService:
                 [{"signature": str(signature)}],
             ))
 
-        actions = sources.get("actions", {})
-        failures = [
-            row for row in actions.get("entries") or []
-            if str(row.get("status") or "").lower() in {"error", "failed", "timeout"}
-        ]
-        if len(failures) >= 3:
-            groups: dict[str, list[dict]] = {}
-            for row in failures:
-                groups.setdefault(self._action_key(row), []).append(row)
-            for key, rows in groups.items():
-                tool = str(rows[0].get("tool") or "Tool")
-                alerts.append(self._alert(
-                    "accuretta", "action_failures", "low", f"{tool} did not complete",
-                    f"{len(rows)} recorded occurrence(s). Review the error, or quiet it if it is expected.",
-                    f"accuretta:action:{key}", str(rows[0].get("target") or tool), rows,
-                ))
+        # Agent tool failures (run_powershell "did not complete", etc.) are
+        # agent-health telemetry, not system security — they used to be emitted
+        # here as source="accuretta"/kind="action_failures" alerts and drowned
+        # the overview (2026-09). They stay out by design; the collected action
+        # records still feed source_counts, and the LLM-scored
+        # "command looked malicious" alert kind reads recent agent commands.
 
-        unique: dict[str, dict] = {}
-        for alert in alerts:
-            current = unique.get(alert["id"])
-            if not current or _SEVERITY_RANK[alert["severity"]] > _SEVERITY_RANK[current["severity"]]:
-                unique[alert["id"]] = alert
-        alerts = sorted(
-            unique.values(),
-            key=lambda item: (_SEVERITY_RANK[item["severity"]], item.get("first_seen", "")),
-            reverse=True,
-        )
+        alerts.extend(self._watchlist_alerts(sources))
+
+        alerts = self._dedupe_alerts(alerts)
         timeline = sorted(timeline, key=lambda item: item.get("time", ""), reverse=True)[:80]
         return {
             "generated_at": _now(),
@@ -515,7 +962,9 @@ class SecurityOverviewService:
                 "tcp_connections": int(network.get("tcp_count") or 0),
                 "udp_listeners": int(network.get("udp_count") or 0),
                 "persistence_items": len(persistence.get("all_entries") or []),
-                "action_records": len(actions.get("entries") or []),
+                "running_processes": int((sources.get("processes") or {}).get("count") or 0),
+                "agent_commands": len((sources.get("commands") or {}).get("entries") or []),
+                "action_records": len((sources.get("actions") or {}).get("entries") or []),
             },
         }
 
@@ -538,22 +987,11 @@ class SecurityOverviewService:
         allowed = {row["entity_key"]: set(row.get("behaviors") or []) for row in whitelist}
         all_alerts = public.pop("alerts_all", [])
         filters = self._alert_filters()
-        ignored = {row["match_key"] for row in filters if row["mode"] == "ignore"}
-        dismissed = {row["match_key"] for row in filters if row["mode"] == "dismiss"}
-        filtered_alerts = []
-        for item in all_alerts:
-            if item.get("source") == "accuretta" and item.get("kind") == "action_failures":
-                evidence = [row for row in item.get("evidence", [])
-                            if self._action_key(row) not in ignored
-                            and self._action_key(row, occurrence=True) not in dismissed]
-                if not evidence:
-                    continue
-                item["evidence"] = evidence
-                item["dismissible"] = True
-                item["detail"] = (f"{len(evidence)} recorded occurrence(s). Dismiss hides these occurrences. "
-                                  "Ignore repeats hides matching tool, target and failure records in future scans.")
-            filtered_alerts.append(item)
-        all_alerts = filtered_alerts
+        dropped_kinds = {"action_failures"}  # agent-health, never system security
+        all_alerts = [
+            item for item in all_alerts
+            if not (item.get("source") == "accuretta" and str(item.get("kind")) in dropped_kinds)
+        ]
         public["alert_filters"] = filters
         def is_allowed(item: dict) -> bool:
             behaviors = allowed.get(item.get("entity_key"))
@@ -582,6 +1020,13 @@ class SecurityOverviewService:
         public["summary_deferred"] = bool(raw.get("summary_deferred"))
         public["scan"] = self.scan_state()
         public["investigations"] = self._investigation_rows(12)
+        public["watchlist"] = self._watchlist_rows()
+        with self._state_lock:
+            public["attention"] = copy.deepcopy(self._attention)
+        try:
+            public["environment"] = dict(self.env_info() or {})
+        except Exception:
+            public["environment"] = {}
         return public
 
     def _fallback_summary(self, public: dict) -> dict:
@@ -648,6 +1093,12 @@ class SecurityOverviewService:
         raw = self._latest_raw()
         if raw:
             return self._public_snapshot(raw)
+        try:
+            environment = dict(self.env_info() or {})
+        except Exception:
+            environment = {}
+        with self._state_lock:
+            attention = copy.deepcopy(self._attention)
         return {
             "generated_at": None,
             "window_hours": 24,
@@ -658,6 +1109,9 @@ class SecurityOverviewService:
             "whitelist": self._whitelist_rows(),
             "alert_filters": self._alert_filters(),
             "investigations": self._investigation_rows(12),
+            "watchlist": self._watchlist_rows(),
+            "attention": attention,
+            "environment": environment,
             "metrics": {"open_alerts": 0, "hidden_alerts": 0, "coverage_available": 0, "coverage_total": 0},
             "risk": {"state": "quiet", "headline": "No scan has run yet", "detail": "Run a local scan to establish the current situation."},
             "summary": {

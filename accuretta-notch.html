@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Accuretta Notch</title>
+<style>
+@property --a { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
+:root {
+  --ink: #000;
+  --text: #eceaf7;
+  --dim: #8c88a6;
+  --line: rgba(255,255,255,.09);
+  --paper: #efeadf;
+  --blue: #6f86ff;
+  --amber: #ffb547;
+  --risk: 255,181,71;
+  --risk-hi: 255,227,168;
+  --glow: .3;
+  --ok: #4ade9a;
+  --bad: #ff6b7f;
+  --spring: cubic-bezier(.34,1.38,.5,1);
+}
+* { box-sizing: border-box; margin: 0; }
+html, body { height: 100%; }
+body {
+  font: 13px/1.4 "SF Pro Text", "Inter", system-ui, sans-serif;
+  color: var(--text);
+  background: #16161d;
+  overflow: hidden;
+}
+
+.island {
+  position: fixed; top: 0; left: 50%; transform: translateX(-50%);
+  width: 200px; height: 34px;
+  background: var(--ink);
+  border-radius: 0 0 18px 18px;
+  overflow: hidden; cursor: pointer;
+  transition: width .5s var(--spring), height .5s var(--spring), border-radius .4s var(--spring), box-shadow .4s;
+  z-index: 10;
+}
+.island[data-state="alert"]  { width: 540px; height: 44px; border-radius: 0 0 24px 24px; animation: wobble .7s var(--spring), glow 1.8s ease-in-out .7s infinite; }
+.island[data-state="gate"]   { width: 520px; height: 276px; border-radius: 0 0 32px 32px; cursor: default; animation: glow 1.8s ease-in-out infinite; }
+.island[data-state="prompt"] { width: 560px; height: calc(168px + var(--mh, 0px)); border-radius: 0 0 32px 32px; cursor: default; box-shadow: 0 20px 50px rgba(70,110,255, calc(.25 * var(--glow))); }
+.island[data-state="prompt"][data-thread] { height: calc(318px + var(--mh, 0px)); }
+.island[data-state="gate"][data-kind="registry"] { height: 334px; }
+.island[data-state="work"], .island[data-state="ready"] { width: 540px; height: 44px; border-radius: 0 0 24px 24px; }
+
+@keyframes wobble { 0% { transform: translateX(-50%) scale(.82,.9); } 55% { transform: translateX(-50%) scale(1.04,1.02); } 100% { transform: translateX(-50%) scale(1); } }
+@keyframes glow { 0%,100% { box-shadow: 0 8px 24px rgba(var(--risk), calc(.10 * var(--glow))); } 50% { box-shadow: 0 10px 30px rgba(var(--risk), calc(.34 * var(--glow))); } }
+@keyframes spin { to { --a: 360deg; } }
+
+/* edge light: left, bottom and right only. The top border is clipped away. */
+.rim {
+  position: absolute; inset: 0; border-radius: inherit; padding: 1.5px; z-index: 3;
+  opacity: 0; transition: opacity .4s; pointer-events: none;
+  clip-path: inset(2px 0 0 0);
+  background:
+    conic-gradient(from var(--a), rgba(var(--risk),0) 0deg, rgba(var(--risk),0) 190deg, rgba(var(--risk),.5) 300deg, rgba(var(--risk-hi),.65) 332deg, rgba(var(--risk),0) 360deg),
+    linear-gradient(rgba(var(--risk),.10), rgba(var(--risk),.10));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: spin 3.4s linear infinite;
+}
+.island[data-state="alert"] .rim, .island[data-state="gate"] .rim { opacity: 1; }
+
+.view { position: absolute; inset: 0; opacity: 0; pointer-events: none; transition: opacity .2s; }
+.island[data-state="idle"] .v-idle, .island[data-state="off"] .v-idle,
+.island[data-state="alert"] .v-alert,
+.island[data-state="work"] .v-work,
+.island[data-state="ready"] .v-ready,
+.island[data-state="gate"] .v-gate,
+.island[data-state="prompt"] .v-prompt { opacity: 1; pointer-events: auto; transition: opacity .3s .15s; }
+
+.pill { display: flex; align-items: center; justify-content: space-between; height: 100%; padding: 0 16px 0 14px; }
+.pill .label { font-weight: 600; letter-spacing: .01em; }
+.pill .sub { color: var(--dim); font-size: 12px; margin-left: 8px; font-weight: 400; }
+.left { display: flex; align-items: center; gap: 10px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.dot.amber { background: rgb(var(--risk)); box-shadow: 0 0 10px rgb(var(--risk)); animation: blink 1s infinite; }
+.dot.blue { background: var(--blue); box-shadow: 0 0 10px var(--blue); animation: blink 1s infinite; }
+@keyframes blink { 50% { opacity: .35; } }
+
+.island[data-state="off"] .v-idle .dot { background: #4a4858; box-shadow: none; }
+.island[data-state="off"] .v-idle .logo { opacity: .28; filter: grayscale(1); }
+
+/* dot matrix: each dot has its own phase, speed and floor, so the light never moves as one block */
+.logo circle { transform-box: fill-box; transform-origin: center; }
+.island[data-busy] .logo circle { animation: twinkle var(--p) ease-in-out var(--d) infinite; }
+.island[data-state="alert"] .logo circle { animation-duration: calc(var(--p) * 2); }
+@keyframes twinkle {
+  0%, 100% { opacity: var(--lo); transform: scale(.82); }
+  9%  { opacity: 1; transform: scale(1.22); }
+  32% { opacity: .6; transform: scale(1); }
+  68% { opacity: var(--lo); transform: scale(.88); }
+}
+
+/* model load: dots ignite along a diagonal, bottom left to top right, each with its own jitter */
+.island[data-loading][data-state] .logo circle { animation: powerup 2.6s ease-in-out calc(var(--k) * 1.6s) infinite both; }
+@keyframes powerup {
+  0%   { opacity: .14; transform: scale(.8); }
+  10%  { opacity: 1;   transform: scale(1.28); }
+  28%  { opacity: .75; transform: scale(1.02); }
+  75%  { opacity: .2;  transform: scale(.86); }
+  100% { opacity: .14; transform: scale(.8); }
+}
+.island[data-ready][data-state] .logo circle { animation: ready .7s ease-out calc(var(--k) * .35s) both; }
+@keyframes ready {
+  0%   { opacity: .5; transform: scale(.9); }
+  35%  { opacity: 1;  transform: scale(1.3); }
+  100% { opacity: 1;  transform: scale(1); }
+}
+.model::after { content: ""; position: absolute; left: 0; width: 38%; bottom: 0; height: 1.5px; background: var(--paper); opacity: 0; }
+.island[data-loading] .model::after { opacity: .8; animation: slide 1.4s ease-in-out infinite; }
+@keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(270%); } }
+.island[data-loading] #modelName { color: var(--dim); }
+
+.card { padding: 46px 22px 20px; height: 100%; display: flex; flex-direction: column; }
+.head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.head h2 { font-size: 15px; font-weight: 650; }
+.head p { color: var(--dim); font-size: 12px; }
+.head .tag { margin-left: auto; }
+.head .icon-btn { margin-left: 6px; }
+.tag { white-space: nowrap; flex: none; font-size: 11px; padding: 3px 9px; border-radius: 99px; border: 1px solid rgba(var(--risk),.45); color: rgb(var(--risk)); }
+
+.cmd {
+  font: 12px/1.5 "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  background: #0f0f17; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; color: #cfd0ff;
+}
+.cmd b { color: rgb(var(--risk)); font-weight: 500; }
+.meta { display: flex; gap: 16px; margin: 10px 2px 0; color: var(--dim); font-size: 12px; }
+.meta em { font-style: normal; color: var(--text); }
+
+button { font: inherit; cursor: pointer; border: 0; color: var(--text); background: none; }
+button:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
+.actions { margin-top: auto; display: grid; grid-template-columns: auto auto 1fr; gap: 8px; align-items: stretch; }
+.btn { white-space: nowrap; padding: 10px 14px; border-radius: 12px; font-weight: 600; transition: transform .12s, background .15s, border-color .15s, color .15s; }
+.btn:active { transform: scale(.97); }
+.btn.quiet { color: var(--dim); font-weight: 500; }
+.btn.quiet:hover { color: var(--text); }
+.btn.outline { border: 1px solid rgba(255,255,255,.16); }
+.btn.outline:hover { border-color: rgba(255,107,127,.7); color: var(--bad); }
+.btn.solid { background-color: var(--paper); color: #14130f; display: inline-flex; justify-content: center; align-items: center; gap: 8px; box-shadow: inset 0 -2px 0 rgba(0,0,0,.18); }
+.btn.solid:hover { background-color: #fff; }
+.btn.solid kbd { font: 600 11px/1 ui-monospace, "SF Mono", monospace; padding: 3px 6px; border-radius: 6px; background: rgba(20,19,15,.12); color: #3b382e; }
+
+.icon-btn { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; color: var(--dim); transition: color .15s, background .15s; }
+.icon-btn:hover { color: var(--bad); background-color: rgba(255,107,127,.12); }
+
+.thread { display: none; flex: 1; min-height: 0; overflow-y: auto; flex-direction: column; gap: 6px; margin-bottom: 14px; padding: 6px 2px 0 4px;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 16px); mask-image: linear-gradient(to bottom, transparent 0, #000 16px); }
+.island[data-thread] .thread { display: flex; }
+.msg.user { color: #6f6c86; font-size: 12.5px; }
+.msg.agent { font-size: 13px; line-height: 1.6; white-space: pre-wrap; color: rgba(236,234,247,.7); }
+.msg.agent .w { animation: wfade .4s ease-out both; }
+@keyframes wfade { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+.cap { margin-top: 6px; color: #5a5770; font-size: 11px; }
+
+.promptbox { display: flex; align-items: center; gap: 10px; background: #0f0f17; border: 1px solid var(--line); border-radius: 16px; padding: 8px 8px 8px 12px; transition: border-color .2s; }
+.promptbox:focus-within { border-color: rgba(255,255,255,.35); }
+.promptbox input { flex: 1; background: none; border: 0; outline: 0; color: var(--text); font: inherit; font-size: 14px; }
+.promptbox input::placeholder { color: #6b6884; }
+.send { width: 32px; height: 32px; border-radius: 10px; background: var(--paper); display: grid; place-items: center; transition: background .15s, transform .12s; }
+.send:hover { background: #fff; }
+.send:active { transform: scale(.94); }
+.row { display: flex; align-items: center; justify-content: space-between; margin-top: auto; padding-top: 12px; }
+.row .right { display: flex; align-items: center; gap: 8px; }
+.hint { color: var(--dim); font-size: 12px; }
+.hint.ok { color: var(--ok); }
+.hint.bad { color: var(--bad); }
+.hint.ok::before { content: "\2713  "; }
+
+.model { position: relative; overflow: hidden; display: inline-flex; align-items: center; gap: 7px; padding: 5px 9px 5px 10px; border-radius: 99px; background: #12121b; border: 1px solid var(--line); font-size: 12px; transition: border-color .15s; }
+.model:hover, .island[data-menu] .model { border-color: rgba(255,255,255,.28); }
+.model svg { color: var(--dim); }
+.model .chev { transition: transform .25s var(--spring); }
+.island[data-menu] .model .chev { transform: rotate(180deg); }
+
+.menu { display: none; margin-top: 8px; padding: 4px; background: #0f0f17; border: 1px solid var(--line); border-radius: 14px; }
+.island[data-menu] .menu { display: block; }
+.opt { width: 100%; display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 10px; text-align: left; font-size: 12.5px; color: var(--dim); transition: background .12s, color .12s; }
+.opt:hover { background: #181826; color: var(--text); }
+.opt .chk { width: 12px; color: var(--paper); font-size: 12px; }
+.opt .nm { flex: 1; }
+.opt .mt { font-size: 11.5px; color: #66637d; }
+.opt[aria-selected="true"] { color: var(--text); }
+
+.rt { display: flex; align-items: center; gap: 9px; }
+.ctx { display: inline-flex; }
+.ctx svg { display: block; }
+.ctx .trk { stroke: rgba(255,255,255,.14); }
+.ctx .arc { stroke: var(--paper); transition: stroke-dashoffset .8s cubic-bezier(.4,0,.2,1), stroke .3s; }
+.ctx.warn .arc { stroke: #ffb547; }
+.ctx.crit .arc { stroke: var(--bad); }
+.island[data-state="off"] .ctx { opacity: .3; }
+
+#workSub { display: inline-block; max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; font: 11.5px/1.5 "JetBrains Mono", "SF Mono", ui-monospace, monospace; }
+#workSub.swap { animation: toolin .28s ease-out; }
+@keyframes toolin { from { opacity: 0; transform: translateY(3px); } }
+
+/* compaction: dots pull toward the center, hold, then spring back */
+.island[data-compact][data-state] .logo circle { animation: compact 1.3s cubic-bezier(.6,0,.3,1) var(--cd) both; }
+@keyframes compact {
+  0%       { transform: translate(0,0) scale(1); opacity: 1; }
+  38%, 58% { transform: translate(var(--dx), var(--dy)) scale(.55); opacity: .85; }
+  100%     { transform: translate(0,0) scale(1); opacity: 1; }
+}
+
+.cmd { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.meta em.warn { color: rgb(var(--risk)); }
+.head > div { min-width: 0; }
+.head h2 { white-space: nowrap; }
+.head p { display: flex; align-items: center; white-space: nowrap; }
+.pg { color: var(--dim); padding: 0 7px; font-size: 14px; line-height: 1; }
+.pg:first-child { padding-left: 0; }
+.pg:hover { color: var(--text); }
+
+[data-hold] { -webkit-user-select: none; user-select: none; touch-action: none; }
+.btn.solid { background-image: linear-gradient(rgba(var(--risk), .5), rgba(var(--risk), .5)); background-repeat: no-repeat; background-size: 0% 100%; }
+.btn.solid.holding { animation: holdbar var(--hold) linear forwards; }
+@keyframes holdbar { to { background-size: 100% 100%; } }
+.icon-btn { background-image: linear-gradient(rgba(255,107,127,.45), rgba(255,107,127,.45)); background-repeat: no-repeat; background-position: center; background-size: 0 0; }
+.icon-btn.holding { color: var(--bad); animation: holdgrow var(--hold) linear forwards; }
+@keyframes holdgrow { to { background-size: 100% 100%; } }
+
+[hidden] { display: none !important; }
+.pill.wings { display: grid; grid-template-columns: 1fr 190px 1fr; padding: 0 20px 0 18px; }
+.wl, .wr { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.wr { justify-content: flex-end; gap: 9px; }
+.wr .sub { margin: 0; }
+
+.strip { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; font: 11.5px/1 "JetBrains Mono", "SF Mono", ui-monospace, monospace; color: var(--dim); }
+.strip b { color: var(--text); font-weight: 500; }
+.strip i { width: 1px; height: 11px; background: rgba(255,255,255,.16); }
+.strip .tw { display: inline-flex; align-items: center; gap: 10px; }
+.chips { margin-left: auto; display: flex; gap: 6px; }
+.chip { padding: 3px 8px; border-radius: 7px; background: #15151d; color: var(--dim); font: 11px/1.2 "SF Pro Text", "Inter", system-ui, sans-serif; }
+
+.diff { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #0c0c13; font: 12px/1.7 "JetBrains Mono", "SF Mono", ui-monospace, monospace; }
+.dh { display: flex; justify-content: space-between; gap: 12px; padding: 6px 12px; color: var(--dim); border-bottom: 1px solid var(--line); white-space: nowrap; }
+.dh span:first-child { overflow: hidden; text-overflow: ellipsis; }
+.cnt u { text-decoration: none; color: #5fd48f; }
+.cnt s { text-decoration: none; color: #ff7d8d; }
+.dl { display: flex; gap: 10px; padding: 0 12px; white-space: nowrap; }
+.dl i { width: 14px; font-style: normal; text-align: right; color: #55526b; }
+.dl b { width: 8px; font-weight: 500; }
+.dl span { overflow: hidden; text-overflow: ellipsis; }
+.dl.del { background: rgba(255,90,110,.12); color: #ffb3bd; }
+.dl.add { background: rgba(70,210,130,.12); color: #a8f0c8; }
+
+@media (max-width: 500px) { .island[data-state="gate"], .island[data-state="prompt"] { width: 94vw; } }
+@media (prefers-reduced-motion: reduce) { .island, .island *, .rim { animation: none !important; transition-duration: .01s !important; } }
+</style>
+</head>
+<body>
+
+<div class="island" id="island" data-state="idle" role="group" tabindex="0" aria-label="Accuretta">
+  <div class="rim"></div>
+
+  <div class="view v-idle"><div class="pill">
+    <svg class="logo" data-cols="11" width="26" height="19"></svg>
+    <span class="dot"></span>
+  </div></div>
+
+  <div class="view v-alert"><div class="pill wings">
+    <div class="wl"><svg class="logo" data-cols="11" width="28" height="20"></svg><span class="label">Approval needed</span></div>
+    <span></span>
+    <div class="wr"><span class="sub" id="alertSub">1 gate</span><span class="dot amber"></span></div>
+  </div></div>
+
+  <div class="view v-work"><div class="pill wings">
+    <div class="wl"><svg class="logo" data-cols="11" width="28" height="20"></svg><span class="sub" id="workSub">planning</span></div>
+    <span></span>
+    <div class="wr"><span class="sub">Working</span><span class="dot blue"></span></div>
+  </div></div>
+
+  <div class="view v-ready"><div class="pill wings">
+    <div class="wl"><svg class="logo" data-cols="11" width="28" height="20"></svg><span class="label">Model ready</span></div>
+    <span></span>
+    <div class="wr"><span class="sub" id="readySub"></span><span class="dot"></span></div>
+  </div></div>
+
+  <div class="view v-gate"><div class="card">
+    <div class="strip"><b id="gStep"></b><i></i><span>ctx <b id="sCtx">34%</b></span><span class="tw" id="sTpsWrap"><i></i><span><b id="sTps">38</b> t/s</span></span><span class="chips"><span class="chip" id="gModel"></span><span class="chip" id="gTarget"></span></span></div>
+    <div class="head">
+      <svg class="logo" data-cols="14" width="42" height="30"></svg>
+      <div><h2>Approval gate</h2><p id="gSub">Agent wants to run a command</p></div>
+      <span class="tag" id="gTag">Command</span>
+      <button class="icon-btn" data-act="power" aria-label="Shut down agent" title="Shut down agent"></button>
+    </div>
+    <div class="cmd" id="gCmdBox"><b>$</b> <span id="gCmd"></span></div>
+    <div class="diff" id="gDiff" hidden></div>
+    <div class="meta"><span>Scope <em id="gScope"></em></span><span>Writes <em id="gWrites"></em></span></div>
+    <div class="actions">
+      <button class="btn quiet" data-act="ask">Ask agent</button>
+      <button class="btn outline" data-act="deny">Deny</button>
+      <button class="btn solid" id="approveBtn" data-act="approve">Approve <kbd>&#9166;</kbd></button>
+    </div>
+  </div></div>
+
+  <div class="view v-prompt"><div class="card">
+    <div class="thread" id="thread">
+      <div class="msg user" id="userMsg"></div>
+      <div class="msg agent"><div id="agentMsg"></div><p class="cap">Mock reply. Nothing ran.</p></div>
+    </div>
+    <div class="promptbox">
+      <svg class="logo" data-cols="11" width="30" height="22"></svg>
+      <input id="q" type="text" placeholder="Tell Accuretta what to do" autocomplete="off" aria-label="Prompt">
+      <button class="send" id="send" aria-label="Send"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#14130f" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
+    </div>
+    <div class="row">
+      <button class="model" id="model" aria-haspopup="listbox" aria-expanded="false" aria-label="Change model">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg>
+        <span id="modelName"></span>
+        <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div class="right"><span class="ctx"></span><span class="hint" id="hint">Enter sends</span><button class="icon-btn" data-act="power" aria-label="Shut down agent" title="Shut down agent"></button></div>
+    </div>
+    <div class="menu" id="menu" role="listbox" aria-label="Local models"></div>
+  </div></div>
+</div>
+
+<script>
+const MODELS = [
+  { name: 'Qwen 3.8 27B', meta: 'vision' },
+  { name: 'Qwen3 35B-A3B', meta: 'MoE' },
+  { name: 'Qwen3 27B', meta: 'dense' }
+];
+const MOCK_REPLY = 'Scan finished on 10.0.0.12. Three ports are open: SSH on 22 (OpenSSH 8.9), plus HTTP on 80 and HTTPS on 443 (both nginx 1.18.0). I made no changes.\n\nThe nginx version looks old. I suggest I compare it with known advisories next. This step only reads data, so it needs no approval.';
+const MOCK_GATES = [
+  { cmd: 'curl -sI http://10.0.0.12', kind: 'command', step: '2 of 7', target: '10.0.0.12' },
+  { cmd: 'nmap -sV -p 22,80,443 10.0.0.12', kind: 'command', step: '3 of 7', target: '10.0.0.12' },
+  { cmd: 'reg add "HKCU\\Software\\LabTest" /v Flag /t REG_DWORD /d 1 /f', kind: 'registry', step: '5 of 7', writes: 'registry', target: '10.0.0.12', path: 'HKCU\\Software\\LabTest', diff: [['-', 'Flag  REG_DWORD  0'], ['+', 'Flag  REG_DWORD  1']] }
+];
+const KIND_LABEL = { command: 'Command', registry: 'Registry' };
+const HOLD_MS = { approve: 1000, power: 800 };
+const RING = 50.27;
+const POWER = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v8"/><path d="M6.4 6.6a8 8 0 1 0 11.2 0"/></svg>';
+const RING_SVG = '<svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke-width="3"><circle class="trk" cx="10" cy="10" r="8"/><circle class="arc" cx="10" cy="10" r="8" stroke-linecap="round" stroke-dasharray="50.27" stroke-dashoffset="50.27" transform="rotate(-90 10 10)"/></svg>';
+
+const island = document.getElementById('island');
+const $ = (s) => document.querySelector(s);
+const cfg = { mockLoadMs: 6000, demo: true };
+let timer, streamTimer, loadTimer, readyTimer, compactTimer, toolTimers = [];
+let modelIdx = 0, lastPrompt = 'Scan 10.0.0.12 for open ports';
+let gates = [], gi = 0, approvedAny = false, lastCmd = '';
+const hold = { t: null, el: null };
+
+const emit = (type, detail = {}) => island.dispatchEvent(new CustomEvent('notch', { detail: { type, ...detail } }));
+
+document.querySelectorAll('[data-act="power"]').forEach(b => { b.innerHTML = POWER; b.dataset.hold = HOLD_MS.power; b.title = 'Hold to shut down'; });
+document.querySelectorAll('.ctx').forEach(el => { el.innerHTML = RING_SVG; });
+
+function inPoly(x, y, p) {
+  let c = false;
+  for (let i = 0, j = p.length - 1; i < p.length; j = i++) {
+    const [xi, yi] = p[i], [xj, yj] = p[j];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) c = !c;
+  }
+  return c;
+}
+
+const BIG = [[165, 990], [625, 315], [868, 298], [500, 878], [470, 888]];
+const SMALL = [[672, 648], [885, 645], [1112, 975], [862, 940]];
+const X0 = 150, Y0 = 285, W = 980, H = 725;
+
+function drawLogo(svg) {
+  const cols = +svg.dataset.cols, cell = W / cols, rows = Math.ceil(H / cell);
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  let out = '';
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const x = X0 + (c + .5) * cell, y = Y0 + (r + .5) * cell;
+    if (!inPoly(x, y, BIG) && !inPoly(x, y, SMALL)) continue;
+    const t = (x - X0) / W, u = (y - Y0) / H;
+    const hue = 212 + t * 50 + u * 30, light = 66 - (1 - Math.abs(u - .65)) * 12;
+    const k = ((1 - u) * .5 + t * .5) * .88 + Math.random() * .12;
+    const mx = X0 + W / 2 - x, my = Y0 + H / 2 - y, cd = Math.hypot(mx, my) / W * .3;
+    const p = 1.3 + Math.random() * 2.1, d = -Math.random() * p, lo = (.12 + Math.random() * .3).toFixed(2);
+    out += `<circle cx="${x - X0}" cy="${y - Y0}" r="${cell * .36}" fill="hsl(${hue} 95% ${light}%)" style="--k:${k.toFixed(3)};--dx:${(mx * .6).toFixed(0)}px;--dy:${(my * .6).toFixed(0)}px;--cd:${cd.toFixed(2)}s;--p:${p.toFixed(2)}s;--d:${d.toFixed(2)}s;--lo:${lo}"/>`;
+  }
+  svg.innerHTML = out;
+}
+document.querySelectorAll('.logo').forEach(drawLogo);
+
+function setContext(p) {
+  p = Math.max(0, Math.min(1, p));
+  document.querySelectorAll('.ctx').forEach(el => {
+    el.querySelector('.arc').style.strokeDashoffset = RING * (1 - p);
+    el.classList.toggle('warn', p >= .75 && p < .9);
+    el.classList.toggle('crit', p >= .9);
+    el.title = `Context ${Math.round(p * 100)}%`;
+  });
+  const c = $('#sCtx');
+  if (c) c.textContent = Math.round(p * 100) + '%';
+}
+setContext(.34);
+
+function setStats({ tps } = {}) {
+  $('#sTpsWrap').hidden = tps == null;
+  if (tps != null) $('#sTps').textContent = Math.round(tps);
+}
+
+function setTool(t) {
+  const el = $('#workSub');
+  el.textContent = t;
+  el.classList.remove('swap'); void el.offsetWidth; el.classList.add('swap');
+}
+function runTools(steps) {
+  steps.forEach(([ms, text, fn]) => toolTimers.push(setTimeout(() => { setTool(text); if (fn) fn(); }, ms)));
+}
+
+function compact() {
+  clearTimeout(compactTimer);
+  island.removeAttribute('data-compact'); void island.offsetWidth;
+  island.setAttribute('data-compact', '');
+  emit('compact');
+  compactTimer = setTimeout(() => island.removeAttribute('data-compact'), 1800);
+}
+
+const normGate = (g) => ({ cmd: '', kind: 'command', scope: 'lab-net', step: '', writes: 'none', target: '', ...g });
+
+const esc = (t) => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function renderDiff(g) {
+  let a = 0, b = 0;
+  const rows = g.diff.map(([op, text]) => {
+    const n = op === '-' ? ++a : ++b;
+    return `<div class="dl ${op === '-' ? 'del' : 'add'}"><i>${n}</i><b>${op}</b><span>${esc(text)}</span></div>`;
+  }).join('');
+  // Prefer the bridge's full-line counts: the rows shown are capped, the
+  // counts are not.
+  const cnt = g.counts && (g.counts.adds || g.counts.dels)
+    ? `<u>+${g.counts.adds}</u> <s>-${g.counts.dels}</s>`
+    : `<u>+${b}</u> <s>-${a}</s>`;
+  const box = $('#gDiff');
+  box.title = g.cmd;
+  box.innerHTML = `<div class="dh"><span>${esc(g.path || '')}</span><span class="cnt">${cnt}</span></div>${rows}`;
+}
+
+function renderGate() {
+  const g = gates[gi];
+  if (!g) return;
+  $('#gTag').textContent = KIND_LABEL[g.kind] || KIND_LABEL.command;
+  $('#gCmd').textContent = g.cmd;
+  const reg = g.kind === 'registry';
+  // Any gate can carry diff rows now: registry queries get their best-effort
+  // read-only diff, write/edit gates get the +/− preview from the bridge.
+  const hasDiff = Array.isArray(g.diff) && g.diff.length > 0;
+  island.dataset.kind = reg ? 'registry' : 'command';
+  $('#gCmdBox').hidden = reg && hasDiff;
+  $('#gDiff').hidden = !hasDiff;
+  if (hasDiff) renderDiff(g);
+  $('#gModel').textContent = MODELS[modelIdx].name;
+  $('#gTarget').textContent = g.target;
+  $('#gTarget').hidden = !g.target;
+  $('#gScope').textContent = g.scope;
+  $('#gStep').textContent = g.step;
+  const w = $('#gWrites');
+  w.textContent = g.writes;
+  w.classList.toggle('warn', g.writes !== 'none');
+  $('#gSub').innerHTML = gates.length > 1
+    ? `<button class="pg" data-act="prev" aria-label="Previous gate">&#8249;</button>${gi + 1} of ${gates.length}<button class="pg" data-act="next" aria-label="Next gate">&#8250;</button>`
+    : 'Agent wants to run a command';
+  const ap = $('#approveBtn'), strict = g.kind === 'registry';
+  ap.dataset.hold = strict ? HOLD_MS.approve : '';
+  ap.innerHTML = strict ? 'Hold to approve <kbd>&#9166;</kbd>' : 'Approve <kbd>&#9166;</kbd>';
+}
+
+function updateAlert() {
+  $('#alertSub').textContent = gates.length === 1 ? '1 gate' : `${gates.length} gates`;
+}
+
+function addGate(g) {
+  if (island.dataset.state === 'off') return;
+  gates.push(normGate(g));
+  const s = island.dataset.state;
+  if (s === 'gate') renderGate();
+  else if (s === 'alert') updateAlert();
+  else setState('alert');
+}
+
+function navGate(d) {
+  if (gates.length < 2) return;
+  gi = (gi + d + gates.length) % gates.length;
+  renderGate();
+}
+
+function resolveGate(decision) {
+  if (!gates.length) return;
+  const [g] = gates.splice(gi, 1);
+  if (decision === 'approve') { approvedAny = true; lastCmd = g.cmd; }
+  emit(decision, { gate: g });
+  if (gates.length) { gi = Math.min(gi, gates.length - 1); renderGate(); return; }
+  gi = 0;
+  if (approvedAny) { approvedAny = false; if (cfg.demo) runApproved(); else setState('work'); }
+  else setState('idle');
+}
+function approve() { resolveGate('approve'); }
+function deny() { resolveGate('deny'); }
+function powerOff() { setState('off'); emit('power'); }
+const ACTS = { approve, power: powerOff };
+
+function holdStart(el, action) {
+  const ms = +el.dataset.hold;
+  if (!ms || hold.el || !action) return;
+  hold.el = el;
+  el.style.setProperty('--hold', ms + 'ms');
+  el.classList.add('holding');
+  hold.t = setTimeout(() => { holdCancel(); action(); }, ms);
+}
+function holdCancel() {
+  clearTimeout(hold.t);
+  if (hold.el) hold.el.classList.remove('holding');
+  hold.el = null;
+}
+
+function renderMenu() {
+  $('#modelName').textContent = MODELS[modelIdx].name;
+  $('#menu').innerHTML = MODELS.map((m, i) =>
+    `<button class="opt" role="option" data-i="${i}" aria-selected="${i === modelIdx}"><span class="chk">${i === modelIdx ? '&#10003;' : ''}</span><span class="nm">${m.name}</span><span class="mt">${m.meta}</span></button>`
+  ).join('');
+}
+renderMenu();
+
+function openMenu() {
+  island.setAttribute('data-menu', '');
+  island.style.setProperty('--mh', ($('#menu').offsetHeight + 8) + 'px');
+  $('#model').setAttribute('aria-expanded', 'true');
+}
+function closeMenu() {
+  if (!island.hasAttribute('data-menu')) return false;
+  island.removeAttribute('data-menu');
+  island.style.setProperty('--mh', '0px');
+  $('#model').setAttribute('aria-expanded', 'false');
+  return true;
+}
+
+const setHint = (text, cls = '') => { const h = $('#hint'); h.className = ('hint ' + cls).trim(); h.textContent = text; };
+
+function loadModel() {
+  clearTimeout(loadTimer); clearTimeout(readyTimer);
+  if (island.dataset.state === 'ready') setState('idle');
+  island.removeAttribute('data-ready');
+  island.removeAttribute('data-loading');
+  void island.offsetWidth;
+  island.setAttribute('data-loading', '');
+  $('#q').placeholder = `Loading ${MODELS[modelIdx].name}`;
+  setHint('Loading');
+  if (cfg.mockLoadMs) loadTimer = setTimeout(modelReady, cfg.mockLoadMs);
+}
+
+function modelReady() {
+  if (!island.hasAttribute('data-loading')) return;
+  clearTimeout(loadTimer);
+  const name = MODELS[modelIdx].name;
+  island.removeAttribute('data-loading');
+  void island.offsetWidth;
+  island.setAttribute('data-ready', '');
+  $('#q').placeholder = 'Tell Accuretta what to do';
+  setHint(`${name} ready`, 'ok');
+  emit('modelready', { model: name });
+  if (island.dataset.state === 'idle') { $('#readySub').textContent = name; setState('ready'); }
+  readyTimer = setTimeout(() => {
+    island.removeAttribute('data-ready');
+    setHint('Enter sends');
+    if (island.dataset.state === 'ready') setState('idle');
+  }, 2800);
+}
+
+function stream(text) {
+  const el = $('#agentMsg');
+  el.textContent = ''; island.setAttribute('data-busy', '');
+  const words = text.split(' ');
+  let i = 0;
+  (function tick() {
+    if (i < words.length) {
+      const s = document.createElement('span');
+      s.className = 'w'; s.textContent = words[i++] + ' ';
+      el.appendChild(s);
+      $('#thread').scrollTop = 1e5;
+      streamTimer = setTimeout(tick, 28 + Math.random() * 50);
+    } else island.removeAttribute('data-busy');
+  })();
+}
+
+function removeGate(id) {
+  const i = gates.findIndex(g => g.id === id);
+  if (i < 0) return;
+  gates.splice(i, 1);
+  if (gi >= gates.length) gi = Math.max(0, gates.length - 1);
+  const s = island.dataset.state;
+  if (!gates.length) { if (s === 'gate' || s === 'alert') setState('idle'); return; }
+  if (s === 'gate') renderGate(); else if (s === 'alert') updateAlert();
+}
+
+function setModels(list, active = 0) {
+  if (!Array.isArray(list) || !list.length) return;
+  MODELS.splice(0, MODELS.length, ...list);
+  modelIdx = Math.max(0, Math.min(active, MODELS.length - 1));
+  renderMenu();
+}
+
+function modelFailed(msg = 'Load failed') {
+  if (!island.hasAttribute('data-loading')) return;
+  clearTimeout(loadTimer);
+  island.removeAttribute('data-loading');
+  $('#q').placeholder = 'Tell Accuretta what to do';
+  setHint(msg, 'bad');
+  emit('modelfailed', { model: MODELS[modelIdx].name });
+  readyTimer = setTimeout(() => setHint('Enter sends'), 3500);
+}
+
+function beginReply(userText) {
+  if (userText != null) lastPrompt = userText;
+  $('#userMsg').textContent = lastPrompt;
+  $('#agentMsg').textContent = '';
+  island.setAttribute('data-thread', '');
+  setState('prompt');
+  island.setAttribute('data-busy', '');
+}
+function appendReply(chunk) {
+  const el = document.createElement('span');
+  el.className = 'w'; el.textContent = chunk;
+  $('#agentMsg').appendChild(el);
+  $('#thread').scrollTop = 1e5;
+}
+function endReply() { island.removeAttribute('data-busy'); }
+
+function setState(s) {
+  clearTimeout(timer); clearTimeout(streamTimer);
+  toolTimers.forEach(clearTimeout); toolTimers = [];
+  closeMenu();
+  island.dataset.state = s;
+  island.toggleAttribute('data-busy', s === 'work' || s === 'alert');
+  if (s === 'off') { island.removeAttribute('data-thread'); gates = []; gi = 0; approvedAny = false; }
+  if (s === 'alert' || s === 'gate') {
+    if (!gates.length) { if (!cfg.demo) return setState('idle'); gates.push(normGate(MOCK_GATES[1])); }
+    gi = Math.min(gi, gates.length - 1);
+    if (s === 'gate') renderGate(); else updateAlert();
+  }
+  if (s === 'prompt') setTimeout(() => $('#q').focus(), 350);
+}
+
+function showReply() {
+  $('#userMsg').textContent = lastPrompt;
+  $('#agentMsg').textContent = '';
+  island.setAttribute('data-thread', '');
+  setState('prompt');
+  timer = setTimeout(() => stream(MOCK_REPLY), 500);
+}
+
+function runApproved() {
+  setState('work');
+  runTools([
+    [0, lastCmd],
+    [1000, 'compacting context', () => { compact(); setContext(.18); }],
+    [2400, 'parsing output']
+  ]);
+  timer = setTimeout(() => { showReply(); setContext(.24); }, 3200);
+}
+
+function dismiss() {
+  const s = island.dataset.state;
+  if (s === 'gate') setState('alert');
+  else if (s === 'prompt') setState(gates.length ? 'alert' : 'idle');
+}
+
+island.addEventListener('click', (e) => {
+  const s = island.dataset.state;
+  if (!e.target.closest('.menu, .model')) closeMenu();
+  const h = e.target.closest('[data-hold]');
+  if (h && h.dataset.hold) return;
+  const act = e.target.closest('[data-act]')?.dataset.act;
+  if (act === 'approve') return approve();
+  if (act === 'deny') return deny();
+  if (act === 'prev' || act === 'next') return navGate(act === 'next' ? 1 : -1);
+  if (act === 'ask') return setState('prompt');
+  if (e.target.closest('#model')) return island.hasAttribute('data-menu') ? closeMenu() : openMenu();
+  const opt = e.target.closest('.opt');
+  if (opt) {
+    const i = +opt.dataset.i;
+    closeMenu();
+    if (i !== modelIdx) { modelIdx = i; renderMenu(); loadModel(); emit('model', { model: MODELS[modelIdx].name }); }
+    return;
+  }
+  if (s === 'idle') setState('prompt');
+  else if (s === 'alert') setState('gate');
+  else if (s === 'off') { setState('idle'); emit('wake'); }
+});
+
+island.addEventListener('pointerdown', (e) => {
+  const el = e.target.closest('[data-hold]');
+  if (el && el.dataset.hold) holdStart(el, ACTS[el.dataset.act]);
+});
+island.addEventListener('pointerout', (e) => { if (hold.el && !hold.el.contains(e.relatedTarget)) holdCancel(); });
+document.addEventListener('pointerup', holdCancel);
+document.addEventListener('pointercancel', holdCancel);
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { if (!closeMenu()) dismiss(); return; }
+  const inGate = island.dataset.state === 'gate';
+  if (inGate && !e.target.closest('input')) {
+    if (e.key === 'ArrowRight') navGate(1);
+    if (e.key === 'ArrowLeft') navGate(-1);
+    if (e.key === 'Enter' && !e.repeat && !e.target.closest('button')) {
+      const b = $('#approveBtn');
+      if (b.dataset.hold) holdStart(b, approve); else approve();
+    }
+  }
+  if ((e.key === 'Enter' || e.key === ' ') && !e.repeat) {
+    const h = e.target.closest && e.target.closest('[data-hold]');
+    if (h && h.dataset.hold) { e.preventDefault(); holdStart(h, ACTS[h.dataset.act]); }
+  }
+  if ((e.key === 'Enter' || e.key === ' ') && e.target === island) island.click();
+});
+document.addEventListener('keyup', (e) => { if (e.key === 'Enter' || e.key === ' ') holdCancel(); });
+document.addEventListener('click', (e) => {
+  if (!e.composedPath().includes(island)) { closeMenu(); dismiss(); }
+});
+
+function send() {
+  const v = $('#q').value.trim();
+  if (!v || island.hasAttribute('data-loading')) return;
+  lastPrompt = v; $('#q').value = '';
+  emit('send', { prompt: v, model: MODELS[modelIdx].name });
+  setState('work');
+  if (!cfg.demo) return;
+  setContext(.41);
+  runTools([[0, 'reading scope'], [650, 'whois 10.0.0.12'], [1300, 'planning step 3']]);
+  timer = setTimeout(() => MOCK_GATES.forEach(g => addGate(g)), 2000);
+}
+$('#send').addEventListener('click', send);
+$('#q').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+
+window.notch = { setState, showReply, approve, deny, addGate, setTool, setContext, setStats, compact, loadModel, modelReady, modelFailed, removeGate, setModels, beginReply, appendReply, endReply, config: cfg };
+</script>
+</body>
+</html>
