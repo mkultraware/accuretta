@@ -147,6 +147,34 @@ function showOpenMain() {
   btn.hidden = false;
 }
 
+// ---- live status in the prompt view -----------------------------------------
+// The work pill owns the status line, but the owner can leave the pill: any
+// click on the island opens the conversation while a turn is still running.
+// Without a status line there, the thread reads as finished-or-dead and the
+// owner cannot tell the request is still being worked on.
+function liveStatusEl() {
+  let el = document.getElementById("liveStatus");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "liveStatus";
+    const thread = document.getElementById("thread");
+    if (thread) thread.appendChild(el);
+  }
+  return el;
+}
+function updateLiveStatus() {
+  const el = liveStatusEl();
+  if (!el) return;
+  const on = streaming && (state() === "prompt") &&
+    (lastActivity === "thinking" || lastActivity === "tool");
+  if (on) {
+    const line = document.getElementById("workSub");
+    el.textContent = (lastActivity === "tool" && line && line.textContent.trim())
+      ? line.textContent.trim() : "thinking…";
+  }
+  el.style.display = on ? "" : "none";
+}
+
 // ---- activity ------------------------------------------------------------
 // No extra glyph: the dot-matrix A already IS the agent, and the widget
 // twinkles it whenever the island is busy. This decides what the narrow line
@@ -167,6 +195,7 @@ function setActivity(phase) {
     lastActivity = phase;
     reportDiag("activity");
   }
+  updateLiveStatus();
 }
 
 // ---- dot-matrix pill FX -----------------------------------------------------
@@ -325,6 +354,7 @@ function toggleTaskPanel() {
   // With a panel, its header is the entry point; without one, keep the latest
   // reply in view instead of the empty top of the thread.
   if (t) t.scrollTop = recentDecisions.length ? 0 : 1e9;
+  updateLiveStatus();
   reportDiag("task-panel");
 }
 
@@ -500,6 +530,13 @@ function toggleTaskPanel() {
     // a quiet divider separates the archive from the live turn below it
     ".island[data-expanded] #userMsg { border-top: 1px solid var(--line); margin-top: 6px; padding-top: 8px; }",
     ".msg.arch.user { color: #6f6c86; }",
+    // live status line shown at the bottom of the thread while a notch turn
+    // is streaming and the owner is looking at the conversation view
+    "#liveStatus {",
+    "  display: none; font: 11.5px/1.5 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;",
+    "  color: var(--dim); padding: 2px 0 6px;",
+    "}",
+    "#liveStatus::before { content: '\\25cf\\00a0\\00a0'; color: var(--accent2); }",
     // the approved-task panel: what the agent is cleared to do, per kind
     ".task-panel { display: flex; flex-direction: column; gap: 9px; }",
     // The approved-task panel shares #thread with the conversation. Hide the
@@ -1061,6 +1098,9 @@ async function runTurn(prompt) {
       if (om) om.hidden = true;
       notch.beginReply(prompt);
       replyOpen = true;
+      // The card just became the visible surface: show the running status
+      // under the (still empty) reply immediately, not at the first word.
+      updateLiveStatus();
     }
   };
 
@@ -1091,6 +1131,12 @@ async function runTurn(prompt) {
     if (thread) thread.scrollTop = 1e9;
   };
 
+  // Echo the prompt and open the card before anything streams back. Waiting
+  // for the first content delta left the thinking/tool phase invisible — a
+  // click during that window opened the previous turn's thread and looked
+  // like the request went nowhere.
+  openReply();
+
   const pushWords = (text) => {
     const clean = stripCascade(stripThink(text));
     if (!clean) return;
@@ -1117,10 +1163,12 @@ async function runTurn(prompt) {
 // card and no error. Keep the card open and say what happened instead.
   const finish = (why) => {
     if (wordBuf) { openReply(); replyRaw += wordBuf; wordBuf = ""; }
+    let cardIsError = !!why;
     if (!replyRaw.trim()) {
       openReply();
       replyRaw = why || "The agent finished the turn without a readable reply. "
         + "Nothing was changed. Try again, or check the agent log.";
+      cardIsError = true;
       renderReply();
     } else if (replyOpen) {
       renderReply();
@@ -1131,6 +1179,7 @@ async function runTurn(prompt) {
       const p = document.querySelector("#agentMsg p:last-of-type");
       if (p) p.classList.add("sug-line");
     }
+    updateLiveStatus();
     if (replyOpen) {
       // A turn that actually touched the machine gets a send-off: the A breaks
       // down and rebuilds, and the exit to the full surface appears — that is
@@ -1140,6 +1189,10 @@ async function runTurn(prompt) {
         pillFX("break");
         showOpenMain();
       }
+      // A failed turn must surface even if the owner folded the island away:
+      // the reply card only shows when the island opens, so the notification
+      // is what tells an away-owner the request did not go through.
+      if (cardIsError) notify("error");
       notch.endReply();
     }
     streaming = false;
@@ -1330,6 +1383,7 @@ function setToolLine(name, args) {
   lastToolStartAt = Date.now();
   pillFX(fxForTool(name));
   setActivity("tool");
+  updateLiveStatus();
   reportDiag("tool");
   return text;
 }
@@ -1351,12 +1405,20 @@ function connectEvents() {
     switch (evt.type) {
       case "chat_start":
         if (evt.chat_id) activeChatId = evt.chat_id;
-        if (state() !== "gate" && state() !== "alert") notch.setState("work");
+        // Do not yank this surface off the streaming conversation: when the
+        // notch itself started the turn and the owner is looking at the card,
+        // the prompt + live status are already on screen. Other surfaces'
+        // turns (or a folded island) still flip to the work pill.
+        if (!(streaming && state() === "prompt") &&
+            state() !== "gate" && state() !== "alert") notch.setState("work");
         setActivity("thinking");
         break;
       case "tool_start":
         if (state() !== "gate" && state() !== "alert") {
-          if (state() !== "work") notch.setState("work");
+          // Same rule as chat_start: never yank the owner off the streaming
+          // conversation card. The tool line is already mirrored below the
+          // thread by updateLiveStatus().
+          if (!(streaming && state() === "prompt") && state() !== "work") notch.setState("work");
           setToolLine(evt.name, evt.arguments);
         }
         break;

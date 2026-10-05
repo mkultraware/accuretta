@@ -725,7 +725,12 @@ function send() {
   if (!v || island.hasAttribute('data-loading')) return;
   lastPrompt = v; $('#q').value = '';
   emit('send', { prompt: v, model: MODELS[modelIdx].name });
-  setState('work');
+  // emit() is synchronous, so the wiring's send handler has already run by the
+  // next line: the notch's openReply has reopened the conversation card with
+  // the prompt echoed and the live status under it. Forcing the work pill here
+  // used to beat that and hide the whole thinking/tool phase behind a bar.
+  // Demo mode keeps its own rehearsal flow and needs the pill.
+  if (cfg.demo) setState('work');
   if (!cfg.demo) return;
   setContext(.41);
   runTools([[0, 'reading scope'], [650, 'whois 10.0.0.12'], [1300, 'planning step 3']]);
