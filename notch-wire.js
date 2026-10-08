@@ -191,11 +191,31 @@ function setActivity(phase) {
     line.classList.toggle("shimmer", phase === "thinking");
     line.style.display = line.textContent.trim() ? "" : "none";
   }
+  setWorkRight(phase);
   if (phase !== lastActivity) {
     lastActivity = phase;
     reportDiag("activity");
   }
   updateLiveStatus();
+}
+
+// The pill's right side used to read a static "Working" next to the phase
+// word on the left — the same fact twice, saying nothing. Each phase now
+// gets its own one-liner, shimmering like the thinking line: what the
+// island is FOR the owner, not what the code is doing.
+const WORK_RIGHT_WORDS = {
+  thinking: "thinking",
+  composing: "writing",
+  tool: "on it",
+  idle: "",
+};
+function setWorkRight(phase) {
+  const el = document.getElementById("workRight");
+  if (!el) return;
+  const word = WORK_RIGHT_WORDS[phase];
+  el.textContent = word ?? "";
+  el.classList.toggle("shimmer", !!word);
+  el.style.display = word ? "" : "none";
 }
 
 // ---- dot-matrix pill FX -----------------------------------------------------
@@ -413,9 +433,9 @@ function toggleTaskPanel() {
     // the tool glyph in the work pill
     ".tool-ico { display: inline-flex; align-items: center; color: var(--dim); flex: none; }",
     ".tool-ico svg { width: 15px; height: 15px; display: block; }",
-    // "thinking": a highlight sweeps across the word while the model works, so
-    // the pill reads as alive instead of frozen on the word "Working".
-    "#workSub.shimmer {",
+    // "thinking": a highlight sweeps across the word while the model works,
+    // so both sides of the work pill read as alive.
+    "#workSub.shimmer, .sub.shimmer {",
     "  background-image: linear-gradient(100deg,",
     "    var(--dim) 0%, var(--dim) 34%, #ffffff 50%, var(--dim) 66%, var(--dim) 100%);",
     "  background-size: 260% 100%;",
@@ -429,7 +449,7 @@ function toggleTaskPanel() {
     "  to   { background-position: -60% 0; }",
     "}",
     "@media (prefers-reduced-motion: reduce) {",
-    "  #workSub.shimmer { animation: none; background-image: none;",
+    "  #workSub.shimmer, .sub.shimmer { animation: none; background-image: none;",
     "    -webkit-text-fill-color: currentColor; color: var(--dim); }",
     "}",
     // ---- dot-matrix pill FX -------------------------------------------------
