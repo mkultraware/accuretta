@@ -43,6 +43,26 @@ let activeChatId = "";              // chat that most recently ran a turn (any s
 let streaming = false;              // a notch-initiated /api/chat is in flight
 let notchChatId = "";
 let lastToolStartAt = 0;            // last tool_start seen on any surface
+
+// ---- live turn mirror --------------------------------------------------------
+// The compact work pill shows one line. Expanding the island must show the
+// whole running turn — the prompt, every tool call as it runs, and the reply
+// as it streams — for a turn THIS surface started (runTurn reads its own
+// POST stream) or one running on another surface (mirrored off /api/events;
+// the bridge forwards token deltas as best-effort transient SSE events so
+// the ring buffer keeps approvals durable).
+const mirror = { active: false, prompt: "" };
+let turnChatId = "";                // chat whose turn the card mirrors right now
+const turnToolRows = [];            // live tool rows inside #thread
+const handledCalls = new Set();     // tool_start dedupe across POST + SSE copies
+let replyOpen = false;              // the card shows the live turn's prompt+reply
+let replyRaw = "";                  // reply text rendered into #agentMsg
+let fadedChars = 0;                 // plain-text length already given the fade-in
+let wordBuf = "";                   // pending word-flush buffer
+let lastFlush = 0;
+let stripThink = makeThinkStripper();
+
+const turnLive = () => !!(streaming || mirror.active);
 try { notchChatId = localStorage.getItem("accuretta.notch.chat") || ""; } catch (e) {}
 
 const WRITE_KINDS = new Set(["write_file", "edit_file", "replace_ast_node"]);
@@ -95,33 +115,58 @@ const REGISTRY_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
 const MCP_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v5M16 3v5M6 8h12v3a6 6 0 0 1-6 6v4"/></svg>';
 const TEST_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 3h6M10 3v5l-5 9a2.7 2.7 0 0 0 2.4 4h9.2a2.7 2.7 0 0 0 2.4-4l-5-9V3"/><path d="M7.8 15h8.4"/></svg>';
 
+const FILE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>';
+const FOLDER_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+const SEARCH_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-3.6-3.6"/></svg>';
+
+// Icons are keyed by KIND, not by tool name: every read/list/grep call lands
+// on one glyph, so a long turn shows a handful of distinct chips instead of
+// a row of identical wrenches. `toolKey` is also what the chip strip groups
+// by — same kind, one chip with a count.
 const TOOL_ICONS = {
-  run_powershell: RUNNING_COMMAND_SVG, powershell: RUNNING_COMMAND_SVG,
-  sandbox: RUNNING_COMMAND_SVG, session: RUNNING_COMMAND_SVG,
-  open_program: RUNNING_COMMAND_SVG, launch: RUNNING_COMMAND_SVG,
-  git: RUNNING_COMMAND_SVG, run_test: TEST_SVG, test: TEST_SVG,
-  write_file: WRITING_FILE_SVG, create_file: WRITING_FILE_SVG,
-  edit_file: EDITING_FILE_SVG, patch_file: EDITING_FILE_SVG,
-  replace_ast_node: EDITING_FILE_SVG,
-  web_fetch: WRITING_FILE_SVG, download_file: WRITING_FILE_SVG,
-  web_search: GLOBE_SVG, network_snapshot: GLOBE_SVG, whois: GLOBE_SVG,
-  registry: REGISTRY_SVG,
+  file: FILE_SVG, folder: FOLDER_SVG, search: SEARCH_SVG,
+  write: WRITING_FILE_SVG, edit: EDITING_FILE_SVG,
+  run: RUNNING_COMMAND_SVG, test: TEST_SVG,
+  web: GLOBE_SVG, registry: REGISTRY_SVG, mcp: MCP_SVG,
 };
 
-function toolIconSvg(name) {
+const TOOL_KEYS = {
+  read_file: "file", read_text_file: "file",
+  list_directory: "folder", list_files: "folder", find_files: "folder",
+  grep_files: "search", search_files: "search",
+  write_file: "write", create_file: "write",
+  edit_file: "edit", patch_file: "edit", replace_ast_node: "edit",
+  run_powershell: "run", powershell: "run", sandbox: "run", session: "run",
+  open_program: "run", launch: "run", git: "run",
+  run_test: "test", test: "test",
+  web_fetch: "web", download_file: "web",
+  web_search: "web", network_snapshot: "web", whois: "web",
+  registry: "registry",
+};
+
+function toolKey(name) {
   const n = String(name || "").toLowerCase();
-  if (n.startsWith("mcp_")) return MCP_SVG;
-  return TOOL_ICONS[n] || WRENCH_SVG;
+  if (n.startsWith("mcp_")) return "mcp";
+  return TOOL_KEYS[n] || "wrench";
 }
 
-// The work pill has no icon slot of its own; add one before the tool line.
+function toolIconSvg(name) {
+  return TOOL_ICONS[toolKey(name)] || WRENCH_SVG;
+}
+
+// The right end of the work pill carries the running tool's glyph — the same
+// icon the main app puts on the call, sitting exactly where the redundant
+// "on it" echo used to. Created on demand; hidden whenever no tool is running.
 function ensureToolIcon() {
-  const holder = document.querySelector(".v-work .wl");
-  if (!holder || holder.querySelector(".tool-ico")) return null;
-  const span = document.createElement("span");
-  span.className = "tool-ico";
-  span.setAttribute("aria-hidden", "true");
-  holder.insertBefore(span, document.getElementById("workSub"));
+  const holder = document.querySelector(".v-work .wr");
+  if (!holder) return null;
+  let span = holder.querySelector(".tool-ico");
+  if (!span) {
+    span = document.createElement("span");
+    span.className = "tool-ico";
+    span.setAttribute("aria-hidden", "true");
+    holder.appendChild(span);
+  }
   return span;
 }
 
@@ -139,8 +184,12 @@ function showOpenMain() {
     btn.type = "button";
     btn.textContent = "Open in main app \u2197";
     btn.addEventListener("click", () => {
-      const id = encodeURIComponent(notchChatId || activeChatId || "");
-      hostPost({ type: "open-url", url: location.origin + (id ? "/?chat=" + id : "/") });
+      const cid = notchChatId || activeChatId || "";
+      // Tell the desktop window WHICH session to show. The host raises the
+      // app; this event makes it land on this conversation (a browser
+      // deep-link can't reach the already-running pywebview window).
+      if (cid) api("/api/ui/open-chat", { chat_id: cid }).catch(() => {});
+      hostPost({ type: "open-url", url: location.origin + (cid ? "/?chat=" + encodeURIComponent(cid) : "/") });
     });
     host.appendChild(btn);
   }
@@ -165,33 +214,391 @@ function liveStatusEl() {
 function updateLiveStatus() {
   const el = liveStatusEl();
   if (!el) return;
-  const on = streaming && (state() === "prompt") &&
+  const on = turnLive() && (state() === "prompt") &&
     (lastActivity === "thinking" || lastActivity === "tool");
   if (on) {
     const line = document.getElementById("workSub");
     el.textContent = (lastActivity === "tool" && line && line.textContent.trim())
-      ? line.textContent.trim() : "thinking…";
+      ? line.textContent.trim() : "Thinking…";
   }
-  el.style.display = on ? "" : "none";
+  // The line is the card's own "thinking" shimmer, matching the pill: a
+  // highlight sweeps the words instead of a dead dim sentence.
+  el.classList.toggle("shimmer", on);
+  // The injected base rule pins #liveStatus at display:none; resetting the
+  // inline value to "" (the old toggle) re-routed to THAT rule and the line
+  // stayed invisible forever while its text said "thinking…" cruelly out of
+  // sight. A real display value is the only thing that beats the default.
+  el.style.display = on ? "block" : "none";
+  updateComposerAction();
+}
+
+// ---- composer action (send <-> stop) ----------------------------------------
+// While a turn is live (ours or mirrored), the send button morphs into a stop
+// button and the input becomes the steering field — exactly the main app's
+// contract: Enter sends a correction, the button stops the run.
+function updateComposerAction() {
+  const btn = document.getElementById("send");
+  const q = document.getElementById("q");
+  const live = turnLive();
+  if (btn) {
+    btn.classList.toggle("is-stop", live);
+    btn.setAttribute("aria-label", live ? "Stop the running task" : "Send");
+    btn.title = live ? "Stop the running task" : "Send (Enter)";
+  }
+  if (q) {
+    q.placeholder = live ? "Add a correction or more context…" : "Tell Accuretta what to do";
+  }
+}
+
+async function cancelActiveTurn() {
+  const cid = turnChatId || notchChatId || activeChatId || "";
+  if (!cid) return;
+  try { await api("/api/cancel", { chat_id: cid }); } catch (e) {}
+}
+
+// ---- steering from the notch ------------------------------------------------
+// A turn already running anywhere (this surface's own, or one mirrored from
+// the main app) takes the composer text as a STEER — a mid-task correction the
+// harness folds in at the next safe boundary, exactly like the main app's
+// queue. Only an idle composer starts a new turn.
+const steerPending = new Map();     // steer id -> the bubble we rendered for it
+const steerSeq = { n: 0 };
+
+function showSteerMessage(id, text) {
+  const thread = document.getElementById("thread");
+  if (!thread) return;
+  const el = document.createElement("div");
+  el.className = "msg user steer";
+  el.textContent = text;
+  el.title = "Sent to the running task — it lands at the next safe step.";
+  // Above the live reply, below the prompt and tool strip: it reads as part
+  // of the running turn, not as a new question.
+  const agent = thread.querySelector(".msg.agent");
+  if (agent) thread.insertBefore(el, agent); else thread.appendChild(el);
+  thread.scrollTop = 1e9;
+  if (id) steerPending.set(id, el);
+}
+
+function onSteeringEvent(evt) {
+  const id = String(evt.id || "");
+  if (evt.type === "steering_applied" && id) {
+    const el = steerPending.get(id);
+    if (el) { el.classList.add("applied"); steerPending.delete(id); }
+  } else if (evt.type === "steering_deferred") {
+    for (const mid of (evt.ids || [])) {
+      const el = steerPending.get(mid);
+      if (el) {
+        el.classList.add("deferred");
+        el.textContent += "  — not delivered (the task ended first)";
+        steerPending.delete(mid);
+      }
+    }
+  }
+}
+
+async function sendPrompt(prompt) {
+  const text = String(prompt || "").trim();
+  if (!text) return;
+  const cid = turnChatId || notchChatId || activeChatId || "";
+  if (turnLive() && cid) {
+    const id = `nt-${Date.now().toString(36)}-${(steerSeq.n++).toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    let status = "";
+    try {
+      const r = await api("/api/chat/steer", { chat_id: cid, id, text });
+      const j = await r.json().catch(() => null);
+      status = String((j && j.status) || "");
+    } catch (e) { status = ""; }
+    if (status === "pending" || status === "applied") {
+      showSteerMessage(status === "pending" ? id : "", text);
+      return;
+    }
+    if (status === "full") {
+      const thread = document.getElementById("thread");
+      if (thread) {
+        const el = document.createElement("div");
+        el.className = "msg user steer deferred";
+        el.textContent = text + "  — not delivered (too many updates queued)";
+        thread.appendChild(el);
+        thread.scrollTop = 1e9;
+      }
+      return;
+    }
+    // "inactive" (the turn ended between render and send) or a transport
+    // error: fall through and send it as a normal new turn.
+  }
+  runTurn(text);
+}
+
+// The button is stop while a turn is live; capture phase so the widget's own
+// click handler (which would call send) never sees it.
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest && e.target.closest("#send");
+  if (!btn || !turnLive()) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  cancelActiveTurn();
+}, true);
+
+// ---- conversations dropdown --------------------------------------------------
+// The button right of the model chip lists every session with "New session"
+// pinned first. Picking one loads its latest turn into the card and makes it
+// the notch's chat; New session clears the binding so the next send creates a
+// fresh one. Picking is disabled while a turn runs (the card is that turn's).
+function closeConvMenu() {
+  if (!island.hasAttribute("data-conv")) return false;
+  island.removeAttribute("data-conv");
+  const btn = document.getElementById("convBtn");
+  if (btn) btn.setAttribute("aria-expanded", "false");
+  return true;
+}
+
+const CONV_STATE_LABELS = {
+  working: "working", "needs-you": "needs you", finished: "finished",
+  interrupted: "interrupted", stopped: "stopped", failed: "failed",
+};
+
+async function openConvMenu() {
+  const menu = document.getElementById("convMenu");
+  if (!menu) return;
+  if (island.hasAttribute("data-conv")) { closeConvMenu(); return; }
+  if (typeof notch.closeMenu === "function") notch.closeMenu();  // model menu
+  const live = turnLive();
+  const data = await getJson("/api/chats?summary=1");
+  const order = (data && data.order) || [];
+  const chats = (data && data.chats) || {};
+  const rows = [{ id: "", title: "New session", meta: live ? "task running" : "",
+                  selected: !notchChatId, disabled: live }];
+  for (const id of order) {
+    const c = chats[id] || {};
+    rows.push({
+      id,
+      title: String(c.title || id),
+      meta: CONV_STATE_LABELS[c.task_state] || "",
+      selected: id === notchChatId,
+      disabled: live && id !== notchChatId,
+    });
+  }
+  menu.innerHTML = "";
+  for (const row of rows) {
+    const opt = document.createElement("button");
+    opt.type = "button";
+    opt.className = "opt";
+    opt.setAttribute("role", "option");
+    opt.setAttribute("aria-selected", String(row.selected));
+    opt.dataset.id = row.id;
+    if (row.disabled) opt.disabled = true;
+    const chk = document.createElement("span");
+    chk.className = "chk";
+    chk.textContent = row.selected ? "\u2713" : "";
+    const nm = document.createElement("span");
+    nm.className = "nm";
+    nm.textContent = row.title;
+    const mt = document.createElement("span");
+    mt.className = "mt";
+    mt.textContent = row.meta;
+    opt.append(chk, nm, mt);
+    if (!row.disabled) {
+      opt.addEventListener("click", (e) => {
+        e.stopPropagation();          // the widget's island handler owns .opt
+        onConvPicked(row.id);
+      });
+    }
+    menu.appendChild(opt);
+  }
+  island.setAttribute("data-conv", "");
+  const btn = document.getElementById("convBtn");
+  if (btn) btn.setAttribute("aria-expanded", "true");
+  if (typeof notch.positionMenu === "function") notch.positionMenu(menu);
+  reportRect();
+}
+
+async function onConvPicked(id) {
+  closeConvMenu();
+  if (turnLive()) return;                 // belt and braces; menu disables these
+  if (id === notchChatId && state() === "prompt") return;
+  clearTurnRows();
+  const thread = document.getElementById("thread");
+  if (thread) thread.querySelectorAll(".msg.arch").forEach((el) => el.remove());
+  island.removeAttribute("data-expanded");
+  threadExpanded = false;
+  const om = document.getElementById("openMain");
+  if (om) om.hidden = true;
+  replyRaw = ""; fadedChars = 0; wordBuf = ""; lastFlush = 0;
+  if (!id) {
+    notchChatId = "";
+    try { localStorage.removeItem("accuretta.notch.chat"); } catch (e) {}
+    notch.beginReply("");
+    setActivity("idle");
+    return;
+  }
+  notchChatId = id;
+  try { localStorage.setItem("accuretta.notch.chat", id); } catch (e) {}
+  const chat = await getJson(`/api/chats/${encodeURIComponent(id)}`);
+  const msgs = (chat && Array.isArray(chat.messages)) ? chat.messages : [];
+  const visible = msgs.filter(m => (m.role === "user" || m.role === "assistant")
+                                 && !m._internal && !m.invisible);
+  const lastUser = [...visible].reverse().find(m => m.role === "user");
+  const lastAssistant = [...visible].reverse().find(m => m.role === "assistant");
+  notch.beginReply(lastUser ? msgText(lastUser.content) : "");
+  if (lastAssistant) {
+    replyRaw = visibleFinalText(msgText(lastAssistant.content));
+    fadedChars = replyRaw.length;         // loaded history must not re-fade
+    renderReply();
+  }
+  setActivity("idle");
+}
+
+(function wireConvMenu() {
+  const btn = document.getElementById("convBtn");
+  if (btn) {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openConvMenu();
+    });
+  }
+  document.addEventListener("click", (e) => {
+    if (!island.hasAttribute("data-conv")) return;
+    if (e.target.closest && (e.target.closest("#convMenu") || e.target.closest("#convBtn"))) return;
+    closeConvMenu();
+  }, true);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && island.hasAttribute("data-conv")) {
+      closeConvMenu();
+      e.stopPropagation();
+    }
+  }, true);
+  new MutationObserver(() => {
+    // Any state change (a gate arriving, the turn ending) dismisses the list.
+    if (island.hasAttribute("data-conv") && state() !== "prompt") closeConvMenu();
+  }).observe(island, { attributes: true, attributeFilter: ["data-state"] });
+})();
+
+// ---- tool chips in the expanded card ---------------------------------------
+// Every tool_start becomes ONE small glyph in a compact strip between the
+// prompt and the reply — the main app's icon language, sized for the island.
+// No bars, no labels, no dots: the running glyph breathes blue, finished ones
+// settle dim, and the exact action text lives in the tooltip and in the
+// shimmering status line below. A chip stays "running" until the next event
+// proves it finished (another tool starts, or words start streaming).
+function ensureToolStrip() {
+  const thread = document.getElementById("thread");
+  if (!thread) return null;
+  let strip = thread.querySelector(".turn-tools");
+  if (!strip) {
+    strip = document.createElement("div");
+    strip.className = "turn-tools";
+    const userMsg = document.getElementById("userMsg");
+    if (userMsg && userMsg.parentNode === thread) userMsg.insertAdjacentElement("afterend", strip);
+    else thread.appendChild(strip);
+  }
+  return strip;
+}
+
+function addTurnToolRow(evt) {
+  const strip = ensureToolStrip();
+  if (!strip) return;
+  markRowsDone();
+  const key = toolKey(evt.name);
+  const label = toolLabel(evt.name, evt.arguments);
+  let group = turnToolRows.find((r) => r.key === key);
+  if (group) {
+    // Same kind of work again: bump the count instead of adding another
+    // identical glyph (a 30-call read loop stays one chip).
+    group.count += 1;
+    if (group.countEl) {
+      group.countEl.textContent = "×" + group.count;
+    } else {
+      group.countEl = document.createElement("b");
+      group.countEl.className = "tcount";
+      group.countEl.textContent = "×" + group.count;
+      group.el.appendChild(group.countEl);
+    }
+    group.el.title = `${label}  (+${group.count - 1} more of this kind)`;
+  } else {
+    const chip = document.createElement("span");
+    chip.className = "turn-tool running";
+    chip.title = label;
+    chip.innerHTML = toolIconSvg(evt.name);
+    strip.appendChild(chip);
+    group = { key, el: chip, count: 1, countEl: null, running: true };
+    turnToolRows.push(group);
+  }
+  group.running = true;
+  group.el.classList.remove("done");
+  group.el.classList.add("running");
+  const thread = document.getElementById("thread");
+  if (thread) thread.scrollTop = 1e9;
+}
+
+function markRowsDone() {
+  for (const r of turnToolRows) {
+    if (!r.running) continue;
+    r.running = false;
+    r.el.classList.remove("running");
+    r.el.classList.add("done");
+  }
+}
+
+function clearTurnRows() {
+  for (const r of turnToolRows) r.el.remove();
+  turnToolRows.length = 0;
+  // Steer bubbles belong to the turn that received them. A new turn or a
+  // session switch must not carry one conversation's corrections into the
+  // next (they showed up — green — in every conversation switched to).
+  for (const el of document.querySelectorAll("#thread .msg.user.steer")) el.remove();
+  steerPending.clear();
+}
+
+// A turn started on another surface: the user prompt is already persisted by
+// the time chat_start broadcasts, so pull it once and echo it above the live
+// tool rows when the owner expands the card.
+async function seedMirrorPrompt(chatId) {
+  if (!chatId) return;
+  const chat = await getJson(`/api/chats/${encodeURIComponent(chatId)}`);
+  if (!mirror.active || turnChatId !== chatId) return;
+  const msgs = (chat && Array.isArray(chat.messages)) ? chat.messages : [];
+  const u = [...msgs].reverse().find(m => m && m.role === "user" && !m._internal && !m.invisible);
+  if (!u) return;
+  mirror.prompt = msgText(u.content);
+  if (state() === "prompt") {
+    const um = document.getElementById("userMsg");
+    if (um) um.textContent = mirror.prompt;
+  }
+}
+
+// One tool_start handler for BOTH copies of every event (the notch's own
+// POST response and the SSE broadcast). The work pill keeps its single-line
+// behaviour; the row is what makes the expanded card read like the main app.
+function onToolStart(evt) {
+  const key = String(evt.call_id || evt.name || "") + "|" + String(evt.name || "");
+  if (handledCalls.has(key)) return;
+  handledCalls.add(key);
+  // Another surface's chat must not paint its tools over our turn's card.
+  if (turnChatId && evt.chat_id && String(evt.chat_id) !== turnChatId) return;
+  if (state() === "gate" || state() === "alert") return;   // the gate owns the screen
+  if (!(streaming && state() === "prompt") && state() !== "work") notch.setState("work");
+  setToolLine(evt.name, evt.arguments);
+  if (streaming || mirror.active) addTurnToolRow(evt);
 }
 
 // ---- activity ------------------------------------------------------------
-// No extra glyph: the dot-matrix A already IS the agent, and the widget
-// twinkles it whenever the island is busy. This decides what the narrow line
-// beside it says: a shimmering "thinking" while the model works, the truncated
-// tool phrase while a tool runs, nothing at all once words are coming out.
-const ACTIVITY_THINKING = "thinking";
+// ONE live-event line, not a status word plus an echo: the pill starts at
+// "thinking…" and the line is then REPLACED by each live event as it happens
+// ("Reading main.py…", "Running command…", "writing…"). The whole line
+// shimmers so it reads as live; the tool's own glyph sits on the right where
+// the old "on it" echo was.
+const ACTIVITY_THINKING = "thinking…";
+const ACTIVITY_WORDS = { thinking: ACTIVITY_THINKING, composing: "writing…", tool: "" };
 let lastActivity = "";
 function setActivity(phase) {
   const line = document.getElementById("workSub");
   if (line) {
-    // setTool() writes the tool phrase itself; the other phases own their text.
-    if (phase === "thinking") line.textContent = ACTIVITY_THINKING;
-    else if (phase !== "tool") line.textContent = "";
-    line.classList.toggle("shimmer", phase === "thinking");
+    // setTool() writes the tool phrase itself; the other phases own theirs.
+    if (phase !== "tool") line.textContent = ACTIVITY_WORDS[phase] || "";
+    line.classList.toggle("shimmer", !!line.textContent.trim());
     line.style.display = line.textContent.trim() ? "" : "none";
   }
-  setWorkRight(phase);
+  setWorkIcon(phase);
   if (phase !== lastActivity) {
     lastActivity = phase;
     reportDiag("activity");
@@ -199,23 +606,13 @@ function setActivity(phase) {
   updateLiveStatus();
 }
 
-// The pill's right side used to read a static "Working" next to the phase
-// word on the left — the same fact twice, saying nothing. Each phase now
-// gets its own one-liner, shimmering like the thinking line: what the
-// island is FOR the owner, not what the code is doing.
-const WORK_RIGHT_WORDS = {
-  thinking: "thinking",
-  composing: "writing",
-  tool: "on it",
-  idle: "",
-};
-function setWorkRight(phase) {
-  const el = document.getElementById("workRight");
-  if (!el) return;
-  const word = WORK_RIGHT_WORDS[phase];
-  el.textContent = word ?? "";
-  el.classList.toggle("shimmer", !!word);
-  el.style.display = word ? "" : "none";
+// The right side is the running tool's glyph, not a second line. Hidden while
+// the model only thinks/writes — the twinkling dot-matrix A already says the
+// agent is the one working.
+function setWorkIcon(phase) {
+  const ico = ensureToolIcon();
+  if (!ico) return;
+  ico.style.display = phase === "tool" ? "" : "none";
 }
 
 // ---- dot-matrix pill FX -----------------------------------------------------
@@ -345,13 +742,30 @@ function closeTaskPanel() {
 
 function toggleTaskPanel() {
   if (closeTaskPanel()) {                // second click closes it
-    if (state() === "prompt" && !recentDecisions.length) notch.setState("idle");
-    else if (state() === "prompt") notch.setState("work");
+    if (state() === "prompt") notch.setState(turnLive() ? "work" : "idle");
+    return;
+  }
+  island.setAttribute("data-thread", "");
+  // A turn is running: the click reveals the LIVE TURN — prompt, tool rows,
+  // streaming reply — instead of the historical approvals panel, which would
+  // hide the conversation and answer nothing about what is happening now.
+  if (turnLive()) {
+    island.removeAttribute("data-panel");
+    if (mirror.prompt) {
+      const um = document.getElementById("userMsg");
+      if (um) um.textContent = mirror.prompt;
+    }
+    notch.setState("prompt");
+    if (turnLive()) island.setAttribute("data-busy", "");   // keep the logo twinkling
+    if (replyRaw) renderReply();      // repaint words buffered while folded
+    const t = document.getElementById("thread");
+    if (t) t.scrollTop = 1e9;
+    updateLiveStatus();
+    reportDiag("task-panel");
     return;
   }
   // the work pill is the entry point; a click while idle also opens it
   if (state() === "idle") notch.setState("work");
-  island.setAttribute("data-thread", "");
   // No decisions recorded: skip the panel entirely. The owner clicked to
   // talk to the agent, not to be told there is no history — the conversation
   // card alone is the answer, and a "nothing approved yet" block read like
@@ -430,12 +844,32 @@ function toggleTaskPanel() {
     ".hint.hint-redundant { display: none; }",
     // conversation reads like a chat: the owner on the right, Accuretta left
     ".msg.user { text-align: right; }",
+    // a steer sent to the RUNNING task (from this notch while a turn is live):
+    // visually dimmer than a real user turn, with its delivery state.
+    ".msg.user.steer { color: #6f6c86; opacity: .85; }",
+    ".msg.user.steer.applied { color: var(--ok); opacity: .8; }",
+    ".msg.user.steer.deferred { color: rgb(var(--risk)); opacity: .9; }",
     // the tool glyph in the work pill
     ".tool-ico { display: inline-flex; align-items: center; color: var(--dim); flex: none; }",
     ".tool-ico svg { width: 15px; height: 15px; display: block; }",
-    // "thinking": a highlight sweeps across the word while the model works,
-    // so both sides of the work pill read as alive.
-    "#workSub.shimmer, .sub.shimmer {",
+    // live tool chips inside the conversation card: the main app's icon
+    // language, sized for the island — a compact strip of glyphs, no bars.
+    // The running glyph breathes blue; finished ones settle dim. The action
+    // text lives in the tooltip and in the status line, not in a row label.
+    ".turn-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin: 5px 0 5px; }",
+    ".turn-tools:empty { display: none; }",
+    ".turn-tool { display: inline-flex; align-items: center; justify-content: center; color: #6a6784; transition: color .2s ease; }",
+    ".turn-tool svg { width: 13px; height: 13px; display: block; }",
+    ".turn-tool.running { color: var(--blue); animation: tool-breathe 1.6s ease-in-out infinite; transform-origin: center; }",
+    ".turn-tool.done { color: #57546b; }",
+    ".turn-tool .tcount { margin-left: 3px; font: 600 10px/1 'SF Pro Text', 'Inter', system-ui, sans-serif; color: inherit; }",
+    "@keyframes tool-breathe {",
+    "  0%, 100% { opacity: .5; transform: scale(.9); }",
+    "  50%      { opacity: 1;  transform: scale(1.08); }",
+    "}",
+    // Live-event shimmer on the minimized pill: a quick white sweep across the
+    // mono one-liner while it works.
+    "#workSub.shimmer {",
     "  background-image: linear-gradient(100deg,",
     "    var(--dim) 0%, var(--dim) 34%, #ffffff 50%, var(--dim) 66%, var(--dim) 100%);",
     "  background-size: 260% 100%;",
@@ -444,12 +878,30 @@ function toggleTaskPanel() {
     "  color: transparent; -webkit-text-fill-color: transparent;",
     "  animation: notch-shimmer 1.5s linear infinite;",
     "}",
+    // The open card's status line copies the MAIN APP's think-line language:
+    // sans, italic, 12.5px, and the accent sweeping through slowly (2.2s)
+    // instead of a fast white blink.
+    "#liveStatus.shimmer {",
+    "  font-family: 'SF Pro Text', 'Inter', system-ui, -apple-system, sans-serif;",
+    "  font-size: 12.5px; font-style: italic; font-weight: 500;",
+    "  background-image: linear-gradient(90deg,",
+    "    var(--dim) 0%, var(--dim) 30%, var(--blue) 50%, var(--dim) 70%, var(--dim) 100%);",
+    "  background-size: 250% 100%;",
+    "  background-repeat: no-repeat;",
+    "  -webkit-background-clip: text; background-clip: text;",
+    "  color: transparent; -webkit-text-fill-color: transparent;",
+    "  animation: notch-shimmer 2.2s linear infinite;",
+    "}",
+    // Travel stays inside 0..100% so the 250%-wide background always covers
+    // the text: beyond that the uncovered tail went transparent, which read
+    // as the line "fading in and out". 100% -> 0% sweeps the highlight
+    // left-to-right.
     "@keyframes notch-shimmer {",
-    "  from { background-position: 160% 0; }",
-    "  to   { background-position: -60% 0; }",
+    "  from { background-position: 100% 0; }",
+    "  to   { background-position: 0% 0; }",
     "}",
     "@media (prefers-reduced-motion: reduce) {",
-    "  #workSub.shimmer, .sub.shimmer { animation: none; background-image: none;",
+    "  #workSub.shimmer, #liveStatus.shimmer { animation: none; background-image: none;",
     "    -webkit-text-fill-color: currentColor; color: var(--dim); }",
     "}",
     // ---- dot-matrix pill FX -------------------------------------------------
@@ -481,11 +933,24 @@ function toggleTaskPanel() {
     "  58% { transform: translate(calc(var(--dx) * .5), 42px) rotate(24deg); opacity: .12; }",
     "  80% { transform: translate(calc(var(--dx) * -.25), -6px) rotate(-8deg); opacity: .8; }",
     "}",
-    // the wide beam that rides the pill while an FX runs — this is what uses
-    // the width the text line never does
+    // The wide beam that rides the pill while an FX runs is a GRID item
+    // spanning the spacer + right columns (everything right of the status
+    // text), so its travel lane is pinned to the layout: swapping the tool
+    // label for a longer/shorter one never shifts the streak horizontally.
+    // The three PRIMARY children carry explicit placements because a grid
+    // child with a definite row makes the auto-placement cursor SKIP the
+    // occupied cells, wrapping the following items into an implicit second
+    // row — that was the old dropped right-side text.
     ".v-work .pill { position: relative; }",
-    ".fx-beam { position: absolute; left: 0; right: 0; top: 50%; height: 2px; margin-top: -1px; pointer-events: none; opacity: 0; }",
-    ".fx-beam::before { content: ''; position: absolute; top: 0; bottom: 0; left: 0; width: 34%; border-radius: 2px; }",
+    // The right column is icon-width, so the slack goes to the LEFT — the
+    // phase word + literal call need real estate and must not ellipsize to
+    // "thin…". The 190px middle track is the beam's reserved lane.
+    ".v-work .pill.wings { grid-template-columns: minmax(0, 1fr) 190px auto; }",
+    ".v-work .pill.wings .wl { grid-column: 1; grid-row: 1; }",
+    ".v-work .pill.wings > span:not(.fx-beam) { grid-column: 2; grid-row: 1; }",
+    ".v-work .pill.wings .wr { grid-column: 3; grid-row: 1; }",
+    ".fx-beam { grid-column: 2 / -1; grid-row: 1; align-self: center; position: relative; height: 2px; pointer-events: none; opacity: 0; }",
+    ".fx-beam::before { content: ''; position: absolute; top: 0; bottom: 0; left: 0; width: 30%; border-radius: 2px; }",
     ".fx-beam.run { opacity: 1; }",
     ".fx-beam.run::before { animation: fx-beam-run .9s ease-in-out both; }",
     ".fx-beam[data-kind='laser']::before {",
@@ -505,8 +970,8 @@ function toggleTaskPanel() {
     "  box-shadow: 0 0 10px 2px rgba(255,120,140,.4);",
     "}",
     "@keyframes fx-beam-run {",
-    "  from { transform: translateX(-120%); }",
-    "  to { transform: translateX(340%); }",
+    "  from { transform: translateX(0); }",
+    "  to { transform: translateX(360%); }",
     "}",
     "@media (prefers-reduced-motion: reduce) {",
     "  .island[data-fx] .logo circle { animation: none !important; }",
@@ -554,14 +1019,16 @@ function toggleTaskPanel() {
     // is streaming and the owner is looking at the conversation view
     "#liveStatus {",
     "  display: none; font: 11.5px/1.5 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;",
-    "  color: var(--dim); padding: 2px 0 6px;",
+    "  color: var(--dim); padding: 4px 0 6px;",
+    // One line, like the pill: a monster path must ellipsize, not wrap the card.
+    "  max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;",
     "}",
-    "#liveStatus::before { content: '\\25cf\\00a0\\00a0'; color: var(--accent2); }",
     // the approved-task panel: what the agent is cleared to do, per kind
     ".task-panel { display: flex; flex-direction: column; gap: 9px; }",
     // The approved-task panel shares #thread with the conversation. Hide the
-    // conversation while it is open instead of removing it from the DOM.
-    ".island[data-panel] .msg { display: none; }",
+    // conversation (and the live tool rows) while it is open instead of
+    // removing anything from the DOM.
+    ".island[data-panel] .msg, .island[data-panel] .turn-tools { display: none; }",
     ".task-row {",
     "  border: 1px solid var(--line); border-radius: 11px; padding: 8px 10px;",
     "  background: #0c0c13;",
@@ -635,7 +1102,17 @@ function toggleTaskPanel() {
 // touching the approved UI: window focus, DOM focus, whether keydown/pointer
 // events arrive at all, and whether page timers are actually running.
 const diag = { keys: 0, pointers: 0, lastKey: "", lastPointer: "" };
+// One report per burst, not one per event. A keystroke used to run every
+// layout read below, serialize the whole object across the WebView2 channel,
+// and (host-side) open+wrote+closed the log file — per key. That was the
+// typing lag. The counters keep incrementing, so a throttled report still
+// proves input arrives; only the per-event cost is gone.
+const _diagLastAt = {};
 function reportDiag(what) {
+  const now = Date.now();
+  const minGap = what === "keydown" ? 900 : what === "pointerdown" ? 400 : 0;
+  if (minGap && now - (_diagLastAt[what] || 0) < minGap) return;
+  _diagLastAt[what] = now;
   const el = document.activeElement;
   const q = document.getElementById("q");
   const hintEl = document.getElementById("hint");
@@ -780,18 +1257,22 @@ function onHostMessage(e) {
     requestAnimationFrame(() => {
       island.classList.remove("is-entering");
       // An approval that was hidden by the hotkey is still pending: show it
-      // again rather than a bare idle pill.
+      // again rather than a bare idle pill. Same for a turn that is still
+      // running on any surface — idle above live work reads as "done".
       if (pending.size && state() === "idle") notch.setState("alert");
+      else if (turnLive() && state() === "idle") notch.setState("work");
       reportRect();
     });
     return;
   }
   if (d && d.type === "outside-click") {
     // The host saw a click land outside the island while a card was open.
-    // Mirror the widget's own Esc handling: gate -> alert, prompt -> alert/idle.
+    // Mirror the widget's own Esc handling: gate -> alert, prompt -> alert /
+    // work while a turn is still running (the empty idle dot used to flash
+    // for a beat before the next tool_start pulled the work pill back).
     const s = state();
     if (s === "gate") notch.setState("alert");
-    else if (s === "prompt") notch.setState(pending.size ? "alert" : "idle");
+    else if (s === "prompt") notch.setState(pending.size ? "alert" : (turnLive() ? "work" : "idle"));
   }
 }
 if (window.chrome && window.chrome.webview && window.chrome.webview.addEventListener) {
@@ -850,10 +1331,11 @@ async function expandThread() {
       ? await getJson(`/api/chats/${encodeURIComponent(notchChatId)}`) : null;
     const msgs = (chat && Array.isArray(chat.messages)) ? chat.messages : [];
     const past = msgs.filter(m => (m.role === "user" || m.role === "assistant") && !m._internal);
-    // The live pair is already on screen. While this turn streams, the reply
-    // is not persisted yet — only the trailing user is ours; once it ended,
-    // the trailing assistant is ours too.
-    const tail = streaming ? 1 : 2;
+    // The live pair is already on screen. While any turn streams (this
+    // surface's POST, or a mirrored foreign turn), the reply is not persisted
+    // yet — only the trailing user is ours; once it ended, the trailing
+    // assistant is ours too.
+    const tail = turnLive() ? 1 : 2;
     const archive = past.slice(0, Math.max(0, past.length - tail)).slice(-80);
     if (archive.length) {
       const frag = document.createDocumentFragment();
@@ -1096,9 +1578,84 @@ function stripCascade(s) {
     .replace(/\\u003c/g, "<");
 }
 
+// The widget appends plain text spans; model output is markdown, so render
+// the accumulated reply ourselves and keep the fade on the newest words.
+// Shared by the notch's own POST stream and the SSE mirror of a turn another
+// surface started — one paint path for both.
+function renderReply() {
+  const el = document.getElementById("agentMsg");
+  if (!el || !notchMarkdown) return;
+  el.innerHTML = notchMarkdown.render(replyRaw);
+  wrapNewWords(el);
+  const thread = document.getElementById("thread");
+  if (thread) thread.scrollTop = 1e9;
+}
+
+// Fade ONLY the text that appeared since the previous paint. The old code
+// re-wrapped the last few words on every 45ms flush, and replacing those
+// nodes restarted their CSS animation from opacity 0 each time — the visible
+// streaming flicker. `fadedChars` is a plain-text cursor: text before it was
+// already animated (and now renders at full opacity), text after it gets the
+// one-shot fade. Code blocks are never wrapped.
+function wrapNewWords(el) {
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) => (node.parentElement && node.parentElement.closest("pre"))
+      ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+  });
+  const nodes = [];
+  let total = 0;
+  while (walker.nextNode()) {
+    nodes.push(walker.currentNode);
+    total += walker.currentNode.nodeValue.length;
+  }
+  if (total <= fadedChars) { fadedChars = total; return; }
+  let acc = 0;
+  for (const node of nodes) {
+    const len = node.nodeValue.length;
+    if (acc + len <= fadedChars) { acc += len; continue; }
+    const off = Math.max(0, fadedChars - acc);
+    const tail = node.nodeValue.slice(off);
+    if (tail) {
+      const span = document.createElement("span");
+      span.className = "w";
+      span.textContent = tail;
+      if (off > 0) {
+        node.nodeValue = node.nodeValue.slice(0, off);
+        node.parentNode.insertBefore(span, node.nextSibling);
+      } else {
+        node.parentNode.replaceChild(span, node);
+      }
+    }
+    acc += len;
+  }
+  fadedChars = total;
+}
+
+function ingestWords(text) {
+  const clean = stripCascade(stripThink(text));
+  if (!clean) return;
+  wordBuf += clean;
+  const now = performance.now();
+  // Paint on a cadence, never mid-buffer: the whole pending tail moves into
+  // the reply at once. Flushing PARTIAL buffers glued words together — token
+  // deltas arrive word-split ("C" |"leaning…"), so a space-boundary flush
+  // would hold "C" and glue it onto the next delta as "CCleaning". 45ms ≈ two
+  // frames: the reply reads as live typing, not as one late block.
+  if (now - lastFlush > 45) {
+    replyRaw += wordBuf;
+    wordBuf = "";
+    lastFlush = now;
+    markRowsDone();            // the model is answering: no tool is running
+    renderReply();
+    // words are coming out: the orb switches to the composing pose
+    setActivity("composing");
+  }
+}
+
 async function runTurn(prompt) {
   if (streaming) return;
   streaming = true;
+  island.setAttribute("data-turn", "live");
   // The approved-task panel shares the thread with the conversation, so the
   // prompt the owner just typed has to come back into view before the reply
   // lands in it.
@@ -1107,9 +1664,10 @@ async function runTurn(prompt) {
   // the pill must say so the moment the owner hits Enter, and it must still do
   // so if the event stream is down.
   setActivity("thinking");
-  const stripThink = makeThinkStripper();
   const turnStartedAt = Date.now();
-  let wordBuf = "", replyOpen = false, lastFlush = 0, replyRaw = "";
+  wordBuf = ""; replyRaw = ""; fadedChars = 0; lastFlush = 0; replyOpen = false;
+  handledCalls.clear();
+  clearTurnRows();
   let replyIsSugTail = false;   // the turn's only output was a cascade block
   const openReply = () => {
     if (!replyOpen) {
@@ -1126,30 +1684,8 @@ async function runTurn(prompt) {
 
   // The widget appends plain text spans; model output is markdown, so render
   // the accumulated reply ourselves and keep the fade on the newest words.
-  const renderReply = () => {
-    const el = document.getElementById("agentMsg");
-    if (!el || !notchMarkdown) return;
-    const html = notchMarkdown.render(replyRaw);
-    el.innerHTML = html;
-    // Animate only the tail so earlier words don't re-fade on every chunk.
-    const blocks = el.children;
-    const last = blocks && blocks.length ? blocks[blocks.length - 1] : null;
-    if (last && last.tagName !== "PRE" && last.childNodes.length) {
-      const tail = last.childNodes[last.childNodes.length - 1];
-      const m = tail && tail.nodeType === 3
-        ? tail.nodeValue.match(/(\s*\S+(?:\s+\S+){0,4})\s*$/)
-        : null;
-      if (m) {
-        const span = document.createElement("span");
-        span.className = "w";
-        span.textContent = m[1];
-        tail.nodeValue = tail.nodeValue.slice(0, tail.nodeValue.length - m[1].length);
-        last.appendChild(span);
-      }
-    }
-    const thread = document.getElementById("thread");
-    if (thread) thread.scrollTop = 1e9;
-  };
+  // renderReply()/ingestWords() live at module scope so the SSE mirror of a
+  // turn started on another surface paints through the exact same pipeline.
 
   // Echo the prompt and open the card before anything streams back. Waiting
   // for the first content delta left the thinking/tool phase invisible — a
@@ -1158,24 +1694,8 @@ async function runTurn(prompt) {
   openReply();
 
   const pushWords = (text) => {
-    const clean = stripCascade(stripThink(text));
-    if (!clean) return;
-    wordBuf += clean;
-    const now = performance.now();
-    // Whole words or small groups, never single characters.
-    if (now - lastFlush > 90 || wordBuf.length > 160) {
-      const m = wordBuf.match(/[\s\S]*\s/);
-      if (m && m[0]) {
-        openReply();
-        replyRaw += m[0];
-        notch.appendReply(m[0]);   // keeps the widget's own bookkeeping
-        renderReply();
-        wordBuf = wordBuf.slice(m[0].length);
-        lastFlush = now;
-        // words are coming out: the orb switches to the composing pose
-        setActivity("composing");
-      }
-    }
+    openReply();
+    ingestWords(text);
   };
   // Nothing readable came out of this turn. That is NOT a successful turn: the
 // island used to collapse straight back to the idle dot, which is
@@ -1212,24 +1732,50 @@ async function runTurn(prompt) {
       // A failed turn must surface even if the owner folded the island away:
       // the reply card only shows when the island opens, so the notification
       // is what tells an away-owner the request did not go through.
-      if (cardIsError) notify("error");
+      if (cardIsError) {
+        notify("error");
+        // The error text lives INSIDE the reply card. If the owner is staring
+        // at the pill (or the pill was auto-revealed by the notify above),
+        // they watched a stuck "thinking" state with the reason hidden —
+        // "then nothing". Open the card so the failure is READ, not felt.
+        if (state() !== "prompt") notch.setState("prompt");
+      } else if (replyRaw.trim()) {
+        // Asked here, answered here: a successful notch-sent turn pops the
+        // reply card open even if the owner folded it to the pill mid-run.
+        // Gates/alert/off own the screen and are left alone.
+        const s = state();
+        if (s === "idle" || s === "work" || s === "ready") notch.setState("prompt");
+      }
       notch.endReply();
     }
     streaming = false;
+    handledCalls.clear();
+    updateComposerAction();          // live just ended: stop -> send
+    if (!mirror.active) island.removeAttribute("data-turn");
+    // A turn that ENDED (ok or error) must never leave the work pill frozen:
+    // the error path in particular carries no chat_end at all.
+    if (state() === "work" && !turnLive()) notch.setState("idle");
   };
   try {
     const resp = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Accuretta-Token": TOKEN },
-      body: JSON.stringify({ chat_id: notchChatId || undefined, message: prompt, mode: "agent" }),
+      body: JSON.stringify({ chat_id: notchChatId || undefined, message: prompt, mode: "agent", surface: "notch" }),
     });
     if (!resp.ok || !resp.body) {
       let msg = `request failed (${resp.status})`;
       try { const j = await resp.json(); if (j && j.error) msg = String(j.error); } catch (e) {}
       openReply();
-      notch.appendReply(msg);
+      replyRaw += msg;
+      renderReply();
       notch.endReply();
+      // Same visibility rule as the stream-failure path: the owner must READ
+      // why the turn died, with the card open, never a frozen thinking pill.
+      if (state() !== "prompt") notch.setState("prompt");
       streaming = false;
+      handledCalls.clear();
+      updateComposerAction();        // live just ended: stop -> send
+      if (!mirror.active) island.removeAttribute("data-turn");
       return;
     }
     const reader = resp.body.getReader();
@@ -1250,7 +1796,10 @@ async function runTurn(prompt) {
           notchChatId = evt.chat_id;
           try { localStorage.setItem("accuretta.notch.chat", notchChatId); } catch (e) {}
         }
+        if (evt.chat_id && !turnChatId) turnChatId = String(evt.chat_id);
         if (evt.type === "delta" && evt.content) pushWords(String(evt.content));
+        else if (evt.type === "tool_start" && evt.name) onToolStart(evt);
+        else if (evt.type === "steering_applied" || evt.type === "steering_deferred") onSteeringEvent(evt);
         else if (evt.type === "error" && evt.error) { pushWords("\n\n" + String(evt.error)); }
         else if (evt.type === "final" && evt.message) {
           // The authoritative answer. A turn can end with the reply only here:
@@ -1274,6 +1823,7 @@ async function runTurn(prompt) {
             // The final supersedes the tail still sitting in the flush
             // buffer; leaving it there made finish() append it twice.
             wordBuf = "";
+            markRowsDone();   // no tool is running under a finished answer
           } else {
             // Nothing survived the strippers, but the bridge still sent this
             // message as the turn's answer — that combination means the model
@@ -1302,7 +1852,11 @@ async function runTurn(prompt) {
         + "Nothing was changed. Try again.");
     } catch (_) {
       try { openReply(); notch.appendReply("connection to the bridge dropped"); notch.endReply(); } catch (_) {}
+      try { if (state() !== "prompt") notch.setState("prompt"); } catch (_) {}
       streaming = false;
+      handledCalls.clear();
+      updateComposerAction();        // live just ended: stop -> send
+      if (!mirror.active) island.removeAttribute("data-turn");
     }
   }
 }
@@ -1422,9 +1976,20 @@ function connectEvents() {
   sse.onmessage = (e) => {
     let evt;
     try { evt = JSON.parse(e.data); } catch (_) { return; }
+    const cid = String(evt.chat_id || "");
     switch (evt.type) {
-      case "chat_start":
+      case "chat_start": {
+        // Our own POST stream already owns its turn (openReply ran before the
+        // fetch resolved); the SSE copy must not reset the card mid-stream.
+        if (streaming) break;
         if (evt.chat_id) activeChatId = evt.chat_id;
+        turnChatId = cid;
+        mirror.active = true;
+        mirror.prompt = "";
+        handledCalls.clear();
+        clearTurnRows();
+        closeTaskPanel();
+        island.setAttribute("data-turn", "live");
         // Do not yank this surface off the streaming conversation: when the
         // notch itself started the turn and the owner is looking at the card,
         // the prompt + live status are already on screen. Other surfaces'
@@ -1432,14 +1997,29 @@ function connectEvents() {
         if (!(streaming && state() === "prompt") &&
             state() !== "gate" && state() !== "alert") notch.setState("work");
         setActivity("thinking");
+        // The card may still show the PREVIOUS turn's reply; a fresh mirror
+        // starts empty and seeds the prompt from the persisted chat.
+        const um = document.getElementById("userMsg");
+        if (um) um.textContent = "";
+        const am = document.getElementById("agentMsg");
+        if (am) am.textContent = "";
+        replyOpen = false; replyRaw = ""; fadedChars = 0; wordBuf = ""; lastFlush = 0;
+        stripThink = makeThinkStripper();
+        seedMirrorPrompt(cid);
+        updateLiveStatus();
         break;
+      }
       case "tool_start":
-        if (state() !== "gate" && state() !== "alert") {
-          // Same rule as chat_start: never yank the owner off the streaming
-          // conversation card. The tool line is already mirrored below the
-          // thread by updateLiveStatus().
-          if (!(streaming && state() === "prompt") && state() !== "work") notch.setState("work");
-          setToolLine(evt.name, evt.arguments);
+        onToolStart(evt);
+        break;
+      case "delta":
+        // Our own POST reader paints its own deltas; the SSE copy would
+        // double-render. Mirror only a turn this surface did not start.
+        if (streaming) break;
+        if (mirror.active && evt.content &&
+            (!cid || !turnChatId || cid === turnChatId)) {
+          ingestWords(String(evt.content));
+          updateLiveStatus();
         }
         break;
       case "ctx_fill":
@@ -1471,13 +2051,43 @@ case "approval:decided": {
       case "models:update":
         refreshModels();
         break;
-      case "chat_end":
+      case "steering_applied":
+      case "steering_deferred":
+        // Delivery receipt for a steer this notch sent (applied at the next
+        // safe boundary, or dropped because the turn ended first).
+        onSteeringEvent(evt);
+        break;
+      case "chat_end": {
+        // Scope the ending to the chat the notch is actually mirroring. Two
+        // things used to collapse the island to the idle dot MID-TASK: a
+        // chat_end from another surface's chat, and a reconnect replaying an
+        // older turn's chat_end (Last-Event-ID). Both read as "the agent is
+        // done" while it was not — the idle flash that snapped back to work
+        // on the next tool_start.
+        if (streaming) break;
+        if (cid && turnChatId && cid !== turnChatId) break;
         notch.setStats(); // hide t/s
+        mirror.active = false;
+        turnChatId = "";
+        markRowsDone();
+        island.removeAttribute("data-turn");
+        island.removeAttribute("data-busy");
         setActivity("idle");
+        // A finished mirrored turn whose owner is NOT at the main app pops the
+        // reply out here — asking from the phone or leaving the app minimized
+        // otherwise means the answer lands unseen. Focused app => stay quiet
+        // (the main window already showed the turn live).
+        const shouldPop = !evt.web_focused && !!replyRaw.trim() &&
+          state() !== "gate" && state() !== "alert" && state() !== "off";
         // Never yank the card away from a turn this surface is streaming —
         // the SSE copy can arrive before we have read our own response.
-        if (state() === "work" && !streaming) notch.setState("idle");
+        if (state() === "work") notch.setState(shouldPop ? "prompt" : "idle");
+        else if (shouldPop && (state() === "idle" || state() === "ready")) notch.setState("prompt");
+        // A mirrored turn that did real work gets the same send-off the
+        // notch's own turns get.
+        if (state() === "prompt" && turnToolRows.length) showOpenMain();
         break;
+      }
       case "error":
         if (evt.error) notify("error");
         break;
@@ -1507,7 +2117,8 @@ island.addEventListener("notch", (e) => {
       break;
     }
     case "send":
-      if (d.prompt) runTurn(String(d.prompt));
+      // Live turn anywhere => steer; idle => new turn. See sendPrompt.
+      if (d.prompt) sendPrompt(String(d.prompt));
       break;
     case "model":
       if (d.model) onModelPicked(String(d.model));

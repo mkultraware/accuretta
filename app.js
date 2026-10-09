@@ -3318,6 +3318,19 @@
     loadClientContext().catch(() => {});
     setTimeout(() => checkModelAdvisor({ notify: true }).catch(() => {}), 1200);
 
+    // Belt-and-braces chat sync: an SSE reconnect or a missed chat_start once
+    // left notch-born sessions invisible until reload. Any focus/visibility
+    // return refreshes the rail; the 10s poll cannot fire while backgrounded.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && !state.streaming) {
+        loadChats().then(renderChatList).catch(() => {});
+      }
+    });
+    window.addEventListener("focus", () => {
+      if (!state.streaming) loadChats().then(renderChatList).catch(() => {});
+      openRequestedChat();
+    });
+
     // Background self-correct: re-tune for the currently loaded model on every
     // boot so saved settings from old/buggy autotune runs heal themselves.
     // Grow-only is enforced server-side via min_ctx — never shrinks ctx behind
@@ -3395,21 +3408,33 @@
       }
     }
   }
-  async function saveSettings(update) {
-    const prevModel = state.settings.model;
-    const saved = await api("/api/settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(update),
-    });
-    if (!saved || saved.error) throw new Error(saved?.error || "Settings could not be saved");
-    state.settings = saved;
-    // model changed mid-stream → abort so next send uses fresh model cleanly
-    if (update.model && update.model !== prevModel && state.streaming) {
-      stopStreaming();
-    }
-    renderStatus();
-    renderModelPill();
+  // Every settings write runs through ONE chain. The toggle switches
+  // auto-save on click, so two quick toggles used to fire two concurrent
+  // POSTs whose responses could land out of order — a stale response then
+  // overwrote state.settings (and a form re-population persisted the stale
+  // value back). Serializing also keeps the bridge's read-modify-write from
+  // interleaving. Callers still await the returned promise as before.
+  let settingsSaveChain = Promise.resolve();
+  function saveSettings(update) {
+    const run = async () => {
+      const prevModel = state.settings.model;
+      const saved = await api("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(update),
+      });
+      if (!saved || saved.error) throw new Error(saved?.error || "Settings could not be saved");
+      state.settings = saved;
+      // model changed mid-stream → abort so next send uses fresh model cleanly
+      if (update.model && update.model !== prevModel && state.streaming) {
+        stopStreaming();
+      }
+      renderStatus();
+      renderModelPill();
+      return saved;
+    };
+    settingsSaveChain = settingsSaveChain.catch(() => {}).then(run);
+    return settingsSaveChain;
   }
 
   let preferenceSaveChain = Promise.resolve();
@@ -3585,6 +3610,26 @@
     branchName.textContent = branchValue;
   }
 
+  // A pending "open this session" request from the notch's Open-in-main-app
+  // button. Applied here (and retried on window focus) so the raise that the
+  // overlay host performs lands on the requested conversation.
+  function openRequestedChat() {
+    const cid = state._pendingOpenChat;
+    if (!cid) return;
+    if (state.chats?.chats?.[cid]) {
+      state._pendingOpenChat = "";
+      selectChat(cid);
+      return;
+    }
+    loadChats().then(() => {
+      renderChatList();
+      if (state._pendingOpenChat === cid && state.chats?.chats?.[cid]) {
+        state._pendingOpenChat = "";
+        selectChat(cid);
+      }
+    }).catch(() => {});
+  }
+
   async function selectChat(id) {
     document.querySelector('#revealer-deck .research-rail')?.remove();
     if (state.chatId) localStorage.setItem("accuretta:draft:" + state.chatId, $("#composer-input").value);
@@ -3735,7 +3780,14 @@
       state.mobileTab = "chat";
       applyMobileTab();
     } else if (isCompactViewport()) {
-      app.classList.add("sidebar-collapsed");
+      // A session born in the notch (bridged takeover) must surface its rail:
+      // the owner left the notch to read here, and a sidebar auto-collapsed
+      // exactly then reads as "the conversation is nowhere in the app".
+      if (chat.origin === "island") {
+        app.classList.remove("sidebar-collapsed");
+      } else {
+        app.classList.add("sidebar-collapsed");
+      }
     }
     // SSE carries live context updates. Fetch once on selection, then use a
     // slow visible/streaming-only fallback in case the event stream reconnects.
@@ -11586,6 +11638,168 @@
     });
   }
 
+  // ---------- foreign live turn ----------
+  // A turn can run on another surface while this window is open (the notch
+  // overlay's composer). The bridge persists its user message and broadcasts
+  // chat_start / tool_start / deltas / final / chat_end on /api/events, but
+  // this window only ever rendered turns IT posted — the open session showed
+  // nothing until a reload, so a notch prompt read as sent to the void.
+  // Mirroring feeds those events through the exact same render pipeline as an
+  // own turn (handleEvent into a live agent row), for the session on screen;
+  // turns in other sessions are surfaced by the rail refresh that accompanies
+  // chat_start.
+  const FOREIGN_EVENT_TYPES = new Set([
+    "steering_applied", "steering_deferred", "delta", "thinking_start",
+    "thinking_delta", "thinking_end", "command_requested", "command_spawned",
+    "command_finished", "command_not_executed", "tool_start", "tool_stream",
+    "heartbeat", "tool_result", "tool_dialect_warning", "tools_unavailable",
+    "context_trimmed", "version_saved", "savings", "stats", "final",
+    "research_update", "notice", "breach", "rt_phase", "rt_mission",
+    "turn_changes", "plan", "chat:note", "error",
+  ]);
+  // Events that can only occur while a turn is actually running. A window that
+  // booted (or reconnected) mid-turn has no chat_start left to catch, so the
+  // first of these attaches the mirror; chat_end still ends it normally. Kept
+  // tighter than FOREIGN_EVENT_TYPES — final/error/savings, version_saved and
+  // replayed post-turn events must never open a live row for a finished turn.
+  const LIVE_FOREIGN_EVENT_TYPES = new Set([
+    "delta", "thinking_start", "thinking_delta", "steering_applied",
+    "tool_start", "tool_stream", "command_requested", "command_spawned",
+    "heartbeat",
+  ]);
+  let foreignTurn = null;   // { chatId, row, ctx, userMsg } while mirroring
+  let foreignStarting = false;
+
+  function maybeAttachForeignTurn(evt) {
+    if (foreignTurn || !evt.chat_id) return;
+    if (!LIVE_FOREIGN_EVENT_TYPES.has(evt.type)) return;
+    beginForeignTurn(evt.chat_id);
+  }
+
+  function beginForeignTurn(cid) {
+    const id = String(cid || "");
+    if (!id || state.streaming || foreignTurn || foreignStarting) return;
+    if (id !== String(state.chatId || "")) return;   // only the session on screen
+    foreignStarting = true;
+    try {
+      const agentRow = document.createElement("div");
+      agentRow.className = "bubble-row";
+      agentRow.innerHTML = `
+        ${AGENT_AVATAR_HTML}
+        <div class="bubble-col">
+          <div class="think-container think-line">
+            <div class="think-header" style="cursor: pointer;">
+              <i class="ph ph-caret-right think-caret"></i>
+              <i class="ph ph-brain think-check-icon"></i>
+              <span class="think-title shimmer">Thinking…</span>
+            </div>
+            <div class="think-content hidden"></div>
+          </div>
+          <div class="tool-stack" id="tool-stack"></div>
+          <div class="bubble agent hidden" id="stream-bubble"></div>
+          <div class="bubble-meta streaming">streaming<span class="typing"><span></span><span></span><span></span></span></div>
+        </div>`;
+      const welcome = document.querySelector("#chat-inner .welcome-screen");
+      if (welcome) $("#chat-inner").innerHTML = "";
+      $("#chat-inner").appendChild(agentRow);
+      window.AccurettaOrb?.setState(agentRow, "thinking");
+      scrollToBottom(true);
+      const ctx = {
+        bubble: agentRow.querySelector("#stream-bubble"),
+        toolStack: agentRow.querySelector("#tool-stack"),
+        toolCards: new Map(),
+        row: agentRow,
+        buf: "",
+        getBuf() { return ctx.buf; },
+        setBuf(v) { ctx.buf = v; },
+      };
+      foreignTurn = { chatId: id, row: agentRow, ctx, userMsg: null };
+      state.liveTurn = { chatId: id, row: agentRow, userMsg: null };
+      // Same bookkeeping as an own turn: the composer offers a correction,
+      // Stop cancels the notch's turn server-side, and a send is queued.
+      state.streaming = true;
+      state.abortCtl = new AbortController();
+      setStreamingUI(true);
+      appendAgentLog("Turn started in the notch — mirroring it here.");
+    } finally {
+      foreignStarting = false;
+    }
+    // The bridge saves the user turn BEFORE chat_start broadcasts, so the
+    // prompt can be fetched and echoed above the live row like a local send.
+    // Failure is non-fatal: the reply/error still lands via the events.
+    api(`/api/chats/${encodeURIComponent(id)}`).then(chat => {
+      if (!foreignTurn || foreignTurn.chatId !== id) return;
+      const msgs = Array.isArray(chat?.messages) ? chat.messages : [];
+      const u = [...msgs].reverse().find(m => m && m.role === "user" && !m._internal && !m.invisible);
+      if (!u) return;
+      if (state.messages.some(m => m.role === "user" && m.content === u.content && m.t === u.t)) return;
+      foreignTurn.userMsg = u;
+      if (state.liveTurn && state.liveTurn.chatId === id) state.liveTurn.userMsg = u;
+      if (state.chatId !== id) return;               // user switched away mid-fetch
+      state.messages.push(u);
+      if (foreignTurn.row.parentNode) foreignTurn.row.parentNode.insertBefore(renderBubble(u), foreignTurn.row);
+      scrollToBottom(true);
+    }).catch(() => {});
+  }
+
+  function handleForeignEvent(evt) {
+    if (!foreignTurn || String(evt.chat_id || "") !== foreignTurn.chatId) return false;
+    if (!FOREIGN_EVENT_TYPES.has(evt.type)) return false;
+    try { handleEvent(evt, foreignTurn.ctx); }
+    catch (err) { console.error("mirror event failed on", evt.type, err); }
+    return true;
+  }
+
+  function finishForeignTurn() {
+    const ft = foreignTurn;
+    if (!ft) return;
+    foreignTurn = null;
+    const row = ft.row;
+    if (row) {
+      try {
+        updateThinkLine(row, false);
+        const meta = row.querySelector(".bubble-meta");
+        if (meta) {
+          meta.classList.remove("streaming");
+          meta.querySelectorAll(".typing").forEach(d => d.remove());
+        }
+        finalizeToolGroup(row);
+        collapseWorkBlock(row);
+        osintCardFinalize(row);
+        secretRailFinalize(row);
+        attackRailFinalize(row);
+        const revealerDeck = document.querySelector("#revealer-deck");
+        if (revealerDeck) delete revealerDeck.dataset.rtEngagement;
+        renderTaskHandoff(row, ft.chatId);
+      } catch (err) { console.warn("mirror finalize failed", err); }
+    }
+    state.streaming = false;
+    state.abortCtl = null;
+    if (state.liveTurn && state.liveTurn.chatId === ft.chatId) state.liveTurn = null;
+    setStreamingUI(false, row?._notificationFailed ? "failed" : row?._notificationCancelled ? "stopped" : "completed");
+    loadChats().then(renderChatList).catch(() => {});
+    scheduleMessageQueueDrain(state.chatId);
+    // A turn that ended before its prompt was fetched (or whose row a re-render
+    // detached) would leave history with no answer on screen. The bridge
+    // persists the whole turn before chat_end, so rebuild from storage.
+    if (state.chatId === ft.chatId && (!ft.userMsg || (row && !row.isConnected))) {
+      rebuildActiveChat(ft.chatId);
+    }
+  }
+
+  async function rebuildActiveChat(chatId) {
+    try {
+      const c = await api(`/api/chats/${encodeURIComponent(chatId)}`);
+      if (state.chatId !== chatId) return;
+      state.chats.chats[chatId] = c;
+      state.messages = (c.messages || []).filter(
+        m => (m.role === "user" || m.role === "assistant"
+              || (m.role === "system" && m._note)) && !m._internal
+      );
+      renderMessages();
+    } catch (err) { console.warn("chat rebuild failed", err); }
+  }
+
   // ---------- SSE ----------
   // Tracks the bridge's monotonic event-id snapshot across reconnects.
   // When `hello` arrives with a snapshot_id LOWER than the last one we
@@ -11602,6 +11816,18 @@
       _lastSseEventAt = Date.now();
       let evt;
       try { evt = JSON.parse(e.data); } catch { return; }
+      // A mirrored foreign turn owns these events: paint them into its live
+      // row exactly like a locally-sent turn. chat_end is its finish line (the
+      // bridge persists the whole turn before broadcasting it).
+      if (evt.type === "chat_end") {
+        if (foreignTurn && String(evt.chat_id || "") === foreignTurn.chatId) {
+          finishForeignTurn();
+          return;
+        }
+      } else {
+        maybeAttachForeignTurn(evt);
+        if (handleForeignEvent(evt)) return;
+      }
       if (evt.type === "approval:new") {
         state.approvals.set(evt.approval.id, evt.approval);
         reflectApprovalInLiveTurn(evt.approval, "pending");
@@ -11638,15 +11864,22 @@
           c.title = evt.title;
           renderChatList();
         }
+      } else if (evt.type === "ui:open-chat") {
+        // The notch's "Open in main app" raised this window and asked for a
+        // session. A backgrounded WebView can throttle this delivery, so the
+        // request is remembered and retried on the focus that raise causes.
+        if (!evt.chat_id) return;
+        state._pendingOpenChat = evt.chat_id;
+        openRequestedChat();
       } else if (evt.type === "chat_start") {
-        // A chat started on another surface (the notch). The bridge persists
-        // the chat — title included — before this event broadcasts, so a
-        // reload here sees it fully. Only refresh when it is genuinely
-        // unknown: main-app turns re-firing this every round would rebuild
-        // the sidebar mid-stream for nothing.
-        const cid = evt.chat_id;
-        const known = !cid || state.chats?.chats?.[cid] || state.chats?.order?.includes(cid);
-        if (!known) loadChats().then(renderChatList).catch(() => {});
+        // A turn began on another surface (the notch) — either a session this
+        // app has never seen or one it knows. The bridge persists the chat —
+        // title included — before this event broadcasts, so refreshing the
+        // rail makes a new island-born session appear at once and flips a
+        // known one to WORKING without waiting for the 10s poll. Then mirror
+        // the turn into the session if it is the one on screen.
+        loadChats().then(renderChatList).catch(() => {});
+        beginForeignTurn(evt.chat_id);
       } else if (evt.type === "ctx_fill") {
         // Per-round assembled-prompt size, pushed BEFORE the round streams.
         // The 2s poll only reports the last completed round, so without this
@@ -17317,10 +17550,28 @@
     }));
 
     // responsive
+    // Drag-resizing the OS window fires this per frame. Restructuring the
+    // toolbar and re-compositing ~80 backdrop-blur layers each tick is what
+    // made the native resize feel stuttery, so: mark the drag (CSS drops the
+    // blurs while it lasts), and only touch the mobile layout when the
+    // breakpoint actually changed.
+    let _resizeSettleTimer = 0;
     window.addEventListener("resize", () => {
-      document.body.classList.toggle("is-mobile", isMobile());
+      const body = document.body;
+      if (!body.classList.contains("is-resizing")) body.classList.add("is-resizing");
+      clearTimeout(_resizeSettleTimer);
+      _resizeSettleTimer = setTimeout(() => body.classList.remove("is-resizing"), 180);
+    }, { passive: true });
+
+    let _lastMobileLayout = isMobile();
+    window.addEventListener("resize", () => {
+      const mobile = isMobile();
+      if (mobile !== _lastMobileLayout) {
+        _lastMobileLayout = mobile;
+        document.body.classList.toggle("is-mobile", mobile);
+        applyMobileToolbarLayout();
+      }
       syncCompactShell();
-      applyMobileToolbarLayout();
     });
 
     // ----- mobile swipe-left from sidebar back to chat -----

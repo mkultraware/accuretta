@@ -117,7 +117,15 @@
     if (welcome) mount(welcome);
   }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
-  window.addEventListener("resize", () => { if (canvas?.isConnected) { fit(); paint(performance.now()); } });
+  // Re-fit only when the drag settles: resizing the backing store is a full
+  // canvas reallocation, and doing it on every resize event made the window
+  // drag stutter. The stretched frame during the drag is imperceptible.
+  let resizeTimer = 0;
+  window.addEventListener("resize", () => {
+    if (!canvas?.isConnected) return;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => { fit(); paint(performance.now()); }, 120);
+  });
   document.addEventListener("visibilitychange", wake);
   motion.addEventListener?.("change", () => {
     if (canvas?.isConnected && motion.matches) paint(performance.now());

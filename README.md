@@ -145,7 +145,7 @@ A separate small window lives under the top edge of the screen. It shows what th
 
 Approval gates in the notch show the command and, for file writes and edits, the line-level change the bridge attached. Writing while a task runs works the same way it does in the main window: the correction reaches the active run at its next safe stopping point. After a turn that touched the machine, an **Open in main app** button opens the main window on that session.
 
-A chat started in the notch is an ordinary session. It appears in the main window's sidebar as soon as it exists, and both surfaces read and write the same history. Double-clicking the empty space in the notch's conversation pulls that full history into the island; double-click again to fold back to the latest turn.
+A chat started in the notch is an ordinary session. It appears in the main window's sidebar as soon as it exists, and both surfaces read and write the same history. Double-clicking the empty space in the notch's conversation pulls that full history into the island; double-click again to fold back to the latest turn. When a turn finishes while the main window isn't focused — or whenever the prompt was sent from the island — the reply pops the island's conversation open so the answer is read where the question was asked.
 
 ## Remote work over Tailscale
 

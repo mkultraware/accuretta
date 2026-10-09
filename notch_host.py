@@ -81,6 +81,8 @@ VK_MENU = 0x12             # Alt
 VK_CONTROL = 0x11
 SW_HIDE = 0
 SW_SHOWNA = 8
+SW_RESTORE = 9
+MAIN_WINDOW_TITLE = "Accuretta"   # pywebview window created in accuretta_app.py
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
 
 # ---- window messages --------------------------------------------------------
@@ -165,15 +167,107 @@ user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintyp
 user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 kernel32.GetCurrentThreadId.argtypes = []
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+user32.FindWindowW.restype = wintypes.HWND
+user32.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
+user32.EnumWindows.restype = wintypes.BOOL
+user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindowTextW.restype = ctypes.c_int
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.IsIconic.restype = wintypes.BOOL
+user32.BringWindowToTop.argtypes = [wintypes.HWND]
+user32.BringWindowToTop.restype = wintypes.BOOL
+
+
+_ENUM_PROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+
+def _find_main_window() -> int:
+    """The desktop app's REAL pywebview window titled 'Accuretta', or 0 when it
+    isn't running (headless bridge / browser-only mode).
+
+    FindWindowW alone is not safe here: Windows 11's shell creates a
+    `Windows.Internal.Shell.TabProxyWindow` carrying the SAME title for the
+    taskbar/Alt-Tab, and FindWindow returns that ghost first — raising it does
+    nothing, so "Open in main app" silently went nowhere. Enumerate top-level
+    windows, skip shell proxies, and take the first real match in Z-order."""
+    found: list[int] = []
+
+    def _visit(hwnd, _lparam):
+        try:
+            title = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, title, 256)
+            if title.value != MAIN_WINDOW_TITLE:
+                return True
+            cls = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, cls, 256)
+            if cls.value.startswith("Windows.Internal.Shell"):
+                return True              # tab/Alt-Tab proxy, not the app
+            found.append(int(hwnd))
+            return False                 # first real match wins
+        except Exception:
+            return True
+
+    try:
+        user32.EnumWindows(_ENUM_PROC(_visit), 0)
+    except Exception:
+        return 0
+    return found[0] if found else 0
+
+
+def _raise_main_window() -> bool:
+    """Restore + foreground the desktop window. False when there is no such
+    window (caller then opens the URL in the default browser instead)."""
+    hwnd = _find_main_window()
+    if not hwnd:
+        return False
+    try:
+        # SW_RESTORE both un-minimizes and activates; harmless on a normal
+        # window, and it is what actually brings a minimized app back.
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        # SetForegroundWindow is ignored unless our thread owns the
+        # foreground; attach briefly to whoever does (same dance as activate).
+        fg = user32.GetForegroundWindow()
+        fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        cur_tid = kernel32.GetCurrentThreadId()
+        attached = False
+        if fg_tid and fg_tid != cur_tid:
+            attached = bool(user32.AttachThreadInput(cur_tid, fg_tid, True))
+        user32.BringWindowToTop(hwnd)
+        raised = user32.SetForegroundWindow(hwnd)
+        if attached:
+            user32.AttachThreadInput(cur_tid, fg_tid, False)
+        log(f"raised main window {hwnd} (SetForeground={bool(raised)} "
+            f"now_fg={user32.GetForegroundWindow() == hwnd} "
+            f"iconic={bool(user32.IsIconic(hwnd))})")
+        return True
+    except Exception as exc:
+        log(f"raise main window failed: {exc!r}")
+        return False
+
+
+_LOG_FH = None
 
 
 def log(msg: str) -> None:
+    # One persistent line-buffered handle: the open/write/close cycle ran on
+    # the window's UI thread for every page message (each keystroke's diag
+    # included), and the file churn was part of the typing lag.
+    global _LOG_FH
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_FILE.open("a", encoding="utf-8") as fh:
-            fh.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        if _LOG_FH is None or _LOG_FH.closed:
+            _LOG_FH = LOG_FILE.open("a", encoding="utf-8", buffering=1)
+        _LOG_FH.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
     except Exception:
-        pass
+        try:
+            if _LOG_FH is not None:
+                _LOG_FH.close()
+        except Exception:
+            pass
+        _LOG_FH = None
 
 
 def _webview2_lib_dir() -> Path:
@@ -834,14 +928,18 @@ class NotchHost:
         elif kind == "open-url":
             # "Open in main app" from the notch. Restricted to the bridge's
             # own origin: the page must never become a shell-open primitive
-            # for arbitrary URLs.
+            # for arbitrary URLs. The DESKTOP window is raised when it exists
+            # — the bridge broadcast from the page points it at the session.
+            # Only when no desktop window is running (headless bridge,
+            # browser-only mode) does this fall back to the default browser.
             url = str(msg.get("url") or "")
             if url.startswith(BASE + "/"):
-                try:
-                    os.startfile(url)          # default browser (Windows host)
-                    log(f"open in main app: {url}")
-                except Exception as exc:
-                    log(f"open-url failed: {exc}")
+                if not _raise_main_window():
+                    try:
+                        os.startfile(url)      # no desktop window: browser
+                        log(f"open in main app (browser fallback): {url}")
+                    except Exception as exc:
+                        log(f"open-url failed: {exc}")
             else:
                 log(f"open-url refused (not the bridge origin): {url[:120]}")
         elif kind == "diag":

@@ -616,6 +616,20 @@ def _normalize_chats_data(value: Any) -> dict:
 def _write_json_atomic_unlocked(path: Path, value: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Keep the LAST GOOD document when replacing a user-facing store: some
+    # component writes a stripped settings.json and the owner loses their
+    # model folder + context, with no way back but manual archaeology.
+    if path == SETTINGS_FILE:
+        try:
+            prev = path.with_suffix(path.suffix + ".prev")
+            if path.is_file() and path.stat().st_size > 0:
+                content = path.read_text(encoding="utf-8", errors="replace")
+                if content.strip() and content != json.dumps(value, ensure_ascii=False, indent=2):
+                    prev.write_text(content, encoding="utf-8")
+                else:
+                    pass
+        except Exception:
+            pass
     tmp.replace(path)
 
 
@@ -1587,7 +1601,8 @@ def _advisor_suggest_settings(settings: dict, observed: dict) -> dict:
             return {}
         current_ctx = max(8192, int(settings.get("num_ctx") or 8192))
         suggested = auto_tune(
-            model_path, vram, profile=inspect_model(model_path), min_ctx=current_ctx)
+            model_path, vram, profile=inspect_model(model_path), min_ctx=current_ctx,
+            proven_cfg=_proven_cfg(model_path))
         return {k: suggested[k] for k in _MODEL_ADVISOR_APPLY_KEYS if k in suggested}
     except Exception:
         return {}
@@ -2140,8 +2155,21 @@ _offline_active = (os.environ.get("ACCURETTA_OFFLINE", "").lower() in {"1", "tru
                    or load_json(SETTINGS_FILE, {}).get("offline_mode") is True)
 
 
+_SETTINGS_LOCK = threading.Lock()
+
+
 def update_settings(updates: dict) -> dict:
-    """Persist validated settings and any model-specific choices in one place."""
+    """Persist validated settings and any model-specific choices in one place.
+
+    The whole read-modify-write is serialized: the UI auto-saves feature
+    toggles on click, so two quick toggles arrive as concurrent POSTs and an
+    unlocked interleave let the later write drop the earlier one's key — the
+    "toggle doesn't survive a restart" report."""
+    with _SETTINGS_LOCK:
+        return _update_settings_locked(updates)
+
+
+def _update_settings_locked(updates: dict) -> dict:
     if "offline_mode" in (updates or {}) and not isinstance(updates["offline_mode"], bool):
         raise ValueError("offline_mode must be true or false")
     allowed = {k: v for k, v in (updates or {}).items() if k in DEFAULT_SETTINGS}
@@ -2924,8 +2952,18 @@ def get_chats() -> dict:
 
 def get_chat_index() -> dict:
     snapshot = get_chats()
+    # The rail reads recency, not creation: `order` only ever tracked creation
+    # order, so a notch-born session (created days ago, updated minutes ago)
+    # sat mid-list while the app auto-selected a stale row — the user's fresh
+    # conversation read as "nowhere to be found". Stable sort keeps ties in
+    # their existing relative order.
+    order = sorted(
+        snapshot["order"],
+        key=lambda cid: int((snapshot["chats"].get(cid) or {}).get("updated") or 0),
+        reverse=True,
+    )
     index: dict[str, dict] = {}
-    for chat_id in snapshot["order"]:
+    for chat_id in order:
         record = snapshot["chats"].get(chat_id)
         if not isinstance(record, dict):
             continue
@@ -2933,7 +2971,7 @@ def get_chat_index() -> dict:
         summary["_summary"] = True
         summary["task_state"] = _chat_task_state(chat_id, record)
         index[chat_id] = summary
-    return {"chats": index, "order": list(snapshot["order"])}
+    return {"chats": index, "order": order}
 
 
 def _chat_task_state(chat_id: str, chat: dict) -> str:
@@ -7591,12 +7629,14 @@ def unsubscribe(q: Queue) -> None:
 # broadcast_event). ctx_fill fires once per agentic round.
 _TRANSIENT_EVENT_TYPES = frozenset({"ctx_fill", "summary_folding"})
 
-# Stream chatter already delivered to the active client over the chat POST
-# response. No SSE consumer renders it (the browser handles only out-of-band
-# state; the Discord listener only reads approval:new), and mirroring every
-# token into each subscriber queue is what let slow or backgrounded clients
-# overflow and get dropped. Skip it on the SSE bus entirely.
-_SSE_SKIP_EVENT_TYPES = frozenset({"delta", "thinking_delta"})
+# Token chatter is normally delivered over the chat POST response, but the
+# notch overlay mirrors a turn that is running on ANOTHER surface (the main
+# app) — it can only see deltas here. Best-effort forwarding: never logged
+# (one token per ring-buffer slot would flush approvals out of the 256-event
+# resume log in seconds) and, under backpressure, the token is dropped rather
+# than evicting a durable event (an approval must never be pushed out by
+# chatter). Losing a handful of tokens only degrades the notch's live mirror.
+_BEST_EFFORT_EVENT_TYPES = frozenset({"delta", "thinking_delta"})
 
 # Count of events discarded for a slow subscriber (queue full). Never removes
 # the subscriber; surfaced only so a persistent flood is observable.
@@ -7605,28 +7645,33 @@ _dropped_event_count = 0
 
 def broadcast_event(evt: dict) -> None:
     global _event_log_id, _dropped_event_count
-    if evt.get("type") in _SSE_SKIP_EVENT_TYPES:
-        return
+    best_effort = evt.get("type") in _BEST_EFFORT_EVENT_TYPES
     with _subs_lock:
-        # High-frequency gauge noise (one per agentic round) is forwarded to
-        # live subscribers but NOT logged — a 120-round turn would otherwise
-        # flush approvals and other resumable state out of the 256-event ring
-        # buffer that Last-Event-ID resume replays from.
-        transient = evt.get("type") in _TRANSIENT_EVENT_TYPES
-        if not transient:
-            _event_log_id += 1
-        evt_id = _event_log_id if not transient else None
-        # Tag a copy so the original dict the caller passed isn't mutated.
-        # Clients that want the id can read evt['_id']; the SSE handler
-        # writes it into the wire `id:` field for Last-Event-ID resume.
         logged = dict(evt)
-        if evt_id is not None:
-            logged["_id"] = evt_id
-            _event_log.append((evt_id, logged))
+        if not best_effort:
+            # High-frequency gauge noise (one per agentic round) is forwarded to
+            # live subscribers but NOT logged — a 120-round turn would otherwise
+            # flush approvals and other resumable state out of the 256-event ring
+            # buffer that Last-Event-ID resume replays from.
+            transient = evt.get("type") in _TRANSIENT_EVENT_TYPES
+            if not transient:
+                _event_log_id += 1
+            evt_id = _event_log_id if not transient else None
+            # Tag a copy so the original dict the caller passed isn't mutated.
+            # Clients that want the id can read evt['_id']; the SSE handler
+            # writes it into the wire `id:` field for Last-Event-ID resume.
+            if evt_id is not None:
+                logged["_id"] = evt_id
+                _event_log.append((evt_id, logged))
         for q in _subscribers:
             try:
                 q.put_nowait(logged)
             except Full:
+                if best_effort:
+                    # A token is expendable; a durable event is not. Drop the
+                    # chatter, keep the queue untouched.
+                    _dropped_event_count += 1
+                    continue
                 # A slow subscriber (backgrounded window, busy browser) must
                 # never be silently unsubscribed while its HTTP stream stays
                 # open — EventSource would never see an error and would never
@@ -27057,6 +27102,25 @@ def _is_ctx_overflow(e: Exception) -> bool:
             or "exceeds the available context" in blob)
 
 
+def _is_llama_unreachable(e: Exception) -> bool:
+    """True when llama-server is not ANSWERING at all — a process that is
+    down or restarting (connection refused / port closed), as opposed to a
+    live server that returned an error. That is the crash-restart window the
+    watchdog heals in seconds: a turn arriving inside it used to die instantly
+    with an error nobody could see."""
+    import urllib.error
+    if isinstance(e, urllib.error.HTTPError):
+        return False
+    blob = str(e).lower()
+    reason = getattr(e, "reason", None)
+    return ("connection refused" in blob
+            or "10061" in blob
+            or "actively refused" in blob
+            or isinstance(reason, ConnectionRefusedError)
+            or "connectionreseterror" in blob.lower()
+            or "name or service not known" in blob)
+
+
 def _is_transient_server_error(e: Exception) -> bool:
     """True when a llama-server failure is likely transient — a 5xx from the
     server's own handler, or a body that names GPU/OOM pressure — as opposed to
@@ -28343,6 +28407,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # persists the intermediates instead of losing the whole turn.
             resp = None
             _transient_retries = 0
+            _llama_retries = 0
             for _ctx_attempt in range(4):
                 try:
                     resp = llama_post_stream("/v1/chat/completions", payload)
@@ -28382,6 +28447,23 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         emit({"type": "notice", "quiet": True,
                               "note": (f"llama-server faulted ({_det}) — retrying in {int(_wait)}s"
                                        + (f" · server said: …{_body_tail}" if _body_tail else ""))})
+                        continue
+                    if _llama_retries < 4 and _is_llama_unreachable(e):
+                        # llama NOT answering at all — most often mid-restart:
+                        # the watchdog respawned it after a crash and it is
+                        # seconds from ready. Formerly the turn died HERE with
+                        # an error the tucked-away notch card never showed —
+                        # the owner watched a stuck "thinking" pill ("then
+                        # nothing"). Now the turn waits for the server.
+                        _llama_retries += 1
+                        _wait = 4.0 * _llama_retries
+                        _det = type(e).__name__
+                        note_intervention("llama_wait")
+                        emit({"type": "notice", "quiet": True,
+                              "note": (f"llama-server is not answering ({_det}) — "
+                                       f"waiting {int(_wait)}s for it to come back; "
+                                       f"it may be restarting after a crash")})
+                        time.sleep(_wait)
                         continue
                     if _is_ctx_overflow(e):
                         emit({"type": "error",
@@ -31752,6 +31834,18 @@ _security_overview = SecurityOverviewService(
 _presence_notify = PresenceNotify()
 
 
+def _web_ui_focused() -> bool:
+    """Whether any fresh web client (the main app window) currently has focus.
+
+    chat_end carries this so the notch knows whether a finished turn's reply
+    has a human in front of it in the app. Unknown counts as watched — the
+    auto pop-out must never fire on a probe failure."""
+    try:
+        return bool(_presence_notify.presence().get("web_focused_fresh"))
+    except Exception:
+        return True
+
+
 # ---- HTTP handler ----------------------------------------------------------
 
 MIME = {
@@ -31917,6 +32011,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Vary", "Accept-Encoding")
         if encoded:
             self.send_header("Content-Encoding", "gzip")
+        # API payloads carry conversations, approvals and settings. Without an
+        # explicit directive Chromium heuristically caches GET JSON in the
+        # WebView2 profile on disk (full chat histories were found in
+        # data/*/EBWebView/Default/Cache) — never store them.
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
         self._set_cors()
         self.end_headers()
         try:
@@ -32831,6 +32931,16 @@ class Handler(BaseHTTPRequestHandler):
             snapshot = _presence_notify.presence()
             snapshot["ok"] = True
             return self._send_json(200, snapshot)
+        if p == "/api/ui/open-chat":
+            # The notch's "Open in main app": the overlay host raises the
+            # desktop window; this broadcast is what makes that window select
+            # the session (an already-running pywebview window never sees a
+            # browser deep-link).
+            cid = str(body.get("chat_id") or "").strip()[:64]
+            if not cid:
+                return self._send_json(400, {"error": "chat_id required"})
+            broadcast_event({"type": "ui:open-chat", "chat_id": cid})
+            return self._send_json(200, {"ok": True})
         if p == "/api/settings":
             try:
                 cur = update_settings(body)
@@ -32991,7 +33101,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             profile = inspect_model(mp)
-            suggested = auto_tune(mp, vram, profile=profile, min_ctx=min_ctx)
+            suggested = auto_tune(mp, vram, profile=profile, min_ctx=min_ctx,
+                                  proven_cfg=_proven_cfg(mp))
             suggested = _preserve_manual_model_spec(mp, suggested)
             # Remember the tune for this model — the next /api/models/load
             # restores it without re-running the tuner.
@@ -33836,10 +33947,23 @@ class Handler(BaseHTTPRequestHandler):
                 "updated": int(time.time()),
                 "messages": [],
             }
+            # Tag the origin so surfaces know where the session was born. The
+            # notch overlay is THE case: the main app's sidebar must be able
+            # to recognize (and surface) a conversation it never created — an
+            # untagged notch chat looked like a lost conversation.
+            if str(body.get("surface") or "").strip().lower() == "notch":
+                chats["chats"][chat_id]["origin"] = "island"
             if chat_id in chats["order"]:
                 chats["order"].remove(chat_id)
             chats["order"].insert(0, chat_id)
         chat = chats["chats"][chat_id]
+        # An untagged session now receiving notch turns gets tagged too, so
+        # the sidebar treatment survives the bridge restart in between; an
+        # existing explicit origin (github/project/security) is never
+        # rewritten.
+        if (str(body.get("surface") or "").strip().lower() == "notch"
+                and not chat.get("origin")):
+            chat["origin"] = "island"
         # remember the mode this chat was last used in so the client can
         # restore it on session switch
         chat["last_mode"] = mode
@@ -34105,7 +34229,7 @@ class Handler(BaseHTTPRequestHandler):
             emit({"type": "research_update", "research": _research_store.get(research_id, chat_id)})
         if _pre_turn_compaction_failed:
             emit({"type": "error", "error": _COMPACTION_STOP_MESSAGE})
-            emit({"type": "chat_end"})
+            emit({"type": "chat_end", "web_focused": _web_ui_focused()})
             return
         if tools_off_reason:
             emit({"type": "tools_unavailable", "message": tools_off_reason})
@@ -34260,7 +34384,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
         try:
-            emit({"type": "chat_end"})
+            emit({"type": "chat_end", "web_focused": _web_ui_focused()})
         except Exception:
             pass
 
@@ -35447,7 +35571,8 @@ def _ram_bandwidth_gbps() -> float:
     return 30.0
 
 
-def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: int = 0) -> dict:
+def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: int = 0,
+              proven_cfg: dict = None) -> dict:
     """Suggest llama-server flags for a (model, VRAM) pair.
 
     Uses GGUF header metadata (layer count, expert count, GQA config) when
@@ -35472,6 +35597,12 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     the same offload caps the normal solve uses; otherwise the normal pick
     stands and a note explains the saved ctx doesn't fit. Absent/0/smaller
     min_ctx changes nothing.
+
+    `proven_cfg` — a previously STAMPED per-model config whose server boot
+    actually succeeded (see _stamp_proven_boot). When its ctx covers min_ctx,
+    the budget estimate is outranked: the saved ctx and offload combo are
+    honored verbatim, because a config that booted and ran beats any estimate
+    of what "should" fit.
 
     Leaves ~8% VRAM headroom when GGUF math is exact, ~15% when falling back
     to filename heuristics. Disables speculative decoding for MoE because
@@ -36137,15 +36268,31 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     # which can OOM at boot). If the saved ctx beats our pick, re-solve pinned
     # to the smallest tier >= min_ctx and keep it only when the offload needed
     # for THAT ctx stays within the solver's normal caps.
+    #
+    # PROVEN configs outrank the budget estimate: a ctx llama-server actually
+    # booted with on this machine (stamped by _stamp_proven_boot) fits by
+    # definition, no matter what the free-VRAM heuristic thinks — that
+    # heuristic is what used to clamp a user's working ctx back down to the
+    # suggested one on every restart. When proven covers min_ctx, the offload
+    # keys come straight from the proven combo: re-deriving them under the
+    # budget can't beat flags that demonstrably booted.
     min_ctx = int(min_ctx or 0)
+    proven = proven_cfg if isinstance(proven_cfg, dict) else {}
+    honored_proven = False
     if min_ctx > chosen_ctx:
+        p_ctx_saved = int(proven.get("proven_ctx") or proven.get("num_ctx") or 0)
         pinned = min((t for t in ctx_tiers if t >= min_ctx), default=None)
-        if pinned is None:
-            notes.append(
-                f"saved ctx {min_ctx:,} exceeds the tuner's {ctx_tiers[0]:,} ceiling — "
-                f"not honored; using {chosen_ctx:,} instead."
-            )
-        else:
+        if p_ctx_saved >= min_ctx:
+            # A ctx the server actually booted with on this machine outranks
+            # the budget estimate — honor the user's ctx outright. The offload
+            # KEYs are re-applied after the batch/thread heuristics below.
+            chosen_ctx = min_ctx
+            chosen_n_cpu_moe = max(0, int(proven.get("n_cpu_moe") or 0))
+            honored_proven = True
+            notes.append(f"honored proven ctx {min_ctx:,} — this exact combo booted "
+                         f"successfully on this machine, so it outranks the VRAM "
+                         f"budget estimate.")
+        elif pinned is not None:
             p_ctx, p_moe, p_tier_notes, p_fits = _solve(out["kv_cache_type"], pinned_tier=pinned,
                                                         v_dtype=out.get("kv_cache_type_v") or "")
             if p_fits:
@@ -36162,6 +36309,11 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
                     f"(KV alone ≈ {kv_pinned:.0f} MB at tier {pinned:,}) — "
                     f"not honored; using {chosen_ctx:,} instead."
                 )
+        else:
+            notes.append(
+                f"saved ctx {min_ctx:,} exceeds the tuner's {ctx_tiers[0]:,} ceiling — "
+                f"not honored; using {chosen_ctx:,} instead."
+            )
 
     out["num_ctx"] = chosen_ctx
     out["n_cpu_moe"] = chosen_n_cpu_moe
@@ -36244,6 +36396,19 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     else:
         out["num_thread"] = 0
         notes.append("threads: 0 (server default — full GPU offload).")
+
+    # A honored proven combo re-applies LAST: the batch/ubatch/thread
+    # heuristics above would otherwise recompute away the exact offload
+    # values that demonstrably booted on this machine.
+    if honored_proven:
+        for _pk in ("num_gpu", "kv_cache_type", "kv_cache_type_v",
+                    "num_batch", "n_ubatch", "num_thread"):
+            if proven.get(_pk) is not None:
+                out[_pk] = proven[_pk]
+        # Same sanity llama.cpp enforces on its own flags.
+        if out["num_batch"] > out["num_ctx"]:
+            out["num_batch"] = max(512, out["num_ctx"])
+            notes.append(f"batch: clamped to {out['num_batch']} (was larger than ctx {out['num_ctx']:,}).")
 
     out["notes"] = " ".join(notes)
     return out
@@ -36933,12 +37098,17 @@ def _watchdog_self_heal(attempt: int) -> None:
                     changed.append(f"num_gpu {cur} → {new}")
         if changed:
             save_json(SETTINGS_FILE, s)
-            if bad_draft:
-                try:
-                    _save_model_config(str(s.get("model_path") or ""),
-                                       {"spec_strategy": "off", "spec_draft_model": ""})
-                except Exception:
-                    pass
+            # Sync the degraded flags into this model's remembered config too —
+            # _apply_model_config would otherwise restore the pre-heal ctx on
+            # the next load and re-enter the crash loop. _MODEL_CONFIG_KEYS
+            # carries the spec keys as well, so a disabled bad draft is
+            # remembered the same way.
+            try:
+                _save_model_config(str(s.get("model_path") or ""),
+                                   {k: s[k] for k in globals().get("_MODEL_CONFIG_KEYS", ())
+                                    if k in s})
+            except Exception:
+                pass
             msg = f"watchdog self-heal (attempt {attempt}): " + "; ".join(changed)
             print(f"[watchdog] {msg}", file=sys.stderr)
             broadcast_event({"type": "llama:auto_degraded", "message": msg, "changes": changed})
@@ -37044,6 +37214,39 @@ def _save_model_config(model_path: str, flags: dict) -> None:
         pass
 
 
+def _stamp_proven_boot(model_path: str, ctx: int) -> None:
+    """Record that THIS model booted successfully on THIS machine at this ctx.
+
+    The tuner's VRAM budget is an estimate (coarse VRAM tiers, free-RAM
+    probes); llama-server actually starting with a context and answering is
+    empirical proof it fits. Boot-time retunes need that proof so grow-only
+    beats the budget estimate instead of clamping a working config back to
+    the suggested one — the exact revert this is being fixed for."""
+    if not model_path or not ctx or ctx <= 0:
+        return
+    try:
+        allc = _models_config()
+        ent = allc.get(model_path)
+        ent = dict(ent) if isinstance(ent, dict) else {}
+        if int(ent.get("proven_ctx") or 0) == int(ctx) and ent.get("booted_at"):
+            return                       # nothing to learn — no disk churn per reload
+        ent["proven_ctx"] = int(ctx)
+        ent["booted_at"] = int(time.time())
+        allc[model_path] = ent
+        save_json(MODELS_CONFIG_FILE, allc)
+    except Exception:
+        pass
+
+
+def _proven_cfg(model_path: str) -> dict:
+    """The proven-boot metadata for a model, or {} — tiny passthrough so
+    callers pass it straight into auto_tune()."""
+    if not model_path:
+        return {}
+    cfg = _models_config().get(model_path)
+    return cfg if isinstance(cfg, dict) else {}
+
+
 def _auto_tune_for_load(model_path: str) -> bool:
     """Auto-tune on model load: restore the model's remembered config if we
     have one; otherwise run the tuner against live free VRAM and remember the
@@ -37061,7 +37264,10 @@ def _auto_tune_for_load(model_path: str) -> bool:
         if vram <= 0:
             return False
         profile = inspect_model(model_path)
-        suggested = auto_tune(model_path, vram, profile=profile)
+        # A fresh tune (no remembered config): still grow-only vs the saved
+        # num_ctx so a user's raised context survives a re-tune here too.
+        _min_ctx_saved = int(get_settings().get("num_ctx") or 0)
+        suggested = auto_tune(model_path, vram, profile=profile, min_ctx=_min_ctx_saved)
         if not suggested.get("num_ctx"):
             return False
         suggested["spec_strategy_source"] = "auto"
@@ -37139,6 +37345,11 @@ class LlamaProcess:
         self._watchdog_disabled = False
         self._restart_failed = False
         self._restart_history: list[float] = []
+        # Breaker auto-recovery: a tripped breaker retries itself a bounded
+        # number of times after a cooldown instead of staying suspended until
+        # a manual restart nobody knows they need.
+        self._breaker_trip_at = 0.0
+        self._breaker_recoveries = 0
         # True while a user-initiated start() is in flight. The watchdog
         # respects this so it doesn't see the brief proc-is-dead window
         # between stop() and the new spawn (e.g. settings reload, model
@@ -37246,6 +37457,8 @@ class LlamaProcess:
         implicitly by every user-initiated start()."""
         self._restart_history = []
         self._restart_failed = False
+        self._breaker_trip_at = 0.0
+        self._breaker_recoveries = 0
         self._watchdog_disabled = False
 
     def shutdown_watchdog(self) -> None:
@@ -37301,19 +37514,45 @@ class LlamaProcess:
         now = time.time()
         self._restart_history = [t for t in self._restart_history if now - t < self.WATCHDOG_WINDOW_S]
         if len(self._restart_history) >= self.WATCHDOG_MAX_CRASHES:
-            self._restart_failed = True
-            msg = (
-                f"llama-server crashed {len(self._restart_history)} times in "
-                f"{int(self.WATCHDOG_WINDOW_S)}s; auto-restart suspended. "
-                f"Fix the config (model path, ctx size, mmproj) and click "
-                f"'Restart server' in Settings to resume."
-            )
-            print(f"[watchdog] {msg}", file=sys.stderr)
-            try:
-                broadcast_event({"type": "llama:watchdog_stuck", "message": msg})
-            except Exception:
-                pass
-            return
+            # Breaker tripped. Permanent suspension used to mean the OWNER had
+            # to notice a dead model and click Restart — meanwhile every turn
+            # died on a dead endpoint ("then nothing"). Now the breaker
+            # self-recovers a bounded number of times after a fresh cooldown
+            # (VRAM freed by a closing app, a wedged driver, whatever wedged
+            # the first boot is usually gone by then), and only a fully
+            # persistent crash-loop keeps it suspended.
+            if (now - self._breaker_trip_at >= self.WATCHDOG_WINDOW_S + 30.0
+                    and self._breaker_recoveries < 2):
+                self._breaker_recoveries += 1
+                self._restart_history = []
+                self._restart_failed = False
+                self._breaker_trip_at = 0.0
+                msg = (f"llama-server stayed down after {self.WATCHDOG_MAX_CRASHES} crashes — "
+                       f"auto-recovery attempt {self._breaker_recoveries}/2 "
+                       "(fresh circuit-breaker cycle, self-healing launch args)")
+                print(f"[watchdog] {msg}", file=sys.stderr)
+                try:
+                    broadcast_event({"type": "llama:watchdog_restart",
+                                     "attempt": 4, "delay": 0,
+                                     "recovery": self._breaker_recoveries})
+                except Exception:
+                    pass
+            else:
+                if self._breaker_trip_at == 0.0:
+                    self._breaker_trip_at = now
+                self._restart_failed = True
+                msg = (
+                    f"llama-server crashed {len(self._restart_history)} times in "
+                    f"{int(self.WATCHDOG_WINDOW_S)}s; auto-restart suspended. "
+                    f"Fix the config (model path, ctx size, mmproj) and click "
+                    f"'Restart server' in Settings to resume."
+                )
+                print(f"[watchdog] {msg}", file=sys.stderr)
+                try:
+                    broadcast_event({"type": "llama:watchdog_stuck", "message": msg})
+                except Exception:
+                    pass
+                return
 
         self._restart_history.append(now)
         # Exponential backoff: 2s, 4s, 8s. The wait is cancellable so a
@@ -37801,6 +38040,17 @@ class LlamaProcess:
                     "vision_capable": bool(mmproj_path)}
         base_url = f"http://127.0.0.1:{port}"
         if wait_for_llama(wait_seconds, base_url=base_url):
+            # The ctx llama launched with is now PROVEN to fit on this machine:
+            # stamp it so boot-time retunes honor the user's choice instead of
+            # clamping it back to the planner's suggested tier. Prefer the
+            # server's OWN reported ctx (it can internally clamp below what we
+            # asked for) — the queried props cache was invalidated on stop.
+            if not port_override:
+                try:
+                    _live_ctx = _llama_props_ctx()
+                except Exception:
+                    _live_ctx = None
+                _stamp_proven_boot(model_path, int(_live_ctx or ctx))
             return {"ok": True, "pid": p.pid, "model": model_path,
                     "ready": True, "mmproj": mmproj_path,
                     "vision_capable": bool(mmproj_path)}

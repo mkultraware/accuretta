@@ -65,6 +65,18 @@ body::after {
 
 }
 
+/* Drag-resizing the OS window re-composites every backdrop-blur layer each
+   frame — the visible stutter. While a resize is in flight, drop the blur and
+   the ambient drift; both snap back when the drag settles. */
+body.is-resizing *,
+body.is-resizing *::before,
+body.is-resizing *::after {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+body.is-resizing::before,
+body.is-resizing::after { animation: none !important; }
+
 button {
   font-family: inherit;
 }
