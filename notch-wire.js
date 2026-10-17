@@ -412,6 +412,52 @@ async function openConvMenu() {
   reportRect();
 }
 
+// Point the composer at a conversation the card is now showing (a mirrored
+// turn from another surface). Persisted like a dropdown pick so a reload
+// keeps sending where the owner last saw the conversation.
+function bindNotchChat(id) {
+  if (!id || id === notchChatId) return;
+  notchChatId = id;
+  try { localStorage.setItem("accuretta.notch.chat", id); } catch (e) {}
+  // Archived blocks above the live pair belong to the previous chat.
+  collapseThread();
+}
+
+// The stored binding outlives the bridge's chat list: a deleted chat's id was
+// still sent, and the bridge re-created an EMPTY chat under it (a "new"
+// conversation), while a stale-but-live id continued an old chat behind an
+// empty card. Drop a dead binding, and paint a live one's latest turn into
+// the card (without opening it) so what the card shows is where Enter goes.
+async function restoreNotchChat() {
+  const id = notchChatId;
+  if (!id) return;
+  const chat = await getJson(`/api/chats/${encodeURIComponent(id)}`);
+  if (id !== notchChatId || turnLive()) return;   // rebound/turn began meanwhile
+  const msgs = (chat && Array.isArray(chat.messages)) ? chat.messages : null;
+  if (!msgs) {
+    const idx = await getJson("/api/chats?summary=1");
+    // Only unbind on a definite "gone" — an unreachable bridge keeps it.
+    if (idx && idx.chats && !idx.chats[id] && id === notchChatId) {
+      notchChatId = "";
+      try { localStorage.removeItem("accuretta.notch.chat"); } catch (e) {}
+    }
+    return;
+  }
+  const visible = msgs.filter(m => (m.role === "user" || m.role === "assistant")
+                                 && !m._internal && !m.invisible);
+  const lastUser = [...visible].reverse().find(m => m.role === "user");
+  const lastAssistant = [...visible].reverse().find(m => m.role === "assistant");
+  if (!lastUser && !lastAssistant) return;
+  const um = document.getElementById("userMsg");
+  if (um) um.textContent = lastUser ? msgText(lastUser.content) : "";
+  island.setAttribute("data-thread", "");
+  if (lastAssistant) {
+    replyRaw = visibleFinalText(msgText(lastAssistant.content));
+    fadedChars = replyRaw.length;         // loaded history must not re-fade
+    renderReply();
+  }
+}
+
 async function onConvPicked(id) {
   closeConvMenu();
   if (turnLive()) return;                 // belt and braces; menu disables these
@@ -594,7 +640,15 @@ function setActivity(phase) {
   const line = document.getElementById("workSub");
   if (line) {
     // setTool() writes the tool phrase itself; the other phases own theirs.
-    if (phase !== "tool") line.textContent = ACTIVITY_WORDS[phase] || "";
+    if (phase !== "tool") {
+      const word = ACTIVITY_WORDS[phase] || "";
+      if (line.textContent !== word) {
+        line.textContent = word;
+        // Same lift-in the tool labels get, so "thinking…" -> "writing…"
+        // doesn't hard-cut between them.
+        if (word) { line.classList.remove("swap"); void line.offsetWidth; line.classList.add("swap"); }
+      }
+    }
     line.classList.toggle("shimmer", !!line.textContent.trim());
     line.style.display = line.textContent.trim() ? "" : "none";
   }
@@ -611,9 +665,147 @@ function setActivity(phase) {
 // agent is the one working.
 function setWorkIcon(phase) {
   const ico = ensureToolIcon();
-  if (!ico) return;
-  ico.style.display = phase === "tool" ? "" : "none";
+  if (ico) ico.style.display = phase === "tool" ? "" : "none";
+  // The A itself becomes what the agent is doing; any other phase hands the
+  // shape back to the A (after a beat, so a tool -> tool hop never flashes it).
+  if (phase === "tool") matrixShow(mxToolKey);
+  else matrixShow("a", MX_HOLD_MS);
 }
+
+// ---- dot-matrix morph -----------------------------------------------------------
+// The A in the work pill (and in the composer) is a dot-matrix DISPLAY: a fixed,
+// dense grid where each dot lights or dims. The A and every tool glyph are
+// masks on that grid, so a morph is dots rippling on/off left to right — dots
+// the two shapes share stay lit, which is what reads as the A *turning into*
+// the glyph rather than swapping for it. The glyph keeps the A's per-dot
+// colour gradient, twinkle and FX (each dot carries the same --k/--dx/--dy/
+// --p/--d vars the widget's drawLogo gives its dots).
+const MX_COLS = 24;                  // dense grid: the widget's A is 11 columns
+const MX_HOLD_MS = 650;              // linger on a glyph before handing back to the A
+const MX_THRESHOLD = 0.3;            // cell coverage that lights a glyph dot
+// Same artwork space and polygons as the widget's drawLogo (the split A).
+const MX_X0 = 150, MX_Y0 = 285, MX_W = 980, MX_H = 725;
+const MX_BIG = [[165, 990], [625, 315], [868, 298], [500, 878], [470, 888]];
+const MX_SMALL = [[672, 648], [885, 645], [1112, 975], [862, 940]];
+
+const mxCell = MX_W / MX_COLS;
+const mxRows = Math.floor(MX_H / mxCell);
+const mxOffY = (MX_H - mxRows * mxCell) / 2;
+const mxMasks = new Map();           // key -> Uint8Array(cols*rows)
+const mxSvgs = [];                   // [{svg, px: [g...], cur}]
+let mxToolKey = "";
+let mxTimer = 0;
+
+function mxInPoly(x, y, p) {
+  let c = false;
+  for (let i = 0, j = p.length - 1; i < p.length; j = i++) {
+    const [xi, yi] = p[i], [xj, yj] = p[j];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) c = !c;
+  }
+  return c;
+}
+
+function mxAMask() {
+  const m = new Uint8Array(MX_COLS * mxRows);
+  for (let r = 0; r < mxRows; r++) for (let c = 0; c < MX_COLS; c++) {
+    const x = MX_X0 + (c + .5) * mxCell, y = MX_Y0 + mxOffY + (r + .5) * mxCell;
+    if (mxInPoly(x, y, MX_BIG) || mxInPoly(x, y, MX_SMALL)) m[r * MX_COLS + c] = 1;
+  }
+  return m;
+}
+
+// Rasterize a tool glyph onto the grid: draw it (square, centred, full grid
+// height) into a supersampled canvas and light every cell it covers enough.
+// Strokes are thickened to ~2.4/24 of the glyph so a 1-dot line never breaks
+// up into stray dots.
+async function mxRasterize(svgText) {
+  const vb = (svgText.match(/viewBox="([^"]+)"/) || [])[1] || "0 0 24 24";
+  const vbW = Number(vb.trim().split(/\s+/)[2]) || 24;
+  const sw = (2.4 * vbW / 24).toFixed(2);
+  const src = svgText
+    .replace(/stroke-width="[^"]*"/g, `stroke-width="${sw}"`)
+    .replace(/currentColor/g, "#000")
+    .replace("<svg ", '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" ');
+  const img = new Image();
+  img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(src);
+  await img.decode();
+  const S = 8;
+  const cv = document.createElement("canvas");
+  cv.width = MX_COLS * S; cv.height = mxRows * S;
+  const ctx = cv.getContext("2d", { willReadFrequently: true });
+  const side = mxRows * S;
+  ctx.drawImage(img, Math.round((cv.width - side) / 2), 0, side, side);
+  const px = ctx.getImageData(0, 0, cv.width, cv.height).data;
+  const m = new Uint8Array(MX_COLS * mxRows);
+  for (let r = 0; r < mxRows; r++) for (let c = 0; c < MX_COLS; c++) {
+    let a = 0;
+    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+      a += px[(((r * S + y) * cv.width) + (c * S + x)) * 4 + 3];
+    }
+    if (a / (255 * S * S) >= MX_THRESHOLD) m[r * MX_COLS + c] = 1;
+  }
+  return m;
+}
+
+function mxBuild(svg) {
+  svg.classList.add("mx");
+  svg.setAttribute("viewBox", `0 0 ${MX_W} ${MX_H}`);
+  const ns = "http://www.w3.org/2000/svg";
+  svg.textContent = "";
+  const px = [];
+  for (let r = 0; r < mxRows; r++) for (let c = 0; c < MX_COLS; c++) {
+    const x = MX_X0 + (c + .5) * mxCell, y = MX_Y0 + mxOffY + (r + .5) * mxCell;
+    const t = (x - MX_X0) / MX_W, u = (y - MX_Y0) / MX_H;
+    const hue = 212 + t * 50 + u * 30, light = 66 - (1 - Math.abs(u - .65)) * 12;
+    const k = ((1 - u) * .5 + t * .5) * .88 + Math.random() * .12;
+    const mx = MX_X0 + MX_W / 2 - x, my = MX_Y0 + MX_H / 2 - y, cd = Math.hypot(mx, my) / MX_W * .3;
+    const p = 1.3 + Math.random() * 2.1, d = -Math.random() * p, lo = .12 + Math.random() * .3;
+    const g = document.createElementNS(ns, "g");
+    g.setAttribute("class", "px");
+    // The ripple: a left-to-right scan with a little per-dot jitter.
+    g.style.setProperty("--md", (t * .24 + Math.random() * .05).toFixed(3) + "s");
+    const dot = document.createElementNS(ns, "circle");
+    dot.setAttribute("cx", (x - MX_X0).toFixed(1));
+    dot.setAttribute("cy", (y - MX_Y0).toFixed(1));
+    dot.setAttribute("r", (mxCell * .4).toFixed(1));
+    dot.setAttribute("fill", `hsl(${hue.toFixed(0)} 95% ${light.toFixed(0)}%)`);
+    dot.setAttribute("style",
+      `--k:${k.toFixed(3)};--dx:${(mx * .6).toFixed(0)}px;--dy:${(my * .6).toFixed(0)}px;` +
+      `--cd:${cd.toFixed(2)}s;--p:${p.toFixed(2)}s;--d:${d.toFixed(2)}s;--lo0:${lo.toFixed(2)}`);
+    g.appendChild(dot);
+    svg.appendChild(g);
+    px.push(g);
+  }
+  const entry = { svg, px, cur: "" };
+  mxSvgs.push(entry);
+  mxApply(entry, "a");
+}
+
+function mxApply(entry, key) {
+  const m = mxMasks.get(key);
+  if (!m || entry.cur === key) return;
+  entry.cur = key;
+  entry.svg.dataset.glyph = key;
+  for (let i = 0; i < entry.px.length; i++) entry.px[i].classList.toggle("on", !!m[i]);
+}
+
+// Show `key` on every matrix ("a" = the logo). A glyph that has not finished
+// rasterizing (first second after load) leaves the A up rather than blanking.
+function matrixShow(key, delayMs = 0) {
+  clearTimeout(mxTimer);
+  const k = mxMasks.has(key) ? key : "a";
+  const go = () => { for (const e of mxSvgs) mxApply(e, k); };
+  if (delayMs) mxTimer = setTimeout(go, delayMs); else go();
+}
+
+(function initMatrix() {
+  mxMasks.set("a", mxAMask());
+  for (const svg of document.querySelectorAll(".v-work .logo, .v-prompt .promptbox .logo")) mxBuild(svg);
+  const glyphs = { ...TOOL_ICONS, wrench: WRENCH_SVG };
+  for (const [key, svgText] of Object.entries(glyphs)) {
+    mxRasterize(svgText).then((m) => mxMasks.set(key, m)).catch(() => {});
+  }
+})();
 
 // ---- dot-matrix pill FX -----------------------------------------------------
 // The A is the agent. Instead of more text, one-shot animations use the pill's
@@ -623,35 +815,59 @@ function setWorkIcon(phase) {
 // rebuilds to its original shape when a turn with real work completes.
 // Every dot already carries --k (column fraction) / --dx / --dy (center-out
 // vector) from drawLogo, which is all the choreography needs.
-const FX_DUR = { laser: 1300, sweep: 1200, build: 1000, break: 1500 };
+// Each covers the LAST dot's finish (duration × iterations + the max --k
+// stagger in the CSS below). Shorter timers dropped data-fx while the
+// late-staggered dots were mid-pose, snapping them out of a laser flare or a
+// half-swept scatter.
+const FX_DUR = { laser: 1550, sweep: 1650, build: 1500, break: 1750 };
 let fxTimer = 0;
 
-function ensureFxBeam() {
+// The dot trail: one row of small dots in the pill's EMPTY middle lane — the
+// logo's dot matrix carrying on into the pill, never a streak across the
+// status text or the tool glyph. Dim at rest while working; each FX plays a
+// pattern through it (see the fx-trail styles).
+const TRAIL_DOTS = 21;
+const TRAIL_REPLAY_MS = 900;          // a burst of same-kind calls replays the wave at most this often
+let trailRunAt = 0;
+
+function ensureFxTrail() {
   const pill = document.querySelector(".v-work .pill");
   if (!pill) return null;
-  let beam = pill.querySelector(".fx-beam");
-  if (!beam) {
-    beam = document.createElement("span");
-    beam.className = "fx-beam";
-    pill.appendChild(beam);
+  let trail = pill.querySelector(".fx-trail");
+  if (!trail) {
+    trail = document.createElement("span");
+    trail.className = "fx-trail";
+    trail.setAttribute("aria-hidden", "true");
+    for (let n = 0; n < TRAIL_DOTS; n++) {
+      const i = n / (TRAIL_DOTS - 1);
+      const dot = document.createElement("i");
+      // --i: position (left-to-right stagger), --c: distance from centre
+      // (ripple stagger), --h: hue, continuing the logo's blue -> violet.
+      dot.style.cssText = `--i:${i.toFixed(3)};--c:${(Math.abs(i - .5) * 2).toFixed(3)};--h:${(222 + i * 40).toFixed(0)}`;
+      trail.appendChild(dot);
+    }
+    pill.appendChild(trail);
   }
-  return beam;
+  return trail;
 }
+ensureFxTrail();
 
 function pillFX(kind) {
   if (!FX_DUR[kind]) return;
-  const beam = ensureFxBeam();
+  const trail = ensureFxTrail();
   island.dataset.fx = kind;
-  if (beam) {
-    beam.dataset.kind = kind;
-    beam.classList.remove("run");
-    void beam.offsetWidth;            // restart the sweep animation
-    beam.classList.add("run");
+  if (trail && (trail.dataset.kind !== kind || !trail.classList.contains("run")
+                || Date.now() - trailRunAt >= TRAIL_REPLAY_MS)) {
+    trail.dataset.kind = kind;
+    trail.classList.remove("run");
+    void trail.offsetWidth;           // restart the pattern
+    trail.classList.add("run");
+    trailRunAt = Date.now();
   }
   if (fxTimer) clearTimeout(fxTimer);
   fxTimer = setTimeout(() => {
     delete island.dataset.fx;
-    if (beam) beam.classList.remove("run");
+    if (trail) trail.classList.remove("run");
   }, FX_DUR[kind]);
 }
 
@@ -878,6 +1094,9 @@ function toggleTaskPanel() {
     "  color: transparent; -webkit-text-fill-color: transparent;",
     "  animation: notch-shimmer 1.5s linear infinite;",
     "}",
+    // The shimmer rule outranks the widget's `#workSub.swap` (same
+    // specificity, later sheet), so every new tool label SNAPPED in. Run both.
+    "#workSub.shimmer.swap { animation: toolin .28s ease-out, notch-shimmer 1.5s linear infinite; }",
     // The open card's status line copies the MAIN APP's think-line language:
     // sans, italic, 12.5px, and the accent sweeping through slowly (2.2s)
     // instead of a fast white blink.
@@ -933,10 +1152,14 @@ function toggleTaskPanel() {
     "  58% { transform: translate(calc(var(--dx) * .5), 42px) rotate(24deg); opacity: .12; }",
     "  80% { transform: translate(calc(var(--dx) * -.25), -6px) rotate(-8deg); opacity: .8; }",
     "}",
-    // The wide beam that rides the pill while an FX runs is a GRID item
-    // spanning the spacer + right columns (everything right of the status
-    // text), so its travel lane is pinned to the layout: swapping the tool
-    // label for a longer/shorter one never shifts the streak horizontally.
+    // On a tool glyph the read flare is a gentle brightness pulse: the full
+    // laser pose (dots at 1.9x, blown-out white) made the icon unreadable
+    // for the length of the flare.
+    ".island[data-fx='laser'] .logo.mx:not([data-glyph='a']) circle { animation-name: fx-pulse; }",
+    "@keyframes fx-pulse {",
+    "  0%, 100% { transform: none; filter: none; }",
+    "  45% { transform: scale(1.15); filter: brightness(1.6); }",
+    "}",
     // The three PRIMARY children carry explicit placements because a grid
     // child with a definite row makes the auto-placement cursor SKIP the
     // occupied cells, wrapping the following items into an implicit second
@@ -944,38 +1167,69 @@ function toggleTaskPanel() {
     ".v-work .pill { position: relative; }",
     // The right column is icon-width, so the slack goes to the LEFT — the
     // phase word + literal call need real estate and must not ellipsize to
-    // "thin…". The 190px middle track is the beam's reserved lane.
+    // "thin…". The 190px middle track is the dot trail's lane.
     ".v-work .pill.wings { grid-template-columns: minmax(0, 1fr) 190px auto; }",
     ".v-work .pill.wings .wl { grid-column: 1; grid-row: 1; }",
-    ".v-work .pill.wings > span:not(.fx-beam) { grid-column: 2; grid-row: 1; }",
+    ".v-work .pill.wings > span:not(.fx-trail) { grid-column: 2; grid-row: 1; }",
     ".v-work .pill.wings .wr { grid-column: 3; grid-row: 1; }",
-    ".fx-beam { grid-column: 2 / -1; grid-row: 1; align-self: center; position: relative; height: 2px; pointer-events: none; opacity: 0; }",
-    ".fx-beam::before { content: ''; position: absolute; top: 0; bottom: 0; left: 0; width: 30%; border-radius: 2px; }",
-    ".fx-beam.run { opacity: 1; }",
-    ".fx-beam.run::before { animation: fx-beam-run .9s ease-in-out both; }",
-    ".fx-beam[data-kind='laser']::before {",
-    "  background: linear-gradient(90deg, transparent, #7cc4ff 45%, #eaf6ff 50%, #7cc4ff 55%, transparent);",
-    "  box-shadow: 0 0 12px 2px rgba(110,180,255,.55);",
+    // The trail sits ONLY in the middle lane and fades out toward both ends,
+    // so no pattern ever reaches the status text or the tool glyph.
+    ".fx-trail {",
+    "  grid-column: 2; grid-row: 1; align-self: center; height: 10px; padding: 0 8px;",
+    "  display: flex; align-items: center; justify-content: space-between; pointer-events: none;",
+    "  -webkit-mask-image: linear-gradient(90deg, transparent, #000 24%, #000 76%, transparent);",
+    "  mask-image: linear-gradient(90deg, transparent, #000 24%, #000 76%, transparent);",
     "}",
-    ".fx-beam[data-kind='sweep']::before {",
-    "  height: 10px; top: -4px; filter: blur(2px);",
-    "  background: linear-gradient(90deg, transparent, rgba(255,170,80,.5), rgba(255,220,160,.75), rgba(255,170,80,.5), transparent);",
+    ".fx-trail i {",
+    "  width: 2.6px; height: 2.6px; border-radius: 50%; flex: none;",
+    "  background: hsl(var(--h) 95% 68%); opacity: 0; transition: opacity .5s ease;",
     "}",
-    ".fx-beam[data-kind='build']::before {",
-    "  background: linear-gradient(90deg, transparent, rgba(120,255,180,.5), rgba(190,255,220,.8), rgba(120,255,180,.5), transparent);",
-    "  box-shadow: 0 0 10px 2px rgba(120,255,180,.4);",
+    ".island[data-busy] .fx-trail i { opacity: .16; }",
+    // read / search / run / anything else: a soft wave travels left to right
+    ".fx-trail.run[data-kind='laser'] i { animation: trail-wave .62s ease-in-out calc(var(--i) * .7s) both; }",
+    // write / edit: the row fills in dot by dot, holds, settles
+    ".fx-trail.run[data-kind='build'] i { animation: trail-fill 1.05s cubic-bezier(.3, 1.4, .5, 1) calc(var(--i) * .42s) both; }",
+    // delete: the row drains right to left, each dot dropping out
+    ".fx-trail.run[data-kind='sweep'] i { animation: trail-drain 1s cubic-bezier(.5, 0, .4, 1) calc((1 - var(--i)) * .55s) both; }",
+    // turn done: one ripple out from the centre, then rest
+    ".fx-trail.run[data-kind='break'] i { animation: trail-ripple .95s ease-out calc(var(--c) * .6s) both; }",
+    "@keyframes trail-wave {",
+    "  0%, 100% { opacity: .16; transform: none; box-shadow: none; }",
+    "  45% { opacity: 1; transform: scale(1.7); box-shadow: 0 0 6px 1px hsl(var(--h) 95% 65% / .7); }",
     "}",
-    ".fx-beam[data-kind='break']::before {",
-    "  background: linear-gradient(90deg, transparent, rgba(255,120,140,.5), rgba(255,190,200,.8), rgba(255,120,140,.5), transparent);",
-    "  box-shadow: 0 0 10px 2px rgba(255,120,140,.4);",
+    "@keyframes trail-fill {",
+    "  0% { opacity: .16; transform: scale(.6); }",
+    "  18% { opacity: 1; transform: scale(1.5); box-shadow: 0 0 5px 1px hsl(var(--h) 95% 65% / .6); }",
+    "  40%, 75% { opacity: .85; transform: none; box-shadow: none; }",
+    "  100% { opacity: .16; transform: none; }",
     "}",
-    "@keyframes fx-beam-run {",
-    "  from { transform: translateX(0); }",
-    "  to { transform: translateX(360%); }",
+    "@keyframes trail-drain {",
+    "  0% { opacity: .16; transform: none; }",
+    "  22% { opacity: .9; transform: none; }",
+    "  60% { opacity: 0; transform: translateY(3px) scale(.3); }",
+    "  100% { opacity: .16; transform: none; }",
     "}",
+    "@keyframes trail-ripple {",
+    "  0%, 100% { opacity: .16; transform: none; box-shadow: none; }",
+    "  30% { opacity: 1; transform: scale(1.8); box-shadow: 0 0 6px 1px hsl(var(--h) 95% 65% / .7); }",
+    "}",
+    // ---- dot-matrix morph (see matrixShow) --------------------------------
+    // Every grid dot exists; only lit ones (.on) show. A morph flips .on and
+    // each dot pops in/out after its own --md, so the change ripples across.
+    ".logo.mx .px {",
+    "  opacity: 0; transform: scale(.2); transform-box: fill-box; transform-origin: center;",
+    "  transition: opacity .24s ease var(--md), transform .36s cubic-bezier(.3, 1.5, .5, 1) var(--md);",
+    "}",
+    ".logo.mx .px.on { opacity: 1; transform: none; }",
+    // dark dots do no twinkle/FX work at all (most of the grid is dark)
+    ".logo.mx .px:not(.on) circle { animation: none !important; }",
+    // The A twinkles deep (per-dot floor); a glyph twinkles shallow so its
+    // outline stays legible at this size.
+    ".logo.mx circle { --lo: var(--lo0); }",
+    ".logo.mx:not([data-glyph='a']) circle { --lo: .72; }",
     "@media (prefers-reduced-motion: reduce) {",
     "  .island[data-fx] .logo circle { animation: none !important; }",
-    "  .fx-beam { display: none; }",
+    "  .fx-trail i { animation: none !important; }",
     "}",
     // leaving: the island retreats up into the bezel instead of blinking out
     ".island.is-leaving {",
@@ -986,6 +1240,14 @@ function toggleTaskPanel() {
     ".island.is-entering {",
     "  transform: translateX(-50%) translateY(-104%); opacity: 0;",
     "  transition: none;",
+    "}",
+    // ...and drops back DOWN when is-entering is removed. The widget's own
+    // transition list has no transform/opacity, so the island used to blink
+    // from hidden to fully in place in one frame. No overshoot here: a spring
+    // would pull the island's top edge away from the bezel.
+    ".island:not(.is-entering):not(.is-leaving) {",
+    "  transition: width .5s var(--spring), height .5s var(--spring), border-radius .4s var(--spring),",
+    "    box-shadow .4s, transform .38s cubic-bezier(.22, 1, .36, 1), opacity .24s ease-out;",
     "}",
     // ---- scrollbars: the WebView2 default is a light, arrow-buttoned bar that
     // clashes with the island. Theme every scrollable inside it (thread, model
@@ -1003,15 +1265,24 @@ function toggleTaskPanel() {
     // 540px pills so a reading reply has room) and grows vertically to fit
     // the answer, rather than the old fixed 560x318 box or a shrink-to-fit
     // sliver.
-    ".island[data-state='prompt'] .view.v-prompt { position: relative; inset: auto; }",
-    ".island[data-state='prompt'] {",
-    "  width: 600px;",
-    "  height: auto; max-height: 460px;",
-    "}",
-    ".island[data-state='prompt'][data-thread] { height: auto; }",
-    ".island[data-state='prompt'] .card { height: auto; }",
+    //
+    //
+    // The card's layout is pinned at that 600px width and its natural height
+    // in EVERY state, centered on the island. While the island springs open
+    // or shut, the card is revealed / clipped by the island's edges instead
+    // of re-wrapping every frame (text reflowed and the thread squished as
+    // the island narrowed).
+    //
+    // The island's height is that measured card height (--card-h, kept by a
+    // ResizeObserver below), never `auto`: a transition cannot interpolate
+    // to or from auto, so the card used to SNAP to full height on frame one
+    // while only the width sprang, and fold flat instantly on the way out.
+    ".view.v-prompt { left: 50%; right: auto; bottom: auto; width: 600px; margin-left: -300px; }",
+    ".v-prompt .card { height: auto; }",
+    ".island[data-state='prompt'] { width: 600px; height: min(var(--card-h, 318px), 460px); }",
+    ".island[data-state='prompt'][data-thread] { height: min(var(--card-h, 318px), 460px); }",
     // expanded: the full notch conversation gets headroom to actually read
-    ".island[data-state='prompt'][data-expanded] { max-height: 640px; }",
+    ".island[data-state='prompt'][data-expanded] { height: min(var(--card-h, 318px), 640px); }",
     // a quiet divider separates the archive from the live turn below it
     ".island[data-expanded] #userMsg { border-top: 1px solid var(--line); margin-top: 6px; padding-top: 8px; }",
     ".msg.arch.user { color: #6f6c86; }",
@@ -1054,10 +1325,12 @@ function toggleTaskPanel() {
     ".dot-sep { margin: 0 6px; opacity: .5; }",
     // Keep the reply scrollable INSIDE the card so the prompt box and model
     // row always stay visible under a long answer.
-    ".island[data-state='prompt'] .thread {",
+    // Scoped to the card (not the prompt state) so the thread keeps its size
+    // while the card fades out — see the pinned layout above.
+    ".v-prompt .thread {",
     "  max-height: 296px; overflow-y: auto; -webkit-mask-image: none; mask-image: none;",
     "}",
-    ".island[data-state='prompt'][data-thread] .thread { margin-bottom: 12px; }",
+    ".island[data-thread] .v-prompt .thread { margin-bottom: 12px; }",
     // a long model list scrolls inside the dropdown instead of being cut off
     ".island[data-state='prompt'] .menu {",
     "  max-height: 232px; overflow-y: auto; overscroll-behavior: contain;",
@@ -1288,6 +1561,18 @@ if (window.chrome && window.chrome.webview && window.chrome.webview.addEventList
 // the turn ended. Observe the actual box instead of guessing when size moves.
 if (typeof ResizeObserver !== "undefined") {
   new ResizeObserver(() => reportRect()).observe(island);
+  // The prompt card's natural height drives the island's height (see the
+  // pinned-layout styles): a px value springs open/shut, `auto` snapped.
+  // borderBoxSize is the fractional layout size (offsetHeight rounds down and
+  // clipped the card's last half pixel), immune to the island's wobble.
+  const card = document.querySelector(".v-prompt .card");
+  if (card) {
+    new ResizeObserver((entries) => {
+      const box = entries[0] && entries[0].borderBoxSize && entries[0].borderBoxSize[0];
+      const h = box ? box.blockSize : card.offsetHeight;
+      island.style.setProperty("--card-h", Math.ceil(h) + "px");
+    }).observe(card);
+  }
 }
 
 // ---- full conversation expansion --------------------------------------------
@@ -1950,6 +2235,7 @@ function setToolLine(name, args) {
   const ico = ensureToolIcon();
   if (ico) ico.innerHTML = toolIconSvg(name);
   const text = toolLabel(name, args);
+  mxToolKey = toolKey(name);          // the glyph the A morphs into
   notch.setTool(text);
   // A real tool is running: show the icon + what it is doing, and let the
   // dot-matrix A act it out (laser for scans/reads, sweep for deletions,
@@ -1984,6 +2270,12 @@ function connectEvents() {
         if (streaming) break;
         if (evt.chat_id) activeChatId = evt.chat_id;
         turnChatId = cid;
+        // The card is about to show THIS conversation, so it is the one a
+        // follow-up typed here must continue. Without rebinding, a turn
+        // started in the main app played out in the card and then the next
+        // notch send went to whatever chat the notch was last pinned to (an
+        // old one) or, unpinned, to a brand-new one.
+        bindNotchChat(cid);
         mirror.active = true;
         mirror.prompt = "";
         handledCalls.clear();
@@ -2138,6 +2430,7 @@ island.addEventListener("notch", (e) => {
   await refreshCtx("");
   const list = await getJson("/api/approvals");
   for (const a of (list && list.pending) || []) await onApprovalNew(a);
+  await restoreNotchChat();
   connectEvents();
   reportDiag("hydrated");
   reportRect();

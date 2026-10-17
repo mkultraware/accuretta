@@ -208,7 +208,7 @@
 
 #app .composer-wrap > .composer {
   border: 1px solid var(--border-strong);
-  border-radius: 16px;
+  border-radius: 22px;
   background: var(--bg-raised);
   box-shadow: 0 4px 18px color-mix(in srgb, var(--fg) 5%, transparent);
   backdrop-filter: none;
@@ -339,7 +339,7 @@
 }
 #app .composer-wrap > .composer {
   border: 1px solid color-mix(in srgb, var(--fg) 22%, transparent) !important;
-  border-radius: 12px !important;
+  border-radius: 20px !important;
   background: var(--bg-raised) !important;
   box-shadow: none !important;
   backdrop-filter: none !important;

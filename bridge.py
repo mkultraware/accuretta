@@ -57,6 +57,7 @@ from task_state import UndoStore, file_revision
 from conversation_tools import SteeringInbox, search_conversations
 from deep_research import ResearchStore, RESEARCH_TOOLS, RESEARCH_PROMPT, brief as research_brief, tool_specs as research_tool_specs
 from agent_reliability import EvidenceStore, compare_responses, review_evidence, response_state, identity_fingerprint, feedback, verification_advice
+from cvss_v31 import base_score as cvss_base_score, normalize_cwe
 
 _steering = SteeringInbox()
 from network_policy import install_offline_guard
@@ -986,7 +987,14 @@ _MODEL_ADVISOR_CONFIG_KEYS = (
     "num_thread", "n_parallel", "kv_cache_type", "kv_cache_type_v",
     "flash_attn", "spec_strategy",
 )
-_MODEL_ADVISOR_APPLY_KEYS = set(_MODEL_ADVISOR_CONFIG_KEYS)
+# Newer tuner outputs. They join the config snapshot only when set (non-zero),
+# so configs recorded before they existed keep their signature and history.
+_MODEL_ADVISOR_OPTIONAL_KEYS = ("spec_draft_n_max", "moe_cache_mib")
+# What the running llama-server was actually launched with, where settings
+# alone can't say (spec_draft_n_max 0 = "auto"). Set at spawn, recorded with
+# every turn so speed calibration knows which draft length produced it.
+_RUNTIME_LAUNCH: dict = {"spec_draft_n": 0}
+_MODEL_ADVISOR_APPLY_KEYS = set(_MODEL_ADVISOR_CONFIG_KEYS) | set(_MODEL_ADVISOR_OPTIONAL_KEYS)
 _MODEL_ADVISOR_LABELS = {
     "num_ctx": "Context window", "num_gpu": "GPU layers",
     "num_batch": "Batch size", "n_ubatch": "Micro-batch",
@@ -994,6 +1002,7 @@ _MODEL_ADVISOR_LABELS = {
     "n_parallel": "Parallel sequences", "kv_cache_type": "KV cache",
     "kv_cache_type_v": "V cache", "flash_attn": "Flash attention",
     "spec_strategy": "Speculative decoding",
+    "spec_draft_n_max": "Draft length", "moe_cache_mib": "MoE expert cache",
 }
 
 
@@ -1012,6 +1021,18 @@ def _model_runtime_config(settings: dict | None = None) -> dict:
                 out[key] = int(value or 0)
             except (TypeError, ValueError):
                 out[key] = 0
+    for key in _MODEL_ADVISOR_OPTIONAL_KEYS:
+        try:
+            value = int(s.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value:
+            out[key] = value
+    # "auto" draft length: record the length the server was launched with.
+    # An explicit spec_draft_n_max is already in the snapshot above.
+    if (out.get("spec_strategy") == "draft-mtp" and not out.get("spec_draft_n_max")
+            and _RUNTIME_LAUNCH.get("spec_draft_n")):
+        out["spec_draft_n_eff"] = int(_RUNTIME_LAUNCH["spec_draft_n"])
     return out
 
 
@@ -1104,6 +1125,7 @@ def _record_model_observation(model: str, *, prompt_tokens: int = 0,
                               elapsed_s: float = 0.0, native_fallback: bool = False,
                               completed: bool = True, chat_id: str = "",
                               prompt_ms: float = 0.0, eval_ms: float = 0.0,
+                              draft_n: int = 0, draft_accepted: int = 0,
                               compactions: int = 0,
                               compaction_failures: int = 0,
                               tool_outcomes: list | None = None,
@@ -1223,6 +1245,8 @@ def _record_model_observation(model: str, *, prompt_tokens: int = 0,
             "elapsed_ms": round(max(0.0, float(elapsed_s or 0)) * 1000.0, 2),
             "prefill_ms": round(max(0.0, float(prompt_ms or 0)), 2),
             "eval_ms": round(max(0.0, float(eval_ms or 0)), 2),
+            "draft_n": max(0, int(draft_n or 0)),
+            "draft_accepted": max(0, int(draft_accepted or 0)),
             "native_fallback": bool(native_fallback),
             "compactions": max(0, int(compactions or 0)),
             "compaction_failures": max(0, int(compaction_failures or 0)),
@@ -2025,8 +2049,17 @@ DEFAULT_SETTINGS = {
     "ram_bandwidth_gbps": 30,       # System RAM bandwidth for the auto-tune MoE offload speed model.
                                     # 30 (the default) = AUTO: probe once via memcpy benchmark and cache the result.
                                     # Any other value = manual override (DDR4 ~20, dual-channel DDR5 ~40-60, Apple Silicon 100+).
-    "min_tok_s_estimate": 6,        # Auto-tune won't pick an MoE (ctx, n_cpu_moe) combo whose estimated decode
-                                    # speed falls below this floor (context you can't use isn't a win).
+    "min_tok_s_estimate": 6,        # LEGACY — superseded by min_decode_tok_s below. Kept so old settings
+                                    # files still parse; the tuner no longer reads it.
+    "min_decode_tok_s": 45,         # Minimum generation speed (tok/s) the auto-tuner plans for. It picks the
+                                    # largest context (and MoE offload) whose predicted decode speed at the user's
+                                    # usual chat size stays at or above this. Never changes the model's quantization.
+    "spec_draft_n_max": 0,          # --spec-draft-n-max for MTP drafting. 0 = auto (3, then tuned per model from
+                                    # measured draft acceptance). Measured on a 4090/27B: 1 → 70 tok/s, 3 → 93.
+    "moe_cache_mib": 0,             # --moe-cache-mib: GPU cache for MoE experts kept in system RAM (0 = off).
+                                    # The tuner sizes it when experts are offloaded and the PCIe link pays for it.
+    "exact_fit": True,              # Check the tuner's plan against llama-fit-params (llama.cpp's own memory
+                                    # estimate) and spend the measured slack on context. Off = analytic estimate only.
     "safety_reserve_gb": 1.0,       # SYSTEM RAM kept free for the OS — the floor under available RAM for CPU
                                     # expert/layer offload. Keeps Windows 11 responsive (no thrash/bluescreen)
                                     # when big models push the machine to the edge. Never touches the VRAM budget.
@@ -5051,6 +5084,26 @@ def tool_record_finding(args: dict) -> dict:
     })
     if artifact:
         row["artifact"] = artifact
+    # CVSS and CWE are validated and computed server-side. A local model can
+    # judge qualitative impact, but a wrong vector or invented CWE name must
+    # never reach a platform or client report; invalid input is rejected with
+    # a repairable error while the rest of the finding is still recorded.
+    if args.get("cvss_vector"):
+        scored = cvss_base_score(str(args.get("cvss_vector")))
+        if scored:
+            row["cvss"] = scored
+            row.pop("cvss_error", None)
+        else:
+            row["cvss_error"] = (
+                "Unrecognized CVSS v3.1 base vector. Expected all eight base "
+                "metrics, e.g. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H.")
+    if args.get("cwe"):
+        cwe = normalize_cwe(args.get("cwe"))
+        if cwe:
+            row["cwe"] = cwe
+            row.pop("cwe_error", None)
+        else:
+            row["cwe_error"] = "CWE must look like CWE-79 or 79."
     if is_new:
         findings.append(row)
     chat["findings"] = findings[-200:]
@@ -5234,9 +5287,15 @@ def _rt_endpoint_from_args(args: dict) -> tuple[str, int | None]:
 
 
 def _rt_scope_out_tokens(chat: dict | None) -> list[str]:
-    """Out-of-scope tokens (hosts and/or bare ports) parsed from mission.scope's
-    'out:' segment. Only fires when an explicit out list was declared."""
+    """Out-of-scope tokens from the structured mission scope_out list, falling
+    back to the legacy 'out:' segment of mission.scope. Only fires when an
+    explicit out list was declared."""
     m = _rt_mission_get(chat) if isinstance(chat, dict) else None
+    if m:
+        structured = [str(t).strip().lower() for t in (m.get("scope_out") or [])
+                      if str(t).strip()]
+        if structured:
+            return structured
     scope = str((m or {}).get("scope", "")) if m else ""
     low = scope.lower()
     if "out:" not in low:
@@ -5253,14 +5312,18 @@ def _rt_scope_out_tokens(chat: dict | None) -> list[str]:
 def _rt_scope_in_tokens(chat: dict | None) -> list[str]:
     """Authoritative in-scope allowlist.
 
-    An explicit ``in:`` segment wins. If the user leaves that field blank, the
-    confirmed mission target is the only allowed host. This is intentionally
-    allowlist-based: an ``out:`` denylist alone cannot stop model drift to a
-    host the questionnaire never mentioned.
+    An explicit structured scope_in list wins; then the legacy ``in:``
+    segment. If neither is present, the confirmed mission target is the only
+    allowed host. This is intentionally allowlist-based: an ``out:`` denylist
+    alone cannot stop model drift to a host the questionnaire never mentioned.
     """
     m = _rt_mission_get(chat) if isinstance(chat, dict) else None
     if not m:
         return []
+    structured = [str(t).strip().lower() for t in (m.get("scope_in") or [])
+                  if str(t).strip()]
+    if structured:
+        return structured
     scope = str(m.get("scope") or "")
     low = scope.lower()
     seg = ""
@@ -5361,6 +5424,58 @@ def _rt_context_chat() -> dict | None:
         return None
 
 
+_RT_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+_RT_AUTOMATED_TOOL_NAMES = {
+    # Scanners, sprayers, and fan-out fuzzers. A program or client that bans
+    # automated testing disables exactly this set; the manual primitives
+    # (http_request, rt_browser) remain so enumeration is still possible.
+    "sandbox_nmap", "sandbox_sqlmap", "recon_auth_spray",
+    "recon_port_scan", "recon_content_discovery", "fuzz", "batch_probe",
+}
+
+
+def _rt_clean_required_headers(value: Any) -> dict:
+    """Header-safe name->value map from the gate panel (bounded, latin-1 safe)."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, raw in list(value.items())[:10]:
+        name = str(key or "").strip()
+        text = str(raw or "").strip()
+        if not _RT_HEADER_NAME_RE.match(name) or not text or len(text) > 512:
+            continue
+        if any(ord(char) < 32 or ord(char) == 127 for char in text):
+            continue
+        try:
+            text.encode("latin-1")
+        except UnicodeEncodeError:
+            continue
+        out[name] = text
+    return out
+
+
+def _rt_scope_tokens_from_panel(value: Any) -> list[str]:
+    """Normalize a structured in/out scope field (list or delimited string)."""
+    if isinstance(value, str):
+        value = re.split(r"[,\s|]+", value)
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[str] = []
+    for item in list(value)[:50]:
+        tok = re.sub(r"^https?://", "", str(item or "").strip().lower())
+        tok = tok.strip("/()[]{}'\"")
+        if tok and tok not in ("in", "out", "scope") and tok not in out:
+            out.append(tok[:120])
+    return out
+
+
+def _bounded_int(value: Any, low: int, high: int) -> int:
+    try:
+        return max(low, min(high, int(value)))
+    except (TypeError, ValueError):
+        return low
+
+
 def _rt_clean_user_agent(value: Any) -> str:
     """Return a header-safe custom User-Agent, or blank when invalid."""
     user_agent = str(value or "").strip()
@@ -5382,16 +5497,28 @@ def _rt_required_user_agent() -> str:
 
 
 def _rt_apply_mission_user_agent(headers: dict | None = None) -> dict:
-    """Force the engagement User-Agent after model- or profile-supplied headers."""
+    """Force engagement-required headers after model- or profile-supplied ones.
+
+    The engagement User-Agent and any program-required headers (HackerOne
+    research headers, program tagging) win over whatever the model or the
+    browser profile put in the request, in every HTTP path of the suite.
+    """
     result = dict(headers or {})
-    user_agent = _rt_required_user_agent()
-    if not user_agent:
+    mission = _rt_authorized_mission(_rt_context_chat())
+    if not mission:
         return result
-    for key in list(result):
-        low = str(key).lower()
-        if low == "user-agent" or low.startswith("sec-ch-ua"):
-            result.pop(key, None)
-    result["User-Agent"] = user_agent
+    user_agent = _rt_clean_user_agent(mission.get("user_agent"))
+    if user_agent:
+        for key in list(result):
+            low = str(key).lower()
+            if low == "user-agent" or low.startswith("sec-ch-ua"):
+                result.pop(key, None)
+        result["User-Agent"] = user_agent
+    for name, value in _rt_clean_required_headers(mission.get("required_headers")).items():
+        for key in list(result):
+            if str(key).lower() == name.lower():
+                result.pop(key, None)
+        result[name] = value
     return result
 
 
@@ -6133,6 +6260,34 @@ def _rt_discovered_secret_submission_block(name: str, args: dict,
     return None
 
 
+_RT_DESTRUCTIVE_PATH_RE = re.compile(
+    r"(?i)(?:^|[/_\-.])(delete|destroy|purge|shutdown|drop|wipe|uninstall)(?:[/_\-.]|$)")
+
+
+def _rt_destructive_block(name: str, args: dict) -> str | None:
+    """Block DELETE and destructive-looking paths when the engagement panel
+    left 'allow destructive methods' unchecked (allow_destructive is False)."""
+    if name != "http_request":
+        return None
+    method = str(args.get("method") or "").upper()
+    if not method:
+        method = "POST" if args.get("body") else "GET"
+    if method == "DELETE":
+        return ("refused: DELETE is disabled for this engagement (destructive methods "
+                "were not allowed on the authorization panel). Enable them for the "
+                "engagement or demonstrate the finding with a non-destructive request.")
+    url = str(args.get("url") or args.get("target") or "")
+    try:
+        path = urllib.parse.urlsplit(url if "://" in url else "//" + url).path
+    except Exception:
+        path = url
+    if _RT_DESTRUCTIVE_PATH_RE.search(path or ""):
+        return (f"refused: the path '{path[:120]}' looks destructive and this engagement "
+                f"is limited to non-destructive testing. Allow destructive methods on the "
+                f"engagement if this request is intended.")
+    return None
+
+
 _RT_NETWORK_CMD_RE = re.compile(
     r"\b(?:curl|wget|invoke-webrequest|iwr|invoke-restmethod|irm|nmap|sqlmap|"
     r"nikto|ffuf|gobuster|dirsearch|feroxbuster|netcat|ncat|nc|telnet|ssh|scp|"
@@ -6196,6 +6351,14 @@ def _rt_scope_block(name: str, args: dict) -> str | None:
     if name in _RT_EXPLOIT_TOOL_NAMES and not _rt_incl_exploit_for(chat, settings):
         return ("refused: this action is outside Target Recon mode. Start an authorized Red Team "
                 "assessment for active testing. Finding validation affects reporting, not tool access.")
+    if mission.get("automated_allowed") is False and name in _RT_AUTOMATED_TOOL_NAMES:
+        return ("refused: the engagement questionnaire disables automated testing tools "
+                "(scanners, sprayers, fuzzers). Test manually with http_request, rt_browser, "
+                "or the individual recon checks instead of retrying this tool.")
+    if mission.get("allow_destructive") is False:
+        _destructive = _rt_destructive_block(name, args or {})
+        if _destructive:
+            return _destructive
 
     host, port = _rt_endpoint_from_args(args)
     if not host:
@@ -6321,12 +6484,34 @@ def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
     engagement = str(panel.get("engagement") or "recon").strip().lower()
     if engagement not in ("passive_osint", "frontend_secrets", "recon", "pentest"):
         engagement = "recon"
+    # Structured engagement policy. The freeform `scope` string stays for
+    # display and backwards compatibility; these machine-readable fields are
+    # what the enforcement paths consume, so program scope exports stop being
+    # re-parsed out of prose.
+    scope_in = _rt_scope_tokens_from_panel(panel.get("scope_in"))
+    scope_out = _rt_scope_tokens_from_panel(panel.get("scope_out"))
+    required_headers = _rt_clean_required_headers(panel.get("required_headers"))
+    rate_limit_rpm = _bounded_int(panel.get("rate_limit_rpm"), 0, 6000)
+    request_cap = _bounded_int(panel.get("request_cap"), 0, 1000000)
+    automated_allowed = panel.get("automated_allowed") is not False
+    allow_destructive = panel.get("allow_destructive") is True
     facts = ["constraints: " + constraints[:180]] if constraints else []
+    if not automated_allowed:
+        facts.append("automated testing tools are disabled for this engagement")
+    if not allow_destructive:
+        facts.append("destructive methods are blocked (non-destructive testing only)")
     mission = {
         "target": target[:120],
         "scope": scope[:300],
+        "scope_in": scope_in,
+        "scope_out": scope_out,
         "objective": objective[:300],
         "user_agent": user_agent,
+        "required_headers": required_headers,
+        "rate_limit_rpm": rate_limit_rpm,
+        "request_cap": request_cap,
+        "automated_allowed": automated_allowed,
+        "allow_destructive": allow_destructive,
         "facts": facts,
         "phase": "recon",
         "engagement": engagement,
@@ -6375,10 +6560,37 @@ def _rt_mission_render(chat: dict, budget_chars: int | None = None) -> str:
         head.append(f"mode: {m['engagement']}")
     if m.get("user_agent"):
         head.append(f"required user agent: {m['user_agent']}")
+    required_headers = _rt_clean_required_headers(m.get("required_headers"))
+    if required_headers:
+        head.append("required headers sent on every request: " + ", ".join(sorted(required_headers)))
+    if m.get("scope_in"):
+        head.append("in-scope allowlist: " + ", ".join(str(t) for t in m["scope_in"][:8]))
+    if m.get("scope_out"):
+        head.append("out-of-scope: " + ", ".join(str(t) for t in m["scope_out"][:8]))
+    rpm, cap = _rt_gov_limits(m)
+    if rpm or cap:
+        _usage = _rt_gov_usage(m)
+        _parts = []
+        if rpm:
+            _parts.append(f"{rpm} requests/minute")
+        if cap:
+            _parts.append(f"{cap} requests total")
+        if _usage.get("total_sent") is not None:
+            _parts.append(f"used {_usage['total_sent']}")
+        head.append("engagement request budget: " + ", ".join(_parts))
+    if m.get("automated_allowed") is False:
+        head.append("automated testing tools: disabled for this engagement")
+    if m.get("allow_destructive") is False:
+        head.append("destructive methods: blocked (non-destructive testing only)")
     if budget_chars is None:
         head.append("Authorization controls actions; evidence controls conclusions. In Red Team mode, continue any permitted in-scope, non-destructive test without waiting for a finding to be promoted. For validated claims, preserve two response receipts and a meaningful control, then use review_finding. Scanner output alone is a candidate. Keep observed and inferred impact separate, link completed coverage to receipts, and describe blocked or incomplete checks as gaps.")
         coverage = [p for p in chat.get("security_coverage", []) if p.get("mission_id") == m.get("authorization_id")]
-        head.extend(f"coverage ({p.get('state', 'untested')}): {p.get('feature')} / {p.get('identity')} / {p.get('target')}" for p in coverage[-12:])
+        if coverage:
+            pending = [p for p in coverage if p.get("state", "untested") != "observed"]
+            observed = [p for p in coverage if p.get("state", "untested") == "observed"]
+            head.append(f"coverage: {len(observed)}/{len(coverage)} planned checks observed")
+            head.extend(f"coverage ({p.get('state', 'untested')}): {p.get('feature')} / {p.get('identity')} / {p.get('target')}"
+                        for p in (pending[:6] + observed[-3:])[:8])
     facts = list(m.get("facts") or [])
     if budget_chars is not None:
         used = sum(len(h) + 1 for h in head) + 40
@@ -11969,28 +12181,31 @@ def _github_worktree_prompt(chat: dict | None) -> str:
 
 
 def _project_workspace_metadata(raw: object) -> dict | None:
-    """Validate the private context attached to a from-scratch project chat."""
+    """Validate the private context attached to a project chat.
+
+    New-project sessions carry git metadata (branch, publication). A folder
+    picked from the composer is any directory inside a configured workspace
+    root, so only path membership and a matching label are required."""
     if not isinstance(raw, dict):
         return None
-    name = str(raw.get("name") or "").strip()
     path = normalize_path(str(raw.get("path") or ""))
-    branch = str(raw.get("branch") or "main").strip()
-    brief = str(raw.get("brief") or "").strip()[:4000]
+    if not path or not _workspace_root_for(path) or not Path(path).is_dir():
+        return None
+    name = str(raw.get("name") or "").strip() or Path(path).name
+    branch = str(raw.get("branch") or "").strip()
     owner = str(raw.get("owner") or "").strip()
-    if (not _GITHUB_REPO_RE.fullmatch(name)
-            or name in {".", ".."}
-            or _github_valid_branch_name(branch)
-            or not path
-            or not _workspace_root_for(path)
+    if (not name
+            or len(name) > 120
+            or re.search(r"[\r\n\x00]", name)
             or Path(path).name.lower() != name.lower()
-            or not (Path(path) / ".git").exists()
+            or (branch and _github_valid_branch_name(branch))
             or (owner and not _GITHUB_OWNER_RE.fullmatch(owner))):
         return None
     return {
         "name": name,
         "path": path,
         "branch": branch,
-        "brief": brief,
+        "brief": str(raw.get("brief") or "").strip()[:4000],
         "published": bool(raw.get("published")),
         "owner": owner,
     }
@@ -12004,10 +12219,12 @@ def _project_workspace_prompt(chat: dict | None) -> str:
     lines = [
         "active project for this chat:",
         f"- project: {project['name']}",
-        f"- expected branch: {project['branch']}",
         f"- local path: {project['path']}",
-        f"- GitHub publication: {'published' if project['published'] else 'local only'}",
     ]
+    if project["branch"]:
+        lines.append(f"- expected branch: {project['branch']}")
+    if project["owner"] or (Path(project["path"]) / ".git").exists():
+        lines.append(f"- GitHub publication: {'published' if project['published'] else 'local only'}")
     if project["brief"]:
         lines.append(f"- initial brief: {project['brief']}")
     lines.append(
@@ -18023,6 +18240,154 @@ def _rt_jitter() -> None:
         pass
 
 
+# ---- engagement request governor + ledger -----------------------------------
+# A program's rate limit or a client's request budget is a HARD constraint, not
+# a hint: exceeding it can end an engagement. Every outbound HTTP request the
+# suite makes through its shared fetch paths is admitted here, counted per
+# engagement, and appended to an on-disk ledger that doubles as proof of
+# restraint ("50 requests this hour"). In-memory counters reset on restart; the
+# ledger is the durable record. Sandbox scanners (nmap/sqlmap) manage their own
+# timing inside the guest and are not counted here.
+_RT_GOV_LOCK = threading.Lock()
+_RT_GOV_LEDGER_LOCK = threading.Lock()
+_RT_GOV_STATE: dict[str, dict] = {}
+_RT_GOV_LEDGER_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _rt_gov_state(key: str) -> dict:
+    state = _RT_GOV_STATE.get(key)
+    if state is None:
+        state = {"window_start": time.time(), "window_count": 0, "total": 0, "blocked": 0}
+        _RT_GOV_STATE[key] = state
+        while len(_RT_GOV_STATE) > 128:
+            _RT_GOV_STATE.pop(next(iter(_RT_GOV_STATE)), None)
+    if time.time() - state["window_start"] >= 60:
+        state["window_start"] = time.time()
+        state["window_count"] = 0
+    return state
+
+
+def _rt_gov_limits(mission: dict | None) -> tuple[int, int]:
+    m = mission or {}
+    return (_bounded_int(m.get("rate_limit_rpm"), 0, 6000),
+            _bounded_int(m.get("request_cap"), 0, 1000000))
+
+
+def _rt_gov_preflight(estimated: int, mission: dict | None = None) -> str | None:
+    """Refuse BEFORE any traffic when a fan-out would exceed the engagement
+    budget. `estimated` is how many requests the call is about to send."""
+    mission = mission if mission is not None else _rt_authorized_mission(_rt_context_chat())
+    key = str((mission or {}).get("authorization_id") or "")
+    if not key:
+        return None
+    rpm, cap = _rt_gov_limits(mission)
+    if not rpm and not cap:
+        return None
+    estimate = max(1, int(estimated or 1))
+    with _RT_GOV_LOCK:
+        state = _rt_gov_state(key)
+        window_used, total_used, window_start = (
+            state["window_count"], state["total"], state["window_start"])
+    if cap and total_used + estimate > cap:
+        return (f"refused: this engagement's total request cap is {cap} and "
+                f"{total_used} requests have already been sent; this call would send "
+                f"about {estimate}. Raise the engagement cap or narrow the call.")
+    if rpm and window_used + estimate > rpm:
+        wait = max(1, 60 - int(time.time() - window_start))
+        return (f"refused: the engagement rate limit is {rpm}/minute and {window_used} "
+                f"requests were sent in the current window; this call would send about "
+                f"{estimate}. Wait about {wait}s or raise the engagement limit.")
+    return None
+
+
+def _rt_gov_ledger_append(key: str, host: str, method: str, url: str) -> None:
+    try:
+        folder = DATA / "redteam"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / "request_ledger.jsonl"
+        line = json.dumps({
+            "t": int(time.time()), "mission": key, "host": str(host)[:120],
+            "method": str(method or "GET")[:12], "url": str(url)[:500],
+        }, ensure_ascii=False)
+        with _RT_GOV_LEDGER_LOCK:
+            try:
+                if path.exists() and path.stat().st_size > _RT_GOV_LEDGER_MAX_BYTES:
+                    rotated = folder / "request_ledger.1.jsonl"
+                    if rotated.exists():
+                        rotated.unlink()
+                    path.rename(rotated)
+            except OSError:
+                pass
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _rt_gov_admit(host: str, method: str, url: str = "", mission: dict | None = None) -> str | None:
+    """Count one outbound request against the engagement budget, ledger it,
+    and return a refusal when the request is over budget."""
+    mission = mission if mission is not None else _rt_authorized_mission(_rt_context_chat())
+    key = str((mission or {}).get("authorization_id") or "")
+    if not key:
+        return None
+    rpm, cap = _rt_gov_limits(mission)
+    if not rpm and not cap:
+        # No explicit budget: still ledger every engagement request as the
+        # audit trail a program or client may ask for.
+        _rt_gov_ledger_append(key, host, method, url)
+        return None
+    with _RT_GOV_LOCK:
+        state = _rt_gov_state(key)
+        if cap and state["total"] >= cap:
+            state["blocked"] += 1
+            return (f"refused: this engagement's request cap ({cap}) is reached; "
+                    f"no further requests will be sent for it.")
+        if rpm and state["window_count"] >= rpm:
+            state["blocked"] += 1
+            wait = max(1, 60 - int(time.time() - state["window_start"]))
+            return (f"refused: the engagement rate limit ({rpm}/minute) is reached for "
+                    f"this window. Retry in about {wait}s or raise the limit.")
+        state["window_count"] += 1
+        state["total"] += 1
+    _rt_gov_ledger_append(key, host, method, url)
+    return None
+
+
+def _rt_gov_usage(mission: dict | None) -> dict:
+    """Current engagement usage counters (persist for this process only)."""
+    key = str((mission or {}).get("authorization_id") or "")
+    if not key:
+        return {}
+    with _RT_GOV_LOCK:
+        state = _RT_GOV_STATE.get(key)
+        if not state:
+            return {}
+        return {"window_used": state["window_count"], "total_sent": state["total"],
+                "blocked": state["blocked"]}
+
+
+def _rt_gov_ledger_count(key: str) -> int:
+    """Ledger lines recorded for this engagement, across rotations."""
+    total = 0
+    try:
+        folder = DATA / "redteam"
+        for name in ("request_ledger.jsonl", "request_ledger.1.jsonl"):
+            path = folder / name
+            if not path.exists():
+                continue
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        if json.loads(line).get("mission") == key:
+                            total += 1
+                    except Exception:
+                        continue
+    except Exception:
+        return total
+    return total
+
+
 _RECON_UA = _RT_UA_POOL[0]  # deprecated alias; new code should call _rt_ua()
 
 
@@ -18044,6 +18409,9 @@ def _recon_fetch(url: str, timeout: float = 8.0, max_bytes: int = 8000,
     if extra_headers:
         hdrs.update(extra_headers)
     hdrs = _rt_apply_mission_user_agent(hdrs)
+    _gov = _rt_gov_admit(_rt_url_host(url), "GET", url=url)
+    if _gov:
+        return {"error": _gov, "url": url, "rate_limited": True}
     req = urllib.request.Request(url, headers=hdrs)
     _handlers = [urllib.request.HTTPSHandler(context=ctx)]
     if not follow:
@@ -19033,6 +19401,9 @@ def tool_http_request(args: dict) -> dict:
         req_headers = _browser_headers(profile, accept_html=True)
         req_headers.update(headers)  # caller-supplied headers/cookies win
         req_headers = _rt_apply_mission_user_agent(req_headers)
+        _gov = _rt_gov_admit(_rt_url_host(url), method, url=url)
+        if _gov:
+            return {"error": _gov, "url": url, "method": method, "rate_limited": True}
         attempt_started = time.monotonic()
         try:
             req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
@@ -19443,6 +19814,9 @@ def tool_fuzz(args: dict) -> dict:
     if not values:
         return {"error": "provide `values` (list) or `range` [start, end]"}
     values = [str(v) for v in values][:300]
+    _gov = _rt_gov_preflight(len(values))
+    if _gov:
+        return {"error": _gov, "url": url, "rate_limited": True}
     timeout = max(2.0, min(float(args.get("timeout") or 6.0), 12.0))
 
     def build(v):
@@ -19585,6 +19959,11 @@ def tool_batch_probe(args: dict) -> dict:
             jobs.append((u, p, q, pname))
     if not jobs:
         return {"error": "no query parameters found in targets — include a ?key=value in each URL"}
+
+    _gov = _rt_gov_preflight(len(jobs) * len(payloads))
+    if _gov:
+        return {"error": _gov, "rate_limited": True,
+                "targets": len(targets), "params_tested": len(jobs)}
 
     cap = 400  # hard ceiling on total requests
     counter = {"sent": 0}
@@ -19858,8 +20237,151 @@ def _frontend_secret_record_for_report(record: dict) -> dict:
     return reported
 
 
+# ---- passive frontend-surface extraction (endpoints + source maps) ----------
+# Both run ONLY over bytes scan_js_secrets already fetched (the page, its linked
+# and lazy JavaScript, and any source maps) — zero additional requests to the
+# target. This is extraction, never probing: discovered endpoints are reported
+# as attack surface and are never called; reconstructed sources are just the
+# original files the server already published inside its .map artifacts. Active
+# testing of any of this stays on the gated Red Team engagements.
+
+# Static assets are not endpoints of interest (unless they carry a query).
+_ENDPOINT_STATIC_EXT = (
+    ".js", ".mjs", ".cjs", ".css", ".map", ".png", ".jpg", ".jpeg", ".gif",
+    ".svg", ".webp", ".ico", ".bmp", ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".mp4", ".webm", ".mp3", ".wav", ".avi", ".mov", ".pdf", ".zip",
+)
+# wss://host/path  — websocket endpoints
+_ENDPOINT_WS_RE = re.compile(
+    r"""['"`](wss?://[A-Za-z0-9.\-]+(?::\d+)?(?:/[^'"`\s<>()]*)?)['"`]""", re.IGNORECASE)
+# https://host/path  or  //host/path  — fully-qualified / protocol-relative
+_ENDPOINT_ABS_RE = re.compile(
+    r"""['"`]((?:https?:)?//[A-Za-z0-9.\-]+(?::\d+)?(?:/[^'"`\s<>()]*)?)['"`]""", re.IGNORECASE)
+# /rooted/path  (not //, which the absolute rule owns)
+_ENDPOINT_PATH_RE = re.compile(
+    r"""['"`](/(?!/)[A-Za-z0-9._~\-/]{1,}(?:\?[^'"`\s<>]{0,200})?)['"`]""")
+# Explicit client calls — captures the URL even when generic, plus the verb
+# (from axios.VERB(...) or from an XHR .open("VERB", url)).
+_ENDPOINT_CALL_RE = re.compile(
+    r"""(?:fetch|axios(?:\.(get|post|put|patch|delete|head|options))?|\.open)\s*\(\s*"""
+    r"""(?:['"]([A-Za-z]+)['"]\s*,\s*)?['"`]([^'"`\s<>]{1,400})['"`]""",
+    re.IGNORECASE,
+)
+
+
+def _endpoint_is_noise(value: str) -> bool:
+    v = value.strip()
+    if len(v) < 2 or len(v) > 400:
+        return True
+    if any(ch in v for ch in (" ", "\t", "\n", "<", ">", "{", "}", "$", "\\", "^", "|")):
+        return True
+    if v.count("/") == 0:            # single token, no path — too generic
+        return True
+    # A static asset is not an endpoint even with a cache-busting query.
+    base = v.split("?", 1)[0].split("#", 1)[0].lower()
+    if base.endswith(_ENDPOINT_STATIC_EXT):
+        return True
+    return False
+
+
+def _classify_endpoint(value: str, target_host: str) -> tuple[str, str]:
+    low = value.lower()
+    if low.startswith(("ws://", "wss://")):
+        return "websocket", "external"
+    if low.startswith(("http://", "https://", "//")):
+        try:
+            netloc = urllib.parse.urlparse(
+                value if "://" in value else "https:" + value).netloc
+        except Exception:
+            netloc = ""
+        host = netloc.split("@")[-1].split(":")[0].lower()
+        same = bool(host and target_host and host == target_host)
+        return "absolute_url", ("same_origin" if same else "external")
+    return "path", "same_origin"
+
+
+def _extract_frontend_endpoints(source_url: str, text: str, target_host: str,
+                                seen: set, out: list, cap: int = 2000) -> None:
+    """Append de-duplicated endpoints found in `text` to `out` (bounded)."""
+    def push(value: str, start: int, verb: str = "") -> None:
+        if len(out) >= cap:
+            return
+        v = value.strip()
+        if _endpoint_is_noise(v) or v in seen:
+            return
+        seen.add(v)
+        etype, scope = _classify_endpoint(v, target_host)
+        rec = {"value": v[:300], "type": etype, "scope": scope,
+               "source": source_url, "line": text.count("\n", 0, start) + 1}
+        if verb:
+            rec["method"] = verb.upper()
+        out.append(rec)
+
+    # Call sites first so the HTTP verb is recorded before a plain match dedups.
+    for m in _ENDPOINT_CALL_RE.finditer(text):
+        push(m.group(3), m.start(3), m.group(1) or m.group(2) or "")
+    for m in _ENDPOINT_WS_RE.finditer(text):
+        push(m.group(1), m.start(1))
+    for m in _ENDPOINT_ABS_RE.finditer(text):
+        push(m.group(1), m.start(1))
+    for m in _ENDPOINT_PATH_RE.finditer(text):
+        push(m.group(1), m.start(1))
+
+
+def _reconstruct_source_maps(source_map_sources: list, max_bytes: int) -> dict:
+    """Recover original sources from .map `sourcesContent` already downloaded.
+    Returns the full recovered file tree plus inline content up to max_bytes."""
+    recovered: list[dict] = []
+    contents: list[dict] = []
+    seen_paths: set = set()
+    map_count = 0
+    total = 0
+    truncated = False
+    for map_url, body in source_map_sources:
+        try:
+            data = json.loads(body)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        map_count += 1
+        srcs = data.get("sources") or []
+        cont = data.get("sourcesContent") or []
+        root = str(data.get("sourceRoot") or "")
+        for i, raw_path in enumerate(srcs):
+            path = (root + str(raw_path)) if root else str(raw_path)
+            key = (map_url, path)
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            c = cont[i] if i < len(cont) and isinstance(cont[i], str) else None
+            nbytes = len(c.encode("utf-8", "replace")) if c else 0
+            recovered.append({"path": path[:300], "bytes": nbytes, "map": map_url})
+            if c:
+                if total < max_bytes:
+                    take = c[: max(0, max_bytes - total)]
+                    if len(take) < len(c):
+                        truncated = True
+                    contents.append({"path": path[:300], "content": take})
+                    total += len(take.encode("utf-8", "replace"))
+                else:
+                    truncated = True
+    return {
+        "map_count": map_count,
+        "recovered_file_count": len(recovered),
+        "files": recovered[:1000],
+        "contents": contents,
+        "content_truncated": truncated,
+    }
+
+
 def tool_scan_js_secrets(args: dict) -> dict:
-    """Conservative frontend-secret audit shared by Red Team and its standalone UI."""
+    """Passive frontend audit (the Frontend Secrets engagement): over the page,
+    its linked/lazy JS, and source maps it fetches once, it audits for secrets,
+    maps referenced endpoints/API routes as attack surface (never calling them),
+    and reconstructs original sources from any source maps. Shared by Red Team
+    and its standalone UI. Read-only — no endpoint is probed, no credential
+    submitted."""
     if not get_settings().get("red_team_enabled"):
         return {"error": "red team tools are disabled. Enable them in Settings."}
     url = _recon_prep_url((args.get("url") or args.get("target") or "").strip())
@@ -19870,6 +20392,9 @@ def tool_scan_js_secrets(args: dict) -> dict:
     max_depth = max(0, min(int(args.get("crawl_depth") or 2), 4))
     max_bytes = max(128000, min(int(args.get("max_bytes_per_file") or 1500000), 4000000))
     include_candidates = bool(args.get("include_candidates"))
+    include_endpoints = args.get("include_endpoints", True) is not False
+    reconstruct_sources = args.get("reconstruct_sources", True) is not False
+    max_reconstructed_bytes = max(0, min(int(args.get("max_reconstructed_bytes") or 40000), 200000))
 
     first = _recon_fetch(url, timeout=timeout, max_bytes=max_bytes)
     if "error" in first:
@@ -19952,6 +20477,37 @@ def tool_scan_js_secrets(args: dict) -> dict:
     protected_value_count = _rt_remember_frontend_secret_values(
         _rt_context_chat(), findings + candidates + public_ids)
 
+    # Passive surface extraction over the SAME already-fetched bytes — no new
+    # requests. Reconstructed source is itself frontend code, so it is mined
+    # for endpoints too; secrets inside a .map are already caught above because
+    # its raw text was scanned as a source.
+    target_host = urllib.parse.urlparse(url).netloc.split("@")[-1].split(":")[0].lower()
+    endpoints: list[dict] = []
+    reconstruction: dict | None = None
+    if include_endpoints:
+        ep_seen: set = set()
+        for source_url, kind, text in sources:
+            if kind == "source_map":
+                continue                 # JSON; handled via reconstruction below
+            _extract_frontend_endpoints(source_url, text, target_host, ep_seen, endpoints)
+    source_map_sources = [(u, t) for (u, k, t) in sources if k == "source_map"]
+    if reconstruct_sources and source_map_sources:
+        reconstruction = _reconstruct_source_maps(source_map_sources, max_reconstructed_bytes)
+        if include_endpoints:
+            for item in reconstruction.get("contents", []):
+                _extract_frontend_endpoints(item["path"], item["content"],
+                                            target_host, ep_seen, endpoints)
+    endpoint_hosts = set()
+    for e in endpoints:
+        if e["type"] in ("absolute_url", "websocket") and e.get("scope") != "same_origin":
+            try:
+                v = e["value"]
+                netloc = urllib.parse.urlparse(v if "://" in v else "https:" + v).netloc
+                if netloc:
+                    endpoint_hosts.add(netloc)
+            except Exception:
+                pass
+
     visible_records = findings + (candidates if include_candidates else [])
     reported = [_frontend_secret_record_for_report(record) for record in visible_records[:200]]
     reported_public_ids = [
@@ -19979,13 +20535,20 @@ def tool_scan_js_secrets(args: dict) -> dict:
         "public_identifier_count": len(public_ids),
         "public_identifiers": reported_public_ids,
         "findings": reported,
+        "endpoint_count": len(endpoints),
+        "endpoints": endpoints[:500],
+        "endpoint_external_hosts": sorted(endpoint_hosts)[:100],
+        "source_map_reconstruction": reconstruction,
         "provider_validation_performed": False,
         "credential_submission_guard_active": protected_value_count > 0,
         "note": (
             "Provider-shaped credentials and structurally verified private keys are returned by default. "
             "Exact matched values are included for reporting. Public client identifiers are separated and "
             "uncertain candidates are hidden. No discovered credential was submitted to a provider "
-            "or used for a liveness check."
+            "or used for a liveness check. Endpoints are extracted from the fetched code as attack "
+            "surface only — none were requested; source_map_reconstruction recovers original files the "
+            "server published in its .map artifacts. All passive: no request was made beyond fetching "
+            "the page's own linked assets."
         ),
     }
 
@@ -21463,6 +22026,8 @@ TOOLS: dict[str, dict] = {
                 "artifact_path": {"type": "string", "description": "Existing workspace or recon-evidence file to hash."},
                 "evidence_ids": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 8},
                 "challenge": {"type": "object", "description": "Same challenge object as review_finding: observation quotes, independent control, expected boundary, demonstrated impact, alternative explanation, disproof check, and limitations."},
+                "cvss_vector": {"type": "string", "description": "Optional CVSS v3.1 base vector, e.g. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H. The harness validates all eight base metrics and computes the score; an invalid vector is rejected and the finding still records."},
+                "cwe": {"type": "string", "description": "Optional CWE id, e.g. CWE-79 or 79. The harness validates the id and supplies the canonical name."},
             },
             "required": ["title"],
         },
@@ -21742,7 +22307,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_batch_probe,
     },
     "scan_js_secrets": {
-        "description": "AUTHORIZED PENTEST. Conservative frontend secret audit. Fetches the page, linked/lazy JavaScript, and source maps; suppresses placeholders and hashes; separates public client identifiers; and returns exact matched values for reporting. It does not submit discovered credentials to providers or perform liveness checks. Read-only.",
+        "description": "AUTHORIZED PENTEST. Passive frontend audit. Fetches the page, linked/lazy JavaScript, and source maps ONCE, then from those same bytes (no extra requests): (a) audits for secrets — suppresses placeholders, separates public client identifiers, returns exact values for reporting, never submitting credentials or doing liveness checks; (b) extracts referenced endpoints/API routes as an attack-surface map, reported but NEVER called; (c) reconstructs original source files from any source maps' sourcesContent. Read-only.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -21750,6 +22315,9 @@ TOOLS: dict[str, dict] = {
                 "crawl_depth": {"type": "integer", "description": "Linked JavaScript/source-map discovery depth. Default 2, maximum 4."},
                 "max_files": {"type": "integer", "description": "Maximum linked resources to fetch. Default 60, maximum 200."},
                 "include_candidates": {"type": "boolean", "description": "Also return ambiguous high-entropy assignments and valid JWT structures. Default false."},
+                "include_endpoints": {"type": "boolean", "description": "Extract referenced endpoints/API routes from the fetched code as an attack-surface map (never requested). Default true."},
+                "reconstruct_sources": {"type": "boolean", "description": "Reconstruct original source files from any discovered source maps (sourcesContent). Default true."},
+                "max_reconstructed_bytes": {"type": "integer", "description": "Inline reconstructed-source budget in bytes. Default 40000, maximum 200000 (the full recovered file list is always returned regardless)."},
             },
             "required": ["url"],
         },
@@ -24494,6 +25062,12 @@ def _excluded_tools(include_exploit: bool = True, chat_id: str = "") -> set[str]
             excluded |= set(TOOLS) - _RT_PASSIVE_ALLOWED_TOOL_NAMES
         elif not include_exploit:
             excluded |= _RT_EXPLOIT_TOOL_NAMES
+        # A program or client that bans automated testing loses the scanner
+        # and fuzzer schemas entirely — pruning beats a runtime refusal, which
+        # small models treat as a loop invitation.
+        _mission = _rt_mission_get(chat) if isinstance(chat, dict) else None
+        if _mission and _mission.get("automated_allowed") is False:
+            excluded |= _RT_AUTOMATED_TOOL_NAMES
     if not s.get("analysis_tools_enabled"):
         excluded |= _ANALYSIS_SUITE_TOOL_NAMES
     if (not s.get("remote_access_enabled", True)
@@ -27753,6 +28327,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
     turn_tool_outcomes: list[dict] = []
     turn_prompt_ms_total = 0.0
     turn_eval_ms_total = 0.0
+    turn_draft_n = 0
+    turn_draft_accepted = 0
     turn_compactions = 0
     turn_compaction_failures = 0
     turn_interventions = {key: 0 for key in _HARNESS_INTERVENTION_KEYS}
@@ -28565,6 +29141,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             "eval_duration": int((t.get("predicted_ms") or 0) * 1e6),
                             "prompt_eval_count": t.get("prompt_n"),
                             "prompt_eval_duration": int((t.get("prompt_ms") or 0) * 1e6),
+                            "draft_n": t.get("draft_n"),
+                            "draft_n_accepted": t.get("draft_n_accepted"),
                         }
                         continue
                     if "usage" in obj and "choices" not in obj:
@@ -28705,6 +29283,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         last_stats.setdefault("prompt_eval_count", t.get("prompt_n"))
                         last_stats.setdefault("eval_duration", int((t.get("predicted_ms") or 0) * 1e6))
                         last_stats.setdefault("prompt_eval_duration", int((t.get("prompt_ms") or 0) * 1e6))
+                        # Speculative acceptance feeds the tuner's per-model
+                        # draft-length choice (absent when spec is off).
+                        last_stats.setdefault("draft_n", t.get("draft_n"))
+                        last_stats.setdefault("draft_n_accepted", t.get("draft_n_accepted"))
                 # if the stream ended while still inside reasoning (no answer
                 # tokens came), close the channel so the UI can render it cleanly.
                 if reasoning_open:
@@ -28748,6 +29330,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     turn_prompt_total += _raw_pe
                     turn_eval_ms_total += max(0.0, float(last_stats.get("eval_duration", 0) or 0) / 1e6)
                     turn_prompt_ms_total += max(0.0, float(last_stats.get("prompt_eval_duration", 0) or 0) / 1e6)
+                    turn_draft_n += max(0, int(last_stats.get("draft_n") or 0))
+                    turn_draft_accepted += max(0, int(last_stats.get("draft_n_accepted") or 0))
                     turn_peak_prompt = max(turn_peak_prompt, int(_real_prompt or 0))
                     global _last_prompt_tokens
                     _last_prompt_tokens = _real_prompt
@@ -29324,6 +29908,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         chat_id=chat_id,
                         prompt_ms=turn_prompt_ms_total,
                         eval_ms=turn_eval_ms_total,
+                        draft_n=turn_draft_n,
+                        draft_accepted=turn_draft_accepted,
                         compactions=turn_compactions,
                         compaction_failures=turn_compaction_failures,
                         tool_outcomes=turn_tool_outcomes,
@@ -29759,6 +30345,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     chat_id=chat_id,
                     prompt_ms=turn_prompt_ms_total,
                     eval_ms=turn_eval_ms_total,
+                    draft_n=turn_draft_n,
+                    draft_accepted=turn_draft_accepted,
                     compactions=turn_compactions,
                     compaction_failures=turn_compaction_failures,
                     tool_outcomes=turn_tool_outcomes,
@@ -31297,6 +31885,9 @@ def tool_rt_generate_report(args: dict) -> dict:
         return {"error": "red team tools are disabled. Enable them in Settings."}
     title = (args.get("title") or "Red Team Engagement Report").strip()
     body = (args.get("findings") or "").strip()
+    template = str(args.get("template") or "generic").strip().lower()
+    if template not in {"generic", "hackerone", "bugcrowd"}:
+        template = "generic"
     chats_data = None
     try:
         chat_id = _current_chat_id.get() or ""
@@ -31378,6 +31969,12 @@ def tool_rt_generate_report(args: dict) -> dict:
                       f"- Status: **{_md(item.get('status'), 30)}**",
                       f"- Severity: **{_md(item.get('severity'), 20)}**",
                       f"- Harness-observed source: **{'yes' if item.get('source_observed') else 'no'}**"]
+            if isinstance(item.get("cvss"), dict):
+                lines.append(f"- CVSS (validated): `{_md(item['cvss'].get('vector'), 200)}` "
+                             f"({item['cvss'].get('score')}, {_md(item['cvss'].get('severity'), 20)})")
+            if isinstance(item.get("cwe"), dict):
+                _cwe_name = f" · {_md(item['cwe'].get('name'), 120)}" if item["cwe"].get("name") else ""
+                lines.append(f"- Weakness: {_md(item['cwe'].get('id'), 30)}{_cwe_name}")
             if item.get("description"):
                 lines += ["", "Model-authored claim (interpretation, not a verified impact statement):", "", _md(item.get("description"), 2000)]
             if item.get("inferred_impact"):
@@ -31393,12 +31990,53 @@ def tool_rt_generate_report(args: dict) -> dict:
             if item.get("evidence_ids"):
                 lines += ["", "Evidence IDs: " + ", ".join(_md(value, 80) for value in item["evidence_ids"])]
             if review.get("control_id"):
-                lines += ["Control ID: " + _md(review["control_id"], 80)]
+                lines.append("Control ID: " + _md(review["control_id"], 80))
             for key, value in (review.get("challenge") or {}).items():
                 if isinstance(value, str):
                     label = "model-authored impact interpretation" if key == "demonstrated_impact" else key.replace('_', ' ')
                     lines.append(f"- {_md(label)}: {_md(value, 2000)}")
             lines.append("")
+    if template in ("hackerone", "bugcrowd") and ledger:
+        platform = "HackerOne" if template == "hackerone" else "Bugcrowd"
+        lines += [f"## {platform} submission fields", "",
+                  "One block per finding in the platform's field shape. Severity, CVSS, and CWE "
+                  "are harness-validated; description, impact, and remediation text is "
+                  "model-authored and labeled as such — verify before submitting.", ""]
+        for item in ledger:
+            cvss = item.get("cvss") if isinstance(item.get("cvss"), dict) else None
+            cwe = item.get("cwe") if isinstance(item.get("cwe"), dict) else None
+            artifact = item.get("artifact") if isinstance(item.get("artifact"), dict) else {}
+            lines += [f"### {_md(item.get('id'), 70)} — {_md(item.get('title'))}", "",
+                      f"- **Title:** {_md(item.get('title'))}"]
+            if cvss:
+                lines.append(f"- **Severity / CVSS:** {_md(item.get('severity'), 20)} · "
+                             f"`{_md(cvss.get('vector'), 200)}` ({cvss.get('score')}, {_md(cvss.get('severity'), 20)})")
+            else:
+                lines.append(f"- **Severity / CVSS:** {_md(item.get('severity'), 20)} (no validated CVSS vector)")
+            if cwe:
+                _cwe_name = f" — {_md(cwe.get('name'), 120)}" if cwe.get("name") else ""
+                lines.append(f"- **Weakness (CWE):** {_md(cwe.get('id'), 30)}{_cwe_name}")
+            lines += [f"- **Asset / endpoint:** {_md(item.get('target'), 240)}",
+                      f"- **Status / confidence:** {_md(item.get('status'), 30)} · {int(item.get('confidence') or 0)}%"]
+            if item.get("evidence_ids"):
+                lines.append("- **Evidence IDs:** " + ", ".join(_md(v, 80) for v in item["evidence_ids"]))
+            if artifact:
+                lines.append(f"- **Artifact:** `{_md(artifact.get('path'), 180)}` sha256 `{_md(artifact.get('sha256'), 80)}`")
+            receipt_ids = set(item.get("evidence_ids") or [])
+            steps = [r for r in observations if r.get("id") in receipt_ids]
+            if steps:
+                lines += ["", "Steps to reproduce (from this engagement's recorded receipts):"]
+                for r in steps:
+                    lines.append(f"1. `{_md(r.get('tool'), 60)}` against `{_md(r.get('target'), 200)}` → {_md(r.get('state'), 60)}")
+            if item.get("description"):
+                lines += ["", "Description (model-authored; not independently verified):", "",
+                          _md(item.get("description"), 2000)]
+            if item.get("inferred_impact"):
+                lines += ["", "Impact (inferred by the model; not demonstrated):", "",
+                          _md(item["inferred_impact"], 2000)]
+            lines.append("")
+        if body:
+            lines += ["## Remediation / analyst narrative (model-authored)", "", body, ""]
     coverage = [copy.deepcopy(p) for p in (chat or {}).get("security_coverage", []) if p.get("mission_id") == mission_id]
     by_id = {r["id"]: r for r in observations}
     for planned in coverage:
@@ -31426,10 +32064,15 @@ def tool_rt_generate_report(args: dict) -> dict:
     unresolved = sum(p["state"] != "observed" for p in coverage)
     incomplete = sum(r["state"] != "observed" for r in observations)
     recorded_plan_complete = bool(coverage) and unresolved == 0
+    ledger_sent = _rt_gov_ledger_count(mission_id) if mission_id else 0
     lines += ["## Assessment completeness", "",
               f"{unresolved} planned checks unresolved; {incomplete} recorded checks blocked, inconclusive, or unavailable.",
+              (f"{ledger_sent} outbound HTTP request(s) recorded in the engagement ledger "
+               f"(`data/redteam/request_ledger.jsonl`) — the audit trail for program or client "
+               f"questions about traffic volume and touched hosts." if ledger_sent else
+               "No outbound HTTP requests were recorded in the engagement ledger."),
               ("Every check in the recorded coverage plan has linked observations. This does not certify that the plan was exhaustive."
-               if recorded_plan_complete else "The recorded coverage plan is incomplete. Report ready does not mean all phases passed."), ""]
+               if recorded_plan_complete else "The recorded coverage plan was incomplete. Report ready does not mean all phases passed."), ""]
     if evidence:
         lines += ["## Evidence artifacts", "", "| file | size | sha256 |", "|---|---:|---|"] + evidence + ["",
                  "_evidence files live in `data/recon_evidence/`._"]
@@ -31521,6 +32164,7 @@ TOOLS["rt_generate_report"] = {
         "properties": {
             "title": {"type": "string", "description": "report title"},
             "findings": {"type": "string", "description": "optional analyst narrative markdown; structured session findings are included automatically"},
+            "template": {"type": "string", "enum": ["generic", "hackerone", "bugcrowd"], "description": "generic (default) keeps the harness report shape; hackerone or bugcrowd adds per-finding submission blocks with validated severity/CVSS/CWE fields."},
         },
         "required": [],
     },
@@ -31871,6 +32515,7 @@ STATIC_WHITELIST = {
     "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css", "signal-field.js",
     "research-ui.js", "research-ui.css", "dropdown-menus.js",
     "security-scan-field.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css", "theme-flowlines.js",
+    "dot-matrix.js",
     # notch overlay: the island UI (served unchanged) + its bridge wiring
     "accuretta-notch.html", "notch-wire.js", "notch-markdown.js",
     # brand assets — see index.html <link rel="..."> tags
@@ -32184,6 +32829,7 @@ class Handler(BaseHTTPRequestHandler):
             "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css",
             "research-ui.js", "research-ui.css", "dropdown-menus.js",
             "signal-field.js", "security-scan-field.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css", "theme-flowlines.js",
+            "dot-matrix.js",
             "accuretta-notch.html", "notch-wire.js", "notch-markdown.js",
         }
         cache_control = ("no-cache, must-revalidate" if live_ui_asset
@@ -33091,7 +33737,7 @@ class Handler(BaseHTTPRequestHandler):
             detected = None
             if vram <= 0:
                 detected = detect_vram_gb()
-                vram = float(detected.get("gb") or 0)
+                vram = float(detected.get("free_total_gb") or detected.get("gb") or 0)
                 try:
                     _ram_mb, _vram_mb = _running_instance_mem_mb()
                     if _vram_mb > 0:
@@ -33437,6 +34083,21 @@ class Handler(BaseHTTPRequestHandler):
                 chats["chats"][cid]["last_mode"] = mode
                 save_json(CHATS_FILE, chats)
                 return self._send_json(200, {"ok": True, "mode": mode})
+            return self._send_json(404, {"error": "not found"})
+        if p.startswith("/api/chats/") and p.endswith("/project"):
+            cid = p.split("/")[3]
+            chats = get_chats()
+            if cid in chats["chats"]:
+                raw_project = body.get("project_workspace")
+                if raw_project is None:
+                    chats["chats"][cid].pop("project_workspace", None)
+                else:
+                    project = _project_workspace_metadata(raw_project)
+                    if not project:
+                        return self._send_json(400, {"error": "choose a folder inside a configured workspace folder"})
+                    chats["chats"][cid]["project_workspace"] = project
+                save_json(CHATS_FILE, chats)
+                return self._send_json(200, chats["chats"][cid])
             return self._send_json(404, {"error": "not found"})
         if p == "/api/approvals/decide":
             ok = decide_approval(body.get("id") or "", body.get("decision") or "deny",
@@ -34433,8 +35094,11 @@ def detect_vram_gb() -> dict:
                     })
                 if gpus:
                     # GPU 0 = primary. `gb` is FREE so the tuner never budgets
-                    # VRAM another process already holds.
+                    # VRAM another process already holds. `free_total_gb` sums
+                    # every GPU: llama.cpp splits layers across all visible
+                    # cards, so the tuner budgets all of them.
                     out["gb"] = gpus[0]["free_gb"]
+                    out["free_total_gb"] = round(sum(g["free_gb"] for g in gpus), 1)
                     out["total_gb"] = gpus[0]["total_gb"]
                     out["name"] = gpus[0]["name"]
                     out["gpus"] = gpus
@@ -35424,7 +36088,40 @@ def _running_instance_mem_mb() -> tuple[float, float]:
                         vram_mb += float(parts[1])
     except Exception:
         vram_mb = 0.0
+    if vram_mb <= 0 and os.name == "nt":
+        # Under WDDM nvidia-smi reports every process's memory as "[N/A]", so
+        # the add-back above silently read 0 and a tune with the model loaded
+        # budgeted only the ~1-2 GB left free (exact fit showed "21.0 of
+        # 1.2 GB" and never grew context). Windows' own per-process counter
+        # (what Task Manager shows) has the real figure.
+        vram_mb = _win_gpu_process_mem_mb(pid)
     return ram_mb, vram_mb
+
+
+def _win_gpu_process_mem_mb(pid: int) -> float:
+    """Dedicated GPU memory (MiB) a process holds, from Windows' GPU Process
+    Memory performance counter. 0 when unavailable. ~1.5 s (PowerShell)."""
+    if os.name != "nt" or not pid:
+        return 0.0
+    hit = _WIN_GPU_MEM_CACHE.get(pid)
+    if hit and time.monotonic() - hit[0] < 10.0:    # one tune asks several times
+        return hit[1]
+    script = (f"$s=(Get-Counter '\\GPU Process Memory(pid_{int(pid)}_*)\\Dedicated Usage' "
+              f"-ErrorAction SilentlyContinue).CounterSamples; "
+              f"[math]::Round(($s | Measure-Object CookedValue -Sum).Sum/1MB)")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                           capture_output=True, text=True, timeout=15,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        value = (r.stdout or "").strip().splitlines()[-1] if (r.stdout or "").strip() else ""
+        mb = float(value) if value.replace(".", "", 1).isdigit() else 0.0
+    except Exception:
+        mb = 0.0
+    _WIN_GPU_MEM_CACHE[pid] = (time.monotonic(), mb)
+    return mb
+
+
+_WIN_GPU_MEM_CACHE: dict = {}
 
 
 def _free_vram_gb_for_tune() -> float:
@@ -35432,7 +36129,8 @@ def _free_vram_gb_for_tune() -> float:
     VRAM the currently-running instance holds (freed by the swap). Without
     this, a no-tier user re-tuning while a model is loaded budgets only the
     crumbs the old instance left behind."""
-    gb = float(detect_vram_gb().get("gb") or 0)
+    det = detect_vram_gb()
+    gb = float(det.get("free_total_gb") or det.get("gb") or 0)
     try:
         _ram_mb, vram_mb = _running_instance_mem_mb()
         if vram_mb > 0:
@@ -35569,6 +36267,274 @@ def _ram_bandwidth_gbps() -> float:
             pass
         return bw
     return 30.0
+
+
+# ---- decode speed model + exact fit (auto-tune) ------------------------------
+# Decode is memory-bound: every generated token reads the GPU-resident weights
+# (for MoE only the active experts), the KV cache filled so far, and whatever
+# weights live in system RAM. Predicted tok/s =
+#     spec_gain × calibration / (gpu_bytes / gpu_bw + cpu_bytes / ram_bw)
+# where gpu_bw starts from the card's published bandwidth and calibration is
+# learned from the passive per-turn telemetry (_record_model_observation), so
+# the estimate converges on this machine's real speed with no benchmark run.
+
+# Published memory bandwidth (GB/s). First match wins, so within a family the
+# longer name comes first ("4070 ti super" before "4070 ti" before "4070").
+_GPU_BANDWIDTH_GBPS = (
+    ("rtx pro 6000", 1792), ("5090", 1792), ("5080", 960), ("5070 ti", 896), ("5070", 672),
+    ("5060 ti", 448), ("5060", 448),
+    ("4090", 1008), ("4080 super", 736), ("4080", 717), ("4070 ti super", 672),
+    ("4070 ti", 504), ("4070 super", 504), ("4070", 504), ("4060 ti", 288), ("4060", 272),
+    ("3090 ti", 1008), ("3090", 936), ("3080 ti", 912), ("3080", 760), ("3070 ti", 608),
+    ("3070", 448), ("3060 ti", 448), ("3060", 360),
+    ("2080 ti", 616), ("2080 super", 496), ("2080", 448), ("2070", 448), ("2060", 336),
+    ("titan rtx", 672), ("6000 ada", 960), ("a6000", 768), ("a5000", 768), ("a4500", 640),
+    ("a4000", 448), ("l40s", 864), ("l40", 864), ("a100", 1555), ("h200", 4800), ("h100", 2000),
+    ("r9700", 640), ("7900 xtx", 960), ("7900 xt", 800), ("9070 xt", 640), ("9070", 640),
+)
+# Share of peak bandwidth llama.cpp decode reaches before calibration kicks in.
+_DECODE_BW_EFFICIENCY = 0.72
+# CPU-side expert/layer math runs well below a memcpy probe's bandwidth.
+# Fitted to a measured run: a Q8 35B-A3B with 23-25 of 41 expert layers on CPU
+# decodes ~45-51 tok/s on a 4090 + 82 GB/s RAM.
+_CPU_DECODE_EFFICIENCY = 0.4
+# Speculative drafts barely help MoE: each drafted token routes to different
+# experts, so verifying a draft reads more expert weights.
+_SPEC_GAIN_MOE = 1.05
+# Speedup each speculative strategy is assumed to give before this model has
+# measured turns (calibration then absorbs the real figure). draft-mtp's is at
+# draft length 3; other lengths scale by _MTP_LEN_FACTOR, measured back to back
+# on a 4090 / 27B Q4 (1 → 70, 2 → 88, 3 → 93, 4 → 92 tok/s).
+_SPEC_GAIN_DEFAULT = {"off": 1.0, "ngram-mod": 1.0, "draft-mtp": 1.5, "dflash": 1.8, "dspark": 1.8}
+_MTP_LEN_FACTOR = {1: 0.75, 2: 0.94, 3: 1.0, 4: 0.99, 5: 0.97, 6: 0.95}
+_FIT_CTX_CAP = 262144
+
+
+def _typical_fill_tokens(model_path: str) -> tuple[int, str]:
+    """How full this user's chats actually get: the 90th-percentile peak
+    prompt size of recorded turns on this model, else across every model,
+    else 32k. The speed floor is judged here, because a bigger context window
+    costs no decode speed until it's filled — only its VRAM (which on MoE
+    pushes experts to RAM) slows every reply."""
+    def p90(vals: list[int]) -> int:
+        vals = sorted(vals)
+        return vals[min(len(vals) - 1, int(len(vals) * 0.9))]
+    try:
+        models = (load_json(MODEL_RUNTIME_FILE, {}) or {}).get("models") or {}
+    except Exception:
+        models = {}
+    mine_keys = {_model_profile_key(model_path), Path(str(model_path)).stem}
+    mine, everyone = [], []
+    for key, row in models.items():
+        for cfg in (row.get("configs") or {}).values():
+            for o in cfg.get("observations") or []:
+                peak = int(o.get("peak_context_tokens") or 0)
+                if peak > 0:
+                    everyone.append(peak)
+                    if key in mine_keys:
+                        mine.append(peak)
+    if len(mine) >= 5:
+        return max(8192, p90(mine)), f"your {len(mine)} recorded turns on this model"
+    if len(everyone) >= 5:
+        return max(8192, p90(everyone)), "your recorded turns across all models"
+    return 32768, "default — no recorded turns yet"
+
+
+def _gpu_bandwidth_gbps(name: str, total_gb: float) -> tuple[float, str]:
+    """(GB/s, source) for a GPU: published figure by name, else a conservative
+    guess from its VRAM size. Laptop parts run well below their desktop names."""
+    n = " ".join(str(name or "").lower().split())
+    for key, gbps in _GPU_BANDWIDTH_GBPS:
+        if key in n:
+            if "laptop" in n or "mobile" in n:
+                return gbps * 0.6, f"{key} laptop (est.)"
+            return float(gbps), key
+    gb = float(total_gb or 0)
+    guess = 900.0 if gb >= 23 else 600.0 if gb >= 15 else 450.0 if gb >= 11 else 300.0 if gb >= 7 else 200.0
+    return guess, f"unknown GPU, {gb:.0f} GB class (est.)"
+
+
+def _tune_gpus(vram_gb: float) -> list[dict]:
+    """Detected GPUs as [{name, total_gb, free_gb, bw_gbps, bw_src}]. Falls back
+    to one GPU of `vram_gb` when nvidia-smi isn't available."""
+    det = detect_vram_gb()
+    gpus = []
+    for g in det.get("gpus") or []:
+        bw, src = _gpu_bandwidth_gbps(g.get("name", ""), g.get("total_gb", 0))
+        gpus.append({**g, "bw_gbps": bw, "bw_src": src})
+    if not gpus:
+        bw, src = _gpu_bandwidth_gbps("", vram_gb)
+        gpus = [{"name": "GPU", "total_gb": vram_gb, "free_gb": vram_gb, "bw_gbps": bw, "bw_src": src}]
+    return gpus
+
+
+def _effective_gpu_bw(gpus: list[dict]) -> float:
+    """Layer split runs the GPUs one after another per token, each over its
+    share of the weights (llama.cpp splits by free memory) — so the combined
+    rate is the share-weighted harmonic mean of their bandwidths."""
+    weights = [max(float(g.get("free_gb") or g.get("total_gb") or 0), 0.1) for g in gpus]
+    total = sum(weights)
+    inv = sum((w / total) / max(float(g["bw_gbps"]), 1.0) for w, g in zip(weights, gpus))
+    return 1.0 / inv if inv > 0 else 300.0
+
+
+def _decode_bytes_per_token(profile: dict, size_mb: float, *, kv_dtype: str, v_dtype: str,
+                            fill: int, n_cpu_moe: int = 0, num_gpu: int = 99,
+                            dense_share=None, active_expert_bytes: float = 0.0) -> tuple[float, float]:
+    """(gpu_bytes, cpu_bytes) read per decoded token. MoE reads its dense part
+    plus only the active experts; dense models read every weight. The KV read
+    grows with how much of the context is filled."""
+    n_layer = int(profile.get("block_count", 0) or 0)
+    model_bytes = max(size_mb, 0.0) * 1048576.0
+    try:
+        kv_read = float(_kv_total_bytes(profile, kv_dtype, max(int(fill), 1), v_dtype) or 0)
+    except Exception:
+        kv_read = 0.0
+    if profile.get("is_moe") and active_expert_bytes > 0 and dense_share and n_layer:
+        off = min(max(int(n_cpu_moe), 0), n_layer) / n_layer
+        dense_bytes = model_bytes * float(dense_share)
+        return dense_bytes + active_expert_bytes * (1 - off) + kv_read, active_expert_bytes * off
+    if n_layer and 0 < num_gpu < n_layer:
+        frac = num_gpu / n_layer
+        return model_bytes * frac + kv_read, model_bytes * (1 - frac)
+    return model_bytes + kv_read, 0.0
+
+
+def _decode_tok_s(gpu_bytes: float, cpu_bytes: float, *, gpu_bw_gbps: float, ram_bw_gbps: float,
+                  spec_gain: float = 1.0, calib: float = 1.0) -> float:
+    t = gpu_bytes / (max(gpu_bw_gbps, 1.0) * 1e9 * _DECODE_BW_EFFICIENCY)
+    if cpu_bytes > 0:
+        t += cpu_bytes / (max(ram_bw_gbps, 1.0) * 1e9 * _CPU_DECODE_EFFICIENCY)
+    return (spec_gain * calib / t) if t > 0 else float("inf")
+
+
+def _decode_observations(model_path: str) -> list[tuple[dict, dict]]:
+    """(config settings, observation) pairs with enough output to time decode,
+    newest last, for one model from the passive telemetry file."""
+    try:
+        data = load_json(MODEL_RUNTIME_FILE, {})
+        models = (data or {}).get("models") or {}
+        # Turns land under the chat's model name — usually the file stem ("X"
+        # for X.gguf) — and some callers record the full file name. Read both.
+        rows = [models.get(k) or {} for k in
+                dict.fromkeys((_model_profile_key(model_path), Path(str(model_path)).stem))]
+    except Exception:
+        return []
+    pairs = []
+    for cfg in [c for row in rows for c in (row.get("configs") or {}).values()]:
+        settings = cfg.get("settings") or {}
+        for o in cfg.get("observations") or []:
+            if int(o.get("output_tokens") or 0) >= 64 and float(o.get("eval_ms") or 0) > 0:
+                pairs.append((settings, o))
+    pairs.sort(key=lambda p: p[1].get("ts", 0))
+    return pairs[-80:]
+
+
+def _decode_calibration(model_path: str, predict) -> tuple[float, int]:
+    """Median of measured ÷ predicted decode speed over this model's recorded
+    turns (each predicted for its own config and context fill). (1.0, 0) until
+    at least 5 usable turns exist. Clamped so one odd week can't run away."""
+    ratios = []
+    for settings, o in _decode_observations(model_path):
+        try:
+            measured = float(o["output_tokens"]) / (float(o["eval_ms"]) / 1000.0)
+            predicted = predict(settings, int(o.get("peak_context_tokens") or 0))
+        except Exception:
+            continue
+        if predicted and predicted != float("inf") and measured > 0:
+            ratios.append(min(max(measured / predicted, 0.2), 5.0))
+    if len(ratios) < 5:
+        return 1.0, len(ratios)
+    ratios.sort()
+    mid = len(ratios) // 2
+    med = ratios[mid] if len(ratios) % 2 else (ratios[mid - 1] + ratios[mid]) / 2
+    return min(max(med, 0.4), 2.5), len(ratios)
+
+
+def _draft_length_choice(model_path: str, current: int) -> tuple[int, str]:
+    """MTP draft length from measured acceptance at the current length. One
+    step per tune, toward whichever side the acceptance rate points:
+    measured on a 4090 / 27B, 3 drafts at ~62% acceptance beat 1 (83%) by
+    33% and 4 (50%) by 1%. Needs >= 200 drafted tokens at that length."""
+    cur = current if current > 0 else 3
+    drafted = accepted = 0
+    for settings, o in _decode_observations(model_path):
+        ran_n = int(settings.get("spec_draft_n_max") or settings.get("spec_draft_n_eff") or 0)
+        if ran_n != cur or settings.get("spec_strategy") != "draft-mtp":
+            continue
+        drafted += int(o.get("draft_n") or 0)
+        accepted += int(o.get("draft_accepted") or 0)
+    if drafted < 200:
+        return cur, (f"draft length {cur} (default; acceptance not measured yet)" if cur == 3
+                     else f"draft length {cur} (kept; {drafted} drafted tokens measured, need 200)")
+    rate = accepted / drafted
+    nxt = cur
+    if rate < 0.45 and cur > 1:
+        nxt = cur - 1
+    elif rate > 0.72 and cur < 6:
+        nxt = cur + 1
+    verdict = "kept" if nxt == cur else f"→ {nxt}"
+    return nxt, f"draft length {cur} {verdict} (measured acceptance {rate:.0%} over {drafted:,} drafted tokens)"
+
+
+# -- exact fit via llama-fit-params --------------------------------------------
+_FIT_PARAMS_CACHE: dict = {}
+
+
+def _fit_params_bin() -> str:
+    """llama-fit-params beside the configured llama-server, or ''."""
+    server = find_llama_bin() or ""
+    if not server:
+        return ""
+    p = Path(server)
+    for name in ("llama-fit-params.exe", "llama-fit-params"):
+        cand = p.with_name(name)
+        if cand.is_file():
+            return str(cand)
+    return ""
+
+
+def _fit_params_measure(model_path: str, ctx: int, *, ngl: int, n_cpu_moe: int, kv_k: str,
+                        kv_v: str, ubatch: int, batch: int, flash: bool) -> dict | None:
+    """llama.cpp's own memory estimate for one configuration, without loading
+    the model: {"devices": {name: total MiB}, "ctx": {name: context MiB},
+    "host": MiB}. None when the tool is missing or the run fails. ~0.6 s."""
+    exe = _fit_params_bin()
+    if not exe or not model_path:
+        return None
+    args = ["-m", model_path, "-c", str(int(ctx)), "-ngl", str(int(ngl) if ngl < 99 else 999),
+            "-ctk", kv_k or "f16", "-ctv", kv_v or kv_k or "f16",
+            "-fa", "on" if flash else "off", "-ub", str(int(ubatch)), "-b", str(int(batch)),
+            "-fit", "off", "-fitp", "on"]
+    if n_cpu_moe > 0:
+        args += ["--n-cpu-moe", str(int(n_cpu_moe))]
+    try:
+        key = (exe, os.path.getmtime(model_path), tuple(args))
+    except Exception:
+        key = (exe, 0, tuple(args))
+    if key in _FIT_PARAMS_CACHE:
+        return _FIT_PARAMS_CACHE[key]
+    result = None
+    try:
+        r = subprocess.run([exe] + args, capture_output=True, text=True, timeout=60,
+                           creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0))
+        devices, ctx_mib, host = {}, {}, 0.0
+        for line in (r.stdout or "").splitlines():
+            m = re.fullmatch(r"\s*(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s*", line)
+            if not m:
+                continue
+            name, model_mib, context_mib, compute_mib = m.group(1), *map(float, m.groups()[1:])
+            if name.lower().startswith("host"):
+                host = model_mib + context_mib + compute_mib
+            else:
+                devices[name] = model_mib + context_mib + compute_mib
+                ctx_mib[name] = context_mib
+        if devices:
+            result = {"devices": devices, "ctx": ctx_mib, "host": host}
+    except Exception:
+        result = None
+    _FIT_PARAMS_CACHE[key] = result
+    return result
 
 
 def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: int = 0,
@@ -35853,9 +36819,11 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     #      largest batch we might pick (2048) so it stays conservative.
     #      Falls back to the old flat 1536MB when embd is unknown.
     #   2. runtime allowance: fixed 400MB for CUDA context + driver on GPU tiers.
-    #   3. MTP overhead when draft-mtp is selected: MTP head weights ≈
-    #      nextn_predict_layers × per-layer weight size (per-layer ≈
-    #      size_mb/n_layer) plus ~200MB of speculative buffers.
+    #   3. MTP overhead, from measured breakdowns (4090, 27B qwen35 hybrid,
+    #      one slot): head weights (nextn × per-layer size) + 3 extra copies
+    #      of the recurrent state on hybrids (~150 MiB each) + two draft
+    #      compute buffers of ~196 MiB per 512 of ubatch each. The draft's own
+    #      f16 KV cache grows with context, so it is priced per tier (_kvx).
     embd = profile.get("embedding_length", 0) or 0
     if embd:
         compute_mb = 256.0 + (2048.0 / 512.0) * (embd / 4096.0) * 384.0
@@ -35863,16 +36831,38 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
         compute_mb = 1536.0  # no embd from GGUF — keep the old flat reserve
     runtime_mb = 400.0
     mtp_mb = 0.0
+    draft_kv_per_tok = 0.0       # bytes/token of the MTP draft's own KV cache
+    _tune_caps = llama_caps(find_llama_bin() or "")
     nextn = int(profile.get("nextn_predict_layers", 0) or 0)
+    mtp_fixed_mb = 0.0           # MTP head weights + extra recurrent state
+    mtp_compute_per_512 = 0.0    # MTP draft compute, per 512 tokens of ubatch
+    # The ubatch the batch heuristics below will settle on (full GPU: 1024
+    # from 24 GB up, else 512) — the exact fit re-prices with the real one.
+    _ub_assumed = 1024 if vram >= 24 else 512
     if has_mtp and nextn and n_layer and size_mb > 0:
-        mtp_mb = nextn * (size_mb / n_layer) + 200.0
+        mtp_fixed_mb = nextn * (size_mb / n_layer) + (3 * 150.0 if hy["hybrid"] else 0.0)
+        mtp_compute_per_512 = 2 * 200.0
+        mtp_mb = mtp_fixed_mb + mtp_compute_per_512 * _ub_assumed / 512
+        _bpe = 2.0               # f16 draft KV (see the spawn note on -ctkd)
+        _hkv = profile.get("head_count_kv") or 0
+        _hkv = max(_hkv) if isinstance(_hkv, list) and _hkv else _hkv
+        _kl = int(profile.get("key_length") or 0)
+        if _hkv and _kl:
+            draft_kv_per_tok = nextn * 2 * int(_hkv) * _kl * _bpe
     compute_buf_mb = compute_mb + runtime_mb + mtp_mb
     notes.append(
         f"overhead reserve: {compute_buf_mb:.0f} MB "
         f"(compute buffer {compute_mb:.0f} MB scaled to batch 2048 × embd {embd or 'unknown'}"
         f" + runtime {runtime_mb:.0f} MB"
         + (f" + MTP {mtp_mb:.0f} MB ({nextn} heads)" if mtp_mb else "") + ")."
+        + (f" MTP draft KV: {draft_kv_per_tok / 1024:.1f} KB/token, priced per context tier."
+           if draft_kv_per_tok else "")
     )
+
+    def _kvx(kv_dtype: str, tier: int, v_dtype: str = "") -> float:
+        """KV MB at `tier` tokens, including the MTP draft's own KV cache."""
+        return (_kv_total_mb(profile, kv_dtype, tier, size_gb, v_dtype)
+                + draft_kv_per_tok * tier / (1024 * 1024))
 
     # -- MoE dense/expert split (analytic when GGUF carries the fields) --
     keys = profile.get("keys") or {}
@@ -35932,21 +36922,41 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     # CPU share decodes at roughly RAM-bandwidth / bytes-per-token. We estimate
     # that and refuse (ctx, offload) combos that decode below the user's floor:
     # context you can only read at 2 tok/s is not a win, it's a trap.
+    # The user's floor (Settings → Minimum speed). Applies to dense and MoE.
     try:
-        min_tok_s = float(_s_tune.get("min_tok_s_estimate") or 6)
+        min_tok_s = max(float(_s_tune.get("min_decode_tok_s") or 45), 1.0)
     except Exception:
-        min_tok_s = 6.0
+        min_tok_s = 45.0
     expert_tok_bytes = 0.0
     if is_moe and n_layer > 0 and embd:
         _eu = profile.get("expert_used_count", 0) or 0
         _ef = profile.get("expert_feed_forward_length", 0) or 0
         if _eu and _ef:
-            expert_tok_bytes = _eu * 3 * _ef * embd * _quant_bpw(profile.get("quant", ""))
+            # Bytes per weight from the file itself (size ÷ parameter count from
+            # the same element counts as the dense/expert split), not the quant
+            # name: many GGUFs carry no quant label, and the Q4-ish fallback
+            # under-counted a Q8 35B-A3B's expert reads ~1.8× (predicted 141
+            # tok/s vs ~51 measured).
+            _bpw = _quant_bpw(profile.get("quant", ""))
+            _ecnt = profile.get("expert_count", 0) or 0
+            _vocab = keys.get(f"{arch_name}.vocab_size") or 0
+            if not (isinstance(_vocab, (int, float)) and _vocab):
+                _tok = keys.get("tokenizer.ggml.tokens")
+                _vocab = _tok.get("__array_len__", 0) if isinstance(_tok, dict) else 0
+            if _ecnt and size_mb > 0:
+                _params = n_layer * (4 * embd * embd + _ecnt * 3 * _ef * embd) + int(_vocab or 0) * embd * 2
+                if _params > 0:
+                    _bpw = min(max(size_mb * 1048576 / _params, 0.25), 2.2)
+            expert_tok_bytes = _eu * 3 * _ef * embd * _bpw
     # RAM bandwidth: auto-probed (memcpy benchmark, cached per machine) unless
     # the user pinned a manual value. Probed lazily — only when the speed
     # model will actually run; the benchmark costs ~0.5s once per machine.
+    # expert_tok_bytes is ONE layer's active experts; a token crosses every
+    # layer. (The old estimate scaled the single-layer figure by the offloaded
+    # SHARE, under-counting CPU bytes ~n_layer× — so the floor never fired.)
+    active_expert_bytes = expert_tok_bytes * n_layer if expert_tok_bytes > 0 else 0.0
     ram_bw_gbps = 30.0
-    if expert_tok_bytes > 0:
+    if expert_tok_bytes > 0 or size_mb > budget_mb:
         ram_bw_gbps = _ram_bandwidth_gbps()
         notes.append(f"RAM bandwidth: {ram_bw_gbps:.0f} GB/s (auto-probed unless pinned in settings).")
 
@@ -35975,27 +36985,64 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
                 f"CPU offload capped at {ram_cap_mb/1024:.1f} GB (OS reserve kept)."
             )
 
-    def _est_tok_s(n_off: int) -> float:
-        """Estimated decode tok/s with n_off expert layers' experts on CPU.
-        inf = GPU-only (the GPU bound isn't what this model is for)."""
-        if n_off <= 0 or expert_tok_bytes <= 0:
-            return float("inf")
-        cpu_bytes = (n_off / n_layer) * expert_tok_bytes
-        if cpu_bytes <= 0:
-            return float("inf")
-        return (ram_bw_gbps * 1e9) / cpu_bytes
+    # -- decode speed prediction (see _decode_tok_s) --
+    tune_gpus = _tune_gpus(vram)
+    gpu_bw_gbps = _effective_gpu_bw(tune_gpus)
+    spec_for_speed, _ = _speculative_choice(_s_tune, has_mtp, is_moe, nextn, _auto_pair, _draft_kind)
+
+    def _predict(fill: int, *, n_off: int = 0, num_gpu: int = 99, kv_k: str = "", kv_v: str = "",
+                 spec: str = "", draft_n: int = 3, calib_factor: float = 1.0) -> float:
+        kv_k = kv_k or out.get("kv_cache_type") or "q8_0"
+        gpu_b, cpu_b = _decode_bytes_per_token(
+            profile, size_mb, kv_dtype=kv_k, v_dtype=kv_v, fill=fill, n_cpu_moe=n_off,
+            num_gpu=num_gpu, dense_share=dense_share, active_expert_bytes=active_expert_bytes)
+        gain = _SPEC_GAIN_DEFAULT.get(spec or spec_for_speed, 1.0)
+        if (spec or spec_for_speed) == "draft-mtp":
+            gain *= _MTP_LEN_FACTOR.get(min(max(int(draft_n or 3), 1), 6), 1.0)
+        if is_moe:
+            gain = min(gain, _SPEC_GAIN_MOE)
+        return _decode_tok_s(gpu_b, cpu_b, gpu_bw_gbps=gpu_bw_gbps, ram_bw_gbps=ram_bw_gbps,
+                             spec_gain=gain, calib=calib_factor)
+
+    def _predict_settings(cfg: dict, fill: int) -> float:
+        """Uncalibrated prediction for a recorded config (calibration input).
+        Turns recorded before the launch draft length was tracked ran MTP at
+        the GGUF head count (the old spawn rule), usually 1."""
+        _dn = int(cfg.get("spec_draft_n_eff") or cfg.get("spec_draft_n_max") or (nextn or 1))
+        return _predict(fill, n_off=int(cfg.get("n_cpu_moe") or 0),
+                        num_gpu=int(cfg.get("num_gpu") or 99),
+                        kv_k=str(cfg.get("kv_cache_type") or "q8_0"),
+                        kv_v=str(cfg.get("kv_cache_type_v") or ""),
+                        spec=str(cfg.get("spec_strategy") or "off"), draft_n=_dn)
+
+    calib, calib_n = _decode_calibration(model_path, _predict_settings)
+    typical_fill, fill_src = _typical_fill_tokens(model_path)
+    notes.append(
+        f"speed model: {gpu_bw_gbps:.0f} GB/s GPU ({', '.join(g['bw_src'] for g in tune_gpus)})"
+        + (f", calibrated ×{calib:.2f} from {calib_n} measured turns" if calib_n >= 5
+           else f", uncalibrated ({calib_n} measured turns, needs 5)")
+        + f"; floor {min_tok_s:g} tok/s judged at your usual chat size, ~{typical_fill:,} tokens "
+          f"({fill_src})."
+    )
+
+    def _est_tok_s(n_off: int, ctx_tokens: int = 0) -> float:
+        """Predicted decode tok/s (calibrated) with n_off expert layers on CPU,
+        at the user's usual chat size (never more than the window holds)."""
+        fill = min(typical_fill, ctx_tokens) if ctx_tokens > 0 else typical_fill
+        return _predict(fill, n_off=n_off, calib_factor=calib)
 
     def _kv_marginal_mb_per_tok(k_dt: str, v_dt: str = "") -> float:
         """Marginal KV cost (MB) per extra context token, from a finite
         difference taken high above any sliding window — so windowed layers
         contribute their true marginal (zero past the window) instead of an
         average. 0 when GGUF metadata is unreadable."""
+        draft_mb_tok = draft_kv_per_tok / (1024 * 1024)
         b_hi = _kv_total_bytes(profile, k_dt, 131072, v_dt)
         b_lo = _kv_total_bytes(profile, k_dt, 65536, v_dt)
         if b_hi > b_lo:
-            return (b_hi - b_lo) / (131072 - 65536) / (1024 * 1024)
+            return (b_hi - b_lo) / (131072 - 65536) / (1024 * 1024) + draft_mb_tok
         b = _kv_total_bytes(profile, k_dt, 65536, v_dt)
-        return (b / 65536) / (1024 * 1024) if b else 0.0
+        return ((b / 65536) / (1024 * 1024) + draft_mb_tok) if b else 0.0
 
     # Exact-fit top-up guard: keep this much budget unspent for CUDA
     # fragmentation/allocation jitter when converting leftover VRAM into
@@ -36047,7 +37094,7 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
             chosen_n_cpu_moe = 0
             rejected_slow: list = []   # (tier, need_offload, est_tok_s) — fit but slow
             for tier in ([pinned_tier] if pinned_tier else ctx_tiers):
-                kv_mb = _kv_total_mb(profile, kv_dtype, tier, size_gb, v_dtype)
+                kv_mb = _kvx(kv_dtype, tier, v_dtype)
                 available_for_model = budget_mb - kv_mb - compute_buf_mb - embed_mb
                 if available_for_model <= 0:
                     continue  # KV alone busts the budget
@@ -36060,9 +37107,12 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
                 need_offload = int((shortfall + expert_per_layer_mb - 1) // expert_per_layer_mb)
                 if need_offload > max_offload_layers:
                     continue
-                est = _est_tok_s(need_offload)
+                est = _est_tok_s(need_offload, tier)
                 # A pinned tier is the user's saved ctx — speed never vetoes it.
-                if est >= min_tok_s or need_offload <= fast_zone_layers or pinned_tier:
+                # The fast zone only stands in when the speed model has no
+                # expert sizes to work with.
+                if est >= min_tok_s or pinned_tier or (
+                        expert_tok_bytes <= 0 and need_offload <= fast_zone_layers):
                     chosen_ctx = tier
                     chosen_n_cpu_moe = need_offload
                     break
@@ -36089,7 +37139,7 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
             # If not, say so LOUDLY (quant downshift banner) instead of handing
             # llama-server a config that OOMs at boot.
             if chosen_n_cpu_moe > 0 and chosen_n_cpu_moe >= max_offload_layers and expert_per_layer_mb > 0:
-                kv_check = _kv_total_mb(profile, kv_dtype, chosen_ctx, size_gb, v_dtype)
+                kv_check = _kvx(kv_dtype, chosen_ctx, v_dtype)
                 avail_check = budget_mb - kv_check - compute_buf_mb - embed_mb
                 shortfall_check = size_mb - avail_check
                 need_check = int((shortfall_check + expert_per_layer_mb - 1) // expert_per_layer_mb)
@@ -36107,7 +37157,7 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
                         f"WARNING: model does not fit — {need_check} expert layers would need "
                         f"offloading but caps allow {max_offload_layers}. Expect boot failure."
                     )
-            kv_at_chosen = _kv_total_mb(profile, kv_dtype, chosen_ctx, size_gb, v_dtype)
+            kv_at_chosen = _kvx(kv_dtype, chosen_ctx, v_dtype)
             # Exact-fit top-up: spend leftover budget on context beyond the
             # coarse tier. Offload stays valid — the fit math above guarantees
             # the total (KV + compute + embed + on-GPU weights) stays within
@@ -36123,14 +37173,14 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
                         f"{_kv_marginal_mb_per_tok(kv_dtype, v_dtype)*1024:.1f} KB/token marginal KV)."
                     )
                     chosen_ctx = topped
-                    kv_at_chosen = _kv_total_mb(profile, kv_dtype, chosen_ctx, size_gb, v_dtype)
+                    kv_at_chosen = _kvx(kv_dtype, chosen_ctx, v_dtype)
             if chosen_n_cpu_moe == 0:
                 tier_notes.append(
                     f"context: {chosen_ctx:,} tokens · n_cpu_moe: 0 "
                     f"(model fits fully in VRAM at this context, KV ≈ {kv_at_chosen:.0f} MB)."
                 )
             else:
-                est = _est_tok_s(chosen_n_cpu_moe)
+                est = _est_tok_s(chosen_n_cpu_moe, chosen_ctx)
                 est_txt = (f"; est. decode ~{est:.0f} tok/s at {ram_bw_gbps:.0f} GB/s RAM"
                            if est != float("inf") else "")
                 tier_notes.append(
@@ -36153,12 +37203,12 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
             if pinned_tier:
                 est_ctx = pinned_tier
                 # Fit check: KV + compute must leave something for the model.
-                fits = budget_mb - _kv_total_mb(profile, kv_dtype, est_ctx, size_gb, v_dtype) - compute_buf_mb > 0
+                fits = budget_mb - _kvx(kv_dtype, est_ctx, v_dtype) - compute_buf_mb > 0
             else:
                 ctx_budget_mb = budget_mb * 0.45
                 est_ctx = ctx_tiers[-1]
                 for tier in ctx_tiers:
-                    if _kv_total_mb(profile, kv_dtype, tier, size_gb, v_dtype) <= ctx_budget_mb:
+                    if _kvx(kv_dtype, tier, v_dtype) <= ctx_budget_mb:
                         est_ctx = tier
                         break
                 fits = True
@@ -36172,7 +37222,7 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
         # priced exactly per tier, so SWA dense models (Gemma, Mistral) get
         # the big windows their windowed layers make nearly free.
         if pinned_tier:
-            kv_mb = _kv_total_mb(profile, kv_dtype, pinned_tier, size_gb, v_dtype)
+            kv_mb = _kvx(kv_dtype, pinned_tier, v_dtype)
             if size_mb + kv_mb + compute_buf_mb > budget_mb:
                 return pinned_tier, 0, [], False
             dense_ctx = pinned_tier
@@ -36180,7 +37230,7 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
             dense_ctx = ctx_tiers[-1]
             fits_any = False
             for tier in ctx_tiers:
-                kv_mb = _kv_total_mb(profile, kv_dtype, tier, size_gb, v_dtype)
+                kv_mb = _kvx(kv_dtype, tier, v_dtype)
                 if size_mb + kv_mb + compute_buf_mb <= budget_mb:
                     dense_ctx = tier
                     fits_any = True
@@ -36203,7 +37253,7 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
         # Exact-fit top-up: the tier ladder is coarse — spend the leftover
         # budget on context directly instead of leaving it on the table.
         if not pinned_tier and dense_ctx < ctx_tiers[0]:
-            kv_at_chosen = _kv_total_mb(profile, kv_dtype, dense_ctx, size_gb, v_dtype)
+            kv_at_chosen = _kvx(kv_dtype, dense_ctx, v_dtype)
             leftover = budget_mb - (size_mb + kv_at_chosen + compute_buf_mb)
             topped = _topup_ctx(dense_ctx, leftover, kv_dtype, v_dtype)
             if topped != dense_ctx:
@@ -36213,7 +37263,7 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
                     f"{_kv_marginal_mb_per_tok(kv_dtype, v_dtype)*1024:.1f} KB/token marginal KV)."
                 )
                 dense_ctx = topped
-        kv_at_chosen = _kv_total_mb(profile, kv_dtype, dense_ctx, size_gb, v_dtype)
+        kv_at_chosen = _kvx(kv_dtype, dense_ctx, v_dtype)
         tier_notes.append(
             f"context: {dense_ctx:,} tokens "
             f"(KV ≈ {kv_at_chosen:.0f} MB at {kv_tag})."
@@ -36410,6 +37460,241 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
             out["num_batch"] = max(512, out["num_ctx"])
             notes.append(f"batch: clamped to {out['num_batch']} (was larger than ctx {out['num_ctx']:,}).")
 
+    # -- MTP draft length (from measured acceptance) --
+    if out["spec_strategy"] == "draft-mtp":
+        try:
+            _cur_n = int(_s_tune.get("spec_draft_n_max") or 0)
+        except (TypeError, ValueError):
+            _cur_n = 0
+        out["spec_draft_n_max"], _dl_note = _draft_length_choice(model_path, _cur_n)
+        notes.append(f"speculative: {_dl_note}.")
+    else:
+        out["spec_draft_n_max"] = 0
+
+    # -- MoE expert cache (llama.cpp #29887) --
+    # Never switched on by the tuner. Measured on a 4090 (PCIe 4.0 x16, 82 GB/s
+    # RAM) with a Q8 35B-A3B, 25 of 41 expert layers on CPU, warm A/B/A runs:
+    # a 2.5 GB cache decoded ~40% SLOWER (27 vs 45-50 tok/s). The PR's gains
+    # came from much larger caches on bigger cards, which here would cost the
+    # context. A value set by hand is kept, and its VRAM is priced below.
+    try:
+        cache_mb = float(max(int(_s_tune.get("moe_cache_mib") or 0), 0)) if out["n_cpu_moe"] > 0 else 0.0
+    except (TypeError, ValueError):
+        cache_mb = 0.0
+    if cache_mb:
+        notes.append(f"MoE expert cache: {cache_mb:.0f} MiB kept from Settings (its VRAM comes out of context).")
+
+    # -- Exact fit (llama-fit-params) --
+    # llama.cpp's own estimate of model + KV + compute per device for this exact
+    # config (no model load, ~0.6 s). It replaces the ~8% blanket headroom with
+    # a measured number, and the slack becomes context. Things the tool can't
+    # see (vision projector, speculative drafts, the MoE cache) are added on.
+    _ctx_floor_exact = min_ctx if min_ctx > 0 else 4096
+    exact_mem = None          # (used MiB, usable MiB) when llama-fit-params ran
+    if bool(_s_tune.get("exact_fit", True)) and src == "gguf" and not out.get("does_not_fit"):
+        _b = int(out.get("num_batch") or 512)
+        _ub = int(out.get("n_ubatch") or 0) or min(max(_b // 2, 512), 4096)
+        _kk = out.get("kv_cache_type") or "q8_0"
+        _kv2 = out.get("kv_cache_type_v") or _kk
+        _flash = bool(_s_tune.get("flash_attn", True))
+
+        def _fit(c: int, ub: int = _ub, b: int = _b):
+            return _fit_params_measure(model_path, c, ngl=int(out.get("num_gpu") or 99),
+                                       n_cpu_moe=int(out.get("n_cpu_moe") or 0), kv_k=_kk,
+                                       kv_v=_kv2, ubatch=ub, batch=b, flash=_flash)
+
+        c0 = int(out["num_ctx"])
+        m0 = _fit(c0)
+        if m0:
+            devs = list(m0["devices"])
+            # Memory the new load may use on each device: free now, plus what
+            # the running instance holds (a reload frees it), capped by a
+            # user-set VRAM tier, minus a small margin (+ the GPU reserve on
+            # the display card).
+            try:
+                _inst_vram = _running_instance_mem_mb()[1]
+            except Exception:
+                _inst_vram = 0.0
+            tier_gb = float(_s_tune.get("vram_tier_gb") or 0)
+            avail: dict = {}
+            for i, d in enumerate(devs):
+                g = tune_gpus[i] if i < len(tune_gpus) else tune_gpus[-1]
+                free_mb = float(g.get("free_gb") or 0) * 1024
+                if i == 0:
+                    free_mb += _inst_vram
+                    if tier_gb > 0 and len(devs) == 1:
+                        others = float(g.get("total_gb") or tier_gb) * 1024 - free_mb
+                        free_mb = min(free_mb, tier_gb * 1024 - max(others, 0.0))
+                avail[d] = free_mb - 320.0 - (vram_reserve_gb * 1024 if i == 0 else 0.0)
+            _mtp_now = (mtp_fixed_mb + mtp_compute_per_512 * _ub / 512) if mtp_mb else 0.0
+            extras_fixed = mmproj_mb + draft_mb + _mtp_now + cache_mb
+            draft_mb_tok = draft_kv_per_tok / (1024 * 1024)
+
+            def _need(m: dict, c: int) -> dict:
+                return {d: m["devices"][d] + ((extras_fixed + draft_mb_tok * c) if i == 0 else 0.0)
+                        for i, d in enumerate(devs)}
+
+            alt = max(4096, c0 // 2) if c0 > 8192 else c0 * 2
+            m1 = _fit(alt)
+            slopes = {}
+            if m1:
+                for i, d in enumerate(devs):
+                    s_ = (m0["devices"][d] - m1["devices"].get(d, m0["devices"][d])) / (c0 - alt)
+                    slopes[d] = s_ + (draft_mb_tok if i == 0 else 0.0)
+            n0 = _need(m0, c0)
+            room = {d: avail[d] - n0[d] for d in devs}
+            grow = min((room[d] / slopes[d] for d in devs if slopes.get(d, 0) > 0), default=0.0)
+            target = int((c0 + grow) // 1024 * 1024)
+            target = min(max(target, _ctx_floor_exact), _FIT_CTX_CAP)
+            if honored_proven:
+                target = max(target, c0)          # a booted combo is trusted, never shrunk
+            # Verify the extrapolation and back off if it overshoots.
+            for _ in range(3):
+                if target == c0:
+                    over = max(n0[d] - avail[d] for d in devs)
+                    break
+                mt = _fit(target)
+                if not mt:
+                    over, target = 0.0, c0
+                    break
+                nt = _need(mt, target)
+                over = max(nt[d] - avail[d] for d in devs)
+                if over <= 0:
+                    break
+                step = max(slopes.values(), default=0.0) or 0.05
+                target = max(_ctx_floor_exact, int((target - over / step - 1024) // 1024 * 1024))
+            if over > 0 and target != c0 and all(n0[d] <= avail[d] for d in devs):
+                target, over = c0, 0.0            # unverified growth: keep the plan that fits
+            if over > 0 and not honored_proven and n_layer:
+                # Context is already at its floor and the plan still doesn't
+                # fit: move weights off the GPU (dense layers or MoE expert
+                # layers) until llama.cpp's own estimate says it does.
+                shed_from = (out["num_gpu"], out["n_cpu_moe"])
+                for _ in range(5):
+                    if is_moe and dense_share:
+                        per_layer = size_mb * (1 - dense_share) / n_layer
+                        if out["n_cpu_moe"] >= n_layer:
+                            break
+                        out["n_cpu_moe"] = min(n_layer, out["n_cpu_moe"]
+                                               + int((over + 256) // max(per_layer, 1)) + 1)
+                    else:
+                        per_layer = size_mb / n_layer
+                        cur = out["num_gpu"] if out["num_gpu"] < 99 else n_layer
+                        if cur <= 1:
+                            break
+                        out["num_gpu"] = max(1, cur - int((over + 256) // max(per_layer, 1)) - 1)
+                    mt = _fit(target)
+                    if not mt:
+                        break
+                    over = max(v - avail[d] for d, v in _need(mt, target).items())
+                    if over <= 0:
+                        break
+                if (out["num_gpu"], out["n_cpu_moe"]) != shed_from:
+                    what = (f"n_cpu_moe {shed_from[1]} → {out['n_cpu_moe']}" if is_moe
+                            else f"GPU layers {min(shed_from[0], n_layer)} → {out['num_gpu']} of {n_layer}")
+                    notes.append(f"exact fit: still over at {target:,} tokens — moved weights off the "
+                                 f"GPU ({what}) until llama.cpp's estimate fits.")
+            if over > 0 and not honored_proven:
+                notes.append(
+                    f"exact fit: even {target:,} tokens needs {over:.0f} MiB more than this GPU has "
+                    f"free — expect a boot failure; free VRAM or lower the context.")
+            used = sum(_need(_fit(target) or m0, target).values())
+            total_avail = sum(avail.values())
+            exact_mem = (used, total_avail)
+            if target != c0:
+                notes.append(
+                    f"exact fit (llama-fit-params): ctx {c0:,} → {target:,} — "
+                    f"{used:,.0f} of {total_avail:,.0f} MiB usable across {len(devs)} device(s), "
+                    f"replacing the ~8% estimate headroom with measured memory.")
+                out["num_ctx"] = target
+            else:
+                notes.append(f"exact fit (llama-fit-params): {c0:,} tokens confirmed — "
+                             f"{used:,.0f} of {total_avail:,.0f} MiB usable.")
+            # Context is at the ceiling and memory is left: on MoE, pull expert
+            # layers back from system RAM — every reply gets faster.
+            if (is_moe and dense_share and n_layer and out["n_cpu_moe"] > 0
+                    and out["num_ctx"] >= _FIT_CTX_CAP):
+                per_layer = size_mb * (1 - dense_share) / n_layer
+                shed_from_moe = out["n_cpu_moe"]
+
+                def _fits_now() -> bool:
+                    mt = _fit(out["num_ctx"])
+                    return bool(mt) and all(v <= avail[d] for d, v in _need(mt, out["num_ctx"]).items())
+
+                mt = _fit(out["num_ctx"])
+                if mt:
+                    spare = min(avail[d] - v for d, v in _need(mt, out["num_ctx"]).items())
+                    back = int(spare // max(per_layer, 1))
+                    if back > 0:
+                        out["n_cpu_moe"] = max(0, out["n_cpu_moe"] - back)
+                        # llama.cpp has the last word: step back until it fits.
+                        while out["n_cpu_moe"] < shed_from_moe and not _fits_now():
+                            out["n_cpu_moe"] += 1
+                if out["n_cpu_moe"] < shed_from_moe:
+                    _mf = _fit(out["num_ctx"])
+                    if _mf:
+                        exact_mem = (sum(_need(_mf, out["num_ctx"]).values()), total_avail)
+                    notes.append(f"context is at the {_FIT_CTX_CAP:,} ceiling, so spare VRAM pulled expert "
+                                 f"layers back from RAM: n_cpu_moe {shed_from_moe} → {out['n_cpu_moe']}.")
+            # Context is maxed and memory is left: spend it on prompt speed.
+            # ubatch 2048 roughly doubles prefill on big cards but its compute
+            # buffer costs ~2 GB, so it only wins when context can't grow.
+            cpu_off = out["n_cpu_moe"] > 0 or (not is_moe and out["num_gpu"] < 99)
+            if out["num_ctx"] >= _FIT_CTX_CAP and not cpu_off and _ub < 2048:
+                mu = _fit(out["num_ctx"], ub=2048, b=2048)
+                if mu and all(v <= avail[d] for d, v in _need(mu, out["num_ctx"]).items()):
+                    out["num_batch"], out["n_ubatch"] = 2048, 2048
+                    notes.append("prompt batch: ubatch 2048 — context is at the ceiling and memory "
+                                 "is left over, so it buys faster prompt processing instead.")
+        else:
+            notes.append("exact fit: llama-fit-params unavailable — using the analytic estimate.")
+
+    out["moe_cache_mib"] = int(cache_mb)
+
+    # -- Speed verdict --
+    # Judged at the user's usual chat size: past the offload the solver already
+    # traded against context (MoE), the window size itself costs no decode
+    # speed — so falling short here means the model is the limit, and cutting
+    # context wouldn't help.
+    def _pred_out(ctx_tokens: int) -> float:
+        return _predict(min(typical_fill, int(ctx_tokens)), n_off=out["n_cpu_moe"],
+                        num_gpu=out["num_gpu"], kv_k=out.get("kv_cache_type") or "q8_0",
+                        kv_v=out.get("kv_cache_type_v") or "", spec=out["spec_strategy"],
+                        calib_factor=calib)
+
+    pred_now = _pred_out(int(out["num_ctx"]))
+    if pred_now < min_tok_s:
+        out["speed_floor_unreachable"] = True
+        notes.append(
+            f"speed floor not met: ≈ {pred_now:.0f} tok/s at your usual chat size (floor {min_tok_s:g}). "
+            f"The weights are the limit, not the context window — a smaller context wouldn't be "
+            f"faster at the same chat size; only a smaller model or quant would.")
+    out["predicted_tok_s"] = round(pred_now, 1)
+    notes.append(f"predicted decode ≈ {pred_now:.0f} tok/s at your usual chat size (~{typical_fill:,} tokens).")
+
+    # -- Plain-language summary (the notes are the full reasoning) --
+    summary = [f"Context: {out['num_ctx']:,} tokens"
+               + (f" (was {min_ctx:,})" if min_ctx and min_ctx != out["num_ctx"] else "")]
+    _usual = f"{typical_fill / 1000:.0f}k" if typical_fill >= 1000 else str(typical_fill)
+    if out.get("speed_floor_unreachable"):
+        summary.append(f"Speed: about {pred_now:.0f} tok/s at your usual chat size (~{_usual} tokens) — "
+                       f"below your {min_tok_s:g} tok/s minimum; this model can't go faster on this GPU")
+    else:
+        summary.append(f"Speed: about {pred_now:.0f} tok/s at your usual chat size (~{_usual} tokens; "
+                       f"your minimum: {min_tok_s:g})")
+    if out["n_cpu_moe"] > 0 and n_layer:
+        summary.append(f"{out['n_cpu_moe']} of {n_layer} expert layers run from system RAM")
+    elif not is_moe and n_layer and out["num_gpu"] < 99 and out["num_gpu"] < n_layer:
+        summary.append(f"{n_layer - out['num_gpu']} of {n_layer} layers run from system RAM (slow)")
+    if out["spec_strategy"] == "draft-mtp":
+        summary.append(f"MTP drafting {out.get('spec_draft_n_max') or 3} tokens ahead")
+    summary.append(f"Memory checked with llama.cpp's own estimate ({exact_mem[0] / 1024:.1f} of "
+                   f"{exact_mem[1] / 1024:.1f} GB)" if exact_mem
+                   else "Memory estimated (llama-fit-params not available)")
+    out["summary"] = summary
+    if out["num_batch"] > out["num_ctx"]:
+        out["num_batch"] = max(512, out["num_ctx"])
+
     out["notes"] = " ".join(notes)
     return out
 
@@ -36435,7 +37720,10 @@ def llama_caps(bin_path: str = "") -> dict:
             # enough that assuming them on an old binary would hard-exit the
             # server at boot.
             "ctx_checkpoints": False, "checkpoint_min_step": False,
-            "checkpoint_every_n": False}
+            "checkpoint_every_n": False,
+            # Newer flags: fail-closed until seen in --help (an unknown flag
+            # hard-exits the server at boot).
+            "moe_cache": False, "fit_target": False}
     if not bin_path:
         return caps
     try:
@@ -36474,6 +37762,8 @@ def llama_caps(bin_path: str = "") -> dict:
             # llama.cpp renamed --checkpoint-every-n-tokens → --checkpoint-min-step
             caps["checkpoint_min_step"] = "--checkpoint-min-step" in help_txt
             caps["checkpoint_every_n"] = "--checkpoint-every-n-tokens" in help_txt
+            caps["moe_cache"] = "--moe-cache-mib" in help_txt
+            caps["fit_target"] = "--fit-target" in help_txt
     except Exception:
         pass
     _LLAMA_CAPS_CACHE[key] = caps
@@ -37121,7 +38411,13 @@ def _watchdog_self_heal(attempt: int) -> None:
 # Remembered per GGUF path so switching models restores each model's own best
 # config instead of inheriting the previous model's leftovers.
 _MODEL_TUNE_KEYS = ("num_ctx", "n_cpu_moe", "kv_cache_type", "kv_cache_type_v", "num_gpu",
-                    "num_batch", "n_ubatch", "num_thread", "spec_strategy", "spec_strategy_source")
+                    "num_batch", "n_ubatch", "num_thread", "spec_strategy", "spec_strategy_source",
+                    "spec_draft_n_max", "moe_cache_mib")
+# Tune keys newer than many saved per-model configs: when a model's saved
+# config lacks one, it falls back to the default instead of inheriting the
+# previously loaded model's value (a draft length tuned for one model is
+# meaningless for the next).
+_MODEL_TUNE_RESET_KEYS = ("spec_draft_n_max", "moe_cache_mib")
 _MODEL_PROJECTOR_KEYS = ("mmproj_mode", "mmproj_path")
 _MODEL_PREFERENCE_KEYS = ("reasoning_effort", "spec_draft_model")
 _MODEL_CONFIG_KEYS = _MODEL_TUNE_KEYS + _MODEL_PROJECTOR_KEYS + _MODEL_PREFERENCE_KEYS
@@ -37182,6 +38478,9 @@ def _apply_model_config(model_path: str) -> bool:
     for k in _MODEL_CONFIG_KEYS:
         if k in cfg:
             s[k] = cfg[k]
+    for k in _MODEL_TUNE_RESET_KEYS:
+        if k not in cfg:
+            s[k] = DEFAULT_SETTINGS[k]
     s["mmproj_mode"] = _normalized_mmproj_mode(s)
     s["mmproj_auto"] = s["mmproj_mode"] == "auto"
     if "spec_strategy" in cfg:
@@ -37740,6 +39039,7 @@ class LlamaProcess:
                 spec_strategy = "off" if is_moe else "ngram-mod"
                 print(f"[llama] forcing spec_strategy='{spec_strategy}' fallback for model lacking MTP layers: {os.path.basename(model_path)}")
                 
+        _RUNTIME_LAUNCH["spec_draft_n"] = 0      # set again below if MTP drafts
         no_warmup = bool(s.get("no_warmup", False))
         enable_metrics = bool(s.get("enable_metrics", False))
         extra_args_raw = (s.get("llama_extra_args") or "").strip()
@@ -37798,6 +39098,14 @@ class LlamaProcess:
             "--parallel", str(n_parallel),
             "--reasoning-format", "deepseek",
         ]
+        # -ngl -1 lets llama.cpp's --fit (on by default) place layers, and its
+        # default 1024 MiB per-device margin made it quietly push weights and KV
+        # to system RAM whenever the tuner's exact fit left less than that free
+        # (measured: 176k ctx on a 4090 → 2.6 GB offloaded, 93 → 28 tok/s). The
+        # tuner already keeps its own margin, so fit stays only as a safety net
+        # for a real shortage at boot.
+        if ngl == -1 and caps.get("fit_target"):
+            cmd += ["--fit-target", "384"]
         if caps.get("flash_attn", True):
             cmd += ["--flash-attn", "on" if flash_on else "off"]
         elif flash_on:
@@ -37830,6 +39138,15 @@ class LlamaProcess:
                 # Keeping `n` MoE expert tensors on CPU lets giant MoE models run on
                 # tiny VRAM by paying a latency tax instead of an OOM error.
                 cmd += ["--n-cpu-moe", str(n_cpu_moe)]
+                # GPU cache for the offloaded experts (llama.cpp #29887): hot
+                # experts run on the GPU, only misses cross PCIe. Sized by the
+                # tuner; 0 = off.
+                try:
+                    moe_cache = int(s.get("moe_cache_mib") or 0)
+                except (TypeError, ValueError):
+                    moe_cache = 0
+                if moe_cache > 0 and caps.get("moe_cache"):
+                    cmd += ["--moe-cache-mib", str(moe_cache)]
             elif caps.get("override_tensor"):
                 # Older build without --n-cpu-moe: -ot pushes ALL expert tensors
                 # to CPU (coarser — no per-layer count — but the model boots).
@@ -37868,16 +39185,19 @@ class LlamaProcess:
             # llama.cpp build that includes PR #22673. Picking this on a model
             # without MTP heads will make llama-server exit at startup with
             # "no MTP layers found" — switch to ngram-mod or off in settings.
-            # n-max defaults to whatever nextn_predict_layers the GGUF declares
-            # (different MTP models ship different head counts — Qwen3.6 has 3,
-            # DeepSeek V3 has 1). Falls back to 3 if the metadata isn't readable.
-            spec_n_max = 3
+            # Draft length: the tuner's per-model pick (spec_draft_n_max), else 3.
+            # NOT the GGUF head count — a single MTP head drafts several tokens
+            # in a row, and pinning n-max to nextn_predict_layers (=1 on Qwen
+            # 3.x 27B) left speed on the table: measured on a 4090 / 27B Q4,
+            # chained with ngram-mod, n-max 1 → 70 tok/s, 2 → 88, 3 → 93,
+            # 4 → 92 (acceptance 83% → 50%). Every draft is verified by the
+            # full model, so length only trades speed, never output.
             try:
-                gg_mtp = read_gguf_metadata(model_path)
-                if gg_mtp.get("nextn_predict_layers"):
-                    spec_n_max = max(1, int(gg_mtp["nextn_predict_layers"]))
-            except Exception:
-                pass
+                spec_n_max = int(s.get("spec_draft_n_max") or 0)
+            except (TypeError, ValueError):
+                spec_n_max = 0
+            spec_n_max = min(max(spec_n_max, 1), 8) if spec_n_max > 0 else 3
+            _RUNTIME_LAUNCH["spec_draft_n"] = spec_n_max
             if caps.get("ngram_mod", False):
                 # CHAINED drafters (llama.cpp PR #20981 / #23269): MTP drafts a
                 # few high-quality tokens per step and n-gram backs it up with
@@ -37951,6 +39271,10 @@ class LlamaProcess:
                 print(f"[llama] {spec_strategy} needs a supported build and matching draft GGUF — spec_strategy→off",
                       file=sys.stderr)
         # "off" emits nothing — no speculative decoding.
+        # The MTP draft's KV cache stays at llama.cpp's f16 default on purpose:
+        # measured (4090, 27B, 131k, ub 1024) -ctkd/-ctvd q8_0 saves 240 MiB of
+        # draft KV but grows the two draft compute buffers 392 → 928 MiB each
+        # (flash attention dequant scratch) — a net 830 MiB LOSS.
         # Auto-YaRN: running ctx past the model's trained context without rope
         # scaling silently degrades long-range attention on many architectures
         # (the model "forgets" the early conversation). When the saved ctx

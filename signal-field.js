@@ -1,23 +1,23 @@
-/* Accuretta splash signal field — quiet Canvas 2D dot field adapted from the
-   ThreeUI "Signal Particles" background (PredictiveArcCanvas variant).
-   Two slow travelling sine waves decide which grid points light up; a few
-   deterministic points carry the theme accent. Colours are read from the
-   active theme's CSS custom properties (--fg / --accent / --fg-muted), so
-   the field always matches the theme the user last used. Call
+/* Accuretta splash dot field — the same quiet pool as the app's welcome
+   screen (dot-matrix.js), so the splash hands off to the app without a
+   change of language. A grid of dots sits in an elliptical pool around the
+   lockup and fades out well before the edges; every dot twinkles on its own
+   phase and speed, so the light never moves as one block. A few fixed dots
+   carry the theme accent, and dots near the pointer brighten.
+   Colours come from the active theme's --fg / --accent. Call
    window.AccuSignalField.refresh() after a theme change.
    Robustness: devicePixelRatio-aware (capped at 2x), resize handling,
-   pauses while the tab is hidden, and renders one static frame under
-   prefers-reduced-motion. */
+   pauses while the tab is hidden, one still frame under reduced motion. */
 (function () {
   "use strict";
   var canvas = document.getElementById("signal-field");
   if (!canvas || !canvas.getContext) return;
   var ctx = canvas.getContext("2d");
   var reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  var spacing = 18, dotR = 1.4, W = 0, H = 0, dpr = 1, raf = null;
-  var frameMs = 1000 / 30, lastDraw = 0;
+  var GAP = 18, DOT_R = 1.1, FADE_MS = 700, frameMs = 1000 / 30;
+  var W = 0, H = 0, dpr = 1, raf = null, lastDraw = 0, startedAt = 0;
   var pointer = { x: -9999, y: -9999, active: false };
-  var colors = { base: [9, 9, 11], accent: [0, 102, 255], muted: [82, 82, 91] };
+  var colors = { base: [9, 9, 11], accent: [0, 102, 255] };
 
   function parseColor(str, fallback) {
     if (!str) return fallback;
@@ -39,66 +39,73 @@
     var cs = getComputedStyle(document.documentElement);
     colors.base = parseColor(cs.getPropertyValue("--fg"), [9, 9, 11]);
     colors.accent = parseColor(cs.getPropertyValue("--accent"), [0, 102, 255]);
-    colors.muted = parseColor(cs.getPropertyValue("--fg-muted") || cs.getPropertyValue("--muted"), [82, 82, 91]);
   }
 
   function rgba(c, a) {
     return "rgba(" + (c[0] | 0) + "," + (c[1] | 0) + "," + (c[2] | 0) + "," + a.toFixed(3) + ")";
   }
 
-  function resize() {
-    dpr = Math.min(2, window.devicePixelRatio || 1);
-    spacing = window.matchMedia && window.matchMedia("(max-width: 600px)").matches ? 22 : 18;
-    W = canvas.width = Math.floor(window.innerWidth * dpr);
-    H = canvas.height = Math.floor(window.innerHeight * dpr);
-    canvas.style.width = window.innerWidth + "px";
-    canvas.style.height = window.innerHeight + "px";
-    if (reduced) draw(0);
+  function hash(i, j) {
+    var h = Math.sin(i * 127.1 + j * 311.7) * 43758.5453;
+    return h - Math.floor(h);
   }
 
-  function draw(time) {
+  // 0..1, resting near zero with brief independent flares.
+  function twinkle(i, j, t) {
+    var ph = hash(i, j) * 6.2832, sp = 0.0006 + hash(j, i) * 0.0011;
+    var w = 0.5 + 0.5 * Math.sin(t * sp + ph);
+    return w * w * w;
+  }
+
+  function smooth(e0, e1, v) {
+    var k = Math.max(0, Math.min(1, (v - e0) / (e1 - e0)));
+    return k * k * (3 - 2 * k);
+  }
+
+  function resize() {
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (reduced) draw(0, 1);
+  }
+
+  function draw(t, fade) {
     ctx.clearRect(0, 0, W, H);
-    var s = spacing * dpr;
-    var cols = Math.floor(W / s);
-    var rows = Math.floor(H / s);
-    var ox = (W - cols * s) / 2;
-    var oy = (H - rows * s) / 2;
-    var pr = 150 * dpr; // pointer influence radius
-    for (var i = 0; i <= cols; i++) {
-      for (var j = 0; j <= rows; j++) {
-        var x = ox + i * s;
-        var y = oy + j * s;
-        var nx = i * 0.1, ny = j * 0.1;
-        var wave1 = Math.sin(nx + time * 0.5) * Math.cos(ny - time * 0.3);
-        var wave2 = Math.sin(nx * 0.5 - ny * 0.5 + time * 0.8);
-        var value = wave1 + wave2;
+    var fx = W / 2, fy = H * 0.47;
+    var rx = Math.max(Math.min(W * 0.42, 640), 260), ry = Math.max(H * 0.42, 240);
+    var pr = 150;
+    var ox = (W % GAP) / 2, oy = (H % GAP) / 2;
+    for (var y = oy, j = 0; y < H; y += GAP, j++) {
+      for (var x = ox, i = 0; x < W; x += GAP, i++) {
+        var d = Math.hypot((x - fx) / rx, (y - fy) / ry);
+        var pool = 1 - smooth(0.2, 1, d);
+        var near = 0;
         if (pointer.active) {
-          var dx = x - pointer.x, dy = y - pointer.y;
-          var d2 = dx * dx + dy * dy;
-          if (d2 < pr * pr) value += (1 - Math.sqrt(d2) / pr) * 0.9;
+          var pd = Math.hypot(x - pointer.x, y - pointer.y);
+          if (pd < pr) near = 1 - pd / pr;
         }
-        if (value > 0.1) {
-          var h = Math.sin(i * 12.34) * Math.cos(j * 56.78);
-          var fill;
-          if (h > 0.98) fill = rgba(colors.accent, 0.85);
-          else if (h < -0.98) fill = rgba(colors.muted, 0.8);
-          else {
-            var a = Math.min(0.5, (value - 0.1) * 0.7);
-            fill = rgba(colors.base, a);
-          }
-          ctx.beginPath();
-          ctx.arc(x, y, dotR * dpr, 0, 6.2832);
-          ctx.fillStyle = fill;
-          ctx.fill();
-        }
+        if (pool <= 0 && near <= 0) continue;
+        var tw = twinkle(i, j, t);
+        var accent = hash(i + 7, j + 3) > 0.985;
+        var a = ((accent ? 0.2 : 0.11) + (accent ? 0.5 : 0.3) * tw) * pool + near * 0.35;
+        ctx.fillStyle = rgba(accent ? colors.accent : colors.base, Math.min(0.85, a) * fade);
+        ctx.beginPath();
+        ctx.arc(x, y, DOT_R + near * 0.6, 0, 6.2832);
+        ctx.fill();
       }
     }
   }
 
-  function loop(t) {
-    if (!lastDraw || t - lastDraw >= frameMs) {
-      draw(t * 0.0012);
-      lastDraw = t;
+  function loop(now) {
+    if (!startedAt) startedAt = now;
+    if (!lastDraw || now - lastDraw >= frameMs) {
+      draw(now, Math.min(1, (now - startedAt) / FADE_MS));
+      lastDraw = now;
     }
     raf = requestAnimationFrame(loop);
   }
@@ -107,8 +114,8 @@
   if (!reduced) {
     if (!window.matchMedia || window.matchMedia("(pointer: fine)").matches) {
       window.addEventListener("pointermove", function (e) {
-        pointer.x = e.clientX * dpr;
-        pointer.y = e.clientY * dpr;
+        pointer.x = e.clientX;
+        pointer.y = e.clientY;
         pointer.active = true;
       }, { passive: true });
       document.addEventListener("mouseleave", function () { pointer.active = false; });
@@ -125,7 +132,7 @@
   window.AccuSignalField = {
     refresh: function () {
       readThemeColors();
-      if (reduced) draw(0);
+      if (reduced) draw(0, 1);
     }
   };
 })();

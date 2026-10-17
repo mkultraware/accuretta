@@ -27,11 +27,11 @@
   })();
 </script>
 <script src="/appearance.js?v=1"></script>
-<link rel="stylesheet" href="/app.css?v=81">
-<link rel="stylesheet" href="/ui-refresh.css?v=2">
-<link rel="stylesheet" href="/workspace-shell.css?v=7">
+<link rel="stylesheet" href="/app.css?v=88">
+  <link rel="stylesheet" href="/ui-refresh.css?v=2">
+  <link rel="stylesheet" href="/workspace-shell.css?v=8">
 <link rel="stylesheet" href="/research-ui.css?v=2">
-<link rel="stylesheet" href="/ui-pass.css?v=4">
+<link rel="stylesheet" href="/ui-pass.css?v=12">
 <link rel="stylesheet" href="/assets/vendor/web/icons.css">
 <script src="/assets/vendor/html2canvas/dist/html2canvas.min.js" defer></script>
 <script src="/assets/vendor/jszip/dist/jszip.min.js" defer></script>
@@ -64,7 +64,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.9.2</span>
+        <span class="v" id="brand-v">v0.9.3</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -77,8 +77,23 @@
     </nav>
     <div class="sidebar-scroll">
       <div class="section-head">
-        <span>Sessions</span>
+        <span>Project</span>
         <span class="grow"></span>
+        <button class="iconbtn" id="btn-project-add" type="button" title="Add a project folder" aria-label="Add a project folder"><i class="ph ph-plus"></i></button>
+      </div>
+      <div class="project-scope">
+        <button class="project-scope-row" id="btn-project-scope" type="button" aria-haspopup="menu" aria-controls="project-scope-menu" aria-expanded="false" title="Filter conversations by project">
+          <i class="ph ph-folders" id="project-scope-icon" aria-hidden="true"></i>
+          <span id="project-scope-label">All projects</span>
+          <i class="ph ph-caret-down project-scope-chev" aria-hidden="true"></i>
+        </button>
+        <div class="project-menu" id="project-scope-menu" role="menu" aria-label="Project filter"></div>
+      </div>
+
+      <div class="section-head">
+        <span>Conversations</span>
+        <span class="grow"></span>
+        <button class="iconbtn" id="btn-clear-conversations" type="button" title="Clear conversations" aria-label="Clear conversations"><i class="ph ph-trash"></i></button>
       </div>
       <div class="chatlist" id="chatlist"></div>
 
@@ -106,6 +121,7 @@
         <div class="cost-widget collapsed" id="cost-widget">
           <button type="button" class="cost-widget-head" id="cost-widget-toggle" aria-expanded="false" aria-controls="cost-widget" title="Show savings breakdown">
             <span class="cost-widget-label">Saved vs OpenAI cost</span>
+            <span class="cost-widget-short">est. OpenAI cost</span>
             <span class="cost-widget-amount" id="cost-amount">$0.00</span>
             <i class="ph ph-caret-down cost-widget-chev" aria-hidden="true"></i>
           </button>
@@ -126,21 +142,6 @@
             <button type="button" class="cost-share-btn" id="cost-share" title="Copy a shareable savings card">
               <i class="ph ph-share-network"></i>
             </button>
-          </div>
-        </div>
-        <div class="ctx-gauge" id="ctx-gauge">
-          <div class="ctx-gauge-title">Context memory
-            <button type="button" class="ctx-compact-btn" id="btn-compact"
-                    title="Fold older turns into the session summary now — frees context on long chats without losing detail">compact</button>
-          </div>
-          <div class="ctx-gauge-body">
-            <span class="ctx-gauge-label" id="ctx-gauge-label">0%</span>
-            <svg viewBox="0 0 32 32" width="36" height="36" aria-hidden="true">
-              <circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="2.5" opacity="0.15"></circle>
-              <circle id="ctx-gauge-arc" cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="2.5"
-                      stroke-linecap="round" stroke-dasharray="81.68" stroke-dashoffset="81.68"
-                      transform="rotate(-90 16 16)"></circle>
-            </svg>
           </div>
         </div>
       </div>
@@ -372,6 +373,15 @@
           <div class="composer-foot">
             <span class="composer-hint">Enter to send · Shift+Enter for a new line</span>
             <div class="composer-foot-actions">
+              <button type="button" class="ctx-ring" id="ctx-gauge" aria-label="Context memory: 0% used">
+                <span class="ctx-ring-label" id="ctx-gauge-label">0%</span>
+                <svg viewBox="0 0 32 32" width="20" height="20" aria-hidden="true">
+                  <circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="3.5" opacity="0.18"></circle>
+                  <circle id="ctx-gauge-arc" cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="3.5"
+                          stroke-linecap="round" stroke-dasharray="81.68" stroke-dashoffset="81.68"
+                          transform="rotate(-90 16 16)"></circle>
+                </svg>
+              </button>
               <div class="effort-control hidden" id="reasoning-effort-control">
                 <button class="effort-pill" id="reasoning-effort-pill" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Reasoning effort: Default" title="Reasoning effort for the next message">
                   <i class="ph-bold ph-brain effort-pill-icon" aria-hidden="true"></i>
@@ -396,6 +406,14 @@
               <button class="btn accent" id="btn-send" title="Send (Enter)"><i class="ph-bold ph-arrow-up"></i></button>
             </div>
           </div>
+        </div>
+        <div class="composer-projects">
+          <button class="chip project-chip" id="project-chip" type="button" aria-haspopup="menu" aria-controls="project-menu" aria-expanded="false" title="Choose the folder this session works on">
+            <i class="ph ph-folder-simple" aria-hidden="true"></i>
+            <span class="project-chip-label" id="project-chip-label">No project</span>
+            <i class="ph ph-caret-down project-chip-caret" aria-hidden="true"></i>
+          </button>
+          <div class="project-menu" id="project-menu" role="menu" aria-label="Project"></div>
         </div>
       </div>
     </div>
@@ -447,7 +465,7 @@
     <div class="preview-body" id="preview-body">
       <div id="preview-top-pane">
         <div class="preview-empty" id="preview-empty">
-          <i class="ph ph-layout"></i>
+          <svg class="preview-empty-a" id="preview-empty-a" aria-hidden="true"></svg>
           <div class="h">nothing to render.</div>
           <div class="s">ask the agent to build a page.<br>e.g. "build a pricing page with three tiers."</div>
         </div>
@@ -822,6 +840,27 @@
       <label class="recon-label" for="recon-user-agent" data-recon-active-only data-recon-suite-only>User agent <span class="recon-opt">optional</span></label>
       <input type="text" id="recon-user-agent" class="recon-input" data-recon-active-only data-recon-suite-only maxlength="512" placeholder="program-required User-Agent value" autocomplete="off" autocapitalize="off" spellcheck="false">
       <p class="recon-field-hint" data-recon-active-only data-recon-suite-only>When set, Accuretta applies this value to HTTP requests for the engagement, including requests the model builds itself.</p>
+
+      <label class="recon-label" for="recon-required-headers" data-recon-active-only data-recon-suite-only>Required headers <span class="recon-opt">optional</span></label>
+      <textarea id="recon-required-headers" class="recon-input" data-recon-active-only data-recon-suite-only rows="2" maxlength="2048" placeholder="Header: value — one per line (e.g. X-HackerOne-Research: your_username)" autocomplete="off" spellcheck="false"></textarea>
+      <p class="recon-field-hint" data-recon-active-only data-recon-suite-only>Program-required headers (max 10), forced onto every engagement request after the model's own headers.</p>
+
+      <div class="recon-limits-row" data-recon-active-only data-recon-suite-only>
+        <input type="number" id="recon-rate-limit" class="recon-input" min="0" max="6000" step="1" placeholder="rate limit (req/min)" autocomplete="off">
+        <input type="number" id="recon-request-cap" class="recon-input" min="0" max="1000000" step="1" placeholder="total request cap" autocomplete="off">
+      </div>
+      <p class="recon-field-hint" data-recon-active-only data-recon-suite-only>Optional hard request budget (blank or 0 = unlimited). Fan-out tools refuse before exceeding it, and every request is recorded in the engagement ledger.</p>
+
+      <label class="recon-check" data-recon-active-only data-recon-suite-only>
+        <input type="checkbox" id="recon-automated-check" checked>
+        <span class="custom-checkbox"></span>
+        <span>Allow automated testing tools (nmap, sqlmap, spray, scanners, fuzzers).</span>
+      </label>
+      <label class="recon-check" data-recon-active-only data-recon-suite-only>
+        <input type="checkbox" id="recon-destructive-check">
+        <span class="custom-checkbox"></span>
+        <span>Allow destructive methods (DELETE and destructive-looking endpoints).</span>
+      </label>
 
       <label class="recon-label" data-recon-suite-only>Objective <span class="recon-opt">optional</span></label>
       <div class="recon-chips" id="recon-objective-chips" data-recon-active-only data-recon-suite-only>
@@ -1247,7 +1286,7 @@
 
     <div class="form-group">Auto-tune <span class="hint" style="font-size:10px;font-weight:normal;text-transform:none;letter-spacing:0;">· pick your VRAM, get sane defaults</span></div>
     <div class="form-row">
-      <label>VRAM budget <i class="ph ph-info" title="How much GPU memory to plan around. Auto-detected via nvidia-smi when possible. The auto-tuner uses ~85% of this for weights and KV cache and leaves the rest as headroom."></i></label>
+      <label>VRAM budget <i class="ph ph-info" title="How much GPU memory to plan around. Auto-detected via nvidia-smi when possible. The auto-tuner checks its plan against llama.cpp's own memory estimate (llama-fit-params) and spends what's left on context."></i></label>
       <select id="set-vram-tier">
         <option value="0">Manual · don't touch the advanced fields below</option>
         <option value="6">6 GB · low end laptops, GTX 1660</option>
@@ -1264,10 +1303,15 @@
       <span class="hint" id="vram-detected-hint">detecting GPU...</span>
     </div>
     <div class="form-row">
+      <label>Minimum speed · tok/s <i class="ph ph-info" title="The slowest generation speed you'll accept. Auto-tune picks the largest context (and MoE offload) whose predicted speed at your usual chat size (learned from your history) stays at or above this. It never lowers the model's quantization; if the floor can't be reached on this GPU, the notes say so."></i></label>
+      <input type="number" id="set-min-tok-s" step="5" min="1" max="500">
+      <span class="hint">45 default · learned from your real reply speeds.</span>
+    </div>
+    <div class="form-row">
       <button type="button" class="btn sm" id="btn-autotune"><i class="ph ph-magic-wand"></i>Suggest values for current model</button>
     </div>
     <div class="form-row">
-      <span class="hint" id="autotune-notes" style="display:block;line-height:1.5;"></span>
+      <div class="hint autotune-notes" id="autotune-notes"></div>
     </div>
 
     <div class="form-group">Model Health <span class="hint" style="font-size:10px;font-weight:normal;text-transform:none;letter-spacing:0;">&middot; local setup advisor</span></div>
@@ -1841,7 +1885,8 @@
 <script src="/dropdown-menus.js?v=1"></script>
 <script src="/agent-orb.js?v=4"></script>
 <script src="/theme-flowlines.js?v=2" defer></script>
-<script src="/app.js?v=2026092904"></script>
+<script src="/dot-matrix.js?v=6"></script>
+<script src="/app.js?v=2026101708"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {

@@ -1336,6 +1336,95 @@ button {
   overflow-x: hidden;
 }
 
+/* Project scope row: filters which conversations the list shows. */
+.project-scope {
+  padding: 0 6px 2px;
+  flex: 0 0 auto;
+}
+
+.project-scope-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg-muted);
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.project-scope-row:hover {
+  background: var(--bg-inset);
+  color: var(--fg);
+}
+
+.project-scope-row > .ph:first-child {
+  font-size: 15px;
+  color: var(--fg-faint);
+}
+
+.project-scope-row > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-scope-row .project-scope-chev {
+  font-size: 11px;
+  opacity: 0.65;
+}
+
+.project-scope-row.scoped {
+  color: var(--fg);
+}
+
+.project-scope-row.scoped > .ph:first-child {
+  color: var(--accent);
+}
+
+/* Date buckets inside the conversation list. */
+.chatlist-date {
+  padding: 10px 20px 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-muted);
+  font-weight: 500;
+}
+
+/* Mission categories (Red Team, Frontend Secrets, ...) replace the date
+   bucket for sessions whose chat record carries a mission engagement. */
+.chatlist-mission {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 11px 20px 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-muted);
+  font-weight: 500;
+}
+
+.chatlist-mission > .ph {
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+.chatlist-empty {
+  padding: 10px 12px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fg-faint);
+}
+
 .chatrow {
   display: flex;
   align-items: center;
@@ -1364,6 +1453,27 @@ button {
 
 .chatrow .t {
   flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Two-line conversation rows: title over the project it belongs to. */
+.chatrow .t-wrap {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.chatrow .t-wrap > .t {
+  flex: 0 0 auto;
+}
+
+.chatrow .s {
+  font-size: 10.5px;
+  color: var(--fg-faint);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3115,6 +3225,7 @@ button {
 .recon-disclaimer strong { color: var(--fg); }
 #recon-modal.recon-passive-mode [data-recon-active-only] { display: none; }
 #recon-modal [data-recon-secret-only] { display: none; }
+.recon-limits-row { display: flex; gap: 8px; margin-top: 8px; }
 #recon-modal.recon-secret-mode [data-recon-secret-only] { display: block; }
 #recon-modal.recon-secret-mode [data-recon-suite-only] { display: none; }
 #recon-modal.recon-secret-mode .recon-secret-options {
@@ -6293,6 +6404,66 @@ body.remote-client .chat-scroll {
   text-align: center;
 }
 
+.project-menu {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: calc(var(--z-overlay) + 1);
+  min-width: 260px;
+  max-width: min(420px, calc(100vw - 16px));
+  max-height: min(420px, calc(100vh - 32px));
+  overflow-y: auto;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+  padding: 6px;
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  font-family: var(--font-sans);
+}
+
+.project-menu.open {
+  display: flex;
+}
+
+.project-menu .overflow-section-label {
+  font-family: var(--font-sans);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-faint);
+  padding: 6px 10px 2px;
+}
+
+.project-menu .overflow-section-label:first-child {
+  padding-top: 2px;
+}
+
+.project-menu .project-menu-empty {
+  padding: 10px 10px 4px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fg-muted);
+}
+
+.project-menu .mm-row i {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.project-menu .mm-row-sub {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-faint);
+  font-size: 10px;
+}
+
 .mm-row {
   display: flex;
   align-items: center;
@@ -6536,6 +6707,37 @@ body.remote-client .chat-scroll {
 .composer-hint {
   font-size: 10px;
   color: var(--fg-faint);
+}
+
+.composer-projects {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 8px;
+}
+
+.project-chip {
+  max-width: 100%;
+  min-width: 0;
+  padding: 3px 11px;
+  font-size: 11.5px;
+}
+
+.project-chip i {
+  font-size: 13px;
+}
+
+.project-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
+}
+
+.project-chip .project-chip-caret {
+  font-size: 11px;
+  opacity: 0.65;
 }
 
 .btn {
@@ -16815,17 +17017,6 @@ body,
   display: none;
 }
 
-[data-theme="aperture-dark"] .chat-scroll {
-  background-image: radial-gradient(circle at center, rgba(255, 255, 255, 0.02) 0%, transparent 50%);
-  background-size: 150% 150%;
-  animation: ambient-drift 30s ease-in-out infinite alternate;
-}
-
-@keyframes ambient-drift {
-  0% { background-position: 0% 0%; }
-  100% { background-position: 100% 100%; }
-}
-
 [data-theme="aperture-dark"] .brand .brand-mark {
   opacity: 0.8;
   filter: drop-shadow(0 0 2px rgba(255, 255, 255, 0.2));
@@ -17841,6 +18032,43 @@ pre.code-card.streaming-plain code {
   position: relative;
   z-index: 2;
   flex: 0 0 auto;
+}
+
+/* Project strip: slides BEHIND the prompt box (lower z) so only its side and
+   bottom lines show, like a tag tucked under the card. The tall top padding
+   is the hidden zone under the composer; the chip lands just below the
+   card's bottom edge. Net effect: the block grows downward, nudging the
+   prompt box up a little. */
+[data-theme] .composer-wrap > .composer-projects {
+  position: relative;
+  z-index: 1;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  width: calc(100% - 26px);
+  max-width: 874px;
+  margin: -26px auto 0 auto;
+  padding: 33px 8px 7px;
+  border: 1px solid color-mix(in srgb, var(--fg) 13%, transparent);
+  border-radius: 20px;
+  background: var(--bg-raised);
+  box-shadow: none;
+}
+
+.app.sidebar-collapsed .composer-wrap > .composer-projects {
+  max-width: 954px;
+}
+
+.app.sidebar-collapsed.preview-collapsed .composer-wrap > .composer-projects {
+  max-width: 1054px;
+}
+
+@media (max-width: 820px) {
+  .composer-wrap > .composer-projects,
+  .app.sidebar-collapsed .composer-wrap > .composer-projects,
+  .app.sidebar-collapsed.preview-collapsed .composer-wrap > .composer-projects {
+    width: calc(100% - 14px);
+    max-width: 100%;
+  }
 }
 
 [data-theme] .composer-wrap > .revealer-deck {

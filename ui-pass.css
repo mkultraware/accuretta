@@ -974,3 +974,278 @@
 [data-theme="atelier"] .welcome-suggest-label {
   font-optical-sizing: auto;
 }
+
+/* --- context ring in the composer foot ------------------------------
+   Replaces the sidebar gauge. Ring only; the percentage and breakdown
+   live in the hover card, which also carries the Compact button. */
+.ctx-ring {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg-faint);
+  cursor: pointer;
+  transition: background-color 160ms var(--ease-out), color 160ms var(--ease-out);
+}
+.ctx-ring:hover,
+.ctx-ring:focus-visible {
+  background: color-mix(in srgb, var(--accent-subtle) 55%, var(--bg-inset));
+  color: var(--fg-muted);
+}
+.ctx-ring:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 1px;
+}
+.ctx-ring svg {
+  display: block;
+  overflow: visible;
+}
+.ctx-ring #ctx-gauge-arc {
+  filter: none !important;
+}
+.ctx-ring.warn #ctx-gauge-arc { stroke: var(--warning) !important; }
+.ctx-ring.crit #ctx-gauge-arc { stroke: var(--danger) !important; }
+.ctx-ring.warn { color: var(--warning); }
+.ctx-ring.crit { color: var(--danger); }
+.ctx-ring-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.ctxbd-compact {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 28px;
+  margin-top: 2px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg);
+  font: 500 12px/1 var(--font-sans);
+  cursor: pointer;
+  transition: border-color 160ms var(--ease-out), background-color 160ms var(--ease-out);
+}
+.ctxbd-compact i { font-size: 14px; color: var(--fg-muted); }
+.ctxbd-compact:hover {
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--border-strong));
+  background: color-mix(in srgb, var(--accent-subtle) 55%, var(--bg-inset));
+}
+.ctxbd-compact:disabled { opacity: 0.6; cursor: progress; }
+
+/* --- dot matrix: welcome field + preview empty A ----------------------
+   The field canvas spans both chat rows (messages + composer) and sits
+   under them; dot-matrix.js only paints it while the welcome screen is
+   up and for the ripple that starts a session. */
+.center .chat { position: relative; }
+.center .chat > .dot-field {
+  grid-area: 1 / 1 / -1 / -1;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0;
+}
+.center .chat > .dot-field.on { opacity: 1; }
+.center .chat > .chat-scroll,
+.center .chat > .composer-wrap { position: relative; z-index: 1; }
+
+.preview-empty-a {
+  width: 92px;
+  height: 68px;
+  color: var(--fg-faint);
+  overflow: visible;
+}
+@keyframes dm-twinkle {
+  0%, 100% { opacity: var(--lo); transform: scale(.86); }
+  12% { opacity: 1; transform: scale(1.14); }
+  40% { opacity: .7; transform: scale(1); }
+}
+
+/* --- welcome v2: composer in the middle ---------------------------------
+   .chat gets a third row; while the welcome is up it takes space so the
+   composer sits mid-pane, with recents + quick starts under it. Leaving
+   the welcome collapses the row and the composer settles to the bottom. */
+.center .chat {
+  grid-template-rows: 1fr auto 0fr;
+  transition: grid-template-rows 420ms cubic-bezier(.2, .8, .2, 1);
+}
+.center .chat.is-welcome { grid-template-rows: 1fr auto .9fr; }
+#chat-inner .welcome-screen.welcome-v2 {
+  flex: 1 0 auto;
+  justify-content: flex-end;
+  align-items: center;
+  padding: 24px 24px 8px;
+}
+.wv-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  animation: wv-enter 420ms cubic-bezier(.2, .8, .2, 1) both;
+}
+.wv-a { width: 76px; height: 57px; color: var(--fg-faint); overflow: visible; }
+.wv-a circle { transform-box: fill-box; transform-origin: center; }
+.wv-a circle.on { animation: dm-twinkle var(--p) ease-in-out var(--d) infinite; }
+.wv-title {
+  margin: 0;
+  font: 500 28px/1.2 var(--font-sans);
+  letter-spacing: -0.025em;
+  color: var(--fg);
+  text-align: center;
+}
+.wv-below {
+  grid-area: 3 / 1;
+  position: relative;
+  z-index: 1;
+  align-self: start;
+  width: 100%;
+  max-width: 820px;
+  justify-self: center;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  column-gap: 28px;
+  row-gap: 14px;
+  padding: 6px 0 16px;
+  box-sizing: border-box;
+  animation: wv-enter 420ms 60ms cubic-bezier(.2, .8, .2, 1) both;
+}
+.wv-col { display: flex; flex-direction: column; min-width: 0; }
+.wv-label {
+  padding: 0 10px 6px;
+  font: 500 11px/1.2 var(--font-sans);
+  letter-spacing: .02em;
+  color: var(--fg-muted);
+}
+.wv-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg);
+  font: 400 13px/1 var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 140ms ease;
+}
+.wv-row i { flex: 0 0 auto; font-size: 15px; color: var(--fg-muted); transition: color 140ms ease; }
+.wv-row-t { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wv-row-m { flex: 0 0 auto; font-size: 11px; color: var(--fg-muted); }
+.wv-row:hover, .wv-row:focus-visible, .wv-row.is-picked {
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+}
+.wv-row:hover i, .wv-row.is-picked i { color: var(--accent); }
+.wv-row:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset: 0; }
+@keyframes wv-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+@container chat-pane (max-width: 560px) {
+  .center .chat.is-welcome { grid-template-rows: 1fr auto auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .center .chat { transition: none; }
+  .wv-head, .wv-below { animation: none; }
+  .wv-a circle.on { animation: none; opacity: .9; }
+}
+
+/* --- cost savings: one quiet line until opened ---------------------------
+   Collapsed it reads "$3,834 saved vs OpenAI"; the card chrome and the
+   breakdown come back when it is expanded. */
+[data-theme] #app .sidebar .cost-widget.collapsed,
+#app .sidebar .cost-widget.collapsed {
+  margin-top: 8px;
+  padding: 10px 4px 2px !important;
+  border: 0 !important;
+  border-top: 1px solid var(--border-subtle, var(--border)) !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+#app .sidebar .cost-widget.collapsed .cost-widget-head {
+  flex-direction: row;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+#app .sidebar .cost-widget.collapsed .cost-widget-amount {
+  order: -1;
+  font-size: 13px !important;
+  letter-spacing: -0.01em !important;
+  text-shadow: none !important;
+  flex: 0 0 auto;
+}
+#app .sidebar .cost-widget.collapsed .cost-widget-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-transform: none !important;
+  color: var(--fg-faint) !important;
+}
+#app .sidebar .cost-widget.collapsed .cost-widget-chev {
+  position: static;
+  align-self: center;
+  flex: 0 0 auto;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+#app .sidebar .cost-widget.collapsed:hover .cost-widget-chev,
+#app .sidebar .cost-widget.collapsed .cost-widget-head:focus-visible .cost-widget-chev { opacity: 1; }
+.cost-widget-short { display: none; }
+#app .sidebar .cost-widget.collapsed .cost-widget-label { display: none; }
+#app .sidebar .cost-widget.collapsed .cost-widget-short {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--fg-faint);
+}
+:root { --dm-l: 58%; }
+:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"], [data-theme="aperture-dark"], [data-theme="amaranth"], [data-theme="cartograph"], [data-theme="dim"], [data-theme="atelier"]) { --dm-l: 70%; }
+/* The dot field replaces atelier's flow lines on the new welcome; its
+   vignette existed to hold those lines back and would bury the dots. */
+[data-theme="atelier"] .welcome-screen.welcome-v2::before { display: none; }
+
+/* --- auto-tune result: summary first, reasoning behind a toggle --------- */
+.autotune-notes { display: block; width: 100%; line-height: 1.5; }
+.autotune-notes .autotune-head { color: var(--fg-muted); font-size: 11px; }
+.autotune-notes .autotune-warn {
+  margin-top: 6px; padding: 6px 8px; border-radius: 6px;
+  background: color-mix(in srgb, var(--warning) 12%, transparent); color: var(--fg);
+}
+.autotune-notes .autotune-summary { margin: 8px 0 0; padding-left: 18px; color: var(--fg); font-size: 12.5px; }
+.autotune-notes .autotune-summary li + li { margin-top: 2px; }
+.autotune-notes .autotune-status { margin-top: 8px; color: var(--accent); font-size: 12px; }
+.autotune-notes .autotune-why { margin-top: 8px; }
+.autotune-notes .autotune-why summary { cursor: pointer; color: var(--fg-muted); font-size: 11.5px; }
+.autotune-notes .autotune-why-body {
+  margin-top: 6px; max-height: 240px; overflow: auto; padding-right: 4px;
+  font-size: 11px; color: var(--fg-muted); display: grid; gap: 3px;
+}

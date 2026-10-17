@@ -42,6 +42,7 @@
     queueDispatching: false,
     queueEditId: null,
     queueDrainTimer: null,
+    projectScope: "",        // sidebar filter: "" all | "__none__" | normalized project path
     clientContext: null,
     remoteAccess: null,
     executionTarget: localStorage.getItem("accuretta:execution-target") || "host",
@@ -276,6 +277,12 @@
     if (!result?.ok || !result?.ready) {
       throw new Error(result?.error || "llama-server did not report the model ready");
     }
+    // The context ring caches the server's context size from the last stats
+    // poll, so after a reload (new model, new ctx) it lagged until the next
+    // poll. Drop it and re-read from the freshly started server.
+    state._ctxCapacity = 0;
+    await refreshContextStats();
+    renderStatus();
     return result;
   }
 
@@ -3587,6 +3594,7 @@
 
   function renderTopbarContext(chat) {
     renderWorkspaceIdentity(chat);
+    renderProjectChip(chat);
     const chatContext = $("#topbar-chat-context");
     const projectContext = $("#topbar-project-context");
     const branch = $("#topbar-branch");
@@ -3608,6 +3616,322 @@
     projectContext.title = String(worktree?.path || project);
     branch.hidden = !branchValue;
     branchName.textContent = branchValue;
+  }
+
+  function projectPathKey(value) {
+    return String(value || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  }
+
+  function projectBaseName(value) {
+    return String(value || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
+  }
+
+  function projectPointerForChat(chat) {
+    const pointer = chat?.github_worktree || chat?.project_workspace || null;
+    const path = String(pointer?.path || "").trim();
+    if (!path) return null;
+    return { path, name: String(pointer.name || pointer.repo || projectBaseName(path)) };
+  }
+
+  function renderProjectChip(chat = state.chats?.chats?.[state.chatId]) {
+    const chip = $("#project-chip");
+    const label = $("#project-chip-label");
+    if (!chip || !label) return;
+    const pointer = projectPointerForChat(chat);
+    label.textContent = pointer ? pointer.name : "No project";
+    chip.title = pointer ? pointer.path : "Choose the folder this session works on";
+    chip.classList.toggle("on", !!pointer);
+  }
+
+  function projectCandidates(limit = 6) {
+    const seen = new Set();
+    const recent = [];
+    const folders = [];
+    const push = (list, pointer) => {
+      if (!pointer) return;
+      const key = projectPathKey(pointer.path);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      list.push(pointer);
+    };
+    for (const id of state.chats?.order || []) {
+      push(recent, projectPointerForChat(state.chats?.chats?.[id]));
+      if (recent.length >= limit) break;
+    }
+    for (const folder of state.workspace?.folders || []) {
+      const path = String(folder || "").trim();
+      if (!path) continue;
+      push(folders, { path, name: projectBaseName(path) });
+    }
+    return { recent, folders };
+  }
+
+  function renderProjectMenu() {
+    const menu = $("#project-menu");
+    if (!menu) return;
+    const current = projectPointerForChat(state.chats?.chats?.[state.chatId]);
+    const currentKey = current ? projectPathKey(current.path) : "";
+    const { recent, folders } = projectCandidates();
+    const row = (pointer) => {
+      const selected = projectPathKey(pointer.path) === currentKey;
+      return `<button type="button" class="mm-row${selected ? " loaded" : ""}" role="menuitemradio" aria-checked="${selected}" data-project-path="${esc(pointer.path)}" data-project-name="${esc(pointer.name)}" title="${esc(pointer.path)}">
+        <i class="ph ${selected ? "ph-folder-open" : "ph-folder-simple"}" aria-hidden="true"></i>
+        <span class="mm-row-name">${esc(pointer.name || projectBaseName(pointer.path))}</span>
+        <span class="mm-row-sub">${esc(pointer.path)}</span>
+      </button>`;
+    };
+    const parts = [];
+    if (recent.length) {
+      parts.push('<div class="overflow-section-label">Recent</div>');
+      parts.push(...recent.map(row));
+    }
+    if (folders.length) {
+      parts.push('<div class="overflow-section-label">Workspace folders</div>');
+      parts.push(...folders.map(row));
+    }
+    if (!recent.length && !folders.length) {
+      parts.push('<div class="project-menu-empty">No folders in the workspace yet. Use Open folder… to add one.</div>');
+    }
+    parts.push('<div class="overflow-section-label">Session</div>');
+    if (current) {
+      parts.push('<button type="button" class="mm-row" id="project-clear" role="menuitem"><i class="ph ph-x" aria-hidden="true"></i><span class="mm-row-name">No project</span></button>');
+    }
+    parts.push('<button type="button" class="mm-row" id="project-open-folder" role="menuitem" title="Add a folder from this computer to the workspace"><i class="ph ph-folder-open" aria-hidden="true"></i><span class="mm-row-name">Open folder…</span></button>');
+    menu.innerHTML = parts.join("");
+  }
+
+  async function setChatProject(pointer) {
+    if (!state.chatId) {
+      toast("Open a session before choosing a project.", "error");
+      return false;
+    }
+    try {
+      const updated = await api(`/api/chats/${encodeURIComponent(state.chatId)}/project`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_workspace: pointer }),
+      });
+      if (!updated || updated.error) throw new Error((updated && updated.error) || "the bridge refused the project");
+      const id = state.chatId;
+      state.chats.chats[id] = updated;
+      renderProjectChip(updated);
+      renderTopbarContext(updated);
+      renderChatList();
+      return true;
+    } catch (error) {
+      toast("could not set project: " + (error.message || error), "error");
+      return false;
+    }
+  }
+
+  async function browseForFolder() {
+    try {
+      const result = await api("/api/browse-folder", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      return String(result?.path || "").trim();
+    } catch (error) {
+      toast("could not open the folder picker: " + (error.message || error), "error");
+      return "";
+    }
+  }
+
+  async function addFolderToWorkspace(picked) {
+    const pickedKey = projectPathKey(picked);
+    const inWorkspace = (state.workspace?.folders || []).some(root => {
+      const rootKey = projectPathKey(root);
+      return pickedKey === rootKey || pickedKey.startsWith(rootKey + "/");
+    });
+    if (inWorkspace) return true;
+    const folders = Array.from(new Set([...(state.workspace?.folders || []), picked]));
+    try {
+      const workspace = await api("/api/workspace", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folders }),
+      });
+      if (!workspace || workspace.error) throw new Error((workspace && workspace.error) || "the bridge refused the folder");
+      state.workspace = workspace;
+      renderWorkspace();
+      return true;
+    } catch (error) {
+      toast("could not add the folder to the workspace: " + (error.message || error), "error");
+      return false;
+    }
+  }
+
+  async function pickProjectFolder() {
+    const picked = await browseForFolder();
+    if (!picked) return;
+    if (!(await addFolderToWorkspace(picked))) return;
+    await setChatProject({ path: picked, name: projectBaseName(picked) });
+  }
+
+  async function addProjectFolder() {
+    const picked = await browseForFolder();
+    if (!picked) return;
+    if (!(await addFolderToWorkspace(picked))) return;
+    renderProjectScopeRow();
+    toast(`added ${projectBaseName(picked)} to the project list`);
+  }
+
+  const PROJECT_SCOPE_NONE = "__none__";
+
+  function projectScopeMatches(chat) {
+    const scope = state.projectScope || "";
+    if (!scope) return true;
+    const pointer = projectPointerForChat(chat);
+    if (scope === PROJECT_SCOPE_NONE) return !pointer;
+    return !!pointer && projectPathKey(pointer.path) === scope;
+  }
+
+  function projectScopeInfo() {
+    const scope = state.projectScope || "";
+    if (!scope) return { label: "All projects", icon: "ph-folders", scoped: false };
+    if (scope === PROJECT_SCOPE_NONE) return { label: "No project", icon: "ph-folder-dashed", scoped: true };
+    const { recent, folders } = projectCandidates(50);
+    const hit = [...recent, ...folders].find(p => projectPathKey(p.path) === scope);
+    return { label: (hit && hit.name) || projectBaseName(scope) || scope, icon: "ph-folder-simple", scoped: true };
+  }
+
+  function renderProjectScopeRow() {
+    const btn = $("#btn-project-scope");
+    const label = $("#project-scope-label");
+    const icon = $("#project-scope-icon");
+    if (!btn || !label) return;
+    const info = projectScopeInfo();
+    label.textContent = info.label;
+    if (icon) icon.className = `ph ${info.icon}`;
+    btn.classList.toggle("scoped", info.scoped);
+    btn.title = info.scoped ? `Conversations in ${info.label} — click to change` : "Filter conversations by project";
+  }
+
+  function renderProjectScopeMenu() {
+    const menu = $("#project-scope-menu");
+    if (!menu) return;
+    const scope = state.projectScope || "";
+    const { recent, folders } = projectCandidates(50);
+    const seen = new Set();
+    const projects = [];
+    for (const pointer of [...recent, ...folders]) {
+      const key = projectPathKey(pointer.path);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      projects.push(pointer);
+    }
+    const row = (value, name, path, icon) => {
+      const active = scope === value;
+      return `<button type="button" class="mm-row${active ? " loaded" : ""}" role="menuitemradio" aria-checked="${active}" data-scope="${esc(value)}" title="${esc(path || name)}">
+        <i class="ph ${icon}" aria-hidden="true"></i>
+        <span class="mm-row-name">${esc(name)}</span>
+        ${path ? `<span class="mm-row-sub">${esc(path)}</span>` : ""}
+        ${active ? '<i class="ph ph-check" aria-hidden="true"></i>' : ""}
+      </button>`;
+    };
+    const parts = [
+      row("", "All projects", "", "ph-folders"),
+      row(PROJECT_SCOPE_NONE, "No project", "", "ph-folder-dashed"),
+    ];
+    if (projects.length) {
+      parts.push('<div class="overflow-section-label">Projects</div>');
+      for (const pointer of projects) {
+        parts.push(row(projectPathKey(pointer.path), pointer.name || projectBaseName(pointer.path), pointer.path, "ph-folder-simple"));
+      }
+    }
+    menu.innerHTML = parts.join("");
+  }
+
+  function setProjectScope(scope) {
+    state.projectScope = scope || "";
+    renderProjectScopeRow();
+    renderChatList();
+  }
+
+  async function clearConversations() {
+    const targets = (state.chats?.order || [])
+      .map(id => state.chats.chats[id])
+      .filter(Boolean)
+      .filter(projectScopeMatches);
+    if (!targets.length) {
+      toast("no conversations to clear here", "error");
+      return;
+    }
+    const info = projectScopeInfo();
+    const plural = targets.length === 1 ? "session" : "sessions";
+    const ok = await confirmModal({
+      title: info.scoped ? `Clear ${info.label}` : "Clear conversations",
+      message: `This deletes ${targets.length} ${plural}${info.scoped ? ` in ${info.label}` : ""} and all their saved versions. This can't be undone.`,
+      confirmText: "Clear",
+      danger: true,
+      icon: "ph-trash",
+    });
+    if (!ok) return;
+    const ids = new Set(targets.map(c => c.id));
+    for (const id of ids) {
+      try {
+        await fetch(`/api/chats/${encodeURIComponent(id)}`, { method: "DELETE" });
+      } catch (error) {
+        // keep going: one failed delete must not strand the rest
+      }
+      localStorage.removeItem("accuretta:draft:" + id);
+      state.messageQueues.delete(id);
+    }
+    if (state.queueEditId && ids.has(state.queueEditId)) state.queueEditId = null;
+    await loadChats();
+    if (state.chatId && ids.has(state.chatId)) {
+      if (state.chats.order.length) selectChat(state.chats.order[0]);
+      else await newChat();
+    }
+    renderChatList();
+  }
+
+  function initProjectScope() {
+    const btn = $("#btn-project-scope");
+    const menu = $("#project-scope-menu");
+    if (!btn || !menu) return;
+    const addBtn = $("#btn-project-add");
+    const clearBtn = $("#btn-clear-conversations");
+    btn.addEventListener("click", () => {
+      const willOpen = !menu.classList.contains("open");
+      btn.setAttribute("aria-expanded", String(willOpen));
+      if (willOpen) renderProjectScopeMenu();
+    });
+    menu.addEventListener("click", (event) => {
+      const target = event.target.closest("[data-scope]");
+      if (!target) return;
+      menu.classList.remove("open");
+      btn.setAttribute("aria-expanded", "false");
+      setProjectScope(target.dataset.scope || "");
+    });
+    if (addBtn) addBtn.addEventListener("click", addProjectFolder);
+    if (clearBtn) clearBtn.addEventListener("click", clearConversations);
+    wireOverflow("#btn-project-scope", "#project-scope-menu");
+  }
+
+  function initProjectPicker() {
+    const chip = $("#project-chip");
+    const menu = $("#project-menu");
+    if (!chip || !menu) return;
+    chip.addEventListener("click", () => {
+      const willOpen = !menu.classList.contains("open");
+      chip.setAttribute("aria-expanded", String(willOpen));
+      if (willOpen) renderProjectMenu();
+    });
+    menu.addEventListener("click", async (event) => {
+      const target = event.target.closest("[data-project-path], #project-clear, #project-open-folder");
+      if (!target) return;
+      menu.classList.remove("open");
+      chip.setAttribute("aria-expanded", "false");
+      if (target.id === "project-open-folder") return pickProjectFolder();
+      if (target.id === "project-clear") return setChatProject(null);
+      await setChatProject({
+        path: target.dataset.projectPath || "",
+        name: target.dataset.projectName || projectBaseName(target.dataset.projectPath || ""),
+      });
+    });
+    wireOverflow("#project-chip", "#project-menu");
   }
 
   // A pending "open this session" request from the notch's Open-in-main-app
@@ -4083,31 +4407,74 @@
     if (it) it.action();
   }
 
+  function chatDateBucket(t) {
+    const now = new Date();
+    const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const day = 86400000;
+    const ts = (t || 0) * 1000;
+    if (ts >= startToday) return "Today";
+    if (ts >= startToday - day) return "Yesterday";
+    if (ts >= startToday - 7 * day) return "Previous 7 days";
+    if (ts >= startToday - 30 * day) return "Previous 30 days";
+    return "Older";
+  }
+
+  // Engagement metadata from the chat's mission record decides the sidebar
+  // category — never the auto-derived "Authorized ..." title text. Unknown
+  // engagement slugs still get their own category so future mission types
+  // group correctly the day they ship.
+  const MISSION_CATEGORIES = {
+    pentest: { label: "Red Team", icon: "ph-shield-chevron" },
+    frontend_secrets: { label: "Frontend Secrets", icon: "ph-file-js" },
+    recon: { label: "Target Recon", icon: "ph-crosshair" },
+    passive_osint: { label: "Passive OSINT", icon: "ph-binoculars" },
+  };
+
+  function missionCategory(chat) {
+    const mission = chat?.mission;
+    if (!mission || typeof mission !== "object") return null;
+    const key = String(mission.engagement || "").trim().toLowerCase();
+    if (!key) return null;
+    const known = MISSION_CATEGORIES[key];
+    if (known) return { key, label: known.label, icon: known.icon };
+    const label = key.replace(/[_-]+/g, " ").replace(/\b\w/g, ch => ch.toUpperCase());
+    return { key, label, icon: "ph-shield-star" };
+  }
+
   function renderChatList() {
     const wrap = $("#chatlist");
     wrap.innerHTML = "";
     const seen = new Set();
-    const groupSeen = new Set();
-    for (const id of state.chats.order) {
+    let lastHeadKey = "";
+    let rendered = 0;
+    const ordered = [...(state.chats?.order || [])].sort((a, b) =>
+      ((state.chats.chats?.[b]?.updated || 0) - (state.chats.chats?.[a]?.updated || 0)));
+    for (const id of ordered) {
       if (seen.has(id)) continue;
       seen.add(id);
       const c = state.chats.chats[id];
       if (!c) continue;
+      if (!projectScopeMatches(c)) continue;
+      const missionCat = missionCategory(c);
+      const headKey = missionCat ? `mission:${missionCat.key}` : `date:${chatDateBucket(c.updated)}`;
+      if (headKey !== lastHeadKey) {
+        lastHeadKey = headKey;
+        const head = document.createElement("div");
+        if (missionCat) {
+          head.className = "chatlist-mission";
+          head.innerHTML = `<i class="ph ${missionCat.icon}" aria-hidden="true"></i><span>${esc(missionCat.label)}</span>`;
+        } else {
+          head.className = "chatlist-date";
+          head.textContent = headKey.slice(5);
+        }
+        wrap.appendChild(head);
+      }
       const row = document.createElement("div");
       const isActive = id === state.chatId;
       row.className = "chatrow" + (isActive ? " active" : "");
       const needsYou = [...state.approvals.values()].some(a => a.chat_id === id && a.status === "pending");
       const sessionState = needsYou ? "needs-you" : state.liveTurn?.chatId === id && state.streaming ? "working" : (c.task_state || "ready");
       const sessionLabels = { "needs-you": "Needs you", working: "Working", finished: "Finished", interrupted: "Interrupted", stopped: "Stopped", failed: "Failed", ready: "Ready" };
-      const sessionIcons = {
-        finished: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M5.4 8.3l1.8 1.8 3.4-4"/></svg>',
-        working: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25" stroke-opacity=".25"/><path d="M14.25 8A6.25 6.25 0 0 0 8 1.75"/></svg>',
-        interrupted: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.2 2.2h5.6l3 3v5.6l-3 3H5.2l-3-3V5.2z"/><path d="M8 5.6v3.2"/><circle cx="8" cy="11" r=".9" fill="currentColor" stroke="none"/></svg>',
-        stopped: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M6.4 5.8v4.4M9.6 5.8v4.4"/></svg>',
-        failed: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M6 6l4 4M10 6l-4 4"/></svg>',
-        "needs-you": '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5c-2 0-3.4 1.5-3.4 3.6 0 2.2-.8 3-1.3 3.6h9.4c-.5-.6-1.3-1.4-1.3-3.6 0-2.1-1.4-3.6-3.4-3.6"/><path d="M6.9 11.7a1.2 1.2 0 0 0 2.2 0"/></svg>',
-        ready: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/></svg>',
-      };
       const sessionLabel = sessionLabels[sessionState] || "Ready";
       const sessionHint = `${sessionLabel} · ${relTime(c.updated)}`;
       row.dataset.taskState = sessionState;
@@ -4121,36 +4488,32 @@
       const iconClass = c.origin === "mobile" ? "ph ph-device-mobile"
         : (isGitHubChat ? "ph ph-git-branch"
           : (isProjectChat ? "ph ph-folder-simple"
-            : (isSecurityChat ? "ph ph-magnifying-glass" : "ph ph-chat-circle")));
+            : (isSecurityChat ? "ph ph-magnifying-glass"
+              : (missionCat ? `ph ${missionCat.icon}` : "ph ph-chat-circle"))));
       if (isGitHubChat) row.classList.add("gh-branch");
       if (isProjectChat) row.classList.add("project-session");
-      // Group sessions by their workspace/project so related work reads as
-      // one unit. Only sessions with an explicit workspace get a header.
-      const groupName = isGitHubChat
-        ? `GitHub · ${String(c.github_worktree?.repo || c.github_worktree?.name || "worktree").trim()}`
+      // The project a session belongs to rides along as a subtitle instead of
+      // a section header, so no conversation ever looks like it inherited
+      // another one's project.
+      const projectSubtitle = isGitHubChat
+        ? String(c.github_worktree?.repo || c.github_worktree?.name || "").trim()
         : isProjectChat
           ? String(c.project_workspace?.name || c.project_workspace?.repo || "").trim()
           : "";
-      if (groupName && !groupSeen.has(groupName)) {
-        groupSeen.add(groupName);
-        const head = document.createElement("div");
-        head.className = "session-group-head";
-        head.innerHTML = `<i class="${isGitHubChat ? "ph ph-git-branch" : "ph ph-folder-simple"}" aria-hidden="true"></i><span>${esc(groupName)}</span><span class="grow"></span>`;
-        wrap.appendChild(head);
-      }
       // Supervision badge: states that need attention get a visible text
       // pill; quiet states stay icon-only so the list stays calm.
       const loudStates = { working: 1, "needs-you": 1, failed: 1, stopped: 1, interrupted: 1 };
       const loud = !!loudStates[sessionState];
       const statePill = loud ? `<span class="state-pill" data-state="${esc(sessionState)}" title="${esc(sessionHint)}">${esc(sessionLabel)}</span>` : "";
-      // The pill and the status glyph say the same thing — show one or the
-      // other, never both (glyph only for quiet states like ready/finished).
-      const statusGlyph = loud ? "" : `<span class="d" role="img" aria-label="${esc(sessionLabel)}" title="${esc(sessionHint)}">${sessionIcons[sessionState] || sessionIcons.ready}<span class="sr-only">${esc(sessionLabel)}</span></span>`;
+      // Quiet states (ready/finished) show nothing: a row only carries a
+      // status while the session is working or needs attention.
       row.innerHTML = `
         <i class="${iconClass}"></i>
-        <span class="t">${esc(c.title || "new session")}</span>
+        <span class="t-wrap">
+          <span class="t">${esc(c.title || "new session")}</span>
+          ${projectSubtitle ? `<span class="s">${esc(projectSubtitle)}</span>` : ""}
+        </span>
         ${statePill}
-        ${statusGlyph}
         <button class="del" title="Delete"><i class="ph ph-trash"></i></button>`;
       row.addEventListener("click", (e) => {
         if (e.target.closest(".del")) return;
@@ -4161,6 +4524,15 @@
         deleteChat(id);
       });
       wrap.appendChild(row);
+      rendered++;
+    }
+    if (!rendered) {
+      const empty = document.createElement("div");
+      empty.className = "chatlist-empty";
+      empty.textContent = state.projectScope
+        ? "No conversations in this project yet."
+        : "No conversations yet.";
+      wrap.appendChild(empty);
     }
   }
 
@@ -4169,54 +4541,22 @@
     inner.innerHTML = "";
     if (!state.messages.length) {
       inner.innerHTML = `
-        <div class="welcome-screen">
-          <canvas class="flow-lines-canvas" aria-hidden="true"></canvas>
-          <div class="welcome-quote" aria-hidden="true"><span>&ldquo;</span></div>
-          <div class="welcome-content">
-            <div class="welcome-logo-wrap">
-              <div class="welcome-logo welcome-logo-accent" aria-hidden="true"></div>
-            </div>
-            <h1 class="welcome-title">accuretta</h1>
-            <p class="welcome-subtitle">Your model, your machine. What are we building today?</p>
-            <div class="welcome-suggestions">
-              <button class="welcome-suggest-btn" data-prompt="Design a landing page for my product using HTML, CSS and JS.">
-                <div class="welcome-suggest-icon-wrap">
-                  <i class="ph ph-layout"></i>
-                </div>
-                <span class="welcome-suggest-text">
-                  <span class="welcome-suggest-label">Design a landing page</span>
-                  <span class="welcome-suggest-sub">HTML, CSS + JS, live preview</span>
-                </span>
-                <i class="ph ph-arrow-up-right welcome-suggest-go"></i>
-              </button>
-              <button class="welcome-suggest-btn" data-prompt="Create a Python backend script using FastAPI that serves a simple database.">
-                <div class="welcome-suggest-icon-wrap">
-                  <i class="ph ph-database"></i>
-                </div>
-                <span class="welcome-suggest-text">
-                  <span class="welcome-suggest-label">Create a Python backend</span>
-                  <span class="welcome-suggest-sub">FastAPI over a simple DB</span>
-                </span>
-                <i class="ph ph-arrow-up-right welcome-suggest-go"></i>
-              </button>
-              <button class="welcome-suggest-btn" data-prompt="Help me debug a memory leak in my application.">
-                <div class="welcome-suggest-icon-wrap">
-                  <i class="ph ph-bug"></i>
-                </div>
-                <span class="welcome-suggest-text">
-                  <span class="welcome-suggest-label">Debug a memory leak</span>
-                  <span class="welcome-suggest-sub">paste code, get a diagnosis</span>
-                </span>
-                <i class="ph ph-arrow-up-right welcome-suggest-go"></i>
-              </button>
-            </div>
+        <div class="welcome-screen welcome-v2">
+          <div class="wv-head">
+            <svg class="wv-a" aria-hidden="true"></svg>
+            <h1 class="wv-title">What are we building?</h1>
           </div>
         </div>`;
+      const a = inner.querySelector(".wv-a");
+      if (a && window.AccDots) window.AccDots.buildA(a, 16, { lo: [.6, .85] });
+      enterWelcome();
       initWelcomeScreen();
+      window.AccDots?.field.show();
       const chatScroll = $("#chat-scroll");
       if (chatScroll) chatScroll.scrollTop = 0;
       return;
     }
+    leaveWelcome();
     const start = Math.max(0, Math.min(
       state.messageWindowStart || 0, state.messages.length));
     if (start > 0) {
@@ -4275,33 +4615,90 @@
     scrollToBottom(true);
   }
 
-  function initWelcomeScreen() {
-    // 1. Suggestion buttons trigger instant invisible submission with an ether animation
-    document.querySelectorAll(".welcome-suggest-btn").forEach(btn => {
-      btn.addEventListener("click", () => {
-        const prompt = btn.dataset.prompt;
-
-        // Apply stylish "sent to the ether" disintegrating transition
-        const screen = document.querySelector(".welcome-screen");
-        if (screen) {
-          screen.classList.add("welcome-disintegrating");
-          document.querySelectorAll(".welcome-suggest-btn").forEach(b => {
-            if (b === btn) {
-              b.classList.add("clicked-ether");
-            } else {
-              b.classList.add("fade-out-ether");
-            }
-          });
-        }
-
-        setTimeout(() => {
-          send({ prompt, invisible: true });
-        }, 650);
+  // Empty-session layout: the composer lifts to the middle of the pane
+  // (.chat.is-welcome) with the heading above it and recent sessions plus
+  // quick starts below it, in their own row under the composer.
+  const WELCOME_STARTS = [
+    { label: "Build a page", icon: "ph-layout", prompt: "Design a landing page for my product using HTML, CSS and JS." },
+    { label: "Fix a bug", icon: "ph-bug", prompt: "Help me find and fix a bug in my project." },
+    { label: "Explain this repo", icon: "ph-tree-structure", prompt: "Map this project and explain how it is structured." },
+  ];
+  function welcomeRecents(limit = 3) {
+    const chats = state.chats?.chats || {};
+    return [...(state.chats?.order || [])]
+      .filter(id => id !== state.chatId && chats[id] && (chats[id].title || "new session") !== "new session")
+      .sort((a, b) => (chats[b].updated || 0) - (chats[a].updated || 0))
+      .slice(0, limit)
+      .map(id => {
+        const c = chats[id];
+        const project = String(c.github_worktree?.repo || c.project_workspace?.name || "").trim();
+        const icon = c.github_worktree ? "ph-git-branch" : (c.project_workspace ? "ph-folder-simple" : "ph-chat-circle");
+        return { id, title: c.title, icon, project, when: relTime(c.updated) };
       });
-    });
+  }
+  function enterWelcome() {
+    const chat = document.querySelector(".center .chat");
+    if (!chat) return;
+    chat.classList.add("is-welcome");
+    let below = document.getElementById("welcome-below");
+    if (!below) {
+      below = document.createElement("div");
+      below.id = "welcome-below";
+      below.className = "wv-below";
+      chat.appendChild(below);
+    }
+    syncWelcomeBelowWidth();
+    const recents = welcomeRecents();
+    const row = (attrs, icon, title, meta) =>
+      `<button type="button" class="wv-row" ${attrs}><i class="ph ${icon}" aria-hidden="true"></i>` +
+      `<span class="wv-row-t">${esc(title)}</span>${meta ? `<span class="wv-row-m">${esc(meta)}</span>` : ""}</button>`;
+    below.innerHTML =
+      (recents.length
+        ? `<section class="wv-col"><div class="wv-label">Recent</div>` +
+          recents.map(r => row(`data-chat="${esc(r.id)}"`, r.icon, r.title, r.project || r.when)).join("") +
+          `</section>`
+        : "") +
+      `<section class="wv-col"><div class="wv-label">Start something</div>` +
+      WELCOME_STARTS.map((w, i) => row(`data-start="${i}"`, w.icon, w.label, "")).join("") +
+      `</section>`;
+  }
+  // The composer's max width moves with the sidebar/preview state; keep the
+  // recents + quick starts flush with its edges.
+  let _welcomeRO = null;
+  function syncWelcomeBelowWidth() {
+    const comp = document.querySelector(".composer-wrap > .composer");
+    const below = document.getElementById("welcome-below");
+    if (!comp || !below) return;
+    below.style.maxWidth = comp.offsetWidth + "px";
+    if (!_welcomeRO && "ResizeObserver" in window) {
+      _welcomeRO = new ResizeObserver(() => {
+        const b = document.getElementById("welcome-below");
+        if (b) b.style.maxWidth = comp.offsetWidth + "px";
+      });
+      _welcomeRO.observe(comp);
+    }
+  }
+  // Drops the welcome layout; the composer settles back to the bottom.
+  function leaveWelcome() {
+    window.AccDots?.field.hide();
+    document.querySelector(".center .chat")?.classList.remove("is-welcome");
+    document.getElementById("welcome-below")?.remove();
+  }
 
-    // Background: soft vertical colour bars of varying height (no canvas).
-    buildWelcomeBars();
+  function initWelcomeScreen() {
+    const below = document.getElementById("welcome-below");
+    if (!below) return;
+    below.addEventListener("click", (ev) => {
+      const item = ev.target.closest(".wv-row");
+      if (!item) return;
+      if (item.dataset.chat) { selectChat(item.dataset.chat); return; }
+      const start = WELCOME_STARTS[Number(item.dataset.start)];
+      if (!start) return;
+      // Ripple from the row, then send once the ring is under way.
+      window.AccDots?.field.pulse(item);
+      item.classList.add("is-picked");
+      setTimeout(() => send({ prompt: start.prompt, invisible: true }), 280);
+    });
   }
 
   // Generates the welcome-screen backdrop, modeled on SEKURA's AbstractWave
@@ -5348,6 +5745,10 @@
     // Clear welcome screen visually if we are about to append the agent stream bubble
     const welcome = document.querySelector("#chat-inner .welcome-screen");
     if (welcome) {
+      // First message of the session: ripple the dot field out from the
+      // composer (a quick-start chip already started its own ripple).
+      window.AccDots?.field.pulse(document.querySelector(".composer-wrap > .composer"));
+      leaveWelcome();
       $("#chat-inner").innerHTML = "";
     }
 
@@ -6318,9 +6719,17 @@
       : candidates
         ? `No confirmed exposures · ${candidates} candidate${candidates === 1 ? "" : "s"} separated`
         : `No high-confidence exposures · ${files} file${files === 1 ? "" : "s"} inspected`;
-    if (meta) meta.textContent = publicIds
+    const endpoints = Math.max(0, Number(result?.endpoint_count || 0));
+    const recovered = Math.max(0, Number(result?.source_map_reconstruction?.recovered_file_count || 0));
+    const surfaceBits = [];
+    if (endpoints) surfaceBits.push(`${endpoints} endpoint${endpoints === 1 ? "" : "s"} mapped`);
+    if (recovered) surfaceBits.push(`${recovered} source file${recovered === 1 ? "" : "s"} recovered`);
+    const baseMeta = publicIds
       ? `${publicIds} public identifier${publicIds === 1 ? "" : "s"} kept as context`
       : "No provider validation performed";
+    if (meta) meta.textContent = surfaceBits.length
+      ? `${baseMeta} · ${surfaceBits.join(" · ")}`
+      : baseMeta;
   }
   function secretRailMission(row, mission) {
     if (!row || mission?.engagement !== "frontend_secrets") return;
@@ -13079,7 +13488,8 @@
   async function applyAutoTune(result, opts = {}) {
     const sug = result || {};
     const update = {};
-    for (const k of ["num_ctx", "num_gpu", "num_batch", "n_ubatch", "n_cpu_moe", "num_thread"]) {
+    for (const k of ["num_ctx", "num_gpu", "num_batch", "n_ubatch", "n_cpu_moe", "num_thread",
+                     "spec_draft_n_max", "moe_cache_mib"]) {
       if (sug[k] != null) update[k] = Number(sug[k]);
     }
     if (sug.kv_cache_type) update.kv_cache_type = String(sug.kv_cache_type);
@@ -13120,6 +13530,56 @@
     return update;
   }
 
+  // Tuner result: a few plain lines up top, the full reasoning behind a toggle.
+  function renderAutoTuneNotes(el, headLines, sug, status) {
+    if (!el) return;
+    el.textContent = "";
+    const head = document.createElement("div");
+    head.className = "autotune-head";
+    head.textContent = headLines.filter(line => line && !line.startsWith(">>")).join(" · ");
+    el.appendChild(head);
+    if (sug.quant_downshift) {
+      const warn = document.createElement("div");
+      warn.className = "autotune-warn";
+      warn.textContent = sug.quant_downshift;
+      el.appendChild(warn);
+    }
+    const summary = Array.isArray(sug.summary) ? sug.summary : [];
+    if (summary.length) {
+      const ul = document.createElement("ul");
+      ul.className = "autotune-summary";
+      for (const line of summary) {
+        const li = document.createElement("li");
+        li.textContent = line;
+        ul.appendChild(li);
+      }
+      el.appendChild(ul);
+    }
+    if (status) {
+      const st = document.createElement("div");
+      st.className = "autotune-status";
+      st.textContent = status;
+      el.appendChild(st);
+    }
+    const why = String(sug.notes || "").trim();
+    if (why) {
+      const det = document.createElement("details");
+      det.className = "autotune-why";
+      const sm = document.createElement("summary");
+      sm.textContent = "Why these settings";
+      det.appendChild(sm);
+      const body = document.createElement("div");
+      body.className = "autotune-why-body";
+      for (const line of why.split(/(?<=\.)\s+(?=[A-Za-z])/)) {
+        const p = document.createElement("div");
+        p.textContent = line;
+        body.appendChild(p);
+      }
+      det.appendChild(body);
+      el.appendChild(det);
+    }
+  }
+
   async function runAutoTune() {
     const btn = $("#btn-autotune");
     const notes = $("#autotune-notes");
@@ -13133,6 +13593,11 @@
     if (!tier) {
       toast("pick a VRAM tier (or leave on Manual to skip auto-tune)", "warn", 3000);
       return;
+    }
+    // The tuner reads the saved floor, so persist an edited Minimum speed first.
+    const floorField = Number($("#set-min-tok-s")?.value || 0);
+    if (floorField > 0 && floorField !== Number(state.settings?.min_decode_tok_s ?? 45)) {
+      await saveSettings({ min_decode_tok_s: Math.min(500, Math.max(1, floorField)) });
     }
     if (btn) btn.disabled = true;
     if (notes) notes.textContent = "thinking...";
@@ -13148,7 +13613,7 @@
       const sug = r?.suggested || {};
       // Apply the returned combo verbatim (shared helper: saves every tuner
       // key + mirrors into the drawer fields below).
-      await applyAutoTune(sug);
+      const applied = await applyAutoTune(sug);
 
       // Build a short, friendly notes blob from the server reply + model meta.
       const lines = [];
@@ -13174,13 +13639,41 @@
         lines.push(`>> ${sug.quant_downshift}`);
         lines.push("");
       }
-      if (sug.notes) lines.push(sug.notes);
-      lines.push("applied to settings — the new flags take effect on the next model load.");
-      if (notes) notes.textContent = lines.join("\n");
-      const toastMsg = sug.quant_downshift
-        ? "auto-tune applied — quant downshift suggested"
-        : "auto-tune applied";
-      toast(toastMsg, sug.quant_downshift ? "warn" : "ok", 4000);
+      // Saving here already persisted the tune, so the drawer's Save would see
+      // no change and never restart the server. Reload now when the tuned
+      // model is the one that's running, so "applied" means applied.
+      const baseName = p => String(p || "").split(/[\\/]/).pop();
+      const changedLoadKeys = applied ? Object.keys(applied).filter(k => LOAD_TIME_KEYS.includes(k)) : [];
+      const reload = changedLoadKeys.length > 0 && state.llamaRunning
+        && baseName(state.loadedModel) && baseName(state.loadedModel) === baseName(modelPath);
+      renderAutoTuneNotes(notes, lines, sug,
+        reload ? "Reloading the model with these settings…"
+          : applied ? "Saved — takes effect the next time this model loads."
+            : "Already using these settings.");
+      if (reload) {
+        const tid = "reload-llama";
+        toast(`reloading model (${changedLoadKeys.join(", ")})…`, "info", 60000, tid);
+        state._reloading = true;
+        renderStatus();
+        renderModelPill();
+        try {
+          await requestModelLoad(modelPath);
+          toast("model reloaded with the tuned settings", "ok", 3000, tid);
+          renderAutoTuneNotes(notes, lines, sug, "Applied — the model is running with these settings.");
+        } catch (e) {
+          toast("reload failed: " + (e.message || e), "error", 6000, tid);
+          renderAutoTuneNotes(notes, lines, sug, "Saved, but the reload failed — load the model again to apply.");
+        } finally {
+          state._reloading = false;
+          renderStatus();
+          renderModelPill();
+        }
+      } else {
+        const toastMsg = sug.quant_downshift
+          ? "auto-tune applied — quant downshift suggested"
+          : "auto-tune applied";
+        toast(toastMsg, sug.quant_downshift ? "warn" : "ok", 4000);
+      }
     } catch (e) {
       if (notes) notes.textContent = `auto-tune failed: ${e.message || e}`;
       toast("auto-tune failed: " + (e.message || e), "error", 5000);
@@ -13708,6 +14201,7 @@
     if (kvVSel) kvVSel.value = s.kv_cache_type_v || "";
     fill("#set-vram-reserve", s.vram_reserve_gb ?? 0.25);
     fill("#set-ram-reserve", s.safety_reserve_gb ?? 1.0);
+    fill("#set-min-tok-s", s.min_decode_tok_s ?? 45);
     // VRAM tier picker (auto-tune persistence — 0 = Manual)
     const vramSel = $("#set-vram-tier");
     if (vramSel) vramSel.value = String(s.vram_tier_gb ?? 0);
@@ -13819,6 +14313,7 @@
     "num_ctx", "num_gpu", "num_batch", "num_thread", "kv_cache_type", "kv_cache_type_v", "model_path", "vision_model",
     "n_cpu_moe", "n_ubatch", "n_parallel", "flash_attn",
     "spec_strategy", "spec_draft_model", "spec_draft_mode", "no_warmup", "enable_metrics", "llama_extra_args",
+    "spec_draft_n_max", "moe_cache_mib",
     // mmproj_path changes how the server is launched (--mmproj <path>) so it
     // also requires a relaunch to take effect.
     "mmproj_mode", "mmproj_auto", "mmproj_path",
@@ -13843,6 +14338,7 @@
       kv_cache_type_v: $("#set-kvv")?.value || "",
       vram_reserve_gb: Math.max(0, Number($("#set-vram-reserve")?.value || 0.25)),
       safety_reserve_gb: Math.max(0, Number($("#set-ram-reserve")?.value || 1.0)),
+      min_decode_tok_s: Math.min(500, Math.max(1, Number($("#set-min-tok-s")?.value || 45))),
       n_cpu_moe: Math.max(0, n("#set-ncmoe") || 0),
       n_ubatch: Math.max(0, n("#set-ubatch") || 0),
       n_parallel: Math.max(1, n("#set-parallel") || 1),
@@ -14435,6 +14931,8 @@
     if (!gauge) return;
     gauge.classList.toggle("warn", pct >= 0.7 && pct < 0.9);
     gauge.classList.toggle("crit", pct >= 0.9);
+    const aria = `Context memory: ${pctText} used`;
+    if (gauge.getAttribute("aria-label") !== aria) gauge.setAttribute("aria-label", aria);
     // No native title: the hover card below carries the breakdown, and a
     // native tooltip would double up behind it.
     if (gauge.hasAttribute("title")) gauge.removeAttribute("title");
@@ -14492,6 +14990,10 @@
       <div class="ctxbd-head">Context usage</div>
       <dl class="ctxbd-rows"></dl>
       <div class="ctxbd-foot"></div>
+      <button type="button" class="ctxbd-compact" id="btn-compact"
+              title="Fold older turns into the session summary now — frees context on long chats without losing detail">
+        <i class="ph ph-arrows-in-line-vertical" aria-hidden="true"></i><span>Compact now</span>
+      </button>
     </div>`;
     el.addEventListener("mouseenter", () => {
       if (_ctxPopoverHideTimer) { clearTimeout(_ctxPopoverHideTimer); _ctxPopoverHideTimer = null; }
@@ -14529,11 +15031,12 @@
     const r = anchor.getBoundingClientRect();
     const pw = _ctxPopoverEl.offsetWidth || 300;
     const ph = _ctxPopoverEl.offsetHeight || 200;
-    // Sidebar sits left: prefer right of the gauge, flip if it would clip.
-    let left = r.right + 8;
-    if (left + pw > window.innerWidth - 8) left = Math.max(8, r.left - pw - 8);
+    // Ring sits in the composer foot: open above it, right edges aligned,
+    // and drop below only when there is no room overhead.
+    let left = Math.min(r.right - pw, window.innerWidth - pw - 8);
     if (left < 8) left = 8;
-    const top = Math.max(8, Math.min(r.top, window.innerHeight - ph - 8));
+    let top = r.top - ph - 8;
+    if (top < 8) top = Math.min(r.bottom + 8, window.innerHeight - ph - 8);
     _ctxPopoverEl.style.left = left + "px";
     _ctxPopoverEl.style.top = top + "px";
   }
@@ -14571,6 +15074,18 @@
     if (g.contains(ev.relatedTarget)) return;
     if (_ctxPopoverEl && _ctxPopoverEl.contains(ev.relatedTarget)) return;
     scheduleHideCtxPopover();
+  });
+  // Click and keyboard focus open the same card, so touch (remote over
+  // Tailscale) and keyboard users can reach the Compact button too.
+  document.addEventListener("click", (ev) => {
+    if (ev.target && ev.target.closest && ev.target.closest("#ctx-gauge")) { showCtxPopover(); return; }
+    if (_ctxPopoverEl && !_ctxPopoverEl.hasAttribute("hidden") && !_ctxPopoverEl.contains(ev.target)) scheduleHideCtxPopover();
+  });
+  document.addEventListener("focusin", (ev) => {
+    if (ev.target && ev.target.id === "ctx-gauge") showCtxPopover();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && _ctxPopoverEl && !_ctxPopoverEl.hasAttribute("hidden")) scheduleHideCtxPopover();
   });
   function renderTokTotal() {
     const el = $("#tok-total");
@@ -14674,6 +15189,12 @@
       const p = CLOUD_PRICING[state.costProvider];
       label.textContent = `Estimated ${p ? p.label : state.costProvider} API cost`;
       label.title = "Token-count comparison using the listed rates. Excludes hardware and electricity, and does not imply equal model quality.";
+    }
+    // Collapsed one-liner: amount + a short form of the same label.
+    const short = $("#cost-widget .cost-widget-short");
+    if (short) {
+      const p = CLOUD_PRICING[state.costProvider];
+      short.textContent = `est. ${p ? p.label : state.costProvider} cost`;
     }
 
     // Session row
@@ -16095,11 +16616,16 @@
     // auto-summarizer only fires near the context limit (0.85) — this lets the
     // user compact at a comfortable utilization, especially at task boundaries
     // on long chats, which keeps the model's working window roomy.
-    $("#btn-compact")?.addEventListener("click", async () => {
+    // The button lives in the context ring's hover card, which is built on
+    // first hover — delegate instead of binding at startup.
+    document.addEventListener("click", async (ev) => {
+      if (!(ev.target && ev.target.closest && ev.target.closest("#btn-compact"))) return;
       const cid = state.chatId;
       if (!cid) { toast("No active chat.", "info", 1600); return; }
       const btn = $("#btn-compact");
-      if (btn) { btn.disabled = true; btn.textContent = "…"; }
+      const btnLabel = btn && btn.querySelector("span");
+      if (btn) btn.disabled = true;
+      if (btnLabel) btnLabel.textContent = "Compacting…";
       try {
         const r = await fetch("/api/compact", {
           method: "POST",
@@ -16114,11 +16640,13 @@
             : "Context is already compact — nothing to fold.", "ok", 2400, "summary-fold");
           state._ctxSource = "";
           renderCtxGauge();
+          if (_ctxPopoverEl && !_ctxPopoverEl.hasAttribute("hidden")) renderCtxBreakdown();
         }
       } catch (e) {
         toast("Compact failed: " + e, "warn", 3000);
       }
-      if (btn) { btn.disabled = false; btn.textContent = "compact"; }
+      if (btn) btn.disabled = false;
+      if (btnLabel) btnLabel.textContent = "Compact now";
     });
     $("#btn-settings").addEventListener("click", openSettings);
     $("#btn-settings-m")?.addEventListener("click", openSettings);
@@ -17134,8 +17662,12 @@
       if (disclaimerIcon) disclaimerIcon.className = passive ? "ph ph-eye-slash" : secretAudit ? "ph ph-file-magnifying-glass" : "ph ph-warning";
       const targetLabel = $("#recon-target-label");
       if (targetLabel) targetLabel.textContent = passive ? "Domain" : secretAudit ? "Page URL" : "Target domain or host";
-      ["#recon-target-input", "#recon-scope-in", "#recon-scope-out", "#recon-user-agent", "#recon-objective-text", "#recon-constraint-text"]
+      ["#recon-target-input", "#recon-scope-in", "#recon-scope-out", "#recon-user-agent",
+       "#recon-required-headers", "#recon-rate-limit", "#recon-request-cap",
+       "#recon-objective-text", "#recon-constraint-text"]
         .forEach(s => { const el = $(s); if (el) el.value = ""; });
+      const autoChk = $("#recon-automated-check"); if (autoChk) autoChk.checked = true;
+      const destrChk = $("#recon-destructive-check"); if (destrChk) destrChk.checked = false;
       const targetInput = $("#recon-target-input");
       if (targetInput) targetInput.placeholder = secretAudit ? "https://example.com/app" : "example.com";
       const chk = $("#recon-auth-check"); if (chk) chk.checked = false;
@@ -17183,6 +17715,30 @@
       const scope = passive
         ? `in: ${target}`
         : [scIn ? `in: ${scIn}` : "", scOut ? `out: ${scOut}` : ""].filter(Boolean).join(" | ");
+      const scopeTokens = (value) => (value || "").split(/[,\s|]+/).map(t => t.trim()).filter(Boolean);
+      // Program-required headers: "Name: value" per line, bounded at 10.
+      const headersRaw = ($("#recon-required-headers")?.value || "").trim();
+      const requiredHeaders = {};
+      if (headersRaw) {
+        for (const line of headersRaw.split(/\r?\n/)) {
+          const i = line.indexOf(":");
+          if (i <= 0) continue;
+          const name = line.slice(0, i).trim();
+          const value = line.slice(i + 1).trim();
+          if (/^[A-Za-z0-9-]{1,64}$/.test(name) && value && Object.keys(requiredHeaders).length < 10) {
+            requiredHeaders[name] = value.slice(0, 512);
+          }
+        }
+        if (!Object.keys(requiredHeaders).length) {
+          toast("Required headers need one \"Name: value\" per line.", "warn", 2600);
+          return;
+        }
+      }
+      const numOrZero = (sel, max) => Math.max(0, Math.min(max, parseInt($(sel)?.value || "0", 10) || 0));
+      const rateLimit = numOrZero("#recon-rate-limit", 6000);
+      const requestCap = numOrZero("#recon-request-cap", 1000000);
+      const automatedAllowed = $("#recon-automated-check")?.checked !== false;
+      const allowDestructive = !!$("#recon-destructive-check")?.checked;
       const objective = ($("#recon-objective-text")?.value || "").trim()
         || (passive ? "Build a public-source intelligence profile." : secretAudit ? "Audit frontend resources for exposed credentials." : "");
       const conChips = Array.from(document.querySelectorAll("#recon-constraint-chips .recon-chip.active")).map(c => c.dataset.val);
@@ -17197,6 +17753,13 @@
       // no longer enough for a model to invoke them.
       const mission = {
         target, scope, objective, constraints, user_agent: userAgent,
+        scope_in: scopeTokens(scIn || target),
+        scope_out: scopeTokens(scOut),
+        required_headers: requiredHeaders,
+        rate_limit_rpm: rateLimit,
+        request_cap: requestCap,
+        automated_allowed: automatedAllowed,
+        allow_destructive: allowDestructive,
         authorized: true,
         engagement: passive ? "passive_osint" : secretAudit ? "frontend_secrets" : reconObjective === "gain_access" ? "pentest" : "recon",
       };
@@ -17204,6 +17767,15 @@
       const userAgentTmpl = userAgent
         ? `Accuretta will enforce the required User-Agent ${JSON.stringify(userAgent)} on HTTP requests for this engagement. Do not replace it or claim a different value was sent. `
         : "";
+      const requiredHeaderNames = Object.keys(requiredHeaders);
+      const headerTmpl = requiredHeaderNames.length
+        ? `Accuretta adds the engagement headers (${requiredHeaderNames.join(", ")}) to every HTTP request automatically. Do not try to set them yourself and do not claim other values were sent. `
+        : "";
+      const budgetTmpl = (rateLimit || requestCap)
+        ? `This engagement has a hard request budget (${rateLimit ? rateLimit + "/min" : ""}${rateLimit && requestCap ? ", " : ""}${requestCap ? requestCap + " total" : ""}); tools refuse before exceeding it, so pace fan-out calls and prefer targeted requests. `
+        : "";
+      const policyTmpl = (automatedAllowed ? "" : "Automated testing tools (scanners, sprayers, fuzzers) are disabled for this engagement; test manually with the typed tools. ")
+        + (allowDestructive ? "" : "Destructive methods are blocked (no DELETE or destructive-looking endpoints); prove findings non-destructively. ");
       const passiveTmpl =
         `Run a passive OSINT profile on ${target}. Do not connect to ${target} or any host under it. ` +
         `Use public third-party sources only: recon_rdap, recon_dns without AXFR or loud mode, ` +
@@ -17215,7 +17787,7 @@
         `If a source is unavailable, note the gap instead of replacing it with direct target traffic.`;
       const reconTmpl =
         `Authorized reconnaissance on ${target}. I have confirmed I am authorized to test this target. ` +
-        userAgentTmpl +
+        userAgentTmpl + headerTmpl + budgetTmpl + policyTmpl +
         `Run, in order: recon_dns (domain "${target}"), recon_subdomains (domain "${target}"), ` +
         `recon_tls_audit (host "${target}"), recon_http_fingerprint (url "${target}"), and ` +
         `recon_port_scan (host "${target}"). ` +
@@ -17232,7 +17804,7 @@
         `If there are no returned findings, say that the audit found no high-confidence exposed credentials and mention any skipped out-of-scope resources or fetch errors.`;
       const accessTmpl =
         `Authorized penetration test on ${target}. I have confirmed I am authorized to test this target and I accept responsibility. ` +
-        userAgentTmpl +
+        userAgentTmpl + headerTmpl + budgetTmpl + policyTmpl +
         `This is a REAL engagement, NOT a CTF. There is no fixed number of "flags" to find and no CTF scoring. Do NOT invent a flag count, do NOT track progress as "N/3" or "captured X of Y", and do NOT assume a FLAG{...} exists — a FLAG{...} only matters if a tool result literally contains that string. If the target is clean, the correct outcome is "no exploitable findings", not "0 flags". ` +
         `MINDSET — the scope is wide, so go as deep as the target allows. Gaining access is the START of the work, not the end. After EVERY result ask "what does this unlock, and is there a deeper version of it?", and assume there IS more until you have proven there isn't. Test every endpoint and every parameter in scope, not just the first thing that works. Stay strictly NON-DESTRUCTIVE: read, enumerate, and copy proof — never delete, modify, overwrite, deface, DoS, or leave persistence. Be honest both ways: if something is genuinely safe, say so and move on; if it is exploitable, take it as far as it goes. Do not fabricate a finding to look thorough, and do not abandon a real one early.\n` +
         `Work these phases, letting each result drive the next:\n` +
@@ -17927,6 +18499,8 @@
 
     // ----- mobile toolbar overflow -----
     initMobileToolbarOverflow();
+    initProjectPicker();
+    initProjectScope();
   }
 
   // Periodic refresh for real-time updates

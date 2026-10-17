@@ -16,7 +16,7 @@ Package it into a single windowed .exe (no console) with PyInstaller:
     pyinstaller --noconfirm --windowed --name Accuretta ^
         --add-data "index.html;." --add-data "app.js;." --add-data "app.css;." ^
         --add-data "bridge-client.js;." --add-data "preview-runtime.js;." --add-data "appearance.js;." ^
-        --add-data "signal-field.js;." --add-data "security-scan-field.js;." ^
+        --add-data "signal-field.js;." --add-data "dot-matrix.js;." --add-data "security-scan-field.js;." ^
         --add-data "agent-orb.js;." --add-data "ui-refresh.css;." ^
         --add-data "assets;assets" ^
         --add-data "colors_and_type.css;." --add-data "manifest.webmanifest;." ^
@@ -217,7 +217,7 @@ def _read_app_version() -> str:
 
 
 def _signal_field_js() -> str:
-    """The splash-only signal-field effect, inlined into the intro. The splash is a
+    """The splash-only dot field, inlined into the intro. The splash is a
     self-contained HTML string with no http origin, so it can't <script src>
     the bridge. '' if the file is missing (splash simply runs without it)."""
     try:
@@ -226,74 +226,59 @@ def _signal_field_js() -> str:
         return ""
 
 
-def _build_splash_html() -> str:
-    """Theme-aware boot splash — quiet, flat, typographic.
+def _dot_matrix_js() -> str:
+    """dot-matrix.js, inlined so the splash draws the same matrix A the app
+    does (one source for its geometry). '' if missing: the splash falls back
+    to the PNG mark."""
+    try:
+        return (bridge.ROOT / "dot-matrix.js").read_text(encoding="utf-8")
+    except Exception:
+        return ""
 
-    Design rules: the saved theme supplies the entire palette (bg / fg /
-    muted / accent) and the matching logo variant; every surface is FLAT —
-    no blur, no translucency, no glow, no gradient field, no film grain.
-    The signal field (signal-field.js, inlined) replaces the old static dot
-    grid: a live dot field whose points light up with two slow travelling
-    waves, tinted by the theme's --fg / --accent.
-    Staggered one-shot twinkles cover a warm launch, while eight quiet repeaters
-    keep a slow boot alive without turning the background into a light show.
+
+def _is_dark(hex_color: str) -> bool:
+    m = re.fullmatch(r"#([0-9a-fA-F]{6})", (hex_color or "").strip())
+    if not m:
+        return False
+    r, g, b = (int(m.group(1)[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) < 0.5
+
+
+def _build_splash_html() -> str:
+    """Theme-aware boot splash, in the app's dot-matrix language.
+
+    The saved theme supplies the palette (bg / fg / muted / accent), so the
+    splash opens in the theme the app was last closed in. The matrix A
+    (dot-matrix.js, inlined) is the progress indicator: its dots light from
+    bottom left to top right as boot advances, the next few pulse at the
+    front, and the whole A flashes once at 100%. Behind it, signal-field.js
+    draws the same twinkling dot pool as the welcome screen, so the hand-off
+    to the app reads as one surface.
     window.__splashStage(label, pct) stays the live progress contract.
     """
     theme = _read_saved_theme()
     pal = _splash_palette(theme)
     logo_theme = "light" if pal["fg"].lower() == "#202024" else "dark" if pal["fg"].lower() == "#faf9f6" else theme
-    logo = _logo_data_uri(logo_theme)
     accent = pal["accent"]
-    theme_label = re.sub(r"[^a-z0-9 -]", "", (theme or "light").replace("-", " ")).strip() or "light"
     version = _read_app_version()
-    logo_html = (f'<img src="{logo}" class="logo-img" alt="">' if logo
-                 else '<span class="logo-fallback">a</span>')
+    dark = _is_dark(pal["bg"]) if pal["bg"].startswith("#") else theme not in _LIGHT_THEMES
+    dm_l = "70%" if dark else "58%"
     signal_js = _signal_field_js()
-    signal_script = (f'  <script>\n{signal_js}\n  </script>\n' if signal_js else "")
-    stars = (
-        (7, 18, 2.1, 0.03, 0.48, "repeat", 4.1),
-        (14, 72, 2.3, 0.46, 0.54, "accent repeat", 3.7),
-        (21, 31, 1.1, 0.19, 0.43, "", 6.2),
-        (27, 84, 1.0, 0.83, 0.49, "", 5.4),
-        (33, 15, 1.9, 0.58, 0.46, "accent repeat", 4.5),
-        (39, 25, 1.0, 0.31, 0.51, "", 5.8),
-        (46, 10, 1.2, 0.86, 0.45, "", 6.3),
-        (55, 20, 2.1, 0.11, 0.53, "repeat", 3.9),
-        (63, 13, 2.4, 0.70, 0.47, "accent repeat", 4.7),
-        (71, 28, 1.0, 0.38, 0.44, "", 5.6),
-        (79, 17, 1.2, 0.91, 0.48, "", 6.1),
-        (88, 34, 1.1, 0.24, 0.56, "accent", 5.9),
-        (94, 61, 1.0, 0.77, 0.43, "", 5.3),
-        (85, 79, 2.2, 0.52, 0.50, "repeat", 3.5),
-        (75, 90, 1.0, 0.08, 0.46, "accent", 6.4),
-        (66, 73, 1.2, 0.89, 0.52, "", 5.8),
-        (58, 87, 1.0, 0.34, 0.42, "", 5.6),
-        (45, 92, 2.0, 0.64, 0.55, "accent repeat", 4.3),
-        (34, 75, 1.0, 0.15, 0.47, "", 5.4),
-        (23, 62, 1.2, 0.88, 0.50, "", 6.0),
-        (11, 49, 1.0, 0.41, 0.44, "", 5.7),
-        (92, 11, 1.9, 0.61, 0.49, "accent repeat", 3.8),
-        (18, 44, 1.0, 0.27, 0.48, "", 5.5),
-        (30, 56, 1.2, 0.73, 0.45, "accent", 6.0),
-        (70, 52, 1.0, 0.47, 0.51, "", 5.3),
-        (83, 47, 1.2, 0.17, 0.46, "", 6.4),
-    )
-    star_html = "".join(
-        f'<i class="star {kind}" style="--x:{x}%;--y:{y}%;--s:{size}px;'
-        f'--delay:{delay}s;--duration:{duration}s;--cycle:{cycle}s;'
-        f'--repeat-delay:{-((x * 0.071 + y * 0.037) % cycle):.2f}s"></i>'
-        for x, y, size, delay, duration, kind, cycle in stars
-    )
+    matrix_js = _dot_matrix_js()
+    if matrix_js:
+        mark_html = '<svg class="mx" id="mx" aria-hidden="true"></svg>'
+    else:
+        logo = _logo_data_uri(logo_theme)
+        mark_html = (f'<img src="{logo}" class="logo-img" alt="">' if logo
+                     else '<span class="logo-fallback">a</span>')
+    scripts = "".join(f"  <script>\n{js}\n  </script>\n" for js in (signal_js, matrix_js) if js)
 
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
     :root {{
       --bg: {pal['bg']}; --fg: {pal['fg']}; --muted: {pal['muted']}; --accent: {accent};
-      --edge: color-mix(in srgb, var(--fg) 15%, transparent);
-      --star: color-mix(in srgb, var(--fg) 58%, transparent);
-      --star-accent: color-mix(in srgb, var(--accent) 62%, transparent);
-      --ease: cubic-bezier(.22, 1, .36, 1);
-      --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
+      --dm-l: {dm_l};
+      --ease: cubic-bezier(.2, .8, .2, 1);
     }}
     * {{ box-sizing: border-box; }}
     html, body {{ width: 100%; height: 100%; }}
@@ -303,209 +288,147 @@ def _build_splash_html() -> str:
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", sans-serif;
       user-select: none; -webkit-font-smoothing: antialiased;
     }}
+    #signal-field {{ position: absolute; inset: 0; z-index: 0; pointer-events: none; }}
 
-    /* background pulse #1 — the signal field: a live dot grid whose points
-       light up with two slow travelling waves (signal-field.js, inlined).
-       Masked to the center so the corners stay clean, like the old grid. */
-    #signal-field {{
-      position: absolute; inset: 0; z-index: 0; pointer-events: none;
-      -webkit-mask-image: radial-gradient(ellipse 64% 58% at 50% 46%, #000 26%, transparent 76%);
-      mask-image: radial-gradient(ellipse 64% 58% at 50% 46%, #000 26%, transparent 76%);
-    }}
-
-    .stars {{
-      position: absolute; inset: 0; z-index: 0; pointer-events: none;
-      -webkit-mask-image: radial-gradient(ellipse 92% 88% at 50% 48%, #000 28%, rgba(0, 0, 0, .92) 72%, transparent 100%);
-      mask-image: radial-gradient(ellipse 92% 88% at 50% 48%, #000 28%, rgba(0, 0, 0, .92) 72%, transparent 100%);
-    }}
-    .star {{
-      position: absolute;
-      left: var(--x); top: var(--y);
-      width: var(--s); height: var(--s);
-      border-radius: 50%;
-      color: var(--star);
-      background: currentColor;
-      opacity: 0;
-      animation: star-twinkle var(--duration) ease-out var(--delay) both;
-    }}
-    .star.accent {{ color: var(--star-accent); }}
-    .star.repeat {{
-      box-shadow: 0 0 6px currentColor;
-      animation:
-        star-twinkle var(--duration) ease-out var(--delay) both,
-        star-repeat var(--cycle) linear var(--repeat-delay) infinite;
-    }}
-    .star.repeat::before,
-    .star.repeat::after {{
-      content: "";
-      position: absolute; left: 50%; top: 50%;
-      background: currentColor;
-      transform: translate(-50%, -50%);
-    }}
-    .star.repeat::before {{ width: calc(var(--s) * 3.4); height: 1px; }}
-    .star.repeat::after {{ width: 1px; height: calc(var(--s) * 3.4); }}
-    @keyframes star-twinkle {{
-      0%   {{ opacity: 0; transform: scale(.45); }}
-      28%  {{ opacity: .78; transform: scale(1); }}
-      48%  {{ opacity: .18; transform: scale(.72); }}
-      68%  {{ opacity: .46; transform: scale(.92); }}
-      100% {{ opacity: 0; transform: scale(.5); }}
-    }}
-    @keyframes star-repeat {{
-      0%, 100% {{ opacity: 0; transform: scale(.52); }}
-      5% {{ opacity: .88; transform: scale(1); }}
-      9% {{ opacity: .14; transform: scale(.68); }}
-      14% {{ opacity: .52; transform: scale(.92); }}
-      21% {{ opacity: 0; transform: scale(.55); }}
-    }}
-
-    /* corner chrome — small caps mono, appears last, never competes */
-    .chrome {{
-      position: absolute; left: 0; right: 0; z-index: 2;
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 26px 30px;
-      color: var(--muted);
-      font: 500 9px/1 var(--mono);
-      letter-spacing: .18em; text-transform: uppercase;
-      opacity: 0; animation: chrome-in .7s ease .62s forwards;
-    }}
-    .mast {{ top: 0; }}
-    .foot {{ bottom: 0; }}
-    .mast-item {{ display: inline-flex; align-items: center; gap: 8px; }}
-    .mast-item.dim {{ opacity: .66; }}
-    .dot {{
-      width: 5px; height: 5px; border-radius: 50%; background: var(--accent);
-    }}
-
-    /* the lockup — logo, wordmark, one hairline of progress */
     .lockup {{
       position: relative; z-index: 1;
-      width: min(300px, calc(100vw - 56px));
       display: flex; flex-direction: column; align-items: center;
-      transform: translateY(-1.2vh);
+      transform: translateY(-2vh);
     }}
     .mark {{
-      width: 64px; height: 64px; display: grid; place-items: center;
-      opacity: 0; animation: rise .55s var(--ease) .06s forwards;
+      width: 120px; height: 90px; display: grid; place-items: center;
+      opacity: 0; animation: rise .6s var(--ease) .05s forwards;
+    }}
+    .mx {{ width: 120px; height: 90px; overflow: visible; }}
+    .mx circle {{
+      transform-box: fill-box; transform-origin: center;
+      opacity: .13; transform: scale(.78);
+      transition: opacity .32s ease var(--lag, 0s), transform .32s var(--ease) var(--lag, 0s);
+    }}
+    .mx circle.next {{ animation: frontier 1.3s ease-in-out var(--fd, 0s) infinite; }}
+    .mx circle.lit {{
+      opacity: 1; transform: none;
+      animation: twinkle var(--p) ease-in-out calc(var(--d) + var(--lag, 0s)) infinite;
+    }}
+    body.ready .mx circle {{
+      opacity: 1; transform: none;
+      animation: ready .7s var(--ease) calc(var(--k) * .35s) both;
     }}
     .logo-img {{ width: 64px; height: 64px; object-fit: contain; display: block; }}
-    .logo-fallback {{
-      font-size: 44px; font-weight: 700; color: var(--accent); line-height: 1;
-    }}
-    h1 {{
-      margin: 14px 0 0;
-      font-size: 31px; line-height: 1; font-weight: 640;
-      letter-spacing: -.045em; text-indent: -.045em;
-      opacity: 0; animation: rise .55s var(--ease) .13s forwards;
-    }}
+    .logo-fallback {{ font-size: 44px; font-weight: 700; color: var(--accent); line-height: 1; }}
 
-    .boot {{
-      width: 100%; margin-top: 46px;
-      opacity: 0; animation: rise .55s var(--ease) .21s forwards;
+    h1 {{
+      margin: 22px 0 0;
+      font-size: 22px; line-height: 1.2; font-weight: 500; letter-spacing: -.02em;
+      opacity: 0; animation: rise .6s var(--ease) .14s forwards;
     }}
     .readout {{
-      display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
-      min-height: 15px; margin-bottom: 9px;
-      font: 500 10px/1.4 var(--mono);
-      letter-spacing: .08em; text-transform: uppercase;
-      color: var(--muted);
+      display: flex; align-items: baseline; justify-content: center; gap: 8px;
+      min-height: 18px; margin-top: 10px;
+      font-size: 12px; color: var(--muted);
+      opacity: 0; animation: rise .6s var(--ease) .22s forwards;
     }}
-    #status {{
-      min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-      transition: opacity .15s ease;
-    }}
-    #status::after {{
-      content: ""; display: inline-block; width: 6px; height: 10px;
-      margin-left: 7px; vertical-align: -1px; background: var(--accent);
-      animation: caret 1.1s steps(1) infinite;
-    }}
+    #status {{ max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: opacity .15s ease; }}
     #status.swap {{ opacity: 0; }}
-    .pct {{
-      color: var(--fg); font-variant-numeric: tabular-nums; letter-spacing: .05em;
-    }}
-    .rail {{
-      width: 100%; height: 2px; background: var(--edge); border-radius: 1px;
-      overflow: hidden;
-    }}
-    .fill {{
-      width: 3%; height: 100%; background: var(--accent); border-radius: 1px;
-      transition: width .55s var(--ease);
+    .sep {{ opacity: .5; }}
+    .pct {{ font-variant-numeric: tabular-nums; color: var(--fg); opacity: .72; }}
+
+    .foot {{
+      position: absolute; left: 0; right: 0; bottom: 22px; z-index: 1;
+      text-align: center; font-size: 11px; color: var(--muted); opacity: 0;
+      animation: fade .7s ease .5s forwards;
     }}
 
     @keyframes rise {{
-      from {{ opacity: 0; transform: translateY(7px); }}
-      to   {{ opacity: 1; transform: translateY(0); }}
+      from {{ opacity: 0; transform: translateY(6px); }}
+      to   {{ opacity: 1; transform: none; }}
     }}
-    @keyframes chrome-in {{ to {{ opacity: 1; }} }}
-    @keyframes caret {{
-      0%, 55% {{ opacity: 1; }}
-      56%, 100% {{ opacity: 0; }}
+    @keyframes fade {{ to {{ opacity: .8; }} }}
+    @keyframes twinkle {{
+      0%, 100% {{ opacity: var(--lo); transform: scale(.88); }}
+      12% {{ opacity: 1; transform: scale(1.12); }}
+      40% {{ opacity: .8; transform: scale(1); }}
     }}
-
-    @media (max-width: 640px) {{
-      .chrome {{ padding: 20px; }}
-      .lockup {{ width: min(280px, calc(100vw - 40px)); transform: translateY(-2vh); }}
-      h1 {{ font-size: 27px; }}
-      .boot {{ margin-top: 38px; }}
+    @keyframes frontier {{
+      0%, 100% {{ opacity: .13; transform: scale(.78); }}
+      45% {{ opacity: .7; transform: scale(1.05); }}
     }}
-    @media (max-height: 560px) {{
-      .lockup {{ transform: scale(.88); }}
-      .boot {{ margin-top: 30px; }}
+    @keyframes ready {{
+      0%   {{ opacity: .6; transform: scale(.9); }}
+      35%  {{ opacity: 1;  transform: scale(1.3); }}
+      100% {{ opacity: 1;  transform: scale(1); }}
     }}
+    @media (max-height: 560px) {{ .lockup {{ transform: scale(.9); }} }}
     @media (prefers-reduced-motion: reduce) {{
       *, *::before, *::after {{ animation: none !important; transition-duration: .01ms !important; }}
-      .mark, h1, .boot, .mast, .foot {{ opacity: 1; transform: none; }}
-      .star {{ display: none; }}
+      .mark, h1, .readout, .foot {{ opacity: 1; transform: none; }}
     }}
   </style>
 </head>
 <body>
   <canvas id="signal-field" aria-hidden="true"></canvas>
-  <div class="stars" aria-hidden="true">
-    {star_html}
-  </div>
-
-  <header class="chrome mast">
-    <span class="mast-item"><i class="dot"></i>local runtime</span>
-    <span class="mast-item dim">profile / {theme_label}</span>
-  </header>
 
   <main class="lockup">
-    <div class="mark">{logo_html}</div>
-    <h1>accuretta</h1>
-    <section class="boot" aria-live="polite">
-      <div class="readout">
-        <span id="status">Preparing local runtime</span>
-        <span class="pct" id="pct">0%</span>
-      </div>
-      <div class="rail"><div class="fill" id="fill"></div></div>
-    </section>
+    <div class="mark">{mark_html}</div>
+    <h1>Accuretta</h1>
+    <div class="readout" aria-live="polite">
+      <span id="status">Preparing local runtime</span><span class="sep">·</span><span class="pct" id="pct">0%</span>
+    </div>
   </main>
 
-  <footer class="chrome foot">
-    <span>version: {version}</span>
-    <span>your model · your machine</span>
-  </footer>
+  <footer class="foot">v{version}</footer>
 
-  {signal_script}  <script>
-    window.__splashReadyAt = performance.now();
-    window.__splashStage = function (label, pct) {{
-      var status = document.getElementById('status');
-      var fill = document.getElementById('fill');
-      var readout = document.getElementById('pct');
-      if (status && label && status.textContent !== label) {{
-        status.classList.add('swap');
-        setTimeout(function () {{
-          status.textContent = label;
-          status.classList.remove('swap');
-        }}, 150);
+{scripts}  <script>
+    (function () {{
+      // Order the A's dots along the notch's power-up diagonal (bottom left
+      // to top right) so progress fills the logo in that direction.
+      var svg = document.getElementById('mx');
+      var dots = [];
+      if (svg && window.AccDots) {{
+        window.AccDots.buildA(svg, 16, {{ lo: [.6, .85] }});
+        var vb = svg.viewBox.baseVal;
+        dots = Array.prototype.slice.call(svg.querySelectorAll('circle')).map(function (c) {{
+          var t = +c.getAttribute('cx') / vb.width, u = +c.getAttribute('cy') / vb.height;
+          var k = (1 - u) * .5 + t * .5;
+          c.style.setProperty('--k', k.toFixed(3));
+          return {{ el: c, k: k }};
+        }}).sort(function (a, b) {{ return a.k - b.k; }});
       }}
-      if (typeof pct === 'number') {{
-        var value = Math.max(0, Math.min(100, pct));
-        if (fill) fill.style.width = Math.max(3, value) + '%';
-        if (readout) readout.textContent = Math.round(value) + '%';
+      var shown = 0;
+      function paint(pct) {{
+        if (!dots.length) return;
+        var n = Math.round(Math.max(0, Math.min(1, pct / 100)) * dots.length);
+        for (var i = 0; i < dots.length; i++) {{
+          var el = dots[i].el;
+          // Newly lit dots cascade in order instead of popping at once.
+          if (i < n && !el.classList.contains('lit')) el.style.setProperty('--lag', ((i - shown) * .018).toFixed(3) + 's');
+          el.classList.toggle('lit', i < n);
+          var front = i >= n && i < n + 4;
+          el.classList.toggle('next', front);
+          if (front) el.style.setProperty('--fd', ((i - n) * .12).toFixed(2) + 's');
+        }}
+        shown = Math.max(shown, n);
+        if (pct >= 100) document.body.classList.add('ready');
       }}
-    }};
+      window.__splashReadyAt = performance.now();
+      window.__splashStage = function (label, pct) {{
+        var status = document.getElementById('status');
+        var readout = document.getElementById('pct');
+        if (status && label && status.textContent !== label) {{
+          status.classList.add('swap');
+          setTimeout(function () {{
+            status.textContent = label;
+            status.classList.remove('swap');
+          }}, 150);
+        }}
+        if (typeof pct === 'number') {{
+          var value = Math.max(0, Math.min(100, pct));
+          if (readout) readout.textContent = Math.round(value) + '%';
+          paint(value);
+        }}
+      }};
+      paint(3);
+    }})();
   </script>
 </body></html>"""
 
