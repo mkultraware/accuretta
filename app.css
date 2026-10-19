@@ -3255,6 +3255,7 @@ button {
 }
 .recon-input:focus { outline: none; border-color: var(--accent); }
 .recon-input + .recon-input { margin-top: 8px; }
+textarea.recon-input, #recon-notes-text { min-height: 62px; resize: vertical; line-height: 1.5; }
 .recon-field-hint {
   margin: 7px 2px 0;
   color: var(--fg-subtle);
@@ -18928,23 +18929,22 @@ html[data-custom-ink="light"] .brand .brand-mark-dark { display: block; }
 
 /* Task outcomes and recorded file review. */
 .turn-changes { background: var(--bg-raised); border-radius: 12px 4px 12px 12px; }
-.turn-changes .tc-head { padding: 13px 15px; flex-wrap: wrap; }
+.turn-changes .tc-head { padding: 9px 13px; flex-wrap: wrap; }
 .turn-changes .tc-title { flex-wrap: wrap; }
 .turn-changes .tc-verification { margin-left: auto; color: var(--fg-muted); }
 .turn-changes .tc-verification.passed { color: var(--success); }
 .turn-changes .tc-verification.failed { color: var(--danger); }
 .turn-changes .tc-verification.partial { color: var(--warning); }
-.turn-changes .tc-file { flex-wrap: wrap; padding: 10px 15px; }
+.turn-changes .tc-file { flex-wrap: wrap; padding: 7px 13px; }
 .turn-changes .tc-name { min-width: 0; overflow-wrap: anywhere; }
-.turn-changes .tc-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 13px 15px; border-top: 1px solid var(--border-subtle); }
+.turn-changes .tc-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 9px 13px; border-top: 1px solid var(--border-subtle); }
 .turn-changes :is(.tc-review, .tc-file-open) { border: 1px solid var(--border-strong); border-radius: 7px; padding: 5px 10px; background: var(--bg-raised); color: var(--fg); cursor: pointer; font: inherit; }
 .turn-changes .tc-review { background: var(--fg); color: var(--bg-raised); }
 .turn-changes .tc-file-open { font-size: 11px; }
 .turn-changes .tc-openfolder { margin-left: 0; }
-.turn-changes .tc-coverage { padding: 0 15px 13px; margin: 0; color: var(--fg-muted); font-size: 11px; }
-.turn-changes .tc-checks { padding: 11px 15px; border-top: 1px solid var(--border-subtle); }
-.turn-changes .tc-checks summary { cursor: pointer; }
-.turn-changes .tc-checks :is(p, li) { overflow-wrap: anywhere; color: var(--fg-muted); margin: 8px 0; }
+.turn-changes .tc-checks { padding: 7px 13px; border-top: 1px solid var(--border-subtle); }
+.turn-changes .tc-checks summary { cursor: pointer; color: var(--fg-muted); }
+.turn-changes .tc-checks :is(p, li) { overflow-wrap: anywhere; color: var(--fg-muted); margin: 6px 0; }
 .turn-changes [hidden] { display: none; }
 .task-review-dialog { width: min(960px, calc(100vw - 24px)); max-height: calc(100dvh - 32px); padding: 0; border: 1px solid var(--border-strong); border-radius: 16px; background: var(--bg-raised); color: var(--fg); box-shadow: var(--shadow-lg); }
 .task-review-dialog::backdrop { background: rgba(0, 0, 0, .6); }

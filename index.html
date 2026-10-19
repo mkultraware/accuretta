@@ -64,7 +64,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.9.3</span>
+        <span class="v" id="brand-v">v0.9.4</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -881,6 +881,10 @@
         <button type="button" class="recon-chip" data-group="time" data-val="thorough, take the time">Thorough</button>
       </div>
       <input type="text" id="recon-constraint-text" class="recon-input" data-recon-active-only data-recon-suite-only placeholder="time budget or other limits" autocomplete="off">
+
+      <label class="recon-label">Additional notes to agent <span class="recon-opt">optional</span></label>
+      <textarea id="recon-notes-text" class="recon-input" rows="3" placeholder="Anything the fields above don't capture: endpoints to prioritize, test credentials you're providing, rules of engagement, out-of-band details…" autocomplete="off" spellcheck="false"></textarea>
+      <p class="recon-field-hint">Free text, sent to the model along with the engagement scope.</p>
 
       <div id="recon-blank-notice" class="recon-notice hidden" data-recon-active-only data-recon-suite-only>
         <i class="ph ph-info"></i>

@@ -513,6 +513,37 @@
 #btn-perms[data-mode="medium"] .btn-perms-dot { background: var(--accent); }
 #btn-perms[data-mode="hard"] .btn-perms-dot { background: var(--danger); }
 
+/* /goal full-autonomy: while a hands-free task runs, the perms chip reads
+   "Goal" and pulses so the autonomous state is unmistakable. Cleared when the
+   turn finishes (goal_mode event restores the standing mode). */
+#btn-perms[data-goal] { border-color: var(--accent); }
+#btn-perms[data-goal] .btn-perms-dot { background: var(--accent); animation: goal-perms-pulse 1.4s ease-in-out infinite; }
+@keyframes goal-perms-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+/* One-shot flourish when /goal is switched on: an accent ripple expands out
+   from the composer edge and fades, with a brief accent border tint, plus a
+   quick pop on the chip — subtle but unmistakable that hands-free mode just
+   engaged. */
+.composer.goal-activating { animation: goal-activate 1.2s ease-out; }
+@keyframes goal-activate {
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 72%, transparent); border-color: var(--accent); }
+  25%  { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 55%, transparent); border-color: var(--accent); }
+  60%  { box-shadow: 0 0 0 7px color-mix(in srgb, var(--accent) 24%, transparent); }
+  100% { box-shadow: 0 0 0 11px color-mix(in srgb, var(--accent) 0%, transparent); }
+}
+.composer.goal-activating #btn-perms[data-goal] { animation: goal-chip-flash 1.2s ease-out; }
+@keyframes goal-chip-flash {
+  0%   { transform: scale(1); }
+  28%  { transform: scale(1.14); }
+  55%  { transform: scale(0.98); }
+  100% { transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #btn-perms[data-goal] .btn-perms-dot,
+  .composer.goal-activating,
+  .composer.goal-activating #btn-perms[data-goal] { animation: none; }
+}
+
 /* ============================================================
    4. SESSION SUPERVISION BADGES (chat list)
    Working / Needs you / Failed states become visible text pills
@@ -1248,4 +1279,45 @@
 .autotune-notes .autotune-why-body {
   margin-top: 6px; max-height: 240px; overflow: auto; padding-right: 4px;
   font-size: 11px; color: var(--fg-muted); display: grid; gap: 3px;
+}
+
+/* Save confirmation — a brief, subtle success pop so "Saved" actually registers.
+   controlFeedback() swaps the button content to a check + label and toggles
+   .control-saved; the class turns the button success-green with a short scale
+   pop and a soft ring, then is removed ~1.8s later. !important is intentional:
+   it must beat .btn.accent's own background for the moment it's shown. */
+@keyframes control-saved-pop {
+  0%   { transform: scale(1); }
+  35%  { transform: scale(1.055); }
+  100% { transform: scale(1); }
+}
+.control-saved {
+  background: var(--success) !important;
+  border-color: var(--success) !important;
+  color: var(--accent-fg, #fff) !important;
+  box-shadow: 0 0 0 3px var(--success-subtle);
+  animation: control-saved-pop .45s cubic-bezier(.34, 1.56, .64, 1);
+}
+.control-saved > i { margin-right: 5px; }
+@media (prefers-reduced-motion: reduce) {
+  .control-saved { animation: none; }
+}
+
+/* Settings search: match-count pill on each collapsed section card. Sections
+   stay closed during a search; this tells the user how many settings matched so
+   they can open just the card they want instead of a wall of expanded cards. */
+.settings-section-count {
+  flex: 0 0 auto;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 10px;
+  background: var(--accent-subtle);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }

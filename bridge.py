@@ -2025,6 +2025,10 @@ DEFAULT_SETTINGS = {
                                     # when the context overflows instead of deleting them. False silently
                                     # disables ALL folds — every overflow becomes a plain drop (see the
                                      # trim-triggered fold in run_chat_turn).
+    "summary_fidelity_gate": True,  # after a fold writes the note, deterministically re-inject any sticky
+                                    # section (DECISIONS/ROADBLOCKS/FILES) or load-bearing anchor the new
+                                    # note silently dropped vs the prior note. Add-only, no model call; it
+                                    # can never make a note worse. False = exact pre-gate behavior.
     "passive_model_telemetry": True, # content-free local observations from real turns; no extra benchmark/inference
     # llama-server lifecycle (bridge spawns it for us)
     "watchdog_enabled": True,       # auto-respawn llama-server on silent crash (OOM, segfault).
@@ -2412,6 +2416,12 @@ def _run_small(argv: list[str], timeout: int = 8) -> dict:
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout,
+            # Decode as UTF-8 regardless of the host's locale codepage. Without
+            # this, Windows' text=True uses the ANSI codepage (cp1252), which
+            # mojibakes UTF-8 tool output — e.g. a Mac named "Macbook som
+            # tillhör …" (ö = C3 B6) captured from `tailscale status --json`
+            # arrived as "Ã¶" and was stored as the machine label.
+            encoding="utf-8", errors="replace",
             creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
         )
         return {
@@ -3342,6 +3352,7 @@ def _build_continuity_state(chat: dict, activity: list[dict] | None = None,
     if mission:
         for label, value in (("authorized target", mission.get("target")),
                              ("authorized scope", mission.get("scope")),
+                             ("operator notes", mission.get("notes")),
                              ("required user agent", mission.get("user_agent")),
                              ("mission phase", mission.get("phase"))):
             if value:
@@ -4332,7 +4343,8 @@ _fold_events_lock = threading.Lock()
 def _record_fold_event(chat: dict, reason: str, force: bool, ok: bool,
                        outcome: str, ctx_limit: int, fill: int | None,
                        through: int, cut: int | None,
-                       folded_tokens: int | None = None) -> None:
+                       folded_tokens: int | None = None,
+                       repairs: list | None = None) -> None:
     """Append one compaction-attempt record. Never raises — telemetry must
     not break the fold path it observes."""
     try:
@@ -4352,12 +4364,122 @@ def _record_fold_event(chat: dict, reason: str, force: bool, ok: bool,
             "folded": (cut - through) if (ok and cut is not None) else 0,
             "folded_tokens": folded_tokens,
             "summary_chars": len(chat.get("rolling_summary", "") or ""),
+            "repairs": list(repairs or []),
         }
         with _fold_events_lock:
             with open(FOLD_EVENTS_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+# ---- summary fidelity gate --------------------------------------------------
+# After a fold writes the note, this re-injects anything the new note silently
+# dropped versus the prior note: a sticky section that went empty, or a
+# load-bearing exact anchor that vanished. Deterministic and ADD-ONLY — it never
+# rewrites, reorders or removes, so it cannot turn a good note into a worse one.
+# COMPLETED / ACTIVE TASK / VERIFICATION / NEXT ACTION are intentionally NOT
+# sticky: items there legitimately fall away as work finishes.
+_SUMMARY_STICKY_HEADINGS = (
+    "## ROADBLOCKS:",
+    "## DECISIONS AND CONSTRAINTS:",
+    "## FILES IN USE:",
+)
+_SUMMARY_EMPTY_SECTION_RE = re.compile(r"^none(?:\s+recorded)?\.?$", re.IGNORECASE)
+_FIDELITY_MAX_REINJECT_CHARS = 1200
+
+
+def _split_summary_sections(text: str) -> dict:
+    """Map each required heading to its section body. A heading absent from the
+    text maps to nothing. The note reaching the gate is already schema-valid
+    (every heading present and ordered), but we stay robust to a missing one."""
+    text = str(text or "")
+    found = sorted(
+        (text.find(h), h) for h in _SUMMARY_REQUIRED_HEADINGS if text.find(h) >= 0
+    )
+    out: dict = {}
+    for idx, (pos, heading) in enumerate(found):
+        start = pos + len(heading)
+        end = found[idx + 1][0] if idx + 1 < len(found) else len(text)
+        out[heading] = text[start:end].strip()
+    return out
+
+
+def _section_is_empty(body: str) -> bool:
+    """True for a blank body or a placeholder like '- None recorded.'"""
+    lines = [ln.strip(" -*\t") for ln in str(body or "").splitlines() if ln.strip(" -*\t")]
+    if not lines:
+        return True
+    return all(_SUMMARY_EMPTY_SECTION_RE.match(ln) for ln in lines)
+
+
+def _reinject_under_heading(summary: str, heading: str, block: str) -> str:
+    """Insert `block` immediately after `heading` (staying inside that section).
+    Add-only: whatever the model wrote below is left untouched."""
+    pos = summary.find(heading)
+    if pos < 0:  # schema-valid notes always have it; append defensively if not
+        return summary.rstrip() + "\n\n" + heading + "\n" + block
+    after = pos + len(heading)
+    return summary[:after] + "\n" + block + summary[after:]
+
+
+def _reconcile_summary_fidelity(prior_summary: str, new_summary: str,
+                                candidate_memory: dict | None,
+                                pins: list | None) -> tuple[str, list]:
+    """Deterministic, add-only fidelity gate between writing the fold note and
+    committing it. Returns (possibly-repaired note, list of repair tags). Never
+    raises for the caller's sake is the caller's job; this stays pure."""
+    new_summary = str(new_summary or "")
+    if not new_summary.strip():
+        return new_summary, []
+    prior_summary = str(prior_summary or "")
+    repairs: list = []
+    new_sections = _split_summary_sections(new_summary)
+    prior_sections = _split_summary_sections(prior_summary) if prior_summary else {}
+
+    # 1. Section regression: a sticky section the prior note carried that the
+    #    new note emptied. Restore the prior body verbatim (bounded). This also
+    #    stops the loss compounding, because the NEXT fold re-summarizes a note
+    #    that still holds the content instead of an already-emptied one.
+    for heading in _SUMMARY_STICKY_HEADINGS:
+        prior_body = prior_sections.get(heading, "")
+        if _section_is_empty(prior_body):
+            continue
+        if not _section_is_empty(new_sections.get(heading, "")):
+            continue
+        block = prior_body.strip()[:_FIDELITY_MAX_REINJECT_CHARS].rstrip()
+        block += "\n(restored from prior summary — the fold had dropped this)"
+        new_summary = _reinject_under_heading(new_summary, heading, block)
+        repairs.append("section:" + heading.strip("# :").lower().replace(" ", "_"))
+
+    # 2. Anchor presence: a load-bearing exact anchor the prior note carried but
+    #    the new note dropped. Exact-identifier substring test only — no prose,
+    #    so no false "missing". Restore only anchors the prior note actually had
+    #    (we repair loss; we never invent).
+    anchors = []
+    if isinstance(candidate_memory, dict):
+        anchors = _render_anchor_subset(candidate_memory.get("exact_anchors") or [],
+                                        _FIDELITY_MAX_REINJECT_CHARS)
+    low_new = new_summary.lower()
+    low_prior = prior_summary.lower()
+    missing, used = [], 0
+    for item in anchors:
+        value = str(item).strip()
+        if len(value) < 4 or value.lower() in low_new:
+            continue
+        if prior_summary and value.lower() not in low_prior:
+            continue
+        if used + len(value) + 3 > _FIDELITY_MAX_REINJECT_CHARS:
+            break
+        missing.append(value)
+        used += len(value) + 3
+        if len(missing) >= 12:
+            break
+    if missing:
+        block = "\n".join(f"- {value} (restored exact anchor)" for value in missing)
+        new_summary = _reinject_under_heading(new_summary, "## FILES IN USE:", block)
+        repairs.append(f"anchors:{len(missing)}")
+    return new_summary, repairs
 
 
 def _align_fold_cut(msgs: list[dict], through: int, cut: int) -> int:
@@ -4502,6 +4624,25 @@ def _maybe_roll_summary_unlocked(chat: dict, ctx_limit: int, force: bool = False
         _record_fold_event(chat, reason_hint, force, False, "summarize_failed",
                            ctx_limit, real_fill, through, cut)
         return False
+    # Fidelity gate: deterministically restore anything the new note silently
+    # dropped vs the prior note (sticky section emptied, load-bearing anchor
+    # vanished) BEFORE the flash commits. Add-only; wrapped so it can never
+    # break the fold it protects. Every fold path (auto / proactive / mid-turn /
+    # manual / model tool) funnels through here, so all inherit it at once.
+    _fidelity_repairs: list = []
+    if get_settings().get("summary_fidelity_gate", True):
+        try:
+            new_summary, _fidelity_repairs = _reconcile_summary_fidelity(
+                chat.get("rolling_summary", ""), new_summary,
+                candidate_memory, chat.get("pins") or [])
+            if _fidelity_repairs:
+                _log_compact(chat_id, "fidelity gate restored: " + ", ".join(_fidelity_repairs))
+        except Exception as _fe:
+            try:
+                _log_compact(chat_id, f"fidelity gate error (ignored): {type(_fe).__name__}: {_fe}")
+            except Exception:
+                pass
+            _fidelity_repairs = []
     if new_summary and new_summary != chat.get("rolling_summary", ""):
         _summary_last_fail_by_chat.pop(chat_id, None)
         chat["rolling_summary"] = new_summary
@@ -4535,7 +4676,7 @@ def _maybe_roll_summary_unlocked(chat: dict, ctx_limit: int, force: bool = False
         except Exception:
             pass
         _record_fold_event(chat, reason_hint, force, True, "ok", ctx_limit, real_fill,
-                           through, cut, _fold_tokens)
+                           through, cut, _fold_tokens, repairs=_fidelity_repairs)
         try:
             if _notify:
                 broadcast_event({"type": "summary_folded", "chat_id": chat_id,
@@ -5431,6 +5572,7 @@ _RT_AUTOMATED_TOOL_NAMES = {
     # (http_request, rt_browser) remain so enumeration is still possible.
     "sandbox_nmap", "sandbox_sqlmap", "recon_auth_spray",
     "recon_port_scan", "recon_content_discovery", "fuzz", "batch_probe",
+    "recon_map",
 }
 
 
@@ -7531,10 +7673,123 @@ _approvals_lock = threading.Lock()
 _SAFE_WRITE_KINDS = {"write_file", "edit_file", "replace_ast_node"}
 
 
+# Desktop INPUT kinds — the repetitive click/type/keys/scroll/focus actions that
+# drive a browser or app during an engagement. In soft mode these may run without
+# a prompt when (A) the user's own last message asked for on-screen interaction,
+# or (B) the user flipped the per-session desktop switch (one sentinel unlocks the
+# whole group). Program LAUNCH and window CLOSE are deliberately excluded — they
+# are more consequential, so they keep prompting. Web-tainted desktop actions
+# never reach the auto-approve path (force_prompt is set upstream), so a hostile
+# page still cannot drive the mouse silently.
+_DESKTOP_INPUT_KINDS = {
+    "desktop.click", "desktop.type", "desktop.keys", "desktop.scroll",
+    "desktop.set_value", "desktop.invoke", "desktop.focus",
+}
+# One token in the session-allow set unlocks every desktop input kind at once, so
+# "Allow desktop input for this session" is a single switch, not per-action.
+_DESKTOP_SESSION_SENTINEL = "desktop.input.*"
+
+
 # Kinds the user chose "Always allow (this session)" for — auto-approved until
 # the bridge restarts. Never persisted to disk; destructive kinds never enter it
 # (the UI only offers "always allow" on safe operations).
 _approval_session_allow: set[str] = set()
+
+
+# ---- /goal full-autonomy mode ---------------------------------------------
+# The user types "/goal" to LATCH hands-free mode on for the chat: from then
+# on, approvals auto-pass EXCEPT deletions and other destructive actions, which
+# keep their gate. The latch persists across turns ("full auto until it's
+# done") and stays on until the user turns it off — "/goal off" (also stop /
+# end / done / cancel), or clicking the Goal chip. "/goal <task>" latches on
+# AND runs that task. Critical / force_prompt / web-tainted / protected-path
+# requests are excluded before the goal check runs, so /goal cannot bypass the
+# ClickFix web-taint guard or a protected-system-path gate.
+#
+# The latch is kept in-memory (clears on a bridge restart — a safe default) and
+# mirrored onto the chat dict (chat["goal_mode"]) so it survives a UI reload and
+# is rehydrated at the top of the next turn.
+#
+# Kinds that stay gated even under /goal because they delete data or make a
+# destructive / hard-to-reverse change. Remote_* act on a paired Mac (a
+# separate device, out of scope for a local autonomous run) and desktop.close
+# can discard the user's unsaved work, so both keep prompting too.
+_GOAL_GATE_KINDS = {
+    "delete", "registry", "dangerous_import",
+    "remote_shell", "remote_file_write", "remote_file_copy",
+    "desktop.close",
+}
+_goal_mode_chats: set[str] = set()
+_goal_mode_lock = threading.Lock()
+
+
+def _set_goal_mode(chat_id: str, on: bool) -> None:
+    if not chat_id:
+        return
+    with _goal_mode_lock:
+        if on:
+            _goal_mode_chats.add(chat_id)
+        else:
+            _goal_mode_chats.discard(chat_id)
+
+
+def _chat_in_goal_mode(chat_id: str) -> bool:
+    if not chat_id:
+        return False
+    with _goal_mode_lock:
+        return chat_id in _goal_mode_chats
+
+
+_GOAL_OFF_RE = re.compile(r"^\s*/goal\s+(off|stop|end|done|cancel)\b\s*$", re.IGNORECASE)
+_GOAL_COMMAND_RE = re.compile(r"^\s*/goal\b[ \t]*(.*)$", re.IGNORECASE | re.DOTALL)
+
+
+def _parse_goal_command(text: str) -> tuple[str, str | None]:
+    """Parse a leading /goal slash command. Returns (remaining_task, action):
+      - "/goal off|stop|end|done|cancel"  -> ("", "off")
+      - "/goal on" | "/goal start" | "/goal" -> ("", "on")   (latch, no task)
+      - "/goal <task>"                    -> (task, "on")    (latch + run task)
+      - no /goal                          -> (text, None)    (unchanged)
+    """
+    t = text or ""
+    if _GOAL_OFF_RE.match(t):
+        return "", "off"
+    m = _GOAL_COMMAND_RE.match(t)
+    if not m:
+        return t, None
+    rest = m.group(1).strip()
+    if rest.lower() in ("on", "start"):
+        rest = ""
+    return rest, "on"
+
+
+def _goal_action_is_gated(kind, command: str) -> bool:
+    """True when a request must keep its approval gate even under /goal: a
+    deletion/destructive kind, or a shell/git command line that deletes or
+    overwrites data (rm, del, format, reg delete, git reset --hard, force
+    push, ...)."""
+    return bool(kind in _GOAL_GATE_KINDS or _is_destructive_command(command or ""))
+
+
+def _apply_goal_latch(chat_id: str, on: bool) -> bool:
+    """Set the hands-free latch for a chat, mirror it onto the persisted chat
+    dict (so it survives a UI reload and is rehydrated next turn), and broadcast
+    the goal_mode state to every surface. Returns the new active state."""
+    _set_goal_mode(chat_id, on)
+    try:
+        chats = get_chats()
+        chat = chats.get("chats", {}).get(chat_id)
+        if chat is not None and bool(chat.get("goal_mode")) != bool(on):
+            chat["goal_mode"] = bool(on)
+            save_json(CHATS_FILE, chats)
+    except Exception:
+        pass
+    broadcast_event({"type": "goal_mode", "chat_id": chat_id, "active": bool(on)})
+    return bool(on)
+
+
+def _desktop_session_unlocked() -> bool:
+    return _DESKTOP_SESSION_SENTINEL in _approval_session_allow
 
 # ---- web-taint tracking ----------------------------------------------------
 # ClickFix for LLMs: page content (web_fetch / browser-MCP snapshots) carries
@@ -7632,20 +7887,47 @@ def request_approval(title: str, command: str, details: dict | None = None, time
         details["web_tainted"] = True
         details["force_prompt"] = True
     # The frontend may only offer "remember for this session" on kinds the
-    # bridge actually honors in decide_approval (safe writes + MCP tools).
+    # bridge actually honors in decide_approval (safe writes + MCP tools + the
+    # desktop input group, which ticks the single per-session switch).
     details.setdefault("allow_always",
-                       bool(kind) and (kind in _SAFE_WRITE_KINDS or kind.startswith("mcp_")))
+                       bool(kind) and (kind in _SAFE_WRITE_KINDS or kind.startswith("mcp_")
+                                       or kind in _DESKTOP_INPUT_KINDS))
+    if kind in _DESKTOP_INPUT_KINDS:
+        details.setdefault("allow_always_label", "Allow desktop input for this session")
     try:
         if not details.get("critical") and not details.get("force_prompt"):
+            # /goal full-autonomy: this turn runs hands-free. Auto-pass
+            # everything that is not a deletion/destructive action, overriding
+            # the standing soft/medium/hard mode. Critical, force_prompt and
+            # web-tainted requests were already excluded above, so /goal can't
+            # bypass those. Destructive actions fall through to the normal gate.
+            if _chat_in_goal_mode(_get_current_chat()):
+                if _goal_action_is_gated(kind, command):
+                    details.setdefault("goal_gated", True)
+                else:
+                    return {"status": "goal-auto-approved", "decision": "approve",
+                            "auto": True, "goal": True, "details": details}
             # protected ops and explicitly remote mutations NEVER auto-approve
             mode = _approval_mode()
             if kind and kind in _approval_session_allow:
                 return {"status": "session-approved", "decision": "approve", "auto": True, "details": details}
+            # (B) The per-session desktop switch: one sentinel unlocks every
+            # desktop input kind, in any mode (an explicit user opt-in, like other
+            # session-remembers). force_prompt / web-taint still override above.
+            if kind in _DESKTOP_INPUT_KINDS and _desktop_session_unlocked():
+                return {"status": "session-approved", "decision": "approve", "auto": True, "details": details}
             if mode != "hard" and kind in _SAFE_WRITE_KINDS:
                 return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
             if mode == "soft":
-                if kind in _SOFT_PROMPT_KINDS or _is_desktop_approval_kind(kind):
-                    pass                                    # launches + desktop stay gated
+                if kind in _SOFT_PROMPT_KINDS:
+                    pass                                    # delete/registry/launch stay gated
+                elif _is_desktop_approval_kind(kind):
+                    # (A) Intent: desktop INPUT runs free in soft mode when the
+                    # user's own last message asked for on-screen/browser action.
+                    # Launch/close are not input kinds, so they still prompt.
+                    if kind in _DESKTOP_INPUT_KINDS and _user_asked_desktop_interaction(_last_user_text):
+                        return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
+                    # otherwise desktop stays gated
                 elif (kind or "").startswith("mcp_"):
                     if not _MCP_SOFT_BLOCK.search(kind):    # playwright runs free; delete-ish MCP still prompts
                         return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
@@ -7715,6 +7997,10 @@ def decide_approval(aid: str, decision: str, always: bool = False) -> bool:
             # showed the "remember" checkbox on every approval card.
             if kind and (kind in _SAFE_WRITE_KINDS or kind.startswith("mcp_")):
                 _approval_session_allow.add(kind)
+            # A desktop input kind flips the ONE sentinel, so the whole input
+            # group (click/type/keys/scroll/focus) is unlocked for the session.
+            elif kind in _DESKTOP_INPUT_KINDS:
+                _approval_session_allow.add(_DESKTOP_SESSION_SENTINEL)
         ev.set()
     broadcast_event({"type": "approval:decided", "id": aid, "decision": entry["decision"]})
     return True
@@ -8301,9 +8587,10 @@ def _undo_prune(keep: int = 20) -> None:
 def _open_folder_in_file_manager(raw_path: str) -> dict:
     """Open a folder in the OS file manager (Explorer/Finder/xdg-open).
 
-    Restricted to the configured workspace roots: the bridge binds 0.0.0.0
-    (LAN / Tailscale reachable), so an unconstrained open-any-folder endpoint
-    would let a remote client probe which paths exist via the error text.
+    The "Open folder" button hands us the folder a file was saved into, so just
+    open it. The only guard is a protected system path (Windows/System32,
+    registry hives, etc.) — the agent can't write there anyway, so this never
+    blocks a folder the agent actually saved to.
     """
     p = str(raw_path or "").strip()
     if not p:
@@ -8314,15 +8601,8 @@ def _open_folder_in_file_manager(raw_path: str) -> dict:
         return {"error": "bad path"}
     if not real.is_dir():
         return {"error": "not a folder"}
-    roots = []
-    for f in get_workspace().get("folders", []):
-        try:
-            if isinstance(f, str) and f.strip():
-                roots.append(Path(os.path.realpath(f)))
-        except Exception:
-            continue
-    if not any(real == r or r in real.parents for r in roots):
-        return {"error": "folder is outside the workspace allowlist"}
+    if is_blocked_path(str(real)):
+        return {"error": "cannot open a protected system folder"}
     try:
         if os.name == "nt":
             os.startfile(str(real))  # type: ignore[attr-defined]
@@ -14147,6 +14427,60 @@ def _desktop_post_state() -> dict:
     return state
 
 
+# ---- desktop input focus re-assert -----------------------------------------
+# ROOT CAUSE: synthetic input (pyautogui click/type/keys) lands in whatever
+# window is foreground, but the approval card briefly pulls foreground onto
+# Accuretta when the user clicks Approve — so the input lands on Accuretta, the
+# exact opposite of what the agent asked for. Input delivery and the approval
+# UI compete for one OS resource (foreground focus); this decouples them by
+# snapshotting the intended target BEFORE the card shows and re-asserting it
+# right before the input fires. The UIA tools (invoke/set_value/scroll) drive an
+# element handle directly and are immune, so only the raw-input trio needs this.
+_desktop_target_lock = threading.Lock()
+_desktop_target_window = None  # last intended raw-input target (pygetwindow Window)
+
+
+def _is_accuretta_window(title: str) -> bool:
+    """True for Accuretta's own main window / notch / browser tab (title starts
+    with 'Accuretta'), so we never re-aim synthetic input back onto ourselves."""
+    return str(title or "").strip().lower().startswith("accuretta")
+
+
+def _remember_desktop_target(w) -> None:
+    with _desktop_target_lock:
+        globals()["_desktop_target_window"] = w
+
+
+def _capture_desktop_target() -> None:
+    """Snapshot the foreground window before an approval card can steal focus."""
+    if not _HAVE_PGW:
+        return
+    try:
+        w = _pgw.getActiveWindow()
+    except Exception:
+        w = None
+    if w and not _is_accuretta_window(getattr(w, "title", "")):
+        _remember_desktop_target(w)
+
+
+def _reassert_desktop_target() -> None:
+    """Bring the captured target window back to the foreground right before
+    input synthesis, undoing any focus the approval card pulled to Accuretta."""
+    if not _HAVE_PGW:
+        return
+    with _desktop_target_lock:
+        w = globals().get("_desktop_target_window")
+    if not w:
+        return
+    try:
+        if getattr(w, "isMinimized", False):
+            w.restore()
+        w.activate()
+        time.sleep(0.06)  # let the window manager settle before typing/clicking
+    except Exception:
+        pass
+
+
 def tool_desktop_launch_app(args: dict) -> dict:
     """Launch an application. Only apps in the user's allowlist are permitted."""
     target = (args.get("name") or args.get("path") or "").strip()
@@ -14201,6 +14535,7 @@ def tool_desktop_focus_window(args: dict) -> dict:
         if getattr(w, "isMinimized", False):
             w.restore()
         w.activate()
+        _remember_desktop_target(w)   # this is now the intended input target
         return {"ok": True, "focused": w.title}
     except Exception as e:
         return {"error": str(e)}
@@ -14220,6 +14555,7 @@ def tool_desktop_click(args: dict) -> dict:
     clicks = int(args.get("clicks") or 1)
     if not (1 <= clicks <= 3):
         return {"error": "clicks must be 1..3"}
+    _capture_desktop_target()   # snapshot target before the approval card can steal focus
     gate_err = _gate_action(
         title=f"Click at ({x}, {y})",
         command=f"{button} click x{clicks} at ({x}, {y})",
@@ -14228,6 +14564,7 @@ def tool_desktop_click(args: dict) -> dict:
     )
     if gate_err:
         return gate_err
+    _reassert_desktop_target()  # re-aim at the intended window before the click fires
     try:
         pyautogui.click(x=x, y=y, clicks=clicks, button=button)
         return {"ok": True, "clicked": [x, y], "button": button, "clicks": clicks}
@@ -14243,6 +14580,7 @@ def tool_desktop_type_text(args: dict) -> dict:
     if len(text) > 2000:
         return {"error": "text too long (>2000 chars). Split into smaller chunks."}
     preview = text if len(text) <= 200 else (text[:200] + "…")
+    _capture_desktop_target()   # snapshot target before the approval card can steal focus
     gate_err = _gate_action(
         title="Type text (keyboard)",
         command=f"type: {preview}",
@@ -14251,6 +14589,7 @@ def tool_desktop_type_text(args: dict) -> dict:
     )
     if gate_err:
         return gate_err
+    _reassert_desktop_target()  # re-aim at the intended window before typing
     try:
         pyautogui.typewrite(text, interval=0.01)
         return {"ok": True, "typed_chars": len(text)}
@@ -14272,6 +14611,7 @@ def tool_desktop_press_keys(args: dict) -> dict:
     bad = [k for k in combo if k not in allowed and len(k) != 1]
     if bad:
         return {"error": f"unknown keys: {bad}. See pyautogui.KEYBOARD_KEYS."}
+    _capture_desktop_target()   # snapshot target before the approval card can steal focus
     gate_err = _gate_action(
         title="Press keys",
         command=f"hotkey: {'+'.join(combo)}",
@@ -14280,6 +14620,7 @@ def tool_desktop_press_keys(args: dict) -> dict:
     )
     if gate_err:
         return gate_err
+    _reassert_desktop_target()  # re-aim at the intended window before the keypress
     try:
         if len(combo) == 1:
             pyautogui.press(combo[0])
@@ -18926,6 +19267,578 @@ _RECON_SQL_ERRORS = [
 ]
 
 
+# ---- recon_map: attack-surface discovery -----------------------------------
+# A good surface map is what lets a WEAKER local model succeed: it stops the
+# model guessing where to attack and hands it a ready-to-act list. The quality
+# bar is the discovery itself — crucially, reading the site's JavaScript (where
+# modern apps hide their real API endpoints), not just following <a> links.
+
+# Links/resources in HTML. Captures href/src/action targets.
+_MAP_HREF_RE = re.compile(r"""(?:href|src|action)\s*=\s*["']([^"'<>\s]+)""", re.I)
+# <form ...> ... </form> blocks (non-greedy, DOTALL) to read method/action/fields.
+_MAP_FORM_RE = re.compile(r"<form\b([^>]*)>(.*?)</form>", re.I | re.S)
+_MAP_ATTR_RE = lambda name: re.compile(name + r"""\s*=\s*["']([^"']*)["']""", re.I)
+_MAP_ACTION_RE = _MAP_ATTR_RE("action")
+_MAP_METHOD_RE = _MAP_ATTR_RE("method")
+_MAP_FIELD_RE = re.compile(r"""<(?:input|select|textarea)\b[^>]*?\bname\s*=\s*["']([^"']+)["']""", re.I)
+# URL-ish string literals inside JavaScript (the SPA endpoint goldmine): an
+# absolute path or http(s) URL in quotes/backticks, optional query string.
+_MAP_JS_URL_RE = re.compile(
+    r"""["'`](https?://[^"'`\s]{3,300}|/[A-Za-z0-9_][A-Za-z0-9_./\-]{0,200}(?:\?[^"'`\s]{0,200})?)["'`]""")
+# Explicit client calls — fetch(...), axios.get(...), .ajax({url:...}), xhr.open('GET', ...).
+_MAP_JS_CALL_RE = re.compile(
+    r"""(?:fetch|axios(?:\.\w+)?|\.(?:get|post|put|delete|patch)|open|url)\s*(?:\(|:)\s*["'`]([^"'`]{2,300})["'`]""", re.I)
+# Links we never crawl: they log you out / destroy state, or are static assets
+# with no attack surface. Keeps the map lean and the crawl safe (read-only).
+_MAP_SKIP_RE = re.compile(
+    r"(?:logout|log-off|logoff|signout|sign-out|/delete|/remove|/destroy|/purge|"
+    r"\.(?:png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|css|map|pdf|zip|mp4|mp3|avif))(?:$|[?#])", re.I)
+# JS/JSON content worth mining for endpoints.
+_MAP_JS_CTYPE_RE = re.compile(r"(javascript|ecmascript|/json)", re.I)
+# Path segments that are really IDs — collapse them so /user/1 and /user/2 are
+# ONE thing to test, not thousands. Numeric, uuid, long hex, or date-ish.
+_MAP_ID_SEG_RE = re.compile(
+    r"^(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|"
+    r"[0-9a-f]{16,}|\d{4}-\d{2}-\d{2})$", re.I)
+# Path/param keywords that mark an endpoint as high-value to test first.
+_MAP_JUICY_RE = re.compile(
+    r"(api|admin|account|dashboard|user|login|auth|token|search|query|file|"
+    r"upload|download|report|export|id|redirect|url|path|cmd|exec|debug|graphql)", re.I)
+
+
+def _map_same_origin(url: str, origin: tuple) -> bool:
+    try:
+        u = urllib.parse.urlsplit(url)
+        return (u.scheme, u.hostname, u.port or (443 if u.scheme == "https" else 80)) == origin
+    except Exception:
+        return False
+
+
+def _map_abs(href: str, base: str) -> str:
+    """Absolute, fragment-stripped URL, or '' for non-http (mailto:, js:, data:)."""
+    try:
+        u = urllib.parse.urljoin(base, href.strip())
+        u = urllib.parse.urldefrag(u)[0]
+        return u if u.startswith(("http://", "https://")) else ""
+    except Exception:
+        return ""
+
+
+def _map_template(url: str) -> str:
+    """Collapse ID-like path segments to {id} so near-identical URLs dedupe."""
+    try:
+        u = urllib.parse.urlsplit(url)
+        segs = [("{id}" if _MAP_ID_SEG_RE.match(s) else s) for s in u.path.split("/")]
+        keys = "&".join(sorted(k for k, _ in urllib.parse.parse_qsl(u.query)))
+        return f"{u.scheme}://{u.netloc}{'/'.join(segs)}" + (f"?{keys}" if keys else "")
+    except Exception:
+        return url
+
+
+def _map_params(url: str) -> list:
+    try:
+        return [k for k, _ in urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query)]
+    except Exception:
+        return []
+
+
+def _map_path_id(url: str) -> bool:
+    """True when a path segment is an ID (/user/42, /orders/{uuid}). Those are
+    IDOR/BOLA targets even with no query string, so they belong on the map."""
+    try:
+        return any(_MAP_ID_SEG_RE.match(s) for s in urllib.parse.urlsplit(url).path.split("/"))
+    except Exception:
+        return False
+
+
+def _map_forms(body: str, page_url: str) -> list:
+    """Parse <form> blocks into {method, action(abs), fields:[names]}."""
+    out = []
+    for attrs, inner in _MAP_FORM_RE.findall(body or ""):
+        action = (_MAP_ACTION_RE.search(attrs) or [None, ""])[1] if _MAP_ACTION_RE.search(attrs) else ""
+        method = ((_MAP_METHOD_RE.search(attrs) or [None, "get"])[1] if _MAP_METHOD_RE.search(attrs) else "get").upper()
+        fields = sorted(set(_MAP_FIELD_RE.findall(inner)))
+        target = _map_abs(action, page_url) or page_url
+        if fields:
+            out.append({"method": "POST" if method == "POST" else "GET",
+                        "action": target, "fields": fields})
+    return out
+
+
+def _map_js_endpoints(js_text: str) -> set:
+    """Pull path/URL literals and explicit client-call targets out of JS/JSON."""
+    found = set()
+    for m in _MAP_JS_URL_RE.findall(js_text or ""):
+        found.add(m)
+    for m in _MAP_JS_CALL_RE.findall(js_text or ""):
+        if m.startswith(("http://", "https://", "/")):
+            found.add(m)
+    return found
+
+
+def _map_score(ep: dict) -> int:
+    """Higher = test first: parameters present, then juicy keywords, then POST."""
+    score = 0
+    score += 40 * min(len(ep.get("params") or []), 4)
+    if ep.get("path_id"):
+        score += 30
+    if _MAP_JUICY_RE.search(ep.get("url", "")):
+        score += 25
+    if ep.get("method") == "POST":
+        score += 10
+    if ep.get("source") == "js":
+        score += 5
+    return score
+
+
+# Common locations where apps publish an OpenAPI/Swagger spec or a GraphQL
+# endpoint — probed when the model doesn't hand us an explicit URL, so a weak
+# model just calls recon_map(url) and the spec-derived surface folds in for free.
+_MAP_SPEC_PATHS = ["/openapi.json", "/swagger.json", "/v3/api-docs", "/v2/api-docs",
+                   "/api-docs", "/swagger/v1/swagger.json", "/.well-known/openapi.json"]
+_MAP_GQL_PATHS = ["/graphql", "/api/graphql", "/v1/graphql", "/query"]
+_MAP_GQL_INTROSPECT = ("{__schema{queryType{fields{name args{name}}}"
+                       "mutationType{fields{name args{name}}}}}")
+
+
+def _map_post_json(url: str, payload: dict, timeout: float = 8.0, extra_headers: dict | None = None) -> dict:
+    """POST JSON with the same stealth headers, UA, rate-governance and jitter as
+    _recon_fetch (which is GET-only). Used for GraphQL introspection."""
+    gov = _rt_gov_admit(_rt_url_host(url), "POST", url=url)
+    if gov:
+        return {"error": gov}
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    hdrs = _rt_apply_mission_user_agent(_rt_stealth_headers())
+    hdrs["Content-Type"] = "application/json"
+    if extra_headers:
+        hdrs.update(extra_headers)
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
+    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+    _rt_jitter()
+    try:
+        resp = opener.open(req, timeout=timeout)
+        return {"status": resp.status, "body": resp.read(500_000).decode("utf-8", "replace")}
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read(500_000).decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        return {"status": e.code, "body": body}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _map_openapi(spec: dict, base: str) -> list:
+    """Turn an OpenAPI 3 / Swagger 2 spec into endpoint descriptors: concrete URL,
+    method, query params, whether it has a path param, and body field names."""
+    out = []
+    if not isinstance(spec, dict):
+        return out
+    paths = spec.get("paths") or {}
+    server = ""
+    servers = spec.get("servers")
+    if isinstance(servers, list) and servers and isinstance(servers[0], dict):
+        server = servers[0].get("url") or ""
+    elif spec.get("basePath"):
+        server = str(spec.get("basePath"))
+    root = urllib.parse.urljoin(base, server) if server else base
+    comp = ((spec.get("components") or {}).get("parameters")) or {}
+
+    def deref(p):
+        if isinstance(p, dict) and "$ref" in p:
+            return comp.get(str(p["$ref"]).split("/")[-1], {})
+        return p if isinstance(p, dict) else {}
+
+    for path, item in paths.items():
+        if not isinstance(item, dict):
+            continue
+        shared = [deref(p) for p in (item.get("parameters") or [])]
+        for method, op in item.items():
+            if str(method).lower() not in ("get", "post", "put", "delete", "patch"):
+                continue
+            op = op if isinstance(op, dict) else {}
+            params = shared + [deref(p) for p in (op.get("parameters") or [])]
+            qp = [p.get("name") for p in params if p.get("in") == "query" and p.get("name")]
+            has_path = any(p.get("in") == "path" for p in params) or ("{" in str(path))
+            body = []
+            rb = op.get("requestBody")
+            if isinstance(rb, dict):
+                for media in (rb.get("content") or {}).values():
+                    props = ((media or {}).get("schema") or {}).get("properties") or {}
+                    body += list(props.keys())
+            for p in params:
+                if p.get("in") in ("body", "formData"):
+                    props = (p.get("schema") or {}).get("properties") or {}
+                    body += list(props.keys()) or ([p["name"]] if p.get("name") else [])
+            url = root.rstrip("/") + "/" + str(path).lstrip("/")
+            if qp:
+                url += ("&" if "?" in url else "?") + "&".join(f"{n}=FUZZ" for n in qp)
+            out.append({"url": url, "method": str(method).upper(),
+                        "query": qp, "path_id": has_path, "body": sorted(set(body))})
+    return out
+
+
+def _map_graphql_introspect(url: str, timeout: float = 8.0, extra_headers: dict | None = None) -> list | None:
+    """Introspect a GraphQL endpoint → [{kind, name, args}] for queries+mutations."""
+    r = _map_post_json(url, {"query": _MAP_GQL_INTROSPECT}, timeout, extra_headers=extra_headers)
+    if r.get("error"):
+        return None
+    try:
+        schema = (json.loads(r.get("body") or "{}").get("data") or {}).get("__schema") or {}
+    except Exception:
+        return None
+    ops = []
+    for kind, key in (("query", "queryType"), ("mutation", "mutationType")):
+        for f in ((schema.get(key) or {}).get("fields") or []):
+            if isinstance(f, dict) and f.get("name"):
+                ops.append({"kind": kind, "name": f["name"],
+                            "args": [a.get("name") for a in (f.get("args") or []) if isinstance(a, dict) and a.get("name")]})
+    return ops or None
+
+
+def _map_fetch_openapi(base: str, timeout: float, extra_headers: dict | None = None) -> tuple:
+    """Probe common spec paths; return (spec_dict, url) for the first that parses."""
+    for p in _MAP_SPEC_PATHS:
+        u = urllib.parse.urljoin(base, p)
+        r = _recon_fetch(u, timeout=timeout, max_bytes=2_000_000, extra_headers=extra_headers)
+        if r.get("error") or r.get("status") != 200:
+            continue
+        try:
+            spec = json.loads(r.get("body") or "")
+        except Exception:
+            continue
+        if isinstance(spec, dict) and (spec.get("openapi") or spec.get("swagger") or spec.get("paths")):
+            return spec, u
+    return None, None
+
+
+def _map_find_graphql(base: str, timeout: float, extra_headers: dict | None = None) -> tuple:
+    for p in _MAP_GQL_PATHS:
+        u = urllib.parse.urljoin(base, p)
+        ops = _map_graphql_introspect(u, timeout, extra_headers=extra_headers)
+        if ops:
+            return ops, u
+    return None, None
+
+
+def _map_render(url: str, session: str, policy: dict, timeout: float) -> dict:
+    """Render a page with the scoped headless browser and harvest rendered links,
+    form-field names, and the endpoints the SPA actually CALLED (captured network
+    requests) — the surface a static crawler can't see. Reuses the given browser
+    session, so a login performed earlier in that rt_browser session carries over,
+    giving an authenticated map."""
+    nav = _RT_BROWSER_WORKER.call({"action": "navigate", "url": url, "session": session,
+                                   "policy": policy, "timeout": timeout})
+    if nav.get("error"):
+        return {"error": nav["error"]}
+    links, fields = set(), set()
+    for el in (nav.get("elements") or []):
+        if el.get("href"):
+            links.add(el["href"])
+        if el.get("name"):
+            fields.add(el["name"])
+    reqs = _RT_BROWSER_WORKER.call({"action": "requests", "session": session,
+                                    "policy": policy, "limit": 300})
+    api = set()
+    for ev in (reqs.get("events") or []):
+        if ev.get("blocked"):
+            continue
+        rtype = (ev.get("resource_type") or "").lower()
+        u = ev.get("url") or ""
+        if u and (rtype in ("xhr", "fetch") or "/api" in u or "?" in u):
+            api.add(u)
+    return {"links": links, "fields": fields, "api": api}
+
+
+def tool_recon_map(args: dict) -> dict:
+    """AUTHORIZED RECON. Map a web target's attack surface and return a ready-to-
+    act inventory of endpoints + parameters. Crawls same-origin HTML links,
+    parses <form> fields, AND mines linked JavaScript for API endpoints (where
+    modern single-page apps hide them — a link-only crawler misses these). Output
+    is built to collapse the model's next decision: `targets_for_batch_probe` is a
+    paste-ready list for batch_probe, and `next` names the obvious follow-up.
+    Read-only (GET only; never submits forms or follows logout/delete links).
+    Bounded and scope-enforced. Gated behind red_team_enabled."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    base = (args.get("url") or args.get("target") or "").strip()
+    if not base:
+        return {"error": "url (or target) required"}
+    base = _recon_prep_url(base)
+    try:
+        b = urllib.parse.urlsplit(base)
+        origin = (b.scheme, b.hostname, b.port or (443 if b.scheme == "https" else 80))
+    except Exception:
+        return {"error": f"could not parse url: {base}"}
+    same_origin = args.get("same_origin", True) is not False
+    max_pages = max(1, min(int(args.get("max_pages") or 40), 150))
+    max_depth = max(0, min(int(args.get("max_depth") or 3), 6))
+    max_js = max(0, min(int(args.get("max_js") or 15), 40))
+    timeout = max(2.0, min(float(args.get("timeout") or 6.0), 15.0))
+    # Authenticated reuse: send caller-supplied cookies/headers on every static
+    # fetch (and the GraphQL POST), so the map covers the behind-login surface.
+    extra = {}
+    if isinstance(args.get("headers"), dict):
+        extra.update({str(k): str(v) for k, v in args["headers"].items() if v is not None})
+    if args.get("cookies"):
+        extra["Cookie"] = str(args["cookies"])
+
+    seen_pages, seen_tmpl = set(), set()
+    endpoints, forms, js_files = {}, [], []
+    unreachable, needs_auth = [], []
+
+    def add_endpoint(url, method, source, extra_params=None, force_path_id=False, body=None):
+        tmpl = _map_template(url)
+        key = (method, tmpl)
+        params = sorted(set(_map_params(url)) | set(extra_params or []))
+        pid = _map_path_id(url) or force_path_id or ("{" in tmpl)
+        ep = endpoints.get(key)
+        if ep:
+            ep["params"] = sorted(set(ep["params"]) | set(params))
+            ep["path_id"] = ep.get("path_id") or pid
+            if body:
+                ep["body"] = sorted(set(ep.get("body") or []) | set(body))
+            ep["seen"] += 1
+        else:
+            endpoints[key] = {"url": url, "template": tmpl, "method": method,
+                              "params": params, "path_id": pid, "body": sorted(set(body or [])),
+                              "source": source, "seen": 1}
+
+    frontier = [(base, 0)]
+    js_queue = []
+    while frontier and len(seen_pages) < max_pages:
+        url, depth = frontier.pop(0)
+        tmpl = _map_template(url)
+        if tmpl in seen_tmpl:
+            continue
+        seen_tmpl.add(tmpl)
+        seen_pages.add(url)
+        r = _recon_fetch(url, timeout=timeout, max_bytes=300_000, extra_headers=extra)
+        if r.get("error"):
+            unreachable.append({"url": url, "error": str(r["error"])[:120]})
+            continue
+        status = r.get("status")
+        if status in (401, 403):
+            needs_auth.append({"url": url, "status": status})
+        ctype = (r.get("headers", {}) or {}).get("Content-Type", "")
+        body = r.get("body", "") or ""
+        # This page is itself an endpoint if it carries query params or a path ID.
+        if _map_params(url) or _map_path_id(url):
+            add_endpoint(url, "GET", "crawl")
+        # Mine linked JS even on a mostly-empty SPA shell.
+        for raw in _MAP_HREF_RE.findall(body):
+            absu = _map_abs(raw, url)
+            if not absu:
+                continue
+            if _MAP_SKIP_RE.search(absu):
+                if raw.lower().endswith(".js") and len(js_files) < max_js:
+                    pass  # .js matched the asset skip but we DO want scripts
+                else:
+                    continue
+            if absu.lower().split("?")[0].endswith(".js"):
+                if len(js_files) + len(js_queue) < max_js and absu not in js_queue:
+                    js_queue.append(absu)
+                continue
+            if same_origin and not _map_same_origin(absu, origin):
+                continue
+            if _MAP_SKIP_RE.search(absu):
+                continue
+            if _map_params(absu) or _map_path_id(absu):
+                add_endpoint(absu, "GET", "crawl")
+            nt = _map_template(absu)
+            if nt not in seen_tmpl and depth < max_depth and len(seen_pages) + len(frontier) < max_pages:
+                frontier.append((absu, depth + 1))
+        # Forms → endpoints (parse fields; NEVER submit them).
+        for f in _map_forms(body, url):
+            if same_origin and not _map_same_origin(f["action"], origin):
+                continue
+            forms.append(f)
+            qurl = f["action"] + ("?" if "?" not in f["action"] else "&") + "&".join(
+                f"{n}=FUZZ" for n in f["fields"])
+            add_endpoint(qurl if f["method"] == "GET" else f["action"], f["method"], "form")
+
+    # Mine the collected JavaScript bundles for hidden endpoints.
+    for js_url in js_queue[:max_js]:
+        r = _recon_fetch(js_url, timeout=timeout, max_bytes=800_000, extra_headers=extra)
+        if r.get("error"):
+            continue
+        js_files.append(js_url)
+        for ep_path in _map_js_endpoints(r.get("body", "")):
+            absu = _map_abs(ep_path, base)
+            if not absu or (same_origin and not _map_same_origin(absu, origin)):
+                continue
+            if _MAP_SKIP_RE.search(absu):
+                continue
+            add_endpoint(absu, "GET", "js")
+
+    # OpenAPI/Swagger: an explicit spec URL, else probe common locations. A spec
+    # hands over the WHOLE API surface at once — the biggest breadth win on APIs.
+    auto = args.get("auto_spec", True) is not False
+    spec, openapi_url, spec_count = None, (args.get("openapi_url") or "").strip(), 0
+    if openapi_url:
+        rr = _recon_fetch(_map_abs(openapi_url, base) or openapi_url, timeout=timeout, max_bytes=2_000_000, extra_headers=extra)
+        if not rr.get("error"):
+            try:
+                spec = json.loads(rr.get("body") or "")
+            except Exception:
+                spec = None
+    elif auto:
+        spec, openapi_url = _map_fetch_openapi(base, timeout, extra_headers=extra)
+    if isinstance(spec, dict):
+        for e in _map_openapi(spec, base):
+            if same_origin and not _map_same_origin(e["url"], origin):
+                continue
+            add_endpoint(e["url"], e["method"], "openapi",
+                         extra_params=e["query"], force_path_id=e["path_id"], body=e["body"])
+            spec_count += 1
+
+    # GraphQL: explicit endpoint, else probe. Each query/mutation + its args is
+    # testable surface; they share one POST endpoint, listed under graphql_operations.
+    graphql_ops, graphql_url = None, (args.get("graphql_url") or "").strip()
+    if graphql_url:
+        graphql_url = _map_abs(graphql_url, base) or graphql_url
+        graphql_ops = _map_graphql_introspect(graphql_url, timeout, extra_headers=extra)
+    elif auto:
+        graphql_ops, graphql_url = _map_find_graphql(base, timeout, extra_headers=extra)
+    if graphql_ops:
+        add_endpoint(graphql_url, "POST", "graphql",
+                     extra_params=sorted({a for op in graphql_ops for a in op["args"]}))
+
+    # Headless rendering (opt-in, render=true): a static crawl can't see links a
+    # JS framework injects or the API calls an SPA makes at runtime. Drive the
+    # scoped headless browser to render the base + top crawled pages and harvest
+    # both. Reuses `session` so a login done earlier in that rt_browser session
+    # carries over. Strictly defensive — any failure just falls back to static.
+    rendered, render_note = 0, None
+    if args.get("render"):
+        if not _HAVE_PLAYWRIGHT:
+            render_note = "render=true but Playwright isn't installed; mapped statically only."
+        else:
+            policy = _rt_browser_policy(_rt_context_chat())
+            if not policy:
+                render_note = "render=true but no active browser mission policy; mapped statically only."
+            else:
+                rsession = str(args.get("session") or "recon_map")
+                budget = max(1, min(int(args.get("render_pages") or 4), 12))
+                render_urls = [base] + [u for u in seen_pages if u != base]
+                for ru in render_urls[:budget]:
+                    rr = _map_render(ru, rsession, policy, min(timeout * 3, 30.0))
+                    if rr.get("error"):
+                        render_note = "rendering hit an error on at least one page; partial render."
+                        continue
+                    rendered += 1
+                    for cand in (rr["links"] | rr["api"]):
+                        absu = _map_abs(cand, base)
+                        if not absu or (same_origin and not _map_same_origin(absu, origin)):
+                            continue
+                        if _MAP_SKIP_RE.search(absu):
+                            continue
+                        if _map_params(absu) or _map_path_id(absu) or "/api" in absu:
+                            add_endpoint(absu, "GET", "render")
+
+    eps = sorted(endpoints.values(), key=_map_score, reverse=True)
+    for ep in eps:
+        ep.pop("seen", None)
+        if not ep.get("body"):
+            ep.pop("body", None)
+    param_names = sorted({p for ep in eps for p in ep["params"]})
+    batch_targets = [ep["url"] for ep in eps if ep["method"] == "GET" and ep["params"]][:40]
+    post_eps = [ep["url"] for ep in eps if ep["method"] == "POST"][:20]
+    idor_candidates = [ep["template"] for ep in eps if ep.get("path_id")][:20]
+
+    # Optional coverage seeding (seed_coverage=true): record each discovered
+    # endpoint as an 'untested' row in security_coverage, so the engagement (and
+    # the final report) shows the WHOLE surface vs. what's actually been tested —
+    # the model can't silently forget an endpoint it never got to.
+    seeded = 0
+    if args.get("seed_coverage"):
+        try:
+            cid = _current_chat_id.get() or _get_current_chat()
+            chats = get_chats()
+            chat = chats.get("chats", {}).get(cid, {}) if cid else {}
+            mid = str((_rt_mission_get(_rt_context_chat() or {}) or {}).get("authorization_id") or "")
+            plans = list(chat.get("security_coverage") or [])
+            have = {(p.get("mission_id"), p.get("feature"), p.get("target")) for p in plans}
+            identity = str(args.get("identity") or ("authenticated" if (extra or args.get("render")) else "unauthenticated"))
+            for ep in eps[:40]:
+                feature = f"{ep['method']} {ep['template']}"[:240]
+                key = (mid, feature, ep["url"])
+                if key in have:
+                    continue
+                plans.append({"mission_id": mid, "feature": feature, "identity": identity[:120],
+                              "target": ep["url"][:2000], "state": "untested", "evidence_ids": [],
+                              "limitations": "surface-mapped by recon_map; not yet tested"})
+                have.add(key)
+                seeded += 1
+            if seeded and cid:
+                chat["security_coverage"] = plans
+                chats.setdefault("chats", {})[cid] = chat
+                save_json(CHATS_FILE, chats)
+        except Exception as exc:
+            render_note = ((render_note + " ") if render_note else "") + f"coverage seeding skipped: {exc}"
+
+    # The `next` line exists to collapse a weak model's planning into one call.
+    if batch_targets:
+        nxt = ("Run batch_probe({targets: <targets_for_batch_probe>, probe: 'sqli'}) "
+               "then repeat with 'xss','ssti','lfi'. For each hit, confirm with sql_injection "
+               "or http_request and record_finding.")
+    elif post_eps:
+        nxt = ("No GET-parameter endpoints found; test the POST endpoints with http_request "
+               "(send each form's fields as the body) and watch for injection/auth flaws.")
+    else:
+        nxt = ("No parameterized endpoints surfaced. Try recon_content_discovery for hidden "
+               "paths, or re-run with an authenticated session / higher max_pages.")
+    if idor_candidates:
+        nxt += (" Also test IDOR/BOLA on idor_candidates: with http_request, swap the id for "
+                "another account's and compare the response under each identity.")
+    if graphql_ops:
+        nxt += (f" GraphQL is live at {graphql_url} ({len(graphql_ops)} operations in "
+                "graphql_operations): test each with http_request (POST a query naming its "
+                "args), and try alias/batching abuse and field-level authz.")
+
+    notes = []
+    if spec_count:
+        notes.append(f"Ingested {spec_count} endpoints from an OpenAPI/Swagger spec at {openapi_url}.")
+    if rendered:
+        notes.append(f"Rendered {rendered} page(s) with the headless browser (JS-injected links + runtime API calls).")
+    if render_note:
+        notes.append(render_note)
+    if seeded:
+        notes.append(f"Seeded {seeded} endpoint(s) into security_coverage as 'untested'.")
+    if needs_auth:
+        notes.append(f"{len(needs_auth)} page(s) returned 401/403 — map behind login by supplying a session.")
+    if unreachable:
+        notes.append(f"{len(unreachable)} page(s) were unreachable.")
+    if len(seen_pages) >= max_pages:
+        notes.append(f"Hit the {max_pages}-page crawl budget; raise max_pages to go deeper.")
+    if not js_files and max_js:
+        notes.append("No JavaScript bundles were found/linked; a rendered SPA may hide its endpoints behind JS the crawler couldn't reach.")
+
+    return {
+        "target": base,
+        "endpoints": eps[:120],
+        "param_names": param_names,
+        "targets_for_batch_probe": batch_targets,
+        "post_endpoints": post_eps,
+        "idor_candidates": idor_candidates,
+        "forms": forms[:40],
+        "graphql_endpoint": graphql_url if graphql_ops else None,
+        "graphql_operations": (graphql_ops or [])[:80],
+        "openapi_spec_url": openapi_url if spec_count else None,
+        "stats": {"pages_crawled": len(seen_pages), "js_mined": len(js_files),
+                  "endpoints": len(eps), "params": len(param_names),
+                  "from_openapi": spec_count, "graphql_ops": len(graphql_ops or []),
+                  "rendered_pages": rendered, "coverage_seeded": seeded,
+                  "authenticated": bool(extra or rendered),
+                  "needs_auth": len(needs_auth), "unreachable": len(unreachable)},
+        "coverage_gaps": notes,
+        "next": nxt,
+    }
+
+
 def tool_recon_injection_probe(args: dict) -> dict:
     """AUTHORIZED RECON. Non-destructive injection detection on URL query
     parameters: reflected XSS (marker reflected unencoded) and error-based SQLi
@@ -22412,6 +23325,32 @@ TOOLS: dict[str, dict] = {
         },
         "fn": tool_recon_content_discovery,
     },
+    "recon_map": {
+        "description": "AUTHORIZED RECON. Map a web target's ATTACK SURFACE and return a ready-to-act inventory: every endpoint + its parameters, from (1) crawling same-origin links, (2) parsing <form> fields, (3) mining linked JavaScript for API endpoints (where SPAs hide them), (4) ingesting an OpenAPI/Swagger spec, (5) GraphQL introspection (4+5 auto-discovered at common paths), and (6) optional headless-browser rendering (render=true) to catch JS-injected links and the API calls an SPA makes at runtime. Pass `cookies`/`headers` (or reuse an authenticated rt_browser `session` for rendering) to map the behind-login surface. IDs are collapsed (/user/1,2,3 → one), endpoints ranked by attack value; result includes `targets_for_batch_probe` (paste into batch_probe), `idor_candidates`, `graphql_operations`, and a `next` step. seed_coverage=true records the surface into security_coverage as 'untested'. Read-only: GET only, never submits forms or follows logout/delete links. Bounded + scope-enforced. Use this FIRST so you stop guessing what to test.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Base URL or host to map."},
+                "openapi_url": {"type": "string", "description": "Explicit OpenAPI/Swagger spec URL. Omit to auto-probe common locations."},
+                "graphql_url": {"type": "string", "description": "Explicit GraphQL endpoint to introspect. Omit to auto-probe common locations."},
+                "auto_spec": {"type": "boolean", "description": "Auto-discover an OpenAPI spec + GraphQL endpoint during the map (default true)."},
+                "max_pages": {"type": "integer", "description": "Crawl budget (default 40, max 150)."},
+                "max_depth": {"type": "integer", "description": "Link depth from the base (default 3, max 6)."},
+                "max_js": {"type": "integer", "description": "JavaScript bundles to mine for endpoints (default 15, max 40)."},
+                "same_origin": {"type": "boolean", "description": "Stay on the target's origin (default true)."},
+                "cookies": {"type": "string", "description": "Cookie header to send on every request (map the behind-login surface), e.g. 'session=abc; csrf=xyz'."},
+                "headers": {"type": "object", "description": "Extra request headers (e.g. an Authorization bearer token)."},
+                "render": {"type": "boolean", "description": "Also render pages with the headless browser to catch JS-injected links and the API calls an SPA makes at runtime. Reuses `session` so an earlier login carries over. Slower."},
+                "render_pages": {"type": "integer", "description": "How many pages to render when render=true (default 4, max 12)."},
+                "session": {"type": "string", "description": "rt_browser session name to reuse for rendering (default 'recon_map'); point it at a session where you already logged in for an authenticated map."},
+                "seed_coverage": {"type": "boolean", "description": "Record each discovered endpoint as an 'untested' row in security_coverage so the report shows the whole surface vs. what was tested."},
+                "identity": {"type": "string", "description": "Label for seeded coverage rows (e.g. 'admin', 'user A'). Default inferred from whether auth was supplied."},
+                "timeout": {"type": "number", "description": "Per-request timeout in seconds (default 6)."}
+            },
+            "required": ["url"],
+        },
+        "fn": tool_recon_map,
+    },
     "recon_check_exposure": {
         "description": "AUTHORIZED RECON. Validated checks for high-signal exposures (VCS dirs, config/secret files, phpinfo, actuator, dir listing, security.txt), content-checked and baseline-diffed. check_s3=true also probes public S3 buckets (third-party AWS; approval-gated).",
         "parameters": {
@@ -24227,6 +25166,8 @@ _RT_RECON_TOOL_NAMES = {
     "recon_port_scan", "recon_content_discovery", "recon_check_exposure",
     "recon_subdomain_takeover", "recon_cve_match", "recon_injection_probe",
     "recon_open_services", "recon_capture_evidence",
+    # attack-surface mapper: crawl + JS endpoint mining -> ready-to-act inventory.
+    "recon_map",
     # sandbox-backed scanners (guest does the noisy work) + report builder.
     "sandbox_nmap", "sandbox_sqlmap", "rt_generate_report",
     # Token encoder/decoder (Burp Decoder equivalent) — inspect/forge a token
@@ -25332,10 +26273,27 @@ def tools_for_llama(include_exploit: bool = True, chat_id: str | None = None) ->
             "function": {
                 "name": name,
                 "description": t["description"],
-                "parameters": t["parameters"],
+                "parameters": _wire_tool_parameters(t["parameters"]),
             },
         })
     return out
+
+
+# Top-level schema combinators break llama.cpp's tool-call parser: with
+# `anyOf: [{required:[content]}, {required:[source]}]` on write_file, the
+# server's grammar/PEG parser can no longer match any <parameter=...> block, so
+# every call comes back as `write_file` with `arguments: {}` (reproduced on
+# b11480 with a Qwen3.x 27B; removing only the anyOf restores full args). The
+# model then sees a wall of empty calls in its history and imitates them for
+# other tools too. Keep the combinators in TOOLS — _missing_required_tool_args
+# still enforces them bridge-side — but never ship them on the wire.
+_WIRE_SCHEMA_COMBINATORS = ("anyOf", "oneOf", "allOf", "not")
+
+
+def _wire_tool_parameters(params: dict) -> dict:
+    if not isinstance(params, dict) or not any(k in params for k in _WIRE_SCHEMA_COMBINATORS):
+        return params
+    return {k: v for k, v in params.items() if k not in _WIRE_SCHEMA_COMBINATORS}
 
 
 
@@ -25740,7 +26698,15 @@ _tool_family_history: dict[str, dict[str, int]] = {}   # chat_id -> family -> co
 # independent loop-breaker streaks, but the model ping-pongs between them on the
 # same URL to dodge per-tool limits. Track fetches at the URL level across all
 # fetch-like tools so the combined count trips the breaker.
-_tool_url_history: dict[str, dict[str, int]] = {}      # chat_id -> url_key -> count
+_tool_url_history: dict[str, dict[str, dict]] = {}     # chat_id -> url_key -> {count, fp}
+# Turn-level forward-progress counter. ROOT CAUSE of the old false positives: the
+# breaker measured call REPETITION, but a loop is the ABSENCE of progress. This
+# ticks whenever any call tries a new signature or returns a changed result, and
+# every signature records the tick it last ran at. The streak breaker fires only
+# when a signature keeps returning the SAME result AND nothing else moved in
+# between — so a repeated read sandwiched between calls that are genuinely
+# advancing the task (the grep-A / probe / grep-A pattern) is no longer blocked.
+_tool_progress: dict[str, int] = {}                    # chat_id -> monotonic progress ticks
 _FETCH_LIKE_TOOLS = frozenset({"web_fetch", "http_request"})
 TOOL_REPEAT_LIMIT = 3       # 4th SAME-RESULT call in a row gets refused.
 TOOL_REPEAT_HARD_LIMIT = 20  # absolute backstop for wobbly-output tools (below max_tool_rounds).
@@ -25770,6 +26736,7 @@ def _reset_tool_call_history(chat_id: str) -> None:
         _tool_write_history[chat_id] = {}
         _tool_url_history[chat_id] = {}
         _tool_family_history[chat_id] = {}
+        _tool_progress[chat_id] = 0
 
 
 def _reserve_tool_family_call(canon: str) -> int:
@@ -25800,6 +26767,21 @@ _WRITE_CAPABLE_TOOLS = frozenset(
     {"write_file", "edit_file", "delete_file", "replace_ast_node",
      "remote_write_file", "remote_file_begin",
      "save_skill"})
+
+
+# Idempotent reads: host-target tools that neither mutate state nor leave the
+# machine. Re-running them on unchanged inputs is EXPECTED, not a loop, so when
+# the streak breaker trips for one of these the turn gets the cached result back
+# as a warning instead of a hard refusal — it keeps its data. Derived from the
+# existing read/write/egress classifications (not a hand-kept list) so a new tool
+# is categorised automatically by which set it already belongs to.
+_STATE_CHANGING_OR_EGRESS_TOOLS = (
+    _WRITE_CAPABLE_TOOLS | _FETCH_LIKE_TOOLS | _REMOTE_TOOL_NAMES
+    | _RED_TEAM_TOOL_NAMES | _DESKTOP_TOOL_NAMES
+    | {"run_powershell", "run_tests", "open_program", "delete_file",
+       "extract_archive", "switch_execution_target"})
+_IDEMPOTENT_READ_TOOLS = frozenset(
+    _HOST_TARGET_TOOL_NAMES - _STATE_CHANGING_OR_EGRESS_TOOLS)
 
 
 def _verification_key(path: Any) -> str:
@@ -26062,11 +27044,22 @@ def _tool_call_sig(canon: str, args: dict) -> str:
     return canon + ":" + json.dumps(args or {}, sort_keys=True, default=str)
 
 
-def _tool_repeat_state(sig: str) -> tuple[int, int]:
-    """(consecutive same-result streak, absolute total) for this signature."""
+def _tool_repeat_state(sig: str):
+    """(streak, total, progress_at, last_result) for this signature. progress_at
+    is the turn progress tick when it last ran; comparing it to the current tick
+    tells the breaker whether anything else moved since. last_result is a capped
+    cache so a refusal can still hand the turn the data it already has."""
     with _tool_history_lock:
         rec = _tool_call_history.get(_get_current_chat(), {}).get(sig)
-        return (rec.get("streak", 0), rec.get("total", 0)) if rec else (0, 0)
+        if not rec:
+            return (0, 0, 0, None)
+        return (rec.get("streak", 0), rec.get("total", 0),
+                rec.get("progress_at", 0), rec.get("last_result"))
+
+
+def _current_turn_progress() -> int:
+    with _tool_history_lock:
+        return _tool_progress.get(_get_current_chat(), 0)
 
 
 def _record_tool_result(sig: str, result) -> None:
@@ -26077,21 +27070,36 @@ def _record_tool_result(sig: str, result) -> None:
     returns the SAME result over and over grows the streak toward the limit. This
     is what lets a model legitimately re-read a file it just edited or re-run a
     check after a fix without being falsely blocked. `total` is a high absolute
-    backstop for tools whose output wobbles every call (timestamps, ids)."""
+    backstop for tools whose output wobbles every call (timestamps, ids).
+
+    Also maintains the turn progress counter — a new signature or a changed
+    result is forward motion that forgives OTHER signatures' streaks — and caches
+    a capped copy of the result so a loop-breaker refusal can still return data."""
     try:
         fp = hash(json.dumps(result, sort_keys=True, default=str)[:200000])
     except Exception:
         fp = None
+    try:
+        cached = json.dumps(result, ensure_ascii=False, default=str)[:4000]
+    except Exception:
+        cached = None
     cid = _get_current_chat()
     with _tool_history_lock:
         history = _tool_call_history.setdefault(cid, {})
-        rec = history.get(sig) or {"streak": 0, "total": 0, "fp": None}
+        existing = history.get(sig)
+        rec = existing or {"streak": 0, "total": 0, "fp": None,
+                           "progress_at": 0, "last_result": None}
         rec["total"] += 1
-        if fp is not None and rec.get("fp") == fp:
-            rec["streak"] += 1
-        else:
+        result_changed = fp is not None and rec.get("fp") != fp
+        if existing is None or result_changed:
             rec["streak"] = 1
             rec["fp"] = fp
+            # A new action, or state that actually moved: forward progress.
+            _tool_progress[cid] = _tool_progress.get(cid, 0) + 1
+        else:
+            rec["streak"] += 1
+        rec["progress_at"] = _tool_progress.get(cid, 0)
+        rec["last_result"] = cached
         history[sig] = rec
 
 
@@ -26112,27 +27120,48 @@ def _fetch_url_key(args: dict) -> str:
         return raw[:200]
 
 
-def _record_url_fetch(canon: str, args: dict) -> None:
-    """Increment the cross-tool URL counter for fetch-like tools."""
+def _record_url_fetch(canon: str, args: dict, result=None) -> None:
+    """Track cross-tool URL hits, but only count CONSECUTIVE identical responses.
+    Replaying the same endpoint with a flipped cookie, a new payload, or a
+    different body is core exploitation work — when the response changes, that's
+    progress, so the counter resets. It climbs only when the same URL keeps
+    returning the SAME content via web_fetch/http_request (the ping-pong-to-dodge
+    -per-tool-limits pattern the breaker actually exists to stop)."""
     if canon not in _FETCH_LIKE_TOOLS:
         return
     key = _fetch_url_key(args)
     if not key:
         return
+    try:
+        fp = hash(json.dumps(result, sort_keys=True, default=str)[:200000]) if result is not None else None
+    except Exception:
+        fp = None
     cid = _get_current_chat()
     with _tool_history_lock:
         urls = _tool_url_history.setdefault(cid, {})
-        urls[key] = urls.get(key, 0) + 1
+        rec = urls.get(key)
+        if isinstance(rec, int):            # migrate any legacy int shape
+            rec = {"count": rec, "fp": None}
+        rec = rec or {"count": 0, "fp": None}
+        if fp is not None and rec.get("fp") == fp:
+            rec["count"] += 1               # same response again — no new info
+        else:
+            rec["count"] = 1                # response changed (progress) — reset
+            rec["fp"] = fp
+        urls[key] = rec
 
 
 def _url_fetch_count(args: dict) -> int:
-    """Return how many times ANY fetch-like tool has hit this URL this turn."""
+    """How many times this URL has returned the SAME content this turn."""
     key = _fetch_url_key(args)
     if not key:
         return 0
     cid = _get_current_chat()
     with _tool_history_lock:
-        return _tool_url_history.get(cid, {}).get(key, 0)
+        rec = _tool_url_history.get(cid, {}).get(key)
+        if isinstance(rec, int):
+            return rec
+        return int((rec or {}).get("count", 0))
 
 
 def _missing_required_tool_args(name: str, args: Any) -> list[str]:
@@ -26334,16 +27363,18 @@ def invoke_tool(name: str, args: dict) -> dict:
         _url_hits = _url_fetch_count(args or {})
         if _url_hits >= URL_CROSS_TOOL_LIMIT:
             _url_key = _fetch_url_key(args or {})
+            _, _, _, _url_cached = _tool_repeat_state(_tool_call_sig(canon, args or {}))
             return _finish({
                 "error": (
-                    f"refused: the URL {_url_key} has already been fetched "
+                    f"refused: the URL {_url_key} has returned the SAME content "
                     f"{_url_hits} times this turn via web_fetch/http_request. "
                     f"Switching between fetch tools on the same URL does not "
                     f"help \u2014 the page content is the same. Try a DIFFERENT "
                     f"approach: use a different tool (e.g. recon_content_discovery, "
-                    f"sql_injection, fuzz), change the URL path, or report what "
-                    f"you found so far."
+                    f"sql_injection, fuzz), change the URL path or the request "
+                    f"(payload/cookie, which resets this), or report what you found."
                 ),
+                "cached_result": _url_cached,
                 "repeat_count": _url_hits,
                 "tool": canon,
                 "loop_breaker": True,
@@ -26358,17 +27389,41 @@ def invoke_tool(name: str, args: dict) -> dict:
     # tools whose output wobbles every call. Session tools poll live state and are
     # fully exempt.
     sig = _tool_call_sig(canon, args or {})
-    streak, total = _tool_repeat_state(sig)
-    if not canon.startswith("session_") and (streak >= TOOL_REPEAT_LIMIT or total >= TOOL_REPEAT_HARD_LIMIT):
+    streak, total, progress_at, cached = _tool_repeat_state(sig)
+    # A loop is the ABSENCE of progress. If anything else moved the task forward
+    # since this signature last ran, it is not spinning \u2014 forgive the streak. Only
+    # the absolute backstop (wobbly-output tools hammered past the hard limit)
+    # survives that forgiveness.
+    progressed_since = _current_turn_progress() > progress_at
+    stuck_streak = streak >= TOOL_REPEAT_LIMIT and not progressed_since
+    hard_backstop = total >= TOOL_REPEAT_HARD_LIMIT
+    if not canon.startswith("session_") and (stuck_streak or hard_backstop):
         n = max(streak, total)
-        stuck = streak >= TOOL_REPEAT_LIMIT
+        # Idempotent reads: re-reading unchanged state is expected, not a loop \u2014
+        # hand back the cached result as a warning (unless even the hard backstop
+        # tripped) so the turn keeps its data instead of ending on an error.
+        if (canon in _IDEMPOTENT_READ_TOOLS and not hard_backstop
+                and cached is not None):
+            # NOT a loop_breaker: this returns the data, so it must stay out of the
+            # refused / loop_blocked accounting that keys on a truthy loop_breaker.
+            return _finish({
+                "_repeat_warning": (
+                    f"{canon} returned the same result {n}\u00d7 this turn with the same "
+                    f"arguments. Returning the cached result \u2014 don't call it again "
+                    f"unchanged; change the arguments or move on."
+                ),
+                "cached_result": cached,
+                "repeat_count": n,
+                "tool": canon,
+                "repeat_softened": True,
+            })
         suggestions = []
         if canon == "read_file":
             suggestions.append("for large files, use `offset` to read the next chunk (see the `hint` field in the truncated response)")
         if canon == "list_directory":
             suggestions.append("if you need a deeper level, pass the subdirectory as `path`")
         suggestion_blob = (". " + "; ".join(suggestions)) if suggestions else ""
-        reason = ("returned the SAME result" if stuck else "been called")
+        reason = ("returned the SAME result" if stuck_streak else "been called")
         return _finish({
             "error": (
                 f"refused: {canon} has {reason} {n} times this turn with the SAME "
@@ -26377,6 +27432,9 @@ def invoke_tool(name: str, args: dict) -> dict:
                 f"(edit the file, apply the fix, then re-check), or end the turn and "
                 f"tell the user what you found so far."
             ),
+            # The data from the last identical call, so the turn can still answer
+            # instead of dying on the refusal.
+            "cached_result": cached,
             "repeat_count": n,
             "tool": canon,
             "loop_breaker": True,
@@ -26401,7 +27459,7 @@ def invoke_tool(name: str, args: dict) -> dict:
         traceback.print_exc()
         result = {"error": str(e)}
     _record_tool_result(sig, result)
-    _record_url_fetch(canon, args or {})
+    _record_url_fetch(canon, args or {}, result)
     return _finish(result)
 
 
@@ -33565,6 +34623,15 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/chat/note":
             result = _chat_note(str(body.get("chat_id") or ""), str(body.get("text") or ""))
             return self._send_json(200 if result.get("ok") else 400, result)
+        if p == "/api/chat/goal":
+            # Toggle the /goal hands-free latch for a chat without a turn. The
+            # composer calls this for a bare "/goal" / "/goal off" and for the
+            # chip's click-to-disable; the state is persisted and broadcast.
+            cid = str(body.get("chat_id") or "").strip()[:64]
+            if not cid:
+                return self._send_json(400, {"error": "chat_id required"})
+            active = _apply_goal_latch(cid, body.get("active") is True)
+            return self._send_json(200, {"ok": True, "goal_mode": active})
         if p == "/api/ui/presence":
             # Notification-routing heartbeat: {id: tab id, focused: bool}.
             # Bridge-client.js supplies the auth header; the payload is tiny
@@ -34507,6 +35574,9 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_chat(self, body: dict):
         chat_id = body.get("chat_id") or uuid.uuid4().hex[:12]
         user_text = (body.get("message") or "").strip()
+        # /goal latch command: strip it from the task text so the model sees a
+        # clean instruction. goal_action is "on" | "off" | None.
+        user_text, goal_action = _parse_goal_command(user_text)
         raw_mode = str(body.get("mode") or "agent").strip().lower()
         if raw_mode not in {"auto", "ide", "agent", "research"}:
             return self._send_json(400, {"error": "invalid chat mode"})
@@ -34546,6 +35616,15 @@ class Handler(BaseHTTPRequestHandler):
         _client_context_by_chat[chat_id] = client_ctx
         if client_ctx.get("execution_target") != "host":
             _unlock_bundle(chat_id, "remote")
+        # Bare "/goal" (or "/goal off") with no task: a latch toggle, not a
+        # turn. Flip the hands-free latch and acknowledge over plain JSON — no
+        # model call, no chat bubble. "/goal <task>" falls through and runs.
+        if goal_action and not user_text and not images and not regenerate:
+            active = _apply_goal_latch(chat_id, goal_action == "on")
+            return self._send_json(200, {"ok": True, "goal_mode": active,
+                "message": ("Goal mode on — this chat runs hands-free. Deletions and destructive actions still ask."
+                            if active else
+                            "Goal mode off — back to your standing permission mode.")})
         if not user_text and not images and not regenerate:
             return self._send_json(400, {"error": "empty message"})
         mission_panel = body.get("mission")
@@ -34682,6 +35761,18 @@ class Handler(BaseHTTPRequestHandler):
         chat["updated"] = int(time.time())
         save_json(CHATS_FILE, chats)
 
+        # /goal latch: apply an explicit on/off carried by this message,
+        # otherwise rehydrate the persisted latch so a follow-up turn WITHOUT
+        # /goal still runs hands-free until the user turns it off. The latch
+        # stays on across turns ("full auto until it's done").
+        if goal_action == "on":
+            _apply_goal_latch(chat_id, True)
+        elif goal_action == "off":
+            _apply_goal_latch(chat_id, False)
+        elif chat.get("goal_mode"):
+            _set_goal_mode(chat_id, True)
+        goal_active_now = _chat_in_goal_mode(chat_id)
+
         # Explicit requests to operate a desktop app should expose the semantic
         # tools immediately. Requiring a small local model to discover and load
         # the bundle first wastes a round and often sends it toward PowerShell.
@@ -34806,6 +35897,19 @@ class Handler(BaseHTTPRequestHandler):
                 "\n\nWhen you fix a bug, settle a design decision, or the user states a constraint, "
                 "call pin_note to lock it in for this session so you never undo it or repeat the mistake."
             )
+        # /goal hands-free run: tell the model to carry the task to completion
+        # without pausing for confirmation. Approvals auto-pass for everything
+        # except deletions/destructive actions (still gated by the bridge), so
+        # the model should not ask permission for ordinary steps — just do them.
+        if goal_active_now:
+            system_prompt += (
+                "\n\nGOAL MODE (hands-free): the user launched this task with /goal and wants it carried "
+                "to completion autonomously. Do not stop to ask whether you may proceed with ordinary "
+                "steps (reading, writing files, running commands, running tests) — just do them and keep "
+                "going until the whole task is finished. The system auto-approves non-destructive actions; "
+                "deletions and destructive actions still require the user, so when one is truly needed, do "
+                "it via the proper tool (the user will be asked) and continue. Report only when done or genuinely blocked."
+            )
         # Text-tools mode (Gemma): llama-server won't emit structured tool_calls
         # for this model, so pin the exact shape we CAN parse. One call, python
         # form, inside a tool_code fence — and never claim a tool ran unless a
@@ -34886,6 +35990,14 @@ class Handler(BaseHTTPRequestHandler):
             broadcast_event(evt)
 
         emit({"type": "chat_start", "chat_id": chat_id})
+        # /goal latch: reflect the hands-free state on every surface for this
+        # turn. The latch persists across turns (see _apply_goal_latch); it is
+        # NOT cleared when the turn ends — only "/goal off" or the chip does
+        # that. Announce once when this message turned it on.
+        emit({"type": "goal_mode", "active": goal_active_now})
+        if goal_action == "on":
+            emit({"type": "notice", "note":
+                  "Goal mode on — running this chat hands-free. Deletions and destructive actions still ask."})
         if research_id:
             emit({"type": "research_update", "research": _research_store.get(research_id, chat_id)})
         if _pre_turn_compaction_failed:

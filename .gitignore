@@ -36,6 +36,7 @@ modelfiles/
 .DS_Store
 Thumbs.db
 desktop.ini
+start.lnk
 
 # build / logs
 *.log

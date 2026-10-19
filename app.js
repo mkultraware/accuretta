@@ -3981,6 +3981,8 @@
       state.activeSkill = { name: chat.active_skill, budget: chat.active_skill_budget || 0, body_chars: 0 };
     }
     renderSkillPill();
+    // Reflect this chat's /goal latch on the Access chip (persisted per chat).
+    setGoalModeUI(!!(chat && chat.goal_mode));
     
     // Scan past messages to populate the image-to-source map
     state.imageUrlToSourceMap.clear();
@@ -5658,6 +5660,45 @@
            prompt: 'Continue the saved research and prepare the presentation from the collected evidence.' });
   });
 
+  // /goal hands-free latch — reflect its state on the Access chip and play a
+  // one-shot activation flourish on the composer. The chip reads "Goal" and
+  // pulses while on; turning off restores the standing permission-mode label.
+  // The flourish fires only on the off→on transition (not on every turn's
+  // goal_mode echo), unless `flourish` is forced.
+  function setGoalModeUI(active, { flourish = false } = {}) {
+    const on = !!active;
+    const was = !!state.goalMode;
+    document.body.classList.toggle("goal-mode-active", on);
+    const permsBtn = document.querySelector("#btn-perms");
+    if (permsBtn) {
+      const lbl = permsBtn.querySelector(".perms-chip-label");
+      if (on) {
+        if (!permsBtn.dataset.goal && lbl) permsBtn._goalPrevLabel = lbl.textContent;
+        permsBtn.dataset.goal = "1";
+        if (lbl) lbl.textContent = "Goal";
+        permsBtn.classList.add("on");
+        permsBtn.title = "Goal mode — this chat runs hands-free. Click to turn off. Deletions and destructive actions still ask.";
+      } else if (permsBtn.dataset.goal) {
+        delete permsBtn.dataset.goal;
+        if (lbl && permsBtn._goalPrevLabel != null) lbl.textContent = permsBtn._goalPrevLabel;
+        const mode = (state.settings && state.settings.approval_mode) ||
+          ((state.settings && state.settings.auto_approve_write) ? "medium" : "hard");
+        permsBtn.classList.toggle("on", mode !== "hard");
+        permsBtn.title = "Permissions · " + (mode.charAt(0).toUpperCase() + mode.slice(1));
+      }
+    }
+    if (on && (!was || flourish)) {
+      const comp = document.querySelector(".composer");
+      if (comp) {
+        comp.classList.remove("goal-activating");
+        void comp.offsetWidth;          // restart the keyframes
+        comp.classList.add("goal-activating");
+        setTimeout(() => comp.classList.remove("goal-activating"), 1200);
+      }
+    }
+    state.goalMode = on;
+  }
+
   async function send(opts = {}) {
     // Edit & resend intercept: only composer-originated sends become edits.
     // Queued messages and suggestion-card prompts keep their own meaning —
@@ -5694,6 +5735,44 @@
     }
 
     if (!text && !images.length && !files.length) return false;
+    // /goal latch command. A bare "/goal" (or "/goal off|stop|end|done|cancel")
+    // toggles the hands-free latch WITHOUT starting a turn. "/goal <task>" falls
+    // through and runs the task — the bridge latches goal mode on for the chat,
+    // auto-approving every non-destructive action (deletions/destructive still
+    // ask) until the user turns it off here or with "/goal off".
+    const goalMatch = /^\s*\/goal\b[ \t]*([\s\S]*)$/i.exec(text);
+    if (goalMatch) {
+      const rest = (goalMatch[1] || "").trim();
+      const isOff = /^(off|stop|end|done|cancel)$/i.test(rest);
+      const isBareOn = rest === "" || /^(on|start)$/i.test(rest);
+      if ((isOff || isBareOn) && !images.length && !files.length) {
+        if (!state.chatId) {
+          if (isBareOn) toast("Start a hands-free run with “/goal <task>” — e.g. “/goal build and test the parser”.", "info", 4800, "goal-hint");
+          if (fromComposer) { ta.value = ""; autoResize(ta); }
+          return false;
+        }
+        const active = !isOff;
+        try {
+          await fetch("/api/chat/goal", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: state.chatId, active }),
+          });
+        } catch (e) {}
+        setGoalModeUI(active, { flourish: active });
+        toast(active
+          ? "Goal mode on — this chat runs hands-free. Deletions and destructive actions still ask."
+          : "Goal mode off — back to your standing permissions.",
+          active ? "warn" : "info", 4200, "goal-toggle");
+        if (fromComposer) {
+          ta.value = "";
+          autoResize(ta);
+          if (state.chatId) localStorage.removeItem("accuretta:draft:" + state.chatId);
+        }
+        return false;
+      }
+      // "/goal <task>" continues as a normal turn below; the bridge latches it.
+    }
     // A new request starts fresh: drop any prior turn's plan panel. The model
     // re-emits update_plan if this task is multi-step.
     renderPlanPanel([]);
@@ -7778,6 +7857,11 @@
       window.AccurettaResearch?.update(row, evt.research);
     } else if (evt.type === "notice") {
       if (!evt.quiet) toast(evt.note || "", "info", 3000, "ctx-notice");
+    } else if (evt.type === "goal_mode") {
+      // Bridge echo of the /goal latch state on THIS turn's own stream — apply
+      // it unconditionally (the chat_id can still be null here on a brand-new
+      // chat, which is exactly when the first activation flourish must show).
+      setGoalModeUI(!!evt.active);
     } else if (evt.type === "breach") {
       if (!isAttackRailEnabled(row)) return;
       // Cyber-range / CTF: a FLAG{...} was captured in a tool response = a
@@ -7931,9 +8015,16 @@
     if (!button) return;
     if (button._feedbackOriginal === undefined) button._feedbackOriginal = button.innerHTML;
     clearTimeout(button._feedbackTimer);
-    button.textContent = message;
+    button.innerHTML = `<i class="ph ph-check" aria-hidden="true"></i><span>${esc(message)}</span>`;
+    // Restart the pop even on a rapid second save (remove → reflow → add).
+    button.classList.remove("control-saved");
+    void button.offsetWidth;
+    button.classList.add("control-saved");
     button._feedbackTimer = setTimeout(() => {
-      if (button.isConnected) button.innerHTML = button._feedbackOriginal;
+      if (button.isConnected) {
+        button.innerHTML = button._feedbackOriginal;
+        button.classList.remove("control-saved");
+      }
       delete button._feedbackOriginal;
     }, 1800);
   }
@@ -8346,11 +8437,17 @@
     }).join("");
     // "Open folder" target: the shared parent of this turn's files; falls back
     // to the first workspace root when the files span roots or lack paths.
-    const wsRoots = ((state.workspace && state.workspace.folders) || []).map(s => String(s).replace(/[\\/]+$/, ""));
-    let openDir = _commonDirOf(evt.files.map(f => f.path));
-    if (openDir && wsRoots.length && !wsRoots.some(r => openDir.toLowerCase().startsWith(r.toLowerCase()))) {
-      openDir = "";   // common ancestor fell outside every root — use a root instead
-    }
+    // Normalize separators + Windows case before the root check — f.path uses
+    // "/" while a saved root may use "\", and a raw startsWith would wrongly
+    // reject an in-root folder and fall back to the wrong workspace (the bug).
+    const normPath = s => String(s || "").replace(/\\/g, "/").replace(/\/+$/, "");
+    const wsRoots = ((state.workspace && state.workspace.folders) || []).map(normPath);
+    // "Open folder" target: the folder the files were actually saved into (their
+    // shared parent). The bridge allows opening any folder the agent wrote into
+    // this session, so this reveals exactly where the file landed — even outside
+    // the configured workspace roots (e.g. the Desktop). A workspace root is only
+    // the fallback when no file path is known, or if that folder is rejected.
+    const openDir = normPath(_commonDirOf(evt.files.map(f => f.path)));
     const bar = document.createElement("div");
     bar.className = "turn-changes";
     bar.dataset.turnId = evt.turn_id || "";
@@ -8369,9 +8466,8 @@
       <div class="tc-actions">
         <button class="tc-review" type="button">Review changes</button>
         <button class="tc-openfolder" type="button" title="Open the folder these files live in"><i class="ph ph-folder-open"></i><span>Open folder</span></button>
-        <button class="tc-undo" type="button" ${evt.undone || evt.files.every(f => f.restorable === false) ? "hidden" : ""}><i class="ph ph-arrow-counter-clockwise"></i><span>Undo file edits</span></button>
-      </div>
-      <p class="tc-coverage">Undo covers recorded text file edits. Commands, external actions, and files edited again are preserved.</p>`;
+        <button class="tc-undo" type="button" title="Undo covers recorded text file edits. Commands, external actions, and files edited again are preserved." ${evt.undone || evt.files.every(f => f.restorable === false) ? "hidden" : ""}><i class="ph ph-arrow-counter-clockwise"></i><span>Undo file edits</span></button>
+      </div>`;
     // Same finish batch as the final bubble render: the card lands in the
     // same frame as the think-line flip instead of costing its own layout +
     // scroll chase a frame later. The batch flush scrolls once.
@@ -8398,14 +8494,22 @@
     filesEl.addEventListener("scroll", syncFade, { passive: true });
     const openBtn = bar.querySelector(".tc-openfolder");
     openBtn.addEventListener("click", async () => {
-      const dir = openDir || wsRoots[0] || "";
-      if (!dir) { toast("No folder to open", "warn", 2200); return; }
-      try {
+      const primary = openDir || wsRoots[0] || "";
+      if (!primary) { toast("No folder to open", "warn", 2200); return; }
+      const tryOpen = async (dir) => {
         const resp = await fetch("/api/open-folder", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ path: dir }),
         });
-        const r = await resp.json();
+        return resp.json().catch(() => ({}));
+      };
+      try {
+        let r = await tryOpen(primary);
+        // Rare: the shared parent spans roots / wasn't written this session.
+        // Fall back to a workspace root so the click still lands somewhere.
+        if (!(r && r.ok) && wsRoots[0] && primary !== wsRoots[0]) {
+          r = await tryOpen(wsRoots[0]);
+        }
         if (!(r && r.ok)) toast(r && r.error ? r.error : "Could not open folder", "err", 3200);
       } catch (e) {
         toast("Could not open folder: " + (e.message || e), "err", 3200);
@@ -11927,7 +12031,7 @@
             <label class="permission-option-label">
               <input type="checkbox" id="perm-remember-session">
               <span class="custom-checkbox"></span>
-              <span>Remember this action for this session</span>
+              <span>${esc(a.details.allow_always_label || "Remember this action for this session")}</span>
             </label>
           </div>` : ``}
           <div class="permissions-actions">
@@ -12267,6 +12371,12 @@
         const chatId = evt.chat_id || state.chatId;
         finishSkillSaveRow(chatId, evt.outcome || "saved", evt.skill || "", evt.call_id || "");
         appendAgentLog(`Skill save ${evt.outcome || "finished"}: ${evt.skill || "unnamed"}.`);
+      } else if (evt.type === "goal_mode") {
+        // /goal latch changed (toggle endpoint or a turn). Keep the stored chat
+        // flag in sync, and repaint the chip when it's the chat in view.
+        const c = state.chats && state.chats.chats && state.chats.chats[evt.chat_id];
+        if (c) c.goal_mode = !!evt.active;
+        if (!evt.chat_id || evt.chat_id === state.chatId) setGoalModeUI(!!evt.active);
       } else if (evt.type === "chat:rename") {
         const c = state.chats && state.chats.chats && state.chats.chats[evt.chat_id];
         if (c) {
@@ -12643,14 +12753,22 @@
       chunk.nodes.slice(1).forEach(node => content.appendChild(node));
       section.appendChild(content);
       section.addEventListener("toggle", () => {
-        if (section.open) {
+        // Accordion exclusivity: opening one section closes the others — but NOT
+        // while a search is driving sections open, or multi-section results would
+        // collapse to a single section. The <details> toggle event fires async
+        // (after settingsSearchDriving has already reset), so key off the drawer's
+        // persistent is-searching class instead of that transient flag.
+        if (section.open && !$("#settings-drawer")?.classList.contains("is-searching")) {
           body.querySelectorAll("details.settings-section[open]").forEach(other => {
             if (other !== section) other.open = false;
           });
         }
         // Search-forced opens aren't the user's accordion state — the search
-        // block below sets this flag while it drives sections.
-        if (!settingsSearchDriving) rememberSettingsSections();
+        // block sets this flag while it drives sections, and a card the user
+        // opens WHILE searching shouldn't overwrite their saved layout either.
+        if (!settingsSearchDriving && !$("#settings-drawer")?.classList.contains("is-searching")) {
+          rememberSettingsSections();
+        }
       });
       fragment.appendChild(section);
     });
@@ -12740,6 +12858,22 @@
       ];
       return parts.join(" ").toLowerCase();
     };
+    // Match-count pill on a section summary (right before the chevron). count 0
+    // removes it. Sections stay COLLAPSED during search; the badge tells the user
+    // how many settings matched so they can open just the card they want.
+    const setSectionCount = (section, count) => {
+      const summary = section.querySelector(".settings-section-summary");
+      if (!summary) return;
+      let badge = summary.querySelector(".settings-section-count");
+      if (!count) { badge?.remove(); return; }
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "settings-section-count";
+        badge.setAttribute("aria-hidden", "true");
+        summary.insertBefore(badge, summary.querySelector(".settings-section-chevron"));
+      }
+      badge.textContent = String(count);
+    };
     const applySearch = () => {
       const q = input.value.trim().toLowerCase();
       tools.querySelector(".settings-search").classList.toggle("has-value", !!q);
@@ -12750,20 +12884,29 @@
       settingsSearchDriving = true;
       try {
       sections().forEach(section => {
+        const titleHit = searching && (section.querySelector(".settings-section-title")?.textContent || "").toLowerCase().includes(q);
         const content = section.querySelector(".settings-section-content");
         const rows = content ? [...content.children] : [];
         let sectionHits = 0;
         rows.forEach(row => {
-          const match = !searching || rowHaystack(row).includes(q);
+          // A section-TITLE match reveals the whole section. Searching a section
+          // name (e.g. "key" → Keyboard shortcuts) must show its actual controls,
+          // not just the rows whose own text happens to contain the term —
+          // otherwise the section opens to nothing but its description.
+          const match = !searching || titleHit || rowHaystack(row).includes(q);
           row.hidden = searching && !match;
           if (searching && match) sectionHits++;
         });
-        const titleHit = searching && (section.querySelector(".settings-section-title")?.textContent || "").toLowerCase().includes(q);
+        const isMatch = sectionHits > 0 || !!titleHit;
         if (searching) {
-          section.open = sectionHits > 0 || !!titleHit;
-          if (sectionHits > 0) hitSections++;
+          // Collapsed filtered list: matching section cards show CLOSED, with a
+          // count badge; the user opens the one they want. (Accordion exclusivity
+          // is suppressed while searching, so opening one keeps the others open.)
+          section.open = false;
+          if (isMatch) hitSections++;
           hitRows += sectionHits;
-          section.toggleAttribute("data-no-matches", sectionHits === 0 && !titleHit);
+          section.toggleAttribute("data-no-matches", !isMatch);
+          setSectionCount(section, isMatch ? sectionHits : 0);
         } else {
           // Back to the user's own accordion state so a cleared search
           // leaves the drawer exactly as they'd find it manually.
@@ -12772,8 +12915,9 @@
             section.open = !!saved[section.dataset.settingsSection];
           }
           section.removeAttribute("data-no-matches");
+          setSectionCount(section, 0);
         }
-        section.hidden = searching && sectionHits === 0 && !titleHit;
+        section.hidden = searching && !isMatch;
       });
       } finally {
         settingsSearchDriving = false;
@@ -15849,6 +15993,12 @@
     state._reloading = true;
     renderStatus();
     renderModelPill();
+    // Loading indicator in the revealer deck: a keyed notification card with
+    // the deck's own pulsing live dot. The completion/failure toasts below
+    // reuse the same "model-load" key, so this card morphs into the result
+    // instead of stacking. Long ms keeps it up for the whole (blocking) load.
+    const loadingName = modelPath.split(/[\\/]/).pop().replace(/\.gguf$/i, "");
+    toast(`Loading ${loadingName} into llama-server…`, "info", 600000, "model-load");
     try {
       // Tuner keys were already saved by applyAutoTune above — this persists
       // just the model selection itself.
@@ -15864,14 +16014,14 @@
         const msg = tuned.quant_downshift
           ? "model loaded — auto-tuned (see quant suggestion in notes)"
           : `model loaded — auto-tuned (ctx ${Number(tuned.num_ctx).toLocaleString()}, n_cpu_moe ${tuned.n_cpu_moe ?? 0})`;
-        toast(msg, tuned.quant_downshift ? "warn" : "ok", 4000);
+        toast(msg, tuned.quant_downshift ? "warn" : "ok", 4000, "model-load");
       } else {
-        toast("model loaded", "ok", 2500);
+        toast("model loaded", "ok", 2500, "model-load");
       }
       return true;
     } catch (e) {
       if (hint) hint.textContent = prev || "";
-      toast("load failed: " + (e.message || e), "error", 6000);
+      toast("load failed: " + (e.message || e), "error", 6000, "model-load");
       return false;
     } finally {
       state._reloading = false;
@@ -17349,6 +17499,20 @@
       };
       permsBtn.addEventListener("click", (e) => {
         e.stopPropagation();
+        // While the /goal latch is on, the Access chip IS the off switch — a
+        // click turns hands-free mode off rather than opening the mode popover.
+        if (permsBtn.dataset.goal) {
+          if (state.chatId) {
+            fetch("/api/chat/goal", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ chat_id: state.chatId, active: false }),
+            }).catch(() => {});
+          }
+          setGoalModeUI(false);
+          toast("Goal mode off — back to your standing permissions.", "info", 3200, "goal-toggle");
+          return;
+        }
         const open = !permsPopover?.classList.contains("open");
         permsPopover?.classList.toggle("open", open);
         permsBtn.setAttribute("aria-expanded", String(open));
@@ -17565,6 +17729,20 @@
       if (state.chatId) {
         localStorage.setItem("accuretta:draft:" + state.chatId, e.target.value);
       }
+      // /goal discoverability: swap the composer hint while the line opens with
+      // the command so the user knows it runs the task hands-free.
+      const hint = $(".composer-hint");
+      if (hint) {
+        const isGoal = /^\s*\/goal\b/i.test(e.target.value);
+        if (isGoal && !hint.dataset.goalHint) {
+          hint.dataset.goalHint = "1";
+          hint._prevText = hint.textContent;
+          hint.textContent = "Goal mode — hands-free until you turn it off (/goal off). Deletions and destructive actions still ask.";
+        } else if (!isGoal && hint.dataset.goalHint) {
+          delete hint.dataset.goalHint;
+          if (hint._prevText != null) hint.textContent = hint._prevText;
+        }
+      }
     });
 
     // IDE toolbar: Tailwind CDN toggle
@@ -17664,7 +17842,7 @@
       if (targetLabel) targetLabel.textContent = passive ? "Domain" : secretAudit ? "Page URL" : "Target domain or host";
       ["#recon-target-input", "#recon-scope-in", "#recon-scope-out", "#recon-user-agent",
        "#recon-required-headers", "#recon-rate-limit", "#recon-request-cap",
-       "#recon-objective-text", "#recon-constraint-text"]
+       "#recon-objective-text", "#recon-constraint-text", "#recon-notes-text"]
         .forEach(s => { const el = $(s); if (el) el.value = ""; });
       const autoChk = $("#recon-automated-check"); if (autoChk) autoChk.checked = true;
       const destrChk = $("#recon-destructive-check"); if (destrChk) destrChk.checked = false;
@@ -17751,8 +17929,12 @@
       // This explicit bit is consumed by the bridge to create a per-chat
       // authorization record. Merely enabling Red team tools in Settings is
       // no longer enough for a model to invoke them.
+      // Free-text operator notes from the gate: stored on the mission (so they
+      // persist into the sysprompt across folds) and appended to the opening
+      // instruction the model reads.
+      const notes = ($("#recon-notes-text")?.value || "").trim().slice(0, 2000);
       const mission = {
-        target, scope, objective, constraints, user_agent: userAgent,
+        target, scope, objective, constraints, notes, user_agent: userAgent,
         scope_in: scopeTokens(scIn || target),
         scope_out: scopeTokens(scOut),
         required_headers: requiredHeaders,
@@ -17816,7 +17998,9 @@
         `6) PROVE IT — for every confirmed access or extracted secret, re-send the winning request with save_evidence set (archives request+response with a sha256), or use recon_capture_evidence.\n` +
         `STEALTH — a signature IDS matches the raw request text, so to stay quiet keep recon low-footprint (quiet=true) and obfuscate payloads (url-encode via encode_decode, vary keyword case, use alternate separators); the server still decodes and executes them while the signature misses.\n` +
         `If a tool is blocked by scope or a constraint, record the gap and continue with other permitted work; do not hammer the same gate. Only stop when you have genuinely exhausted the permitted scope. Then write a report: Executive summary (did you get in, how deep, what you reached), What's broken (each finding with severity + evidence), Loot (data, secrets, and credentials extracted), Recommendations. Never claim access or a finding you did not verify with a tool result or a captured artifact — but do not leave a real avenue unexplored. Be factual AND thorough. Once you deliver that report the engagement is CLOSED: treat any later message as a debrief — answer it directly and conversationally, and do NOT run recon or exploit tools again unless the user explicitly tells you to resume or keep testing.`;
-      send({ prompt: passive ? passiveTmpl : secretAudit ? secretTmpl : reconObjective === "gain_access" ? accessTmpl : reconTmpl, invisible: true, mission });
+      const basePrompt = passive ? passiveTmpl : secretAudit ? secretTmpl : reconObjective === "gain_access" ? accessTmpl : reconTmpl;
+      const notesTmpl = notes ? `\n\nADDITIONAL OPERATOR NOTES (these are instructions for this engagement — follow them):\n${notes}` : "";
+      send({ prompt: basePrompt + notesTmpl, invisible: true, mission });
     };
     $("#quick-passive-osint")?.addEventListener("click", () => {
       $("#toolbar-overflow-menu")?.classList.remove("open");

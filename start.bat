@@ -3,6 +3,24 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 title accuretta
 
+REM ---- brand this folder + launcher with the accuretta icon -------------------
+REM Path-independent (%~dp0) and idempotent, so every user — new or returning —
+REM gets the branded look on launch. Git cannot carry the Hidden/System/ReadOnly
+REM attributes desktop.ini needs, nor an absolute .lnk path, so we (re)apply them
+REM locally the first time each machine runs the launcher.
+if exist "%~dp0assets\icons\accuretta.ico" (
+    if not exist "%~dp0desktop.ini" (
+        >"%~dp0desktop.ini" echo [.ShellClassInfo]
+        >>"%~dp0desktop.ini" echo IconResource=assets\icons\accuretta.ico,0
+        >>"%~dp0desktop.ini" echo ConfigFlags=1
+        attrib +h +s "%~dp0desktop.ini" >nul 2>&1
+        attrib +r "%~dp0." >nul 2>&1
+    )
+    if not exist "%~dp0start.lnk" (
+        powershell -NoProfile -Command "$w=New-Object -ComObject WScript.Shell;$s=$w.CreateShortcut('%~dp0start.lnk');$s.TargetPath='%~dp0start.bat';$s.WorkingDirectory='%~dp0';$s.IconLocation='%~dp0assets\icons\accuretta.ico,0';$s.Save()" >nul 2>&1
+    )
+)
+
 REM ============================================================
 REM   accuretta launcher — opens the desktop app (no browser,
 REM   no lingering console). Falls back to browser mode if the
