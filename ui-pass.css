@@ -955,7 +955,6 @@
 
 /* Atelier replaces the blob/pillar backdrop and the quote glyph with
    the line field — one idea per theme. */
-[data-theme="atelier"] .welcome-blobs,
 [data-theme="atelier"] .welcome-quote {
   display: none;
 }
@@ -1259,10 +1258,14 @@
   color: var(--fg-faint);
 }
 :root { --dm-l: 58%; }
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"], [data-theme="aperture-dark"], [data-theme="amaranth"], [data-theme="cartograph"], [data-theme="dim"], [data-theme="atelier"]) { --dm-l: 70%; }
+:is([data-theme="dark"], [data-theme="opal"], [data-theme="aperture-dark"], [data-theme="amaranth"], [data-theme="cartograph"], [data-theme="dim"], [data-theme="atelier"]) { --dm-l: 70%; }
 /* The dot field replaces atelier's flow lines on the new welcome; its
    vignette existed to hold those lines back and would bury the dots. */
 [data-theme="atelier"] .welcome-screen.welcome-v2::before { display: none; }
+
+/* --- auto-tune K / V cache choices, side by side ------------------------- */
+.autotune-kv-row { display: flex; gap: 8px; width: 100%; }
+.autotune-kv-row select { flex: 1 1 0; min-width: 0; }
 
 /* --- auto-tune result: summary first, reasoning behind a toggle --------- */
 .autotune-notes { display: block; width: 100%; line-height: 1.5; }

@@ -13,7 +13,7 @@ runtime, no Electron, no colour-key tricks.
 
 Window contract (from the notch build brief):
   - frameless, transparent, always on top, not in taskbar, not in Alt-Tab
-  - ONE fixed size: 680 x 560 DIP, top edge of the primary display, centred
+  - ONE fixed size: 720 x 560 DIP, top edge of the primary display, centred
   - never steals keyboard focus: gates may arrive while the owner types in
     another app; focus only moves in when the owner clicks the island
   - click-through: only the island itself captures the pointer; everything
@@ -44,8 +44,15 @@ PAGE_URL = f"{BASE}/notch"
 USER_DATA = ROOT / "data" / "notch-webview2"
 LOG_FILE = ROOT / "data" / "notch_host.log"
 
-WIDTH_DIP = 680
+WIDTH_DIP = 720             # 640 DIP expanded island + room for its shadow
 HEIGHT_DIP = 560
+
+# Hover wake: the top edge of the screen, centred, is where the notch lives.
+# Resting the pointer there for a beat brings the pill down.
+WAKE_HALF_W_DIP = 150
+WAKE_EDGE_PX = 2
+WAKE_DWELL_S = 0.12
+HOVER_GRACE_S = 2.5         # a hover-revealed pill tucks away this soon after the pointer leaves
 
 POLL_MS = 40                # cursor / click / capture polling
 HEALTH_EVERY = 50           # ticks between bridge health checks (~2 s)
@@ -76,7 +83,7 @@ HWND_TOPMOST = -1
 SM_CXSCREEN = 0
 SM_CYSCREEN = 1
 VK_LBUTTON = 0x01
-VK_SPACE = 0x20
+VK_N = 0x4E                # the toggle chord is Ctrl+Alt+N (Claude's Quick Entry owns Ctrl+Alt+N)
 VK_MENU = 0x12             # Alt
 VK_CONTROL = 0x11
 SW_HIDE = 0
@@ -179,6 +186,8 @@ user32.IsIconic.argtypes = [wintypes.HWND]
 user32.IsIconic.restype = wintypes.BOOL
 user32.BringWindowToTop.argtypes = [wintypes.HWND]
 user32.BringWindowToTop.restype = wintypes.BOOL
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetWindowRect.restype = wintypes.BOOL
 
 
 _ENUM_PROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -326,6 +335,11 @@ class NotchHost:
         self._hide_reason = ""
         self._leaving = False      # slide-out in flight (window still shown)
         self._leave_started = 0.0
+        self.pointer_inside = False   # last value posted to the page
+        self._wake_since = 0.0        # pointer resting on the wake strip since
+        self._hover_reveal = False    # shown by a hover, not by the owner or an event
+        self.hotkey_ok = False
+        self._hotkey_failures = 0
         self.health_misses = 0
         self.seen_alive = False       # health-exit only counts after first contact
         self.tick_count = 0
@@ -379,7 +393,7 @@ class NotchHost:
         self.dpi = _window_dpi(hwnd)
         self.reposition(initial=True)
         user32.SetWindowRgn(hwnd, gdi32.CreateRectRgn(0, 0, 0, 0), True)
-        # Starts tucked away: the island only appears on Ctrl+Alt+Space or when
+        # Starts tucked away: the island only appears on Ctrl+Alt+N or when
         # something pops up (an approval gate, model ready, an error).
         self.visible = False
         self.gate_visible_until = time.monotonic() + self.FIRST_SHOW_S
@@ -409,10 +423,15 @@ class NotchHost:
     # is why the region approach is used at all). The region is inflated by a
     # per-state pad so the island's rim glow / soft shadow is not clipped;
     # clicks in the pad are swallowed, clicks further out pass through.
-    _RADIUS_DIP = {"idle": 18, "off": 18, "work": 24, "ready": 24,
-                   "alert": 24, "gate": 32, "prompt": 32}
-    _PAD_DIP = {"idle": 4, "off": 4, "work": 12, "ready": 12,
-                "alert": 40, "gate": 48, "prompt": 60}
+    _RADIUS_DIP = {"idle": 16, "off": 16, "work": 16, "ready": 16, "alert": 16,
+                   "home": 24, "gate": 24, "prompt": 24, "notice": 24, "drop": 24}
+    # Expanded cards cast a soft shadow (8 px drop, 22 px blur in the page);
+    # the pad must hold all of it, or the region cuts it off in a hard box.
+    _PAD_DIP = {"idle": 4, "off": 4, "work": 6, "ready": 6, "alert": 6,
+                "home": 36, "gate": 36, "prompt": 36, "notice": 36, "drop": 36}
+    # Cards the owner dismisses deliberately (or the page folds on its own
+    # countdown): never tucked away by the host's idle timer.
+    _HELD_STATES = ("alert", "gate", "prompt", "work", "home", "notice", "drop")
 
     def _island_screen_rect(self):
         if not self.island:
@@ -439,7 +458,9 @@ class NotchHost:
         # square top into a pill, so union a full rect with a rounded band.
         # CombineRgn needs a real destination handle (it returns NULL for a
         # NULL dst), so start from an empty region.
-        r = max(1, min(radius, (bottom - top) // 2))
+        # The padded region's corners round by the pad too, following the
+        # shadow's own soft corner instead of cutting it square.
+        r = max(1, min(radius + pad, (bottom - top) // 2))
         body = gdi32.CreateRectRgn(left, top, right, bottom - r)
         band = gdi32.CreateRoundRectRgn(left, bottom - 2 * r, right, bottom, r * 2, r * 2)
         merged = gdi32.CreateRectRgn(0, 0, 0, 0)
@@ -450,7 +471,7 @@ class NotchHost:
             user32.SetWindowRgn(self.hwnd, merged, True)
 
     # ---- visibility: hidden unless the owner asks or something pops up -------
-    # The island is tucked away by default. Ctrl+Alt+Space toggles it globally
+    # The island is tucked away by default. Ctrl+Alt+N toggles it globally
     # (works while another app has focus); approvals, model-ready and errors
     # reveal it on their own, and it fades back once nothing is pending.
     SHOW_GRACE_S = 6.0            # how long a notification keeps it up
@@ -461,13 +482,17 @@ class NotchHost:
     def show_island(self, reason: str = "") -> None:
         if self.visible:
             self.gate_visible_until = max(self.gate_visible_until, time.monotonic() + self.SHOW_GRACE_S)
+            if reason != "hover":
+                self._hover_reveal = False
             return
         # apply the region first, then drop the window down from the bezel
+        self._hover_reveal = reason == "hover"
         self._leaving = False
         self._apply_region()
         user32.ShowWindow(self.hwnd, SW_SHOWNA)  # 8: show, no activation
         self.visible = True
-        self.gate_visible_until = time.monotonic() + self.SHOW_GRACE_S
+        self.gate_visible_until = time.monotonic() + (
+            HOVER_GRACE_S if self._hover_reveal else self.SHOW_GRACE_S)
         self._to_page({"type": "enter"})
         log(f"shown ({reason})")
         self._request_rect_refresh()
@@ -526,7 +551,7 @@ class NotchHost:
             self.show_island(reason or "hotkey")
 
     def _request_collapse_and_hide(self, reason: str) -> None:
-        """Ctrl+Alt+Space: always a full toggle. The island shrinks to the
+        """Ctrl+Alt+N: always a full toggle. The island shrinks to the
         minimal pill, the widget's spring plays, then it retreats into the
         bezel. A pending approval is not held hostage to the overlay: it stays
         pending on the bridge (and still notifies), it just isn't pinned open."""
@@ -550,16 +575,17 @@ class NotchHost:
             return
         # A pending gate, an open card, or a reply on screen must never be
         # tucked away on a timer: those are dismissed deliberately (Esc, a
-        # click outside, or the hotkey).
-        if self.island_state in ("alert", "gate", "prompt", "work"):
-            self.gate_visible_until = max(self.gate_visible_until,
-                                          time.monotonic() + self.SHOW_GRACE_S)
+        # click outside, or the hotkey). Nor is a pill the pointer rests on.
+        if self.island_state in self._HELD_STATES or self.pointer_inside:
+            grace = HOVER_GRACE_S if self._hover_reveal else self.SHOW_GRACE_S
+            self.gate_visible_until = max(self.gate_visible_until, time.monotonic() + grace)
             return
         if time.monotonic() >= self.gate_visible_until:
-            self.hide_island(f"idle after {self.SHOW_GRACE_S:.0f}s")
+            self.hide_island("hover ended" if self._hover_reveal
+                             else f"idle after {self.SHOW_GRACE_S:.0f}s")
 
     def _tick_hotkey(self) -> None:
-        """Ctrl+Alt+Space arrives as WM_HOTKEY (see _handle_message); this only
+        """Ctrl+Alt+N arrives as WM_HOTKEY (see _handle_message); this only
         logs keyboard traffic so input problems are visible in the log."""
         if self._key_events and not self._logged_keys:
             self._logged_keys = True
@@ -647,11 +673,29 @@ class NotchHost:
         self._wndproc_cb = cb  # keep alive: a GC'd callback would crash
         self._old_wndproc = user32.SetWindowLongPtrW(self.hwnd, GWL_WNDPROC,
                                                      ctypes.cast(cb, ctypes.c_void_p).value)
-        # Ctrl+Alt+Space toggles the island from anywhere. Registered (not
+        # Ctrl+Alt+N toggles the island from anywhere. Registered (not
         # polled) so it cannot fire mid-typing or depend on the cursor.
-        if not user32.RegisterHotKey(self.hwnd, HOTKEY_ID,
-                                     MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE):
-            log("hotkey registration failed (another app owns Ctrl+Alt+Space)")
+        self._register_hotkey()
+
+    def _register_hotkey(self) -> bool:
+        """Claim Ctrl+Alt+N. A previous overlay that is still shutting down
+        (a bridge restart) can hold it for a few seconds, so a failure is
+        retried from the tick until it succeeds; the first one is logged with
+        the Windows error."""
+        if self.hotkey_ok:
+            return True
+        if user32.RegisterHotKey(self.hwnd, HOTKEY_ID,
+                                 MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_N):
+            self.hotkey_ok = True
+            if self._hotkey_failures:
+                log(f"hotkey registered after {self._hotkey_failures} retries")
+            return True
+        err = kernel32.GetLastError()
+        if not self._hotkey_failures:
+            log(f"hotkey registration failed (error {err}"
+                f"{': another app owns Ctrl+Alt+N' if err == 1409 else ''}); retrying")
+        self._hotkey_failures += 1
+        return False
 
     def _handle_message(self, hwnd, msg, wparam, lparam):
         if msg == WM_MOUSEACTIVATE:
@@ -683,7 +727,7 @@ class NotchHost:
             self._key_events += 1
             self._last_win_key = int(wparam)
             # The toggle chord must never reach the page: with the chat card
-            # open it would type "ctrl alt space" into the prompt (and could
+            # open it would type an "n" into the prompt (and could
             # submit it).
             if self._chord_pending():
                 return 0
@@ -693,10 +737,10 @@ class NotchHost:
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def _chord_pending(self) -> bool:
-        """True while Ctrl+Alt+Space is held (its keys are eaten)."""
+        """True while Ctrl+Alt+N is held (its keys are eaten)."""
         return (bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
                 and bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
-                and bool(user32.GetAsyncKeyState(VK_SPACE) & 0x8000))
+                and bool(user32.GetAsyncKeyState(VK_N) & 0x8000))
 
     def _cursor_over_island(self) -> bool:
         pt = wintypes.POINT()
@@ -775,6 +819,8 @@ class NotchHost:
                 return
             if self.tick_count % HEALTH_EVERY == 0:
                 self._tick_display()
+                if not self.hotkey_ok:
+                    self._register_hotkey()     # ~every 2 s until it is ours
             self._tick_nav_retry()
         except Exception as exc:
             log(f"tick error: {exc}")
@@ -785,6 +831,13 @@ class NotchHost:
         rect = self._island_screen_rect() if self.visible else None
         inside = bool(rect) and (rect[0] <= pt.x < rect[0] + rect[2]
                                  and rect[1] <= pt.y < rect[1] + rect[3])
+        if inside != self.pointer_inside:
+            # The page folds Home and notices on a countdown that starts when
+            # the pointer leaves; it cannot see that reliably on its own in a
+            # region-clipped window.
+            self.pointer_inside = inside
+            self._to_page({"type": "pointer", "inside": inside})
+        self._tick_wake(pt)
 
         # Be activatable WHILE the pointer is over the island, so the click
         # that opens the card is the click that activates and focuses it.
@@ -802,12 +855,59 @@ class NotchHost:
         pressed = down and not self.lmb_was_down
         self.lmb_was_down = down
         if pressed:
-            if not inside and self.island_state in ("gate", "prompt") and self.core is not None:
+            if (not inside and self.island_state in ("gate", "prompt", "home", "notice", "drop")
+                    and self.core is not None):
                 # Click landed outside an open card: same as Esc.
                 try:
                     self.core.PostWebMessageAsJson(json.dumps({"type": "outside-click"}))
                 except Exception:
                     pass
+
+    def _tick_wake(self, pt) -> None:
+        """Hover wake: a pointer resting on the top edge above the notch brings
+        the pill down without a click. Works mid-drag too (GetCursorPos keeps
+        reporting while a file is dragged), which is how a file reaches the
+        island when it is tucked away."""
+        if self.visible and not self._leaving:
+            if self._hover_reveal and self._on_wake_strip(pt):
+                # still resting on the edge: keep the pill up
+                self.gate_visible_until = max(self.gate_visible_until,
+                                              time.monotonic() + HOVER_GRACE_S)
+            self._wake_since = 0.0
+            return
+        if self._leaving or not self._on_wake_strip(pt) or self._fullscreen_foreground():
+            self._wake_since = 0.0
+            return
+        now = time.monotonic()
+        if not self._wake_since:
+            self._wake_since = now
+        elif now - self._wake_since >= WAKE_DWELL_S:
+            self._wake_since = 0.0
+            self.show_island("hover")
+
+    def _on_wake_strip(self, pt) -> bool:
+        scale = self.dpi / 96.0
+        cx = self.win_x + self.win_w // 2
+        return pt.y <= WAKE_EDGE_PX and abs(pt.x - cx) <= WAKE_HALF_W_DIP * scale
+
+    def _fullscreen_foreground(self) -> bool:
+        """A full-screen app (video, game, presentation) owns the top edge."""
+        try:
+            fg = user32.GetForegroundWindow()
+            if not fg or fg == self.hwnd:
+                return False
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(fg, cls, 64)
+            if cls.value in ("Progman", "WorkerW", "Shell_TrayWnd"):
+                return False
+            r = wintypes.RECT()
+            if not user32.GetWindowRect(fg, ctypes.byref(r)):
+                return False
+            return (r.left <= 0 and r.top <= 0
+                    and r.right >= user32.GetSystemMetrics(SM_CXSCREEN)
+                    and r.bottom >= user32.GetSystemMetrics(SM_CYSCREEN))
+        except Exception:
+            return False
 
     def _probe_health(self) -> bool:
         try:
@@ -865,9 +965,19 @@ class NotchHost:
         scheduler = TaskScheduler.FromCurrentSynchronizationContext()
         USER_DATA.mkdir(parents=True, exist_ok=True)
 
-        def on_env(task):
+        def create_env(options):
+            env_task = CoreWebView2Environment.CreateAsync(None, str(USER_DATA), options)
+            env_task.ContinueWith(
+                Action[Task[CoreWebView2Environment]](lambda t: on_env(t, options)), scheduler)
+
+        def on_env(task, options):
             if task.IsFaulted:
                 log(f"environment failed: {task.Exception}")
+                if options is not None:
+                    # Browser arguments are a nicety (sound without a click);
+                    # they must never be what keeps the island from loading.
+                    log("retrying the environment without browser arguments")
+                    create_env(None)
                 return
             env = task.Result
             ctl_task = env.CreateCoreWebView2ControllerAsync(IntPtr(self.hwnd))
@@ -882,6 +992,12 @@ class NotchHost:
             self.controller.DefaultBackgroundColor = Color.FromArgb(0, 0, 0, 0)
             self.controller.Bounds = Rectangle(0, 0, self.win_w, self.win_h)
             self.controller.IsVisible = True
+            try:
+                # Files dragged from Explorer onto the island reach the page
+                # (it claims every drop, so nothing ever navigates away).
+                self.controller.AllowExternalDrop = True
+            except Exception:
+                pass
             core = self.controller.CoreWebView2
             self.core = core
             s = core.Settings
@@ -895,9 +1011,20 @@ class NotchHost:
             core.Navigate(PAGE_URL)
             log("webview ready; navigating")
 
-        env_task = CoreWebView2Environment.CreateAsync(None, str(USER_DATA), None)
-        env_task.ContinueWith(
-            Action[Task[CoreWebView2Environment]](on_env), scheduler)
+        # The island's sounds play when something happens (an approval, a
+        # finished turn), not after a click on the page, so the WebView must
+        # not hold audio back for a user gesture.
+        # All five arguments, explicitly: with a single string pythonnet binds
+        # the INTERNAL constructor (it takes a raw COM object), and the
+        # environment then fails to create with a cast error.
+        options = None
+        try:
+            from Microsoft.Web.WebView2.Core import CoreWebView2EnvironmentOptions
+            options = CoreWebView2EnvironmentOptions(
+                "--autoplay-policy=no-user-gesture-required", None, None, False, None)
+        except Exception as exc:
+            log(f"environment options unavailable: {exc!r}")
+        create_env(options)
 
     def _on_web_message(self, _sender, args) -> None:
         try:

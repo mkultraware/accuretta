@@ -429,15 +429,12 @@
 [data-theme="dark"] body,
 [data-theme="dim"] body,
 [data-theme="retro"] body,
-[data-theme="aurora"] body,
-[data-theme="nebula"] body,
-[data-theme="operator"] body,
 [data-theme="amaranth"] body,
 [data-theme="aperture"] body,
 [data-theme="aperture-dark"] body,
 [data-theme="atelier"] body,
+[data-theme="opal"] body,
 [data-theme="pastel"] body,
-[data-theme="velvet"] body,
 .dark body {
   background: var(--bg-gradient, var(--bg)) fixed;
 }
@@ -510,6 +507,96 @@
 
   --btn-send-gradient: linear-gradient(145deg, #D9B571 0%, #BE9250 100%);
   --btn-send-glow: 0 11px 24px -13px rgba(201, 161, 95, 0.38);
+}
+
+/* ============================================================
+   OPAL — a black opal: dark stone with light living inside it.
+   The body is a quiet blue-black and the UI is near-monochrome
+   pearl. The only real colour is play-of-color, the blue / green /
+   gold / ember / rose flash a black opal throws, kept to a tiny
+   turning opal on the active session and a barely-there breath of
+   light on the welcome screen. Everything else is pearl on stone.
+   ============================================================ */
+[data-theme="opal"] {
+  color-scheme: dark;
+
+  --bg:        #0A0B0F;
+  --bg-raised: #111319;
+  --bg-sunken: #07080B;
+  --bg-inset:  #181B23;
+
+  --glass-bg:     rgba(17, 19, 25, 0.92);
+  --glass-border: rgba(236, 238, 244, 0.06);
+  --glass-blur:   18px;
+
+  /* A faint cool glow where light enters the stone, nothing more. */
+  --bg-gradient:
+    radial-gradient(90% 60% at 50% -10%, rgba(140, 160, 255, 0.07), transparent 70%),
+    linear-gradient(180deg, #0C0D12 0%, #0A0B0F 45%, #07080B 100%);
+
+  --fg:        #ECEEF4;
+  --fg-muted:  #A3A8B8;
+  --fg-subtle: #737889;
+  --fg-faint:  #4A4E5C;
+  --fg-invert: #0A0B0F;
+
+  --border:        #1B1E27;
+  --border-strong: #282C38;
+  --border-subtle: #13151C;
+
+  /* Pale periwinkle: the commonest black-opal flash, softened so it
+     reads as light on stone rather than a brand colour. */
+  --accent:        #A9B4FF;
+  --accent-hover:  #C6CDFF;
+  --accent-subtle: rgba(169, 180, 255, 0.11);
+  --accent-fg:     #0A0B0F;
+
+  --success: #7FE3B8;
+  --warning: #F2D37A;
+  --danger:  #FF8A7A;
+  --info:    #8CC8FF;
+  --success-subtle: rgba(127, 227, 184, 0.12);
+  --warning-subtle: rgba(242, 211, 122, 0.12);
+  --danger-subtle:  rgba(255, 138, 122, 0.12);
+  --info-subtle:    rgba(140, 200, 255, 0.12);
+
+  /* Play-of-color: the full flash sequence, used only as thin light.
+     Animated surfaces build their own conic-gradient from --opal-stops
+     so a local --opal-turn can rotate it (a var() inside a custom
+     property resolves where it is declared, here on the root). */
+  --opal-stops: #6FB6FF, #7CEBC6, #EFE07E, #FF9E74, #FF86B8, #A792FF, #6FB6FF;
+  --opal-film: conic-gradient(var(--opal-stops));
+
+  --font-sans:    'Inter Tight', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: 'Inter Tight', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+
+  /* Slightly rounder than the default: polished cabochon, not cut glass. */
+  --r-xs: 5px;
+  --r-sm: 8px;
+  --r-md: 11px;
+  --r-lg: 15px;
+  --r-xl: 20px;
+  --r-2xl: 28px;
+
+  --shadow-xs: 0 1px 0 rgba(0, 0, 0, 0.4);
+  --shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.42), 0 0 0 1px rgba(236, 238, 244, 0.03);
+  --shadow-md: 0 10px 28px -12px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(236, 238, 244, 0.04);
+  --shadow-lg: 0 24px 56px -24px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(236, 238, 244, 0.05);
+  --shadow-pop: 0 32px 80px -30px rgba(0, 0, 0, 0.86), 0 0 0 1px rgba(236, 238, 244, 0.06);
+  --shadow-inset: inset 0 1px 0 rgba(0, 0, 0, 0.35), inset 0 0 0 1px rgba(236, 238, 244, 0.035);
+
+  --btn-shadow-rest:   inset 0 1px 0 rgba(236, 238, 244, 0.05),
+                       0 2px 6px rgba(0, 0, 0, 0.34),
+                       0 0 0 1px rgba(236, 238, 244, 0.04);
+  --btn-shadow-hover:  inset 0 1px 0 rgba(236, 238, 244, 0.08),
+                       0 6px 16px rgba(0, 0, 0, 0.42),
+                       0 0 0 1px rgba(236, 238, 244, 0.07);
+  --btn-shadow-active: inset 0 1px 3px rgba(0, 0, 0, 0.5),
+                       0 0 0 1px rgba(236, 238, 244, 0.04);
+
+  /* The send button is a pearl, not a coloured slab. */
+  --btn-send-gradient: radial-gradient(120% 120% at 30% 20%, #FFFFFF 0%, #E6E8F2 45%, #C9CCDA 100%);
+  --btn-send-glow:     0 0 0 1px rgba(236, 238, 244, 0.10), 0 8px 22px -8px rgba(150, 170, 255, 0.45);
 }
 
 
@@ -638,195 +725,6 @@
 
   --btn-send-gradient: linear-gradient(135deg, #ff7eb6 0%, #ff5e9c 38%, #ff8d5a 100%);
   --btn-send-glow:     0 6px 18px rgba(255, 110, 156, 0.24);
-}
-
-/* ============================================================
-   AURORA THEME — Deep boreal obsidian & vibrant northern lights cyan.
-   Vibrant, highly modern dark theme with luminous highlights.
-   ============================================================ */
-[data-theme="aurora"] {
-  /* Vivid Boreal Aurora - immersive dark teal and neon green */
-  --bg:        #011211;
-  --bg-raised: #032321;
-  --bg-sunken: #010A0A;
-  --bg-inset:  #053633;
-
-  --glass-bg:       rgba(3, 35, 33, 0.6);
-  --glass-border:   rgba(0, 255, 196, 0.15);
-  --ambient-orb-1:  radial-gradient(circle, rgba(0, 255, 196, 0.15) 0%, transparent 70%);
-  --ambient-orb-2:  radial-gradient(circle, rgba(0, 180, 216, 0.1) 0%, transparent 70%);
-
-  /* Immersive sweeping aurora light across the top */
-  --bg-gradient: radial-gradient(ellipse at top, rgba(0, 255, 196, 0.12) 0%, transparent 70%),
-                 linear-gradient(180deg, #011211 0%, #010A0A 100%);
-
-  --fg:        #E0F8F5;
-  --fg-muted:  #7DB5AB;
-  --fg-subtle: #4D877E;
-  --fg-faint:  #295B54;
-  --fg-invert: #011211;
-
-  --border:        #0A3835;
-  --border-strong: #104F4B;
-  --border-subtle: #052623;
-
-  --accent:        #00FFC4;
-  --accent-hover:  #34FFD2;
-  --accent-subtle: rgba(0, 255, 196, 0.15);
-  --accent-fg:     #011211;
-
-  --success-subtle: rgba(106, 196, 154, 0.14);
-  --warning-subtle: rgba(232, 211, 112, 0.14);
-  --danger-subtle:  rgba(255, 106, 0, 0.14);
-  --info-subtle:    rgba(0, 255, 196, 0.12);
-
-  --shadow-xs: 0 1px 0 rgba(0,0,0,0.5);
-  --shadow-sm: 0 1px 3px rgba(0,0,0,0.6), 0 0 0 1px rgba(0, 255, 196, 0.05);
-  --shadow-md: 0 4px 16px rgba(0,0,0,0.7), 0 0 0 1px rgba(0, 255, 196, 0.08);
-  --shadow-lg: 0 16px 45px rgba(0,0,0,0.8), 0 0 0 1px rgba(0, 255, 196, 0.1);
-  --shadow-pop: 0 24px 80px rgba(0,0,0,0.9), 0 0 0 1px rgba(0, 255, 196, 0.15);
-
-  --shadow-inset: inset 0 2px 4px rgba(0,0,0,0.6), inset 0 0 0 1px rgba(0, 255, 196, 0.05);
-
-  --btn-shadow-rest:   inset 0 1px 0 rgba(255,255,255,0.1),
-                       0 2px 6px rgba(0,0,0,0.50),
-                       0 0 0 1px rgba(0, 255, 196, 0.1);
-  --btn-shadow-hover:  inset 0 1px 0 rgba(255,255,255,0.15),
-                       0 4px 12px rgba(0,0,0,0.60),
-                       0 0 0 1px rgba(0, 255, 196, 0.2);
-  --btn-shadow-active: inset 0 2px 5px rgba(0,0,0,0.7),
-                       0 0 0 1px rgba(0, 255, 196, 0.05);
-
-  --btn-send-gradient: linear-gradient(135deg, #00ffc4 0%, #00b4d8 100%);
-  --btn-send-glow:     0 6px 24px rgba(0, 255, 196, 0.4);
-}
-
-/* ============================================================
-   NEBULA THEME — Deep cosmic violet & electric lavender neon.
-   Frosted glass aesthetics, beautiful deep indigo-space gradient, 
-   and luminous, glowing violet/pink/cyan stardust highlights.
-   ============================================================ */
-[data-theme="nebula"] {
-  /* Deep Cosmic Nebula - immersive galactic indigo and hot pink/purple */
-  --bg:        #090514;
-  --bg-raised: #140C2E;
-  --bg-sunken: #05020B;
-  --bg-inset:  #1D1242;
-
-  --glass-bg:       rgba(20, 12, 46, 0.7);
-  --glass-border:   rgba(217, 70, 239, 0.15);
-  --ambient-orb-1:  radial-gradient(circle, rgba(217, 70, 239, 0.12) 0%, transparent 70%);
-  --ambient-orb-2:  radial-gradient(circle, rgba(6, 182, 212, 0.1) 0%, transparent 70%);
-
-  /* Immersive swirling cosmic mesh gradient */
-  --bg-gradient: radial-gradient(circle at 15% 0%, rgba(192, 132, 252, 0.12) 0%, transparent 60%),
-                 radial-gradient(circle at 85% 100%, rgba(217, 70, 239, 0.08) 0%, transparent 60%),
-                 linear-gradient(180deg, #090514 0%, #06030F 100%);
-
-  --fg:        #F4EEFF;
-  --fg-muted:  #A79DC4;
-  --fg-subtle: #796D9C;
-  --fg-faint:  #50466E;
-  --fg-invert: #090514;
-
-  --border:        #291A54;
-  --border-strong: #3F297A;
-  --border-subtle: #190F36;
-
-  --accent:        #E879F9;
-  --accent-hover:  #F0ABFC;
-  --accent-subtle: rgba(232, 121, 249, 0.15);
-  --accent-fg:     #090514;
-
-  --success-subtle: rgba(106, 196, 154, 0.14);
-  --warning-subtle: rgba(232, 211, 112, 0.14);
-  --danger-subtle:  rgba(255, 106, 0, 0.14);
-  --info-subtle:    rgba(192, 132, 252, 0.15);
-
-  --shadow-xs: 0 1px 0 rgba(0,0,0,0.5);
-  --shadow-sm: 0 1px 4px rgba(0,0,0,0.6), 0 0 0 1px rgba(232, 121, 249, 0.05);
-  --shadow-md: 0 6px 20px rgba(0,0,0,0.7), 0 0 0 1px rgba(232, 121, 249, 0.08);
-  --shadow-lg: 0 18px 50px rgba(0,0,0,0.8), 0 0 0 1px rgba(232, 121, 249, 0.1);
-  --shadow-pop: 0 30px 90px rgba(0,0,0,0.9), 0 0 0 1px rgba(232, 121, 249, 0.15);
-
-  --shadow-inset: inset 0 2px 4px rgba(0,0,0,0.6), inset 0 0 0 1px rgba(232, 121, 249, 0.05);
-
-  --btn-shadow-rest:   inset 0 1px 0 rgba(255,255,255,0.1),
-                       0 2px 8px rgba(0,0,0,0.50),
-                       0 0 0 1px rgba(232, 121, 249, 0.1);
-  --btn-shadow-hover:  inset 0 1px 0 rgba(255,255,255,0.15),
-                       0 5px 15px rgba(0,0,0,0.60),
-                       0 0 0 1px rgba(232, 121, 249, 0.2);
-  --btn-shadow-active: inset 0 2px 6px rgba(0,0,0,0.7),
-                       0 0 0 1px rgba(232, 121, 249, 0.05);
-
-  --btn-send-gradient: linear-gradient(135deg, #f472b6 0%, #d946ef 100%);
-  --btn-send-glow:     0 6px 24px rgba(217, 70, 239, 0.40);
-}
-
-/* ============================================================
-   OPERATOR — clean professional slate.
-   A cool blue-slate dark theme in the vein of a modern dev
-   dashboard (Linear / Vercel): neutral graphite surfaces with the
-   faintest blue cast, crisp desaturated text, one confident azure
-   accent, soft quiet shadows. Distinct from every other theme —
-   not warm (dim), not purple (dark/nebula), not neon (aurora).
-   No gimmicks; the restraint is the point.
-   ============================================================ */
-[data-theme="operator"] {
-  /* Developer Slate: sleek professional IDE workstation with sky-blue accents */
-  --bg:        #0D0E12;
-  --bg-raised: #151821;
-  --bg-sunken: #08090C;
-  --bg-inset:  #1E222E;
-
-  --glass-bg:       rgba(21, 24, 33, 0.72);
-  --glass-border:   rgba(255, 255, 255, 0.06);
-
-  --bg-gradient: linear-gradient(180deg, #12151D 0%, #0D0E12 40%, #07080A 100%);
-
-  --fg:        #E2E8F0;
-  --fg-muted:  #94A3B8;
-  --fg-subtle: #64748B;
-  --fg-faint:  #475569;
-  --fg-invert: #08090C;
-
-  --border:        #1F2433;
-  --border-strong: #2F374D;
-  --border-subtle: #12151E;
-
-  --accent:        #38BDF8;
-  --accent-hover:  #7DD3FC;
-  --accent-subtle: rgba(56, 189, 248, 0.12);
-  --accent-fg:     #0D0E12;
-
-  --success-subtle: rgba(106, 196, 154, 0.14);
-  --warning-subtle: rgba(232, 211, 112, 0.14);
-  --danger-subtle:  rgba(255, 106, 0, 0.14);
-  --info-subtle:    rgba(56, 189, 248, 0.12);
-
-  /* Soft, quiet shadows — modern dashboard depth, never harsh. */
-  --shadow-xs: 0 1px 0 rgba(0, 0, 0, 0.3);
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.03);
-  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04);
-  --shadow-lg: 0 14px 40px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.05);
-  --shadow-pop: 0 24px 70px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.06);
-
-  --shadow-inset: inset 0 1px 0 rgba(0, 0, 0, 0.3), inset 0 0 0 1px rgba(255, 255, 255, 0.03);
-
-  --btn-shadow-rest:   inset 0 1px 0 rgba(255, 255, 255, 0.05),
-                       0 1px 1px rgba(0, 0, 0, 0.35),
-                       0 2px 6px rgba(0, 0, 0, 0.35),
-                       0 0 0 1px rgba(255, 255, 255, 0.04);
-  --btn-shadow-hover:  inset 0 1px 0 rgba(255, 255, 255, 0.08),
-                       0 3px 8px rgba(0, 0, 0, 0.45),
-                       0 8px 18px rgba(0, 0, 0, 0.45),
-                       0 0 0 1px rgba(255, 255, 255, 0.06);
-  --btn-shadow-active: inset 0 1px 3px rgba(0, 0, 0, 0.5),
-                       0 0 0 1px rgba(255, 255, 255, 0.04);
-
-  --btn-send-gradient: linear-gradient(135deg, #4D9EFF 0%, #2F7FE6 100%);
-  --btn-send-glow:     0 6px 18px rgba(77, 158, 255, 0.32);
 }
 
 /* ============================================================
@@ -1071,60 +969,6 @@
 }
 
 /* ============================================================
-   VELVET THEME — Lush, rich, premium. No glassmorphism.
-   Deep plum base, smooth opaque surfaces, vibrant coral accent.
-   ============================================================ */
-[data-theme="velvet"] {
-  --bg:        #1A101C;
-  --bg-raised: #251728;
-  --bg-sunken: #100A11;
-  --bg-inset:  #322136;
-
-  /* Strictly no glassmorphism — fully opaque and matte */
-  --glass-bg:       #251728;
-  --glass-border:   rgba(255, 255, 255, 0.05);
-  --glass-blur:     0px;
-
-  --fg:        #F4EBF5;
-  --fg-muted:  #BAA7BC;
-  --fg-subtle: #89798C;
-  --fg-faint:  #5D515F;
-  --fg-invert: #1A101C;
-
-  --border:        #3B2740;
-  --border-strong: #4E3554;
-  --border-subtle: #241626;
-
-  /* Lush coral / peach accent */
-  --accent:        #FF7A66;
-  --accent-hover:  #FF9685;
-  --accent-subtle: rgba(255, 122, 102, 0.15);
-  --accent-fg:     #1A101C;
-
-  --success-subtle: rgba(87, 204, 153, 0.15);
-  --warning-subtle: rgba(255, 204, 92, 0.15);
-  --danger-subtle:  rgba(255, 107, 107, 0.15);
-  --info-subtle:    rgba(102, 178, 255, 0.15);
-
-  /* Extremely smooth, large, very soft shadows (premium matte feel) */
-  --shadow-xs: 0 2px 10px rgba(0,0,0,0.4);
-  --shadow-sm: 0 8px 20px rgba(0,0,0,0.45);
-  --shadow-md: 0 16px 32px rgba(0,0,0,0.5);
-  --shadow-lg: 0 24px 48px rgba(0,0,0,0.6);
-  --shadow-pop: 0 32px 64px rgba(0,0,0,0.7);
-
-  --shadow-inset: inset 0 2px 8px rgba(0,0,0,0.6);
-
-  /* Matte buttons: purely background shifts, very soft shadow, no sharp lines */
-  --btn-shadow-rest:   0 4px 12px rgba(0,0,0,0.3);
-  --btn-shadow-hover:  0 8px 16px rgba(0,0,0,0.4);
-  --btn-shadow-active: inset 0 2px 6px rgba(0,0,0,0.5);
-
-  --btn-send-gradient: linear-gradient(135deg, #FF7A66 0%, #FF5A44 100%);
-  --btn-send-glow:     0 8px 20px rgba(255, 122, 102, 0.3);
-}
-
-/* ============================================================
    CARTOGRAPH — spatial instrument UI.
    Black ceramic, smoked glass, warm vellum, signal orange.
    ============================================================ */
@@ -1164,10 +1008,6 @@
   --btn-shadow-active: none;
   --btn-send-gradient: linear-gradient(#713F63, #713F63);
   --btn-send-glow: none;
-  --wb-a: #D4B7C8;
-  --wb-b: #B9B5A0;
-  --wb-c: #713F63;
-  --wb-strength: 0.5;
 }
 
 [data-theme="cartograph"] {
@@ -1217,11 +1057,6 @@
   --btn-shadow-active: inset 0 1px 3px rgba(0, 0, 0, 0.45);
   --btn-send-gradient: linear-gradient(180deg, #FF8061 0%, #FF5C34 100%);
   --btn-send-glow: 0 8px 24px rgba(255, 91, 51, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.30);
-
-  --wb-a: #D7E2DF;
-  --wb-b: #627B82;
-  --wb-c: #FF6B45;
-  --wb-strength: 0.34;
 }
 
 /* ============================================================ */

@@ -23,15 +23,18 @@
     var theme = localStorage.getItem('accuretta:theme') || 'light';
     if (theme === 'neobrutalism' || theme === 'neobrutalism-dark') theme = 'amaranth';
     if (theme === 'kinetic') theme = 'aperture';
+    if (/^(aurora|nebula|operator|velvet)$/.test(theme)) theme = 'opal';
     document.documentElement.setAttribute('data-theme', theme);
   })();
 </script>
-<script src="/appearance.js?v=1"></script>
-<link rel="stylesheet" href="/app.css?v=88">
+<script src="/appearance.js?v=2"></script>
+<link rel="stylesheet" href="/app.css?v=92">
   <link rel="stylesheet" href="/ui-refresh.css?v=2">
-  <link rel="stylesheet" href="/workspace-shell.css?v=8">
+  <link rel="stylesheet" href="/workspace-shell.css?v=10">
 <link rel="stylesheet" href="/research-ui.css?v=2">
-<link rel="stylesheet" href="/ui-pass.css?v=12">
+<link rel="stylesheet" href="/ui-pass.css?v=15">
+<link rel="stylesheet" href="/workbench.css?v=9">
+<link rel="stylesheet" href="/opal.css?v=2">
 <link rel="stylesheet" href="/assets/vendor/web/icons.css">
 <script src="/assets/vendor/html2canvas/dist/html2canvas.min.js" defer></script>
 <script src="/assets/vendor/jszip/dist/jszip.min.js" defer></script>
@@ -64,7 +67,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v0.9.4</span>
+        <span class="v" id="brand-v">v1.0.0</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -100,10 +103,14 @@
       <div class="sidebar-divider" id="sidebar-resizer" role="separator" aria-orientation="horizontal" title="Drag to resize · double-click to reset"></div>
 
       <div class="section-head ws-section-head">
-        <span>Workspace</span>
+        <button class="wb-explorer-toggle" id="btn-wb-explorer" type="button" aria-expanded="true" title="Show or hide the workspace folders"><i class="ph ph-caret-down" aria-hidden="true"></i><span>Workspace</span></button>
         <span class="grow"></span>
+        <button class="iconbtn wb-ws-tool" id="btn-ws-filter" type="button" title="Filter files" aria-label="Filter files" aria-pressed="false"><i class="ph ph-funnel-simple"></i></button>
+        <button class="iconbtn wb-ws-tool" id="btn-ws-collapse" type="button" title="Collapse all folders" aria-label="Collapse all folders"><i class="ph ph-arrows-in-line-vertical"></i></button>
+        <button class="iconbtn wb-ws-tool" id="btn-ws-refresh" type="button" title="Refresh files and git status" aria-label="Refresh files and git status"><i class="ph ph-arrow-clockwise"></i></button>
         <button class="iconbtn" id="btn-ws-add-toggle" title="Add folder" aria-expanded="false"><i class="ph ph-plus"></i></button>
       </div>
+      <div class="wb-ws-filter" id="wb-ws-filter" hidden><i class="ph ph-magnifying-glass" aria-hidden="true"></i><input type="text" id="wb-ws-filter-input" placeholder="Filter open folders…" autocomplete="off" spellcheck="false" aria-label="Filter files"></div>
       <div class="workspace" id="workspace">
         <div id="ws-list"></div>
         <div class="ws-add hidden" id="ws-add">
@@ -434,27 +441,25 @@
         <button class="active" id="btn-view-preview">Preview</button>
         <button id="btn-view-code">Code</button>
       </div>
-      <div class="viewport-presets" id="viewport-presets" title="Preview viewport width">
-        <button class="vp-btn active" data-vp="full" title="Full width"><i class="ph ph-frame-corners"></i></button>
-        <button class="vp-btn" data-vp="desktop" title="Desktop 1280px"><i class="ph ph-monitor"></i></button>
-        <button class="vp-btn" data-vp="tablet" title="Tablet 820px"><i class="ph ph-device-tablet"></i></button>
-        <button class="vp-btn" data-vp="mobile" title="Mobile 390px"><i class="ph ph-device-mobile"></i></button>
+      <div class="preview-overflow-wrap">
+        <button class="iconbtn" id="btn-viewport" type="button" title="Viewport: Full width" aria-label="Viewport: Full width" aria-haspopup="menu"><i class="ph ph-frame-corners"></i></button>
+        <div class="preview-overflow-menu wb-vp-menu" id="viewport-menu" role="menu">
+          <button class="mm-item vp-opt active" data-vp="full" role="menuitemradio"><i class="ph ph-frame-corners"></i><span>Full width</span></button>
+          <button class="mm-item vp-opt" data-vp="desktop" role="menuitemradio"><i class="ph ph-monitor"></i><span>Desktop</span><em>1280</em></button>
+          <button class="mm-item vp-opt" data-vp="tablet" role="menuitemradio"><i class="ph ph-device-tablet"></i><span>Tablet</span><em>820</em></button>
+          <button class="mm-item vp-opt" data-vp="mobile" role="menuitemradio"><i class="ph ph-device-mobile"></i><span>Mobile</span><em>390</em></button>
+        </div>
       </div>
-      <button class="iconbtn" id="btn-refresh" title="Refresh"><i class="ph ph-arrow-clockwise"></i></button>
+      <button class="iconbtn" id="btn-refresh" title="Reload preview" aria-label="Reload preview"><i class="ph ph-arrow-clockwise"></i></button>
+      <button class="iconbtn" id="btn-open-new" title="Open in browser" aria-label="Open in browser"><i class="ph ph-arrow-square-out"></i></button>
       <div class="preview-overflow-wrap">
         <button class="iconbtn" id="btn-preview-overflow" title="More actions"><i class="ph ph-dots-three"></i></button>
         <div class="preview-overflow-menu" id="preview-overflow-menu">
-          <button class="mm-item" id="btn-screenshot" title="Screenshot the preview as PNG"><i class="ph ph-camera"></i><span>Screenshot</span></button>
-          <button class="mm-item" id="btn-export-project" title="Export as .zip (index.html + any companion files)"><i class="ph ph-package"></i><span>Export project</span></button>
           <button class="mm-item" id="btn-save-to-workspace" title="Save current preview to a workspace folder (no model call)"><i class="ph ph-folder-plus"></i><span>Save to workspace</span></button>
-          <button class="mm-item" id="btn-save-snapshot" title="Save preview to data/snapshots/"><i class="ph ph-floppy-disk"></i><span>Save snapshot</span></button>
-          <button class="mm-item" id="btn-copy-dataurl" title="Copy as data: URL (portable, no server needed)"><i class="ph ph-link-simple"></i><span>Copy as data URL</span></button>
-          <button class="mm-item" id="btn-toggle-console" title="Toggle console pane"><i class="ph ph-terminal"></i><span>Toggle console</span></button>
           <button class="mm-item" id="btn-review-ui" title="Screenshot the preview and attach it to the composer"><i class="ph ph-magnifying-glass"></i><span>Review UI</span></button>
-          <button class="mm-item" id="btn-open-new" title="Open in new tab"><i class="ph ph-arrow-square-out"></i><span>Open in new tab</span></button>
         </div>
       </div>
-      <button class="iconbtn" id="btn-close-preview" title="Minimize"><i class="ph ph-x"></i></button>
+      <button class="iconbtn" id="btn-close-preview" title="Close preview" aria-label="Close preview"><i class="ph ph-x"></i></button>
     </div>
 
     <div class="version-bar" id="version-bar">
@@ -567,12 +572,44 @@
         <span class="usage-eyebrow">Tokens processed locally</span>
         <strong id="usage-token-total">0</strong>
         <span id="usage-range">Loading local counters…</span>
+        <div class="usage-profile" id="usage-profile">
+          <button class="usage-avatar" id="usage-avatar" type="button" title="Add a profile picture" aria-label="Add a profile picture">
+            <img id="usage-avatar-img" alt="" hidden>
+            <i class="ph ph-user-circle-plus" aria-hidden="true"></i>
+          </button>
+          <input type="file" id="usage-avatar-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+          <div class="usage-profile-actions">
+            <div class="usage-share-wrap">
+              <button class="usage-share" id="usage-share" type="button" aria-disabled="true" aria-describedby="usage-share-tip"><i class="ph ph-share-network" aria-hidden="true"></i><span>Share</span></button>
+              <span class="usage-share-tip" id="usage-share-tip" role="tooltip">Add a profile picture to unlock sharing. Click the circle and pick an image.</span>
+            </div>
+            <button class="usage-avatar-remove" id="usage-avatar-remove" type="button" hidden>Remove photo</button>
+          </div>
+        </div>
       </section>
       <div id="usage-content" class="usage-content" aria-live="polite">
         <div class="usage-loading"><i class="ph ph-circle-notch"></i><span>Reading local stats</span></div>
       </div>
       <footer class="usage-privacy"><i class="ph ph-lock-key"></i><span id="usage-privacy">Aggregate counters stay on this machine.</span></footer>
     </div>
+  </div>
+</section>
+
+<!-- ====== MCP SERVERS WINDOW ====== -->
+<div class="mcp-scrim" id="mcp-scrim"></div>
+<section class="mcp-window" id="mcp-window" role="dialog" aria-modal="true" aria-labelledby="mcp-title" aria-hidden="true">
+  <header class="mcp-head">
+    <span class="mcp-head-icon"><i class="ph ph-plugs" aria-hidden="true"></i></span>
+    <div class="mcp-head-text">
+      <h2 id="mcp-title">MCP servers</h2>
+      <span class="mcp-sub" id="mcp-sub">Saved on this machine in bridge_mcp_config.json, which git ignores.</span>
+    </div>
+    <button class="btn accent sm" id="mcp-add" type="button"><i class="ph ph-plus" aria-hidden="true"></i><span>Add server</span></button>
+    <button class="iconbtn" id="mcp-close" type="button" title="Close" aria-label="Close"><i class="ph ph-x"></i></button>
+  </header>
+  <div class="mcp-body">
+    <nav class="mcp-list" id="mcp-list" aria-label="MCP servers"></nav>
+    <div class="mcp-detail" id="mcp-detail"></div>
   </div>
 </section>
 
@@ -904,7 +941,7 @@
   <header class="faq-page-head">
     <button class="faq-back" id="btn-close-faq" type="button" aria-label="Back to chat"><i class="ph ph-arrow-left"></i><span>Back</span></button>
     <div>
-      <span class="faq-eyebrow">Local model field guide</span>
+      <span class="faq-eyebrow">Field guide</span>
       <h1 id="faq-title">FAQ</h1>
     </div>
     <a class="faq-author" href="https://x.com/mkultraware" target="_blank" rel="noopener noreferrer" aria-label="Follow mkultraware on X">
@@ -929,187 +966,171 @@
             <path fill="url(#faq-dot-accent)" d="M225 135 L260 135 Q272 135 277.2 145.8 L332.8 261.2 Q338 272 326 272 L269 272 Q257 272 253.3 260.6 L216.7 146.4 Q213 135 225 135 Z"></path>
           </svg>
         </div>
-        <span class="faq-rail-label">Browse the manual</span>
+        <span class="faq-rail-label">Sections</span>
         <nav>
-          <a href="#faq-essentials" data-faq-nav="faq-essentials"><span>01</span>Essentials</a>
-          <a href="#faq-models" data-faq-nav="faq-models"><span>02</span>Models &amp; images</a>
-          <a href="#faq-memory" data-faq-nav="faq-memory"><span>03</span>Memory</a>
-          <a href="#faq-security" data-faq-nav="faq-security"><span>04</span>Security Overview</a>
-          <a href="#faq-safety" data-faq-nav="faq-safety"><span>05</span>Safety &amp; privacy</a>
-          <a href="#faq-workflow" data-faq-nav="faq-workflow"><span>06</span>Workflow</a>
+          <a href="#faq-basics" data-faq-nav="faq-basics"><span>01</span>Basics</a>
+          <a href="#faq-models" data-faq-nav="faq-models"><span>02</span>Models</a>
+          <a href="#faq-memory" data-faq-nav="faq-memory"><span>03</span>Long sessions</a>
+          <a href="#faq-workflow" data-faq-nav="faq-workflow"><span>04</span>Working with the agent</a>
+          <a href="#faq-tools" data-faq-nav="faq-tools"><span>05</span>Tools &amp; connections</a>
+          <a href="#faq-safety" data-faq-nav="faq-safety"><span>06</span>Safety &amp; privacy</a>
           <a href="#faq-trouble" data-faq-nav="faq-trouble"><span>07</span>Troubleshooting</a>
         </nav>
-        <p>Written for the current build. No mythology, no cloud required.</p>
       </aside>
 
       <main class="faq-document">
         <section class="faq-intro">
           <div>
-            <span class="faq-eyebrow">Accuretta / manual 01</span>
             <h2>Your model.<br>Your machine.</h2>
-            <p>Short answers about running local models, approvals, memory, tools, and the parts that can still bite.</p>
+            <p>Short, honest answers about local models, approvals, memory and tools, including the parts that can still bite.</p>
           </div>
           <label class="faq-search">
             <i class="ph ph-magnifying-glass" aria-hidden="true"></i>
-            <input id="faq-search" type="search" placeholder="Search the field guide" autocomplete="off" spellcheck="false">
+            <input id="faq-search" type="search" placeholder="Search the FAQ" autocomplete="off" spellcheck="false">
             <kbd>/</kbd>
           </label>
         </section>
 
         <div class="faq-results-note" id="faq-results-note" aria-live="polite"></div>
 
-        <section class="faq-group" id="faq-essentials" data-faq-section>
-          <header><span>01</span><div><h3>Essentials</h3><p>What the app is and how a session behaves.</p></div></header>
+        <section class="faq-group" id="faq-basics" data-faq-section>
+          <header><span>01</span><div><h3>Basics</h3><p>What Accuretta is and where things live.</p></div></header>
           <div class="faq-list">
             <details class="faq-item" open>
               <summary><span>What is Accuretta?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Accuretta is a local-first interface and tool harness for models served by <code>llama.cpp</code>. The core app runs on your computer at <code>localhost:8787</code>. It does not require an Accuretta account or a cloud model.</p></div>
+              <div><p>A local-first interface and tool harness for models served by <code>llama.cpp</code>. It runs on your computer at <code>localhost:8787</code> and needs no account and no cloud model.</p></div>
             </details>
             <details class="faq-item">
-              <summary><span>What are Auto, Agent, and IDE modes?</span><i class="ph ph-plus"></i></summary>
-              <div><p><strong>Auto</strong> chooses a suitable route from your request. <strong>Agent</strong> lets the model use enabled tools for files, commands, research, and other work. <strong>IDE</strong> is aimed at building and previewing web interfaces. Your access mode still controls which actions need approval.</p></div>
+              <summary><span>What are Agent, IDE and Deep Research?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Pick a mode in the composer. <strong>Agent</strong> lets the model use your enabled tools: files, commands, the web and more. <strong>IDE</strong> is for building web interfaces, with a wide layout and a live preview. <strong>Deep Research</strong> investigates a question across sources and presents what it found. Your access mode (Soft, Medium or Hard) decides which actions ask first, in every mode.</p></div>
             </details>
             <details class="faq-item">
-              <summary><span>Where are chats and settings stored?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Accuretta keeps its working data under the local <code>data</code> directory, including chats, settings, summaries, memories, and local usage counters. Deleting a chat removes that chat from the app, while aggregate usage totals may remain.</p></div>
+              <summary><span>Where is my data stored?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Chats, settings, summaries, memories and usage counters live in the local <code>data</code> folder. MCP servers are saved in <code>bridge_mcp_config.json</code> in the app folder, which git ignores. Deleting a chat removes it from the app; aggregate usage totals stay.</p></div>
             </details>
           </div>
         </section>
 
         <section class="faq-group" id="faq-models" data-faq-section>
-          <header><span>02</span><div><h3>Models &amp; images</h3><p>The model supplies the brain. The harness supplies the hands.</p></div></header>
+          <header><span>02</span><div><h3>Models</h3><p>The model is the brain. Accuretta supplies the hands.</p></div></header>
           <div class="faq-list">
             <details class="faq-item">
               <summary><span>Can any GGUF model use tools?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Tool quality depends on the model and its chat template. Models that emit standard tool calls use the native path. Some models use text-shaped function calls, which Accuretta can parse through its compatibility path. A model can still be too small, badly quantized, or poorly trained for reliable agent work.</p></div>
+              <div><p>Tool quality depends on the model and its chat template. Models that emit standard tool calls use the native path; models that write function calls as text go through a compatibility parser. A model can still be too small, too heavily quantized or poorly trained for reliable agent work.</p></div>
             </details>
             <details class="faq-item">
-              <summary><span>Can a text-only model understand an attached image?</span><i class="ph ph-plus"></i></summary>
-              <div><p>No. Image display and model vision are separate abilities. The chat can show an attachment, but the model needs compatible vision support and a loaded projector to inspect its pixels. Printing text such as <code>&lt;preview&gt;</code> or running a Python script does not magically create vision.</p></div>
+              <summary><span>Can the model see images?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Only with vision support and a matching <code>mmproj</code> projector loaded. The chat can always show an attachment, but a text-only model can't see its pixels. In Settings the projector can be <strong>Off</strong>, <strong>Auto</strong> (finds a match next to the model) or <strong>Manual</strong>. A mismatched projector fails or produces nonsense.</p></div>
             </details>
             <details class="faq-item">
-              <summary><span>What does the vision projector setting do?</span><i class="ph ph-plus"></i></summary>
-              <div><p>A matching <code>mmproj</code> file connects a supported multimodal model to image input. <strong>Off</strong> keeps the model text-only, <strong>Auto</strong> looks for a compatible projector beside the model, and <strong>Manual</strong> uses the exact projector you choose. A mismatched projector can fail or produce nonsense.</p></div>
+              <summary><span>How do I fit a large model into my VRAM?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Use Settings → Auto-tune with a realistic VRAM budget. Accuretta reads the model's metadata and proposes context size, GPU layers, cache precision, batching and CPU expert offload for MoE models. Treat it as a strong starting point, then check real speed and memory on your machine.</p></div>
             </details>
             <details class="faq-item">
-              <summary><span>How do I fit a large MoE model into limited VRAM?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Use Settings → Auto-tune and set a realistic VRAM budget. Accuretta reads the model metadata and proposes context size, GPU layers, cache precision, batching, and CPU expert offload. Treat the estimate as a strong starting point, then verify real speed and memory use on your machine.</p></div>
-            </details>
-            <details class="faq-item">
-              <summary><span>What happens beyond a model's native context limit?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Accuretta can enable YaRN scaling when the configured context exceeds the limit recorded in the model. This can provide more working space, but it does not retrain the model. Recall, precision, and attention to early details may gradually degrade, and the amount varies by model. Treat extended context as useful extra room rather than guaranteed native-quality memory.</p></div>
+              <summary><span>What happens past a model's native context length?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Accuretta can enable YaRN scaling when the configured context exceeds what the model was trained for. You get more room, but the model isn't retrained: recall of early details can slowly degrade, by an amount that varies per model.</p></div>
             </details>
           </div>
         </section>
 
         <section class="faq-group" id="faq-memory" data-faq-section>
-          <header><span>03</span><div><h3>Memory</h3><p>How long sessions stay useful without eating the whole context window.</p></div></header>
+          <header><span>03</span><div><h3>Long sessions</h3><p>How long tasks stay useful without filling the context window.</p></div></header>
           <div class="faq-list">
             <details class="faq-item">
               <summary><span>What does the context ring show?</span><i class="ph ph-plus"></i></summary>
-              <div><p>It estimates how much of the loaded model's context window the current prompt uses. The ring is a safety gauge, not a perfect tokenizer reading, so it intentionally leans conservative. Hover the ring for a per-category breakdown: system prompt, tool specs, user and assistant turns, and tool results.</p></div>
+              <div><p>An estimate of how much of the loaded model's context the current prompt uses. It leans conservative on purpose. Hover it for a breakdown: system prompt, tool specs, your turns, the model's turns and tool results.</p></div>
             </details>
             <details class="faq-item">
-              <summary><span>What happens when a chat becomes too long?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Accuretta compacts older completed turns into a structured rolling summary. The current system keeps the original request, recent user instructions, and exact identifiers such as paths, URLs, issue IDs, and hashes as separate continuity evidence. The full chat remains stored; the model receives the compacted working version.</p></div>
+              <summary><span>What happens when a chat gets too long?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Accuretta compacts older turns into a structured summary, even in the middle of a long task. Your original request, your mid-task updates and exact details such as paths, URLs, IDs and hashes carry forward, and the full chat stays stored. The first reply after a compaction can be slower while the server rebuilds its cache. Compaction gives the model a cleaner memory; it doesn't make it smarter or raise its context limit.</p></div>
             </details>
             <details class="faq-item">
-              <summary><span>Does compaction make the model smarter?</span><i class="ph ph-plus"></i></summary>
-              <div><p>It gives the same model a cleaner memory. That improves recall in long sessions and reduces the amount of old text sent during compaction. It does not change the model weights, increase the physical context limit, or rescue a weak model from poor reasoning.</p></div>
-            </details>
-            <details class="faq-item">
-              <summary><span>What is long-term memory?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Long-term memories are small durable notes saved across chats, such as a preference, command, or project fact. Review and remove them in Settings. They are useful context, not sacred scripture, so delete stale or incorrect entries.</p></div>
-            </details>
-          </div>
-        </section>
-
-        <section class="faq-group" id="faq-security" data-faq-section>
-          <header><span>04</span><div><h3>Security Overview</h3><p>A local snapshot of what deserves attention and where the view stops.</p></div></header>
-          <div class="faq-list">
-            <details class="faq-item">
-              <summary><span>What does Security Overview actually do?</span><i class="ph ph-plus"></i></summary>
-              <div><p>It runs a read-only check of this Windows machine. It looks at recent System, Application, and Security events, current network activity, common startup and persistence locations, and Accuretta's recent action history. Fixed rules turn that evidence into a short review queue. It does not change the system while scanning.</p></div>
-            </details>
-            <details class="faq-item">
-              <summary><span>Which parts are written by the local model?</span><i class="ph ph-plus"></i></summary>
-              <div><p>The collectors and fixed rules gather evidence, set alert severity, and decide what enters the review queue. When the loaded local model is available, it writes the headline, situation paragraph, coverage note, explanations for notable alerts, and suggested checks. If the model is busy or unavailable, Accuretta uses a rules-based summary instead. This model call is separate from chat and receives no chat history, memories, skills, or tools.</p></div>
-            </details>
-            <details class="faq-item">
-              <summary><span>Does this replace a SIEM or antivirus?</span><i class="ph ph-plus"></i></summary>
-              <div><p>No. Security Overview is a point-in-time local check. It does not continuously collect every event, keep a full security log archive, block malware, quarantine files, or prove that a machine is clean. Missing Windows permissions or disabled logs create blind spots. Keep Windows Security or your chosen endpoint protection enabled.</p></div>
-            </details>
-            <details class="faq-item">
-              <summary><span>What happens when I click Investigate?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Accuretta opens a fresh chat and quietly gives the model a small evidence snapshot from that alert. It does not copy your other chats, send a fake message as you, or start checking things by itself. You decide what to ask next. If you ask it to inspect further, the session follows the same tool and approval rules as any other chat.</p></div>
-            </details>
-            <details class="faq-item">
-              <summary><span>What does Whitelist mean?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Whitelist tells Accuretta that you recognize a specific application or identity and want routine repeats hidden. The reason is stored locally, and materially different behavior can bring the item back for review. Whitelisting does not make a file safe, change Windows permissions, or add an antivirus exception. You can remove an entry from the Whitelist panel at any time.</p></div>
-            </details>
-          </div>
-        </section>
-
-        <section class="faq-group" id="faq-safety" data-faq-section>
-          <header><span>05</span><div><h3>Safety &amp; privacy</h3><p>Local-first still requires a steering wheel and brakes.</p></div></header>
-          <div class="faq-list">
-            <details class="faq-item">
-              <summary><span>What do Soft, Medium, and Hard approval modes mean?</span><i class="ph ph-plus"></i></summary>
-              <div><p><strong>Soft</strong> runs routine project work, workspace writes, non-destructive commands, tests, and persistent sessions without stopping. <strong>Medium</strong> only trusts normal writes inside the workspace. <strong>Hard</strong> asks for every action. Deletions, mutating Git actions, program launches, desktop control, protected or remote changes, and commands influenced by recent web content keep stricter gates. Some destructive actions are refused outright.</p></div>
-            </details>
-            <details class="faq-item">
-              <summary><span>Can keyboard shortcuts approve protected actions?</span><i class="ph ph-plus"></i></summary>
-              <div><p>No. A shortcut may approve the newest ordinary request, but protected actions still require the hold-to-approve control. This prevents an accidental keypress from changing sensitive parts of the system.</p></div>
-            </details>
-            <details class="faq-item">
-              <summary><span>Does anything leave my computer?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Core chat inference and local counters stay on this machine. Data can leave when you deliberately use web tools, allow external preview resources, connect GitHub, enable Discord, pair a remote machine, or ask an agent to contact an online service. Those features are optional and should be treated as network access.</p></div>
-            </details>
-            <details class="faq-item">
-              <summary><span>Are usage stats telemetry?</span><i class="ph ph-plus"></i></summary>
-              <div><p>They are local aggregate counters used by the Usage Stats page. Accuretta records performance totals and model health without storing prompt or reply content in the model comparison dataset. The page does not require sending those counters to a remote analytics service.</p></div>
+              <summary><span>What are long-term memory and pinned notes?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Long-term memories are small notes kept across chats, like a preference or a project fact. Review and delete them in Settings. Pinned notes belong to one chat: the model pins key decisions and fixes so they're never compacted away.</p></div>
             </details>
           </div>
         </section>
 
         <section class="faq-group" id="faq-workflow" data-faq-section>
-          <header><span>06</span><div><h3>Workflow</h3><p>Small conveniences that prevent repetitive finger gymnastics.</p></div></header>
+          <header><span>04</span><div><h3>Working with the agent</h3><p>Steering, reviewing and finding things.</p></div></header>
           <div class="faq-list">
             <details class="faq-item">
-              <summary><span>Can I correct the model while it is working?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Yes. Type your update and use the normal send button. Task updates shows whether it is waiting, delivered, or needs a retry. The model receives it at a safe stopping point; an action already running may finish first. Use the separate stop button to end the task.</p></div>
-            </details>
-            <details class="faq-item">
-              <summary><span>How do I find an old message or tool error?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Press <code>Ctrl+K</code> or <code>⌘K</code> and enter at least two characters. Search covers saved messages, tool output, errors, and filenames mentioned in conversations. Select a result to jump to its message. It does not search every workspace file's contents.</p></div>
+              <summary><span>Can I correct the model while it works?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Yes. Type while it runs and the send button becomes <strong>Steer</strong>. Your update reaches the model at the next safe point, and its card shows when it was received; an action already running finishes first. To end the task, press the stop button, or <code>Esc</code> in the composer.</p></div>
             </details>
             <details class="faq-item">
               <summary><span>What does Review changes show?</span><i class="ph ph-plus"></i></summary>
-              <div><p>It shows recorded text differences for files changed during the task. Supported files open in a preview or source view. Binary or unsupported files offer Show in folder. Undo requires a restorable snapshot and confirmation. The verification summary reports checks that actually ran.</p></div>
+              <div><p>The text differences for files changed during the task. Supported files open in a preview or source view; binary files offer Show in folder. Undo needs a restorable snapshot and asks first. The verification summary lists only checks that actually ran.</p></div>
             </details>
             <details class="faq-item">
-              <summary><span>Why does activity mention an earlier failure after more work?</span><i class="ph ph-plus"></i></summary>
-              <div><p>An individual action can fail before the model tries another approach. The panel distinguishes earlier errors from the current action and keeps the error details available. Continued work alone does not prove the original problem was fixed.</p></div>
+              <summary><span>How do I find an old message or a tool error?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Press <code>Ctrl+K</code> for the command palette: sessions, commands and files. Type two or more characters to also search saved messages, tool output and errors, then pick a result to jump to it. <code>Ctrl+P</code> finds a workspace file by name. Neither searches inside every file.</p></div>
             </details>
             <details class="faq-item">
-              <summary><span>How do scrolling and notification sounds work?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Replies follow the bottom while they grow. Scroll up to read older text without being pulled back down; return to the bottom or click the down arrow to resume. When sound is enabled, permission requests, completion, and failure use distinct sounds. Completion and failure alerts play for tasks lasting at least 40 seconds.</p></div>
+              <summary><span>Which keyboard shortcuts are there?</span><i class="ph ph-plus"></i></summary>
+              <div><p>The defaults below can be changed, or new ones added for approving, new chats and more, in Settings → Keyboard shortcuts: click an action and press keys. <code>Backspace</code> turns one off.</p>
+                <dl class="faq-keys">
+                  <dt><kbd>Enter</kbd> · <kbd>Shift+Enter</kbd></dt><dd>Send · new line</dd>
+                  <dt><kbd>Ctrl+K</kbd></dt><dd>Command palette</dd>
+                  <dt><kbd>Ctrl+P</kbd></dt><dd>Quick open a file</dd>
+                  <dt><kbd>Ctrl+B</kbd> · <kbd>Ctrl+Shift+B</kbd></dt><dd>Sidebar · workspace</dd>
+                  <dt><kbd>Ctrl+J</kbd> · <kbd>Ctrl+\</kbd></dt><dd>Terminal · preview</dd>
+                  <dt><kbd>Ctrl+Shift+↑/↓</kbd></dt><dd>Previous / next tab</dd>
+                  <dt><kbd>Ctrl+W</kbd></dt><dd>Close tab (<kbd>Alt+W</kbd> in a browser)</dd>
+                  <dt><kbd>Esc</kbd></dt><dd>Close a page or overlay; in the composer, stop a running task</dd>
+                </dl></div>
             </details>
             <details class="faq-item">
-              <summary><span>Can I bind my own keyboard shortcuts?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Yes. Open Settings → Keyboard shortcuts, choose an action, and press the combination you want. Shortcuts can approve or deny the newest request, open pages, create a chat, focus the composer, or stop generation. Use Delete or Backspace while recording to clear a binding.</p></div>
-            </details>
-            <details class="faq-item">
-              <summary><span>What keyboard controls are built in?</span><i class="ph ph-plus"></i></summary>
-              <div><p><code>Enter</code> sends from the composer, <code>Shift+Enter</code> adds a line, and <code>Ctrl+K</code> or <code>⌘K</code> opens the session switcher. <code>Escape</code> closes full pages and overlays. Custom shortcuts are added in Settings.</p></div>
+              <summary><span>How do scrolling and sounds work?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Replies and terminal panes follow new output until you scroll up; a down arrow then appears to jump back to the latest. With sound on, approvals, completion and failure each have their own sound. Completion and failure only play for tasks longer than 40 seconds.</p></div>
             </details>
             <details class="faq-item">
               <summary><span>Does the composer keep drafts?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Yes. Draft text is saved per chat in browser storage and restored when you return. Sending the message clears that chat's draft.</p></div>
+              <div><p>Yes, per chat, in this browser's storage. Sending the message clears that chat's draft.</p></div>
+            </details>
+          </div>
+        </section>
+
+        <section class="faq-group" id="faq-tools" data-faq-section>
+          <header><span>05</span><div><h3>Tools &amp; connections</h3><p>Extra tools, playbooks and the security check.</p></div></header>
+          <div class="faq-list">
+            <details class="faq-item">
+              <summary><span>How do I add MCP servers?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Open <strong>MCP servers</strong> from the MCP chip in the top bar, from Settings, or from the <code>Ctrl+K</code> palette. Add a server by its command, or paste the JSON snippet from its README. It starts right away and its tools reach the agent on the next turn; if it fails, the window shows why. API keys stay on this machine and aren't shown again. Servers can only be changed on the computer running Accuretta, and remote (HTTP/SSE) servers aren't supported yet.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>What are Playbooks?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Ready-made guided jobs in the composer's <strong>+</strong> menu: a network scan of this machine, red-team jobs (Passive OSINT, Target Recon, Frontend Secrets, Red Team) and read-only blue-team checks (Health check, Persistence hunt). Red-team playbooks need Red team tools turned on in Settings, and each engagement passes an authorization gate with a target and scope that the tools then enforce. Use them only on systems you own or are authorized to test.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>What does Security Overview do?</span><i class="ph ph-plus"></i></summary>
+              <div><p>A read-only check of this Windows machine: recent System, Application and Security events, network activity, common startup and persistence locations, and Accuretta's own recent actions. Fixed rules decide what enters the review queue. When the local model is free it writes the summary and explanations in a separate call that sees no chats, memories or tools; otherwise a rules-based summary is used. It's a point-in-time check, not antivirus: keep Windows Security or your own endpoint protection on.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>What do Investigate and Whitelist do?</span><i class="ph ph-plus"></i></summary>
+              <div><p><strong>Investigate</strong> opens a fresh chat with a small evidence snapshot from that alert and waits for you; it doesn't start checking on its own. <strong>Whitelist</strong> hides routine repeats of an app or identity you recognize. Clearly different behavior brings it back, and it never marks a file as safe or adds an antivirus exception. Remove entries from the Whitelist panel at any time.</p></div>
+            </details>
+          </div>
+        </section>
+
+        <section class="faq-group" id="faq-safety" data-faq-section>
+          <header><span>06</span><div><h3>Safety &amp; privacy</h3><p>Local-first still needs a steering wheel and brakes.</p></div></header>
+          <div class="faq-list">
+            <details class="faq-item">
+              <summary><span>What do Soft, Medium and Hard mean?</span><i class="ph ph-plus"></i></summary>
+              <div><p><strong>Soft</strong> runs routine project work without stopping: workspace edits, commands and tests, cleaning up files inside a project folder, opening a preview image or document, and cloning or staging with Git. It still asks before deleting or writing anything outside your workspace folders, removing a whole project, committing or pushing, launching or killing programs, and any command it can't fully read. <strong>Medium</strong> only trusts normal edits inside the workspace. <strong>Hard</strong> asks for every action. Desktop control, protected or remote changes and anything influenced by recent web content keep stricter checks in every mode, and some destructive actions are refused outright. A keyboard shortcut can approve ordinary requests only; protected actions always need hold-to-approve.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Does anything leave my computer?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Chat inference and local counters stay here. Data leaves only when you use something that connects out: web tools, external preview resources, GitHub, Discord, a paired device, MCP servers that call online services, or an agent you ask to contact one.</p></div>
+            </details>
+            <details class="faq-item">
+              <summary><span>Are usage stats telemetry?</span><i class="ph ph-plus"></i></summary>
+              <div><p>No. They're local counters for the Usage stats page; prompts and replies aren't stored in them and nothing is sent anywhere. The Share card is drawn on your machine and copied to your clipboard, so it only leaves when you paste it somewhere.</p></div>
             </details>
             <details class="faq-item">
               <summary><span>Can I use Accuretta from another device?</span><i class="ph ph-plus"></i></summary>
-              <div><p>The local server can be reached from your LAN using the inference computer's address. Tailscale support can provide private remote access across your tailnet. Secure browser features may require the HTTPS address created by Tailscale Serve.</p></div>
+              <div><p>Yes, over Tailscale. Accuretta only accepts connections from this computer and from devices on your tailnet; other devices on your local network are refused. Some browser features, like the clipboard, need the HTTPS address from Tailscale Serve (Settings → Enable HTTPS address).</p></div>
             </details>
           </div>
         </section>
@@ -1118,16 +1139,16 @@
           <header><span>07</span><div><h3>Troubleshooting</h3><p>Common failures, translated from machine grunting.</p></div></header>
           <div class="faq-list">
             <details class="faq-item">
-              <summary><span>Why did the model produce no visible answer?</span><i class="ph ph-plus"></i></summary>
-              <div><p>A reasoning model can spend its reply budget thinking and run out before it reaches the answer. Raise the reply or thinking budget, use a lower effort, or choose a model that follows the expected reasoning template more reliably.</p></div>
+              <summary><span>Why is there no visible answer?</span><i class="ph ph-plus"></i></summary>
+              <div><p>A reasoning model can spend its whole reply budget thinking. Raise the reply or thinking budget, lower the effort, or use a model that follows its reasoning template more reliably.</p></div>
             </details>
             <details class="faq-item">
-              <summary><span>Why is the first turn after compaction slower?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Compaction changes the prompt prefix, so the server may need to rebuild its fast attention cache for the new condensed history. Later turns can reuse that prefix again. The pause is real, but it buys room for the session to continue.</p></div>
+              <summary><span>"The inference server faulted mid-turn"</span><i class="ph ph-plus"></i></summary>
+              <div><p>llama-server stopped or returned an error during a reply. The tool work that turn finished is kept. Retry the turn, or send a short message like "continue". If it keeps happening, pick the model again in the composer's model menu to restart the server, and check the <strong>Backend</strong> tab in the terminal panel for the actual error.</p></div>
             </details>
             <details class="faq-item">
-              <summary><span>Why did a tool fail even though the chat still works?</span><i class="ph ph-plus"></i></summary>
-              <div><p>A tool can fail because of permissions, a missing program, network trouble, invalid arguments, or a rejected approval. That usually means the individual action failed, not that Accuretta itself crashed. Read the short error, fix the cause, and retry only that action.</p></div>
+              <summary><span>Why did a tool fail when the chat still works?</span><i class="ph ph-plus"></i></summary>
+              <div><p>Permissions, a missing program, network trouble, invalid arguments or a rejected approval can each fail one action without anything else breaking. Read the short error, fix the cause and retry that action. The activity panel keeps earlier errors visible after the model moves on; more work afterwards doesn't prove the first problem was fixed.</p></div>
             </details>
           </div>
         </section>
@@ -1135,7 +1156,7 @@
         <div class="faq-empty" id="faq-empty" hidden>
           <i class="ph ph-binoculars"></i>
           <strong>No matching answers</strong>
-          <span>Try fewer words. The manual is useful, but it cannot read minds yet.</span>
+          <span>Try fewer or different words.</span>
         </div>
 
         <footer class="faq-footer">
@@ -1169,8 +1190,9 @@
     <span class="kbd">Esc</span>
   </div>
   <div class="palette-list" id="palette-list"></div>
-  <div class="palette-foot">
-    <span class="kbd">↑↓</span> navigate · <span class="kbd">Enter</span> open · <span class="kbd">⌘N</span> new session
+  <div class="palette-foot" id="palette-foot">
+    <span class="kbd">↑↓</span> navigate · <span class="kbd">Enter</span> open · <span class="kbd">Esc</span> close
+    <span class="palette-foot-modes"><span class="kbd">&gt;</span> commands · <span class="kbd">@</span> files</span>
   </div>
 </div>
 
@@ -1268,14 +1290,14 @@
       <span class="hint">lower = more context window fits in VRAM. saving reloads the model.</span>
     </div>
     <div class="form-row">
-      <label>V cache quant · kv_cache_type_v <i class="ph ph-info" title="Manual override only — the auto-tuner never splits K/V: q8_0 K + q4_0 V measured +1.6% PPL AND a slow mixed-dtype path on this machine (llama-perplexity, Qwen3.6-27B). 'same as K' mirrors kv_cache_type."></i></label>
+      <label>V cache quant · kv_cache_type_v <i class="ph ph-info" title="The auto-tuner only splits K/V when you pick different types in Auto-tune: q8_0 K + q4_0 V measured +1.6% PPL AND a slow mixed-dtype path on this machine (llama-perplexity, Qwen3.6-27B). 'same as K' mirrors kv_cache_type."></i></label>
       <select id="set-kvv">
         <option value="">same as K</option>
         <option value="q4_0">q4_0 · manual only, measured +1.6% PPL + slow</option>
         <option value="q8_0">q8_0</option>
         <option value="f16">f16</option>
       </select>
-      <span class="hint">manual override — auto-tune always uses "same as K". saving reloads the model.</span>
+      <span class="hint">manual override · to have auto-tune plan around a type, pick it under Auto-tune. saving reloads the model.</span>
     </div>
     <div class="form-row">
       <label>GPU reserve GB · vram_reserve_gb <i class="ph ph-info" title="Minimal GPU-side safety for Windows desktop/compositor spikes on the same card. 0 = give the LLM everything (the ~8% headroom still guards CUDA workspace)."></i></label>
@@ -1310,6 +1332,24 @@
       <label>Minimum speed · tok/s <i class="ph ph-info" title="The slowest generation speed you'll accept. Auto-tune picks the largest context (and MoE offload) whose predicted speed at your usual chat size (learned from your history) stays at or above this. It never lowers the model's quantization; if the floor can't be reached on this GPU, the notes say so."></i></label>
       <input type="number" id="set-min-tok-s" step="5" min="1" max="500">
       <span class="hint">45 default · learned from your real reply speeds.</span>
+    </div>
+    <div class="form-row">
+      <label>KV cache · context memory <i class="ph ph-info" title="How precisely the context is stored on the GPU. Auto-tune fits the largest context that works with the types you pick here. q8_0 is close to lossless; q4_0 roughly doubles the context for a small quality cost; f16 is exact but halves it. Mixing different K and V types runs on llama.cpp's slower attention path."></i></label>
+      <div class="autotune-kv-row">
+        <select id="set-autotune-kv" aria-label="K cache type for auto-tune">
+          <option value="auto">K · Auto (tuner picks)</option>
+          <option value="q8_0">K · q8_0</option>
+          <option value="q4_0">K · q4_0</option>
+          <option value="f16">K · f16</option>
+        </select>
+        <select id="set-autotune-kv-v" aria-label="V cache type for auto-tune">
+          <option value="">V · same as K</option>
+          <option value="q8_0">V · q8_0</option>
+          <option value="q4_0">V · q4_0</option>
+          <option value="f16">V · f16</option>
+        </select>
+      </div>
+      <span class="hint">q4_0 ≈ twice the context of q8_0 · f16 ≈ half · then press Suggest.</span>
     </div>
     <div class="form-row">
       <button type="button" class="btn sm" id="btn-autotune"><i class="ph ph-magic-wand"></i>Suggest values for current model</button>
@@ -1452,6 +1492,25 @@
       </select>
       <span class="hint">Auto is recommended. Overrides are an escape hatch for new or unusual local model templates.</span>
     </div>
+    <div class="form-row">
+      <label>Verification mode <i class="ph ph-info" title="For models whose chat template supports it (Sage-A1.5): the model pauses inside its reasoning to review what it has established and what failed, then revises its approach. Costs extra thinking tokens. Ignored by other models."></i></label>
+      <select id="set-verification-mode">
+        <option value="auto">Auto (Deep effort only)</option>
+        <option value="on">Always on</option>
+        <option value="off">Off</option>
+      </select>
+    </div>
+
+    <div class="form-group">Sub-agents <span class="hint" style="font-size:10px;font-weight:normal;text-transform:none;letter-spacing:0;">— models trained for spawn_subagent (Sage-A1.5)</span></div>
+    <div class="form-row">
+      <label>Tasks per dispatch <i class="ph ph-info" title="Most sub-agents the model may dispatch in one spawn_subagent call. Larger batches are rejected so the model splits them."></i></label>
+      <input type="number" id="set-subagent-tasks" step="1" min="1" max="8">
+    </div>
+    <div class="form-row">
+      <label>Tool rounds per sub-agent <i class="ph ph-info" title="Each sub-agent gets this many read-only tool rounds before it must answer with what it found."></i></label>
+      <input type="number" id="set-subagent-turns" step="1" min="2" max="60">
+      <span class="hint">Sub-agents run one after another unless Parallel sequences is above 1, which splits the context between slots.</span>
+    </div>
 
     <div class="form-group">Preview</div>
     <div class="form-row inline">
@@ -1469,9 +1528,7 @@
         <option value="dark">Dark</option>
         <option value="dim">Dim</option>
         <option value="retro">Retro</option>
-        <option value="aurora">Aurora</option>
-        <option value="nebula">Nebula</option>
-        <option value="operator">Operator</option>
+        <option value="opal">Opal</option>
         <option value="neumorphic">Neumorphic</option>
         <option value="amaranth">Amaranth</option>
         <option value="aperture">Aperture</option>
@@ -1479,7 +1536,6 @@
         <option value="atelier">Atelier</option>
         <option value="soft">Soft</option>
         <option value="pastel">Pastel</option>
-        <option value="velvet">Velvet</option>
         <option value="cartograph">Cartograph</option>
         <option value="folio">Folio</option>
         <option value="light">Light</option>
@@ -1511,10 +1567,10 @@
     </div>
 
     <div class="form-row">
-      <span class="hint">a small always-on-top island at the top of the screen. shows what the agent is doing, gates approvals, and takes prompts while this window is minimized. press <b>Ctrl+Alt+Space</b> to bring it down or tuck it away.</span>
+      <span class="hint">a small always-on-top island at the top of the screen. shows what the agent is doing, gates approvals, and takes prompts while this window is minimized. press <b>Ctrl+Alt+N</b> (<b>⌃⌥N</b> on a Mac) to bring it down or tuck it away.</span>
     </div>
     <div class="form-row inline">
-      <label>Notch overlay <span class="hint">(Windows)</span> <span class="beta-badge">beta</span></label>
+      <label>Notch overlay <span class="hint">(Windows · macOS)</span> <span class="beta-badge">beta</span></label>
       <div class="sw" id="sw-notch-enabled"></div>
     </div>
     <div class="form-row">
@@ -1523,11 +1579,15 @@
 
     <div class="form-group">Keyboard shortcuts</div>
     <div class="form-row">
-      <span class="hint">pick an action, then press a key combination. approval shortcuts only act on the newest request, and protected actions still require hold-to-approve.</span>
+      <span class="hint">click a shortcut, then press a new key combination. backspace turns one off, and the arrow button restores its default. approval shortcuts only act on the newest request, and protected actions still require hold-to-approve.</span>
+    </div>
+    <div class="form-row">
+      <label for="set-keycap-hints"><input type="checkbox" id="set-keycap-hints"> Show a key hint when a shortcut runs</label>
+      <span class="hint">a small keycap toast at the bottom of the window. stored on this device.</span>
     </div>
     <div class="form-row shortcut-settings-row">
       <div class="shortcut-list" id="shortcut-list"></div>
-      <button class="btn sm shortcut-reset" id="btn-reset-shortcuts" type="button"><i class="ph ph-arrow-counter-clockwise"></i>Clear all</button>
+      <button class="btn sm shortcut-reset" id="btn-reset-shortcuts" type="button"><i class="ph ph-arrow-counter-clockwise"></i>Restore defaults</button>
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
@@ -1555,12 +1615,19 @@
     <div class="form-row">
       <label>Approval mode</label>
       <div class="approval-mode-options" id="seg-approval-mode" role="group" aria-label="Approval mode">
-        <button class="chip" data-approval-mode="soft" type="button" aria-pressed="false"><strong>Soft · Allow routine project work</strong><span>Normal workspace edits, non-destructive commands, tests, and routine tool actions can run automatically.</span><small>Example: edit a project file and run its tests without stopping.</small></button>
+        <button class="chip" data-approval-mode="soft" type="button" aria-pressed="false"><strong>Soft · Allow routine project work</strong><span>Workspace edits, commands, tests and cleanup inside a project run automatically. Anything outside your workspace folders still asks.</span><small>Example: rebuild a render, clear its old frames and open the result without stopping.</small></button>
         <button class="chip" data-approval-mode="medium" type="button" aria-pressed="false"><strong>Medium · Allow workspace edits</strong><span>Normal workspace writes can run automatically. Commands and other approval-controlled actions ask first.</span><small>Example: edit a project file automatically, then ask before running tests.</small></button>
         <button class="chip" data-approval-mode="hard" type="button" aria-pressed="false"><strong>Hard · Ask for each action</strong><span>Ask for approval on each action handled by the approval system, including workspace writes and commands.</span><small>Example: ask before editing a project file and again before running tests.</small></button>
       </div>
       <div class="approval-mode-note"><strong>Stricter rules still apply</strong><p>Deletions, Git changes, program launches, desktop control, protected or remote changes, and actions influenced by recent web content keep their additional checks in every mode. Some destructive actions are blocked outright.</p></div>
       <details class="approval-mode-details"><summary>Reading files and remembered approvals</summary><p>Ordinary read-only tools can run without approval. Choices you explicitly remember for the current session can still allow eligible actions, including in Hard mode. Stricter gates take priority over those choices.</p></details>
+    </div>
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+      <span>MCP servers</span>
+    </div>
+    <div class="form-row inline">
+      <label>Connect tools from MCP servers</label>
+      <button class="btn sm" id="btn-open-mcp" type="button"><i class="ph ph-plugs"></i>Manage</button>
     </div>
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
       <span>Red team tools</span>
@@ -1890,7 +1957,7 @@
 <script src="/agent-orb.js?v=4"></script>
 <script src="/theme-flowlines.js?v=2" defer></script>
 <script src="/dot-matrix.js?v=6"></script>
-<script src="/app.js?v=2026101708"></script>
+<script src="/app.js?v=2026102511"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {

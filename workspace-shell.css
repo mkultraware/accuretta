@@ -190,7 +190,6 @@
 #app .welcome-logo-wrap::after { display: none; }
 #app .welcome-title { font-size: clamp(30px, 4vw, 44px); line-height: 1.1; letter-spacing: -.04em; margin-bottom: 10px; }
 #app .welcome-subtitle { font-size: 14px; margin-bottom: 28px; line-height: 1.6; }
-#app .welcome-blobs { opacity: .18; }
 #app .welcome-suggestions { border: 0; gap: 8px; }
 #app .welcome-suggest-btn {
   min-height: 90px;
@@ -315,8 +314,8 @@
    Codex / Opencode: 1px borders, 6-8px radii, no motion. */
 #app .ctx-gauge,
 #app .cost-widget,
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .ctx-gauge,
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .cost-widget {
+:is([data-theme="dark"], [data-theme="opal"]) .ctx-gauge,
+:is([data-theme="dark"], [data-theme="opal"]) .cost-widget {
   background: var(--bg-raised) !important;
   border: 1px solid var(--border-subtle) !important;
   border-radius: 8px !important;
@@ -333,7 +332,7 @@
   transition: stroke-dashoffset 200ms linear !important;
 }
 #app .ctx-gauge svg circle:first-child,
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .ctx-gauge svg circle:first-child {
+:is([data-theme="dark"], [data-theme="opal"]) .ctx-gauge svg circle:first-child {
   stroke: var(--border-strong) !important;
   opacity: 0.5 !important;
 }
@@ -367,11 +366,6 @@
 #app .iconbtn:hover { background: var(--bg-inset) !important; color: var(--fg) !important; }
 #app .iconbtn:active { background: var(--bg-inset) !important; }
 #app .heartbeat-icon { animation: none !important; opacity: 0.7 !important; transform: none !important; }
-#app .welcome-blobs,
-#app .wb-blob,
-#app .wb-pillars,
-#app .wb-soften { display: none !important; }
-#app .welcome-blobs { opacity: 0 !important; }
 #app .welcome-suggest-btn,
 #app .toolbar-overflow-menu,
 #app .security-dialog {

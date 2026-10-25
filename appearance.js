@@ -24,7 +24,6 @@
       "--accent-subtle": mix(bg, accent, 0.14), "--accent-fg": ink(accent),
       "--glass-bg": surface, "--glass-border": mix(bg, fg, 0.16),
       "--btn-send-gradient": `linear-gradient(${accent}, ${accent})`, "--btn-send-glow": "none",
-      "--wb-a": surface, "--wb-b": mix(bg, accent, 0.45), "--wb-c": accent,
     };
   }
   let applied = [];

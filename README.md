@@ -139,11 +139,17 @@ The approval layer is part of the bridge, not a promise in the system prompt. Th
 
 Approval notifications stay quiet while you are actually at the computer. A focused browser window on any device, or recent local input, marks you present and holds the external DM; it arrives when presence lapses or ten minutes pass, whichever comes first. A held notification is never dropped, only late.
 
-## The notch overlay (Windows, beta)
+## The notch overlay (Windows and macOS, beta)
 
-A separate small window lives under the top edge of the screen. It shows what the agent is doing, presents approvals, and takes prompts while the main Accuretta window is minimized or on another monitor. It runs no tools itself; every action still goes through the bridge's approval layer, and protected actions keep their hold-to-approve gesture there too. Enable it in Settings. **Ctrl+Alt+Space** brings the island down from the bezel or tucks it back up.
+A separate small window lives under the top edge of the screen. It shows what the agent is doing, presents approvals, and takes prompts while the main Accuretta window is minimized or on another monitor. It is part of Accuretta, not a separate app: the bridge starts it and it closes with the bridge. It runs no tools itself; every action still goes through the bridge's approval layer, and protected actions keep their hold-to-approve gesture there too. Enable it in Settings. **Ctrl+Alt+N** (**⌃⌥N** on a Mac) brings the island down from the bezel or tucks it back up, and resting the pointer on the top edge above it brings the pill down too (not while a full-screen app is in front).
 
-Approval gates in the notch show the command and, for file writes and edits, the line-level change the bridge attached. Writing while a task runs works the same way it does in the main window: the correction reaches the active run at its next safe stopping point. After a turn that touched the machine, an **Open in main app** button opens the main window on that session.
+On a Mac the island lives above the menu bar at the top of the screen with the notch; on a MacBook the idle pill sits over the hardware notch and reads as part of it. It never takes focus on its own: clicking it lets you type into it without switching apps, the way Spotlight works. The Mac host uses AppKit and WebKit through PyObjC, which pywebview already installs there.
+
+The island has three sizes. Hidden, a slim pill (the dot-matrix A, plus a dot per session that is working or waiting on you), and an expanded panel with **Home**, **Chat** and **New session** tabs. Home shows the session the notch is pointed at, with its plan steps, next to your other sessions and the latest approvals. Home and the finished card fold back to the pill a few seconds after the pointer leaves, and a hairline along the bottom counts down first.
+
+An approval opens straight to its card, with the command and, for file writes and edits, the line-level change the bridge attached. **Y** allows, **N** denies, **A** allows that kind of action for the rest of the session where the bridge permits it, and **Esc** folds the card to an amber pill without answering it. Writing while a task runs works the same way it does in the main window: the correction reaches the active run at its next safe stopping point. A turn that finishes while you are away from the main window raises a finished card with **Read reply** and **Open in main app**.
+
+Drop a file on the island to ask about it. Images go to the model as images; anything else is uploaded into the workspace's `Incoming` folder and named in the prompt. The island plays short, soft sounds for opening, approvals, finished turns and errors; the speaker button in its header mutes them.
 
 A chat started in the notch is an ordinary session. It appears in the main window's sidebar as soon as it exists, and both surfaces read and write the same history. Double-clicking the empty space in the notch's conversation pulls that full history into the island; double-click again to fold back to the latest turn. When a turn finishes while the main window isn't focused — or whenever the prompt was sent from the island — the reply pops the island's conversation open so the answer is read where the question was asked.
 
@@ -211,7 +217,7 @@ One-shot commands are useful until the task needs state. Session tools keep SSH,
 
 Optional desktop tools use Windows UI Automation to inspect ordinary applications as structured controls and operate them without a vision projector. `uiautomation` powers the CPU-only accessibility path; Pillow and pyautogui are needed only for screenshot and raw mouse/keyboard fallbacks. Actions remain approval-gated and require an interactive host desktop session.
 
-Accuretta includes a dependency-free MCP stdio client. Add servers to `bridge_mcp_config.json`, restart the bridge, and their tools appear alongside the built-in tools. MCP calls require approval by default.
+Accuretta includes a dependency-free MCP stdio client. Open **MCP servers** (the MCP chip in the top bar, Settings, or the Ctrl+K palette) to add a server by its command or paste the JSON snippet from its README; it starts right away and its tools appear alongside the built-in tools. Servers are stored in `bridge_mcp_config.json` (gitignored), which you can still edit by hand. MCP calls require approval by default.
 
 ```json
 {
@@ -317,6 +323,7 @@ accuretta/
   colors_and_type.css    theme tokens
   presence_notify.py     presence-aware delivery for approval DMs
   notch_host.py          Win32 host window for the notch island
+  notch_host_mac.py      macOS host panel for the notch island
   accuretta-notch.html   notch island interface
   notch-wire.js          notch wiring to the bridge event stream
   notch-markdown.js      notch reply renderer

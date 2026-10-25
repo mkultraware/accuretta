@@ -2,7 +2,7 @@
    Accuretta app — layout + components on top of the design system.
    Imports: /colors_and_type.css
    ============================================================ */
-@import url("/colors_and_type.css?v=13");
+@import url("/colors_and_type.css?v=15");
 
 * {
   box-sizing: border-box;
@@ -25,7 +25,7 @@ body {
   position: relative;
 }
 
-/* Ambient backlight glow layers (Aurora/Nebula only, optimized for 35fps GPU workloads) */
+/* Ambient backlight glow layers (themes that set --ambient-orb-*, optimized for 35fps GPU workloads) */
 body::before,
 body::after {
   content: "";
@@ -1276,11 +1276,11 @@ button {
   display: none;
 }
 
-:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .brand .brand-mark-light {
+:is([data-theme="dark"], [data-theme="dim"], [data-theme="opal"]) .brand .brand-mark-light {
   display: none;
 }
 
-:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .brand .brand-mark-dark {
+:is([data-theme="dark"], [data-theme="dim"], [data-theme="opal"]) .brand .brand-mark-dark {
   display: inline-block;
 }
 
@@ -1916,7 +1916,7 @@ button {
   overflow: hidden;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .cost-widget {
+:is([data-theme="dark"], [data-theme="opal"]) .cost-widget {
   background: rgba(22, 22, 28, 0.55) !important;
   backdrop-filter: blur(12px) !important;
   border: 1px solid rgba(255, 255, 255, 0.05) !important;
@@ -2071,7 +2071,7 @@ button {
   transition: all var(--dur-fast) var(--ease-fluid);
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .cost-select {
+:is([data-theme="dark"], [data-theme="opal"]) .cost-select {
   background-color: rgba(255, 255, 255, 0.03) !important;
   border: 1px solid rgba(255, 255, 255, 0.08) !important;
 }
@@ -2082,7 +2082,7 @@ button {
   background-color: var(--bg-inset) !important;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .cost-select:hover {
+:is([data-theme="dark"], [data-theme="opal"]) .cost-select:hover {
   background-color: rgba(255, 255, 255, 0.06) !important;
   border-color: rgba(255, 255, 255, 0.15) !important;
 
@@ -2101,7 +2101,7 @@ button {
 }
 
 /* Specific dark/dim theme override to force dark backgrounds */
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .cost-select option {
+:is([data-theme="dark"], [data-theme="opal"]) .cost-select option {
   background-color: #1a1a1f !important;
   color: #f5f5f7 !important;
 
@@ -3007,7 +3007,7 @@ button {
   overflow: hidden;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .ctx-gauge {
+:is([data-theme="dark"], [data-theme="opal"]) .ctx-gauge {
   background: rgba(22, 22, 28, 0.55) !important;
   backdrop-filter: blur(12px) !important;
   border: 1px solid rgba(255, 255, 255, 0.05) !important;
@@ -3091,7 +3091,7 @@ button {
   opacity: 0.45 !important;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .ctx-gauge svg circle:first-child {
+:is([data-theme="dark"], [data-theme="opal"]) .ctx-gauge svg circle:first-child {
   stroke: rgba(255, 255, 255, 0.15) !important;
   opacity: 0.6 !important;
 }
@@ -4081,7 +4081,7 @@ body.remote-client .chat-scroll {
 }
 
 /* dim theme: matches the brick-clay user bubble — terracotta glyph on
-   the lifted mocha inset, same convention as aurora/nebula. */
+   the lifted mocha inset, same convention as the other dark themes. */
 [data-theme="dim"] .avatar.user {
   background: var(--bg-inset);
   color: var(--accent);
@@ -4095,20 +4095,6 @@ body.remote-client .chat-scroll {
   border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
-
-/* aurora theme: matches the dark spruce and neon green-cyan user bubble. */
-[data-theme="aurora"] .avatar.user {
-  background: var(--bg-inset);
-  color: var(--accent);
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
-}
-
-/* nebula theme: matches the dark cosmic space and neon lavender user bubble. */
-[data-theme="nebula"] .avatar.user {
-  background: var(--bg-inset);
-  color: var(--accent);
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
-}
 
 /* Amaranth theme: dark red identity marker with a restrained lift. */
 [data-theme="amaranth"] .avatar.user {
@@ -4152,11 +4138,11 @@ body.remote-client .chat-scroll {
   display: none;
 }
 
-:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .avatar-mark-light {
+:is([data-theme="dark"], [data-theme="dim"], [data-theme="opal"]) .avatar-mark-light {
   display: none;
 }
 
-:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .avatar-mark-dark {
+:is([data-theme="dark"], [data-theme="dim"], [data-theme="opal"]) .avatar-mark-dark {
   display: block;
 }
 
@@ -4318,96 +4304,6 @@ body.remote-client .chat-scroll {
 
 
 
-
-/* aurora theme user bubble matching the custom dark spruce and neon green-cyan glow */
-[data-theme="aurora"] .bubble.user {
-  background: rgba(3, 35, 33, 0.75) !important;
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  color: var(--fg) !important;
-  border: 1px solid rgba(0, 255, 196, 0.3) !important;
-}
-
-[data-theme="aurora"] .bubble.user:hover {
-  border-color: rgba(0, 255, 196, 0.5) !important;
-}
-
-[data-theme="aurora"] .bubble.user p,
-[data-theme="aurora"] .bubble.user strong,
-[data-theme="aurora"] .bubble.user em,
-[data-theme="aurora"] .bubble.user span {
-  color: var(--fg) !important;
-  -webkit-text-fill-color: var(--fg) !important;
-}
-
-[data-theme="aurora"] .bubble.user code,
-[data-theme="aurora"] .bubble.user pre {
-  background: rgba(0, 255, 196, 0.08) !important;
-  color: var(--accent) !important;
-}
-
-[data-theme="aurora"] .bubble.user .code-card-body {
-  color: var(--fg) !important;
-}
-
-[data-theme="aurora"] .bubble.user .code-card-body .code-line::before {
-  color: color-mix(in srgb, var(--fg) 40%, transparent);
-}
-
-[data-theme="aurora"] .bubble.user .cc-act {
-  color: color-mix(in srgb, var(--accent) 70%, transparent);
-}
-
-[data-theme="aurora"] .bubble.user .cc-act:hover {
-  color: var(--accent);
-  background: rgba(0, 255, 196, 0.10);
-  border-color: rgba(0, 255, 196, 0.20);
-}
-
-/* nebula theme user bubble matching the custom space violet and luminous purple-violet glow */
-[data-theme="nebula"] .bubble.user {
-  background: rgba(20, 12, 46, 0.75) !important;
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  color: var(--fg) !important;
-  border: 1px solid rgba(232, 121, 249, 0.25) !important;
-}
-
-[data-theme="nebula"] .bubble.user:hover {
-  border-color: rgba(232, 121, 249, 0.4) !important;
-}
-
-[data-theme="nebula"] .bubble.user p,
-[data-theme="nebula"] .bubble.user strong,
-[data-theme="nebula"] .bubble.user em,
-[data-theme="nebula"] .bubble.user span {
-  color: var(--fg) !important;
-  -webkit-text-fill-color: var(--fg) !important;
-}
-
-[data-theme="nebula"] .bubble.user code,
-[data-theme="nebula"] .bubble.user pre {
-  background: rgba(167, 139, 250, 0.08) !important;
-  color: var(--accent) !important;
-}
-
-[data-theme="nebula"] .bubble.user .code-card-body {
-  color: var(--fg) !important;
-}
-
-[data-theme="nebula"] .bubble.user .code-card-body .code-line::before {
-  color: color-mix(in srgb, var(--fg) 40%, transparent);
-}
-
-[data-theme="nebula"] .bubble.user .cc-act {
-  color: color-mix(in srgb, var(--accent) 70%, transparent);
-}
-
-[data-theme="nebula"] .bubble.user .cc-act:hover {
-  color: var(--accent);
-  background: rgba(167, 139, 250, 0.10);
-  border-color: rgba(167, 139, 250, 0.20);
-}
 
 /* Amaranth theme user bubble: saturated enough to separate the speaker,
    quiet enough to remain part of the carbon surface system. */
@@ -4804,43 +4700,43 @@ body.remote-client .chat-scroll {
   color: var(--fg-muted);
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .tok-keyword {
+:is([data-theme="dark"], [data-theme="opal"]) .tok-keyword {
   color: #C8A8FF;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .tok-string {
+:is([data-theme="dark"], [data-theme="opal"]) .tok-string {
   color: #B5E29B;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .tok-number {
+:is([data-theme="dark"], [data-theme="opal"]) .tok-number {
   color: #F4A261;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .tok-comment {
+:is([data-theme="dark"], [data-theme="opal"]) .tok-comment {
   color: var(--fg-faint);
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .tok-fn {
+:is([data-theme="dark"], [data-theme="opal"]) .tok-fn {
   color: #7CC0FF;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .tok-tag {
+:is([data-theme="dark"], [data-theme="opal"]) .tok-tag {
   color: #C8A8FF;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .tok-attr {
+:is([data-theme="dark"], [data-theme="opal"]) .tok-attr {
   color: #F4B57A;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .tok-var {
+:is([data-theme="dark"], [data-theme="opal"]) .tok-var {
   color: #F4A261;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .tok-decorator {
+:is([data-theme="dark"], [data-theme="opal"]) .tok-decorator {
   color: #F4B57A;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .tok-punct {
+:is([data-theme="dark"], [data-theme="opal"]) .tok-punct {
   color: var(--fg-muted);
 }
 
@@ -4862,13 +4758,13 @@ body.remote-client .chat-scroll {
 .hljs-strong { font-weight: 700; }
 .hljs-link { text-decoration: underline; }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) :is(.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-built_in, .hljs-name, .hljs-type) { color: #C8A8FF; }
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) :is(.hljs-string, .hljs-symbol, .hljs-bullet, .hljs-regexp, .hljs-addition) { color: #B5E29B; }
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .hljs-number { color: #F4A261; }
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) :is(.hljs-title, .hljs-title.function_, .hljs-title.class_) { color: #7CC0FF; }
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) :is(.hljs-variable, .hljs-template-variable) { color: #F4A261; }
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) :is(.hljs-attr, .hljs-attribute, .hljs-property, .hljs-selector-attr, .hljs-meta, .hljs-meta .hljs-keyword) { color: #F4B57A; }
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) :is(.hljs-tag, .hljs-selector-id, .hljs-selector-class, .hljs-selector-pseudo) { color: #C8A8FF; }
+:is([data-theme="dark"], [data-theme="opal"]) :is(.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-built_in, .hljs-name, .hljs-type) { color: #C8A8FF; }
+:is([data-theme="dark"], [data-theme="opal"]) :is(.hljs-string, .hljs-symbol, .hljs-bullet, .hljs-regexp, .hljs-addition) { color: #B5E29B; }
+:is([data-theme="dark"], [data-theme="opal"]) .hljs-number { color: #F4A261; }
+:is([data-theme="dark"], [data-theme="opal"]) :is(.hljs-title, .hljs-title.function_, .hljs-title.class_) { color: #7CC0FF; }
+:is([data-theme="dark"], [data-theme="opal"]) :is(.hljs-variable, .hljs-template-variable) { color: #F4A261; }
+:is([data-theme="dark"], [data-theme="opal"]) :is(.hljs-attr, .hljs-attribute, .hljs-property, .hljs-selector-attr, .hljs-meta, .hljs-meta .hljs-keyword) { color: #F4B57A; }
+:is([data-theme="dark"], [data-theme="opal"]) :is(.hljs-tag, .hljs-selector-id, .hljs-selector-class, .hljs-selector-pseudo) { color: #C8A8FF; }
 
 .bubble-meta {
   font-size: 11px;
@@ -6286,9 +6182,9 @@ body.remote-client .chat-scroll {
     inset 0 0 0 1px color-mix(in srgb, var(--accent) 50%, transparent);
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .chip.on,
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .toolbar-overflow-menu .chip.on,
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .preview-overflow-menu .chip.on {
+:is([data-theme="dark"], [data-theme="opal"]) .chip.on,
+:is([data-theme="dark"], [data-theme="opal"]) .toolbar-overflow-menu .chip.on,
+:is([data-theme="dark"], [data-theme="opal"]) .preview-overflow-menu .chip.on {
   color: var(--accent-hover);
 }
 
@@ -6313,7 +6209,7 @@ body.remote-client .chat-scroll {
 /* Beat the dark/dim .chip.on color override above — composer chips
    stay on the brighter --accent for the outline-tint look, not the
    even-darker --accent-hover. */
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .composer-tools>.chip.on {
+:is([data-theme="dark"], [data-theme="opal"]) .composer-tools>.chip.on {
   color: var(--accent);
 }
 
@@ -6602,7 +6498,7 @@ body.remote-client .chat-scroll {
   flex-shrink: 0;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .model-pill .model-pill-vision,
+:is([data-theme="dark"], [data-theme="opal"]) .model-pill .model-pill-vision,
 .dark .model-pill .model-pill-vision {
   background: color-mix(in srgb, var(--mint-3) 22%, transparent);
   color: var(--mint);
@@ -10243,7 +10139,7 @@ body,
   padding: 12px 16px !important;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .ctx-gauge {
+:is([data-theme="dark"], [data-theme="opal"]) .ctx-gauge {
   background: rgba(22, 22, 28, 0.55) !important;
   backdrop-filter: blur(12px) !important;
   border: 1px solid rgba(255, 255, 255, 0.05) !important;
@@ -11159,11 +11055,11 @@ body,
   border-bottom-color: color-mix(in srgb, var(--danger, #c92a2a) 40%, var(--border));
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .pycheck-banner.ok {
+:is([data-theme="dark"], [data-theme="opal"]) .pycheck-banner.ok {
   color: #95e0a8;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .pycheck-banner.err {
+:is([data-theme="dark"], [data-theme="opal"]) .pycheck-banner.err {
   color: #ff9b9b;
 }
 
@@ -11249,7 +11145,7 @@ body,
   border-bottom-color: color-mix(in srgb, var(--danger, #c92a2a) 40%, var(--border));
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .doc-preview-banner.err {
+:is([data-theme="dark"], [data-theme="opal"]) .doc-preview-banner.err {
   color: #ff9b9b;
 }
 
@@ -11313,7 +11209,7 @@ body,
   height: 100%;
 }
 
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]),
+:is([data-theme="dark"], [data-theme="opal"]),
 .dark {
   .bubble.agent.quiet {
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22);
@@ -11887,6 +11783,14 @@ body,
   font-family: var(--font-sans);
   font-size: 11px;
   color: var(--fg-muted);
+}
+/* The telemetry strip is a quick-glance aid for phones; desktop already shows
+   model, ctx gauge and speed in the sidebar and bubble meta. */
+@media (min-width: 601px) {
+  #status-line { display: none; }
+  /* With the strip gone the chat would auto-place into the strip's "auto"
+     row and leave the 1fr row empty below it; pin it to the stretch row. */
+  #app > .center > .chat { grid-row: 3; }
 }
 .status-item {
   display: flex;
@@ -12834,7 +12738,7 @@ body,
 .term-err {
   color: var(--danger, #c92a2a);
 }
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .term-err {
+:is([data-theme="dark"], [data-theme="opal"]) .term-err {
   color: #ff8787;
 }
 
@@ -12859,10 +12763,10 @@ body,
 .backend-log-pre .bl-warn { color: #b7791f; }
 .backend-log-pre .bl-ok { color: #2f9e44; }
 .backend-log-pre .bl-key { color: #1971c2; }
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .backend-log-pre .bl-err { color: #ff8787; }
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .backend-log-pre .bl-warn { color: #e5c07b; }
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .backend-log-pre .bl-ok { color: #98c379; }
-:is([data-theme="dark"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .backend-log-pre .bl-key { color: #61afef; }
+:is([data-theme="dark"], [data-theme="opal"]) .backend-log-pre .bl-err { color: #ff8787; }
+:is([data-theme="dark"], [data-theme="opal"]) .backend-log-pre .bl-warn { color: #e5c07b; }
+:is([data-theme="dark"], [data-theme="opal"]) .backend-log-pre .bl-ok { color: #98c379; }
+:is([data-theme="dark"], [data-theme="opal"]) .backend-log-pre .bl-key { color: #61afef; }
 
 /* Shell tab — shared interactive session (agent + user drive the same process).
    Scoped to :not(.hidden) so the ID doesn't out-specify .term-tab-pane.hidden. */
@@ -12911,26 +12815,6 @@ body,
   z-index: 1;
 }
 
-.welcome-blobs {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  overflow: hidden;
-  z-index: 0;
-  /* Blob colours — the SEKURA pastel trio (pink/violet/blue) leaned 55%
-     toward the theme accent, so every theme gets its own palette with no
-     per-theme branching. Override --wb-a/b/c under a [data-theme] block to
-     hand-tune one theme. --wb-strength dims the whole field (dark themes). */
-  --wb-a: color-mix(in oklab, var(--accent) 55%, #ff9a9e);
-  --wb-b: color-mix(in oklab, var(--accent) 55%, #a18cd1);
-  --wb-c: color-mix(in oklab, var(--accent) 55%, #8fd3f4);
-  --wb-strength: 1;
-  opacity: var(--wb-strength);
-  /* Fade the field out toward the bottom of the screen (SEKURA's mask). */
-  -webkit-mask-image: radial-gradient(ellipse 80% 50% at 50% 0%, #000 80%, transparent 100%);
-  mask-image: radial-gradient(ellipse 80% 50% at 50% 0%, #000 80%, transparent 100%);
-}
-
 /* Welcome quote backdrop: a giant opening "..." glyph behind the New Session
    content, uniform across all themes. A real text glyph (not drawn slabs) so
    it reads as a quote mark everywhere. Tinted by mixing --accent toward
@@ -12956,119 +12840,6 @@ body,
 .welcome-quote span {
   display: block;
   transform: translateY(-12%);
-}
-
-/* SEKURA AbstractWave-style backdrop (markup from buildWelcomeBars()):
-   three drifting colour blobs UNDER 28 sharp pleated pillars, then a
-   backdrop-blur softening pass, an overlay pillar pass for edge definition,
-   and grain. The pillars are static — only the colour field moves. */
-
-/* 1. Colour field — oversized blurred blobs on slow drift loops. */
-.wb-blob {
-  position: absolute;
-  border-radius: 50%;
-  will-change: transform, opacity;
-}
-.wb-blob-a {
-  top: -20%; left: -10%; width: 85%; height: 75%;
-  background: var(--wb-a);
-  filter: blur(140px);
-  animation: wb-drift-a 15s ease-in-out infinite;
-}
-.wb-blob-b {
-  top: 10%; right: -10%; width: 75%; height: 65%;
-  background: var(--wb-b);
-  filter: blur(120px);
-  animation: wb-drift-b 18s ease-in-out infinite;
-}
-.wb-blob-c {
-  bottom: -10%; left: 20%; width: 85%; height: 70%;
-  background: var(--wb-c);
-  filter: blur(140px);
-  animation: wb-drift-c 22s ease-in-out infinite;
-}
-
-@keyframes wb-drift-a {
-  0%, 100% { transform: translate(0, 0) rotate(0deg) scale(1); opacity: 0.3; }
-  33%      { transform: translate(30px, -40px) rotate(10deg) scale(1.1); opacity: 0.5; }
-  66%      { transform: translate(-20px, 20px) rotate(-5deg) scale(0.9); opacity: 0.3; }
-}
-@keyframes wb-drift-b {
-  0%, 100% { transform: translate(0, 0) rotate(0deg) scale(1); opacity: 0.4; }
-  33%      { transform: translate(-40px, 30px) rotate(-15deg) scale(0.85); opacity: 0.2; }
-  66%      { transform: translate(30px, -30px) rotate(10deg) scale(1.15); opacity: 0.5; }
-}
-@keyframes wb-drift-c {
-  0%, 100% { transform: translate(0, 0) rotate(0deg) scale(1); opacity: 0.3; }
-  33%      { transform: translate(20px, 20px) rotate(20deg) scale(1.2); opacity: 0.6; }
-  66%      { transform: translate(-40px, -20px) rotate(-10deg) scale(0.8); opacity: 0.2; }
-}
-
-/* 2. Pleats — 28 sharp columns with a horizontal white→black lighting
-   gradient. This is the "vertical bars" read; they stay sharp here and get
-   softened uniformly by the backdrop-blur pass below. */
-.wb-pillars {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  transform: scale(1.05);
-}
-.wb-pillar {
-  flex: 1;
-  height: 100%;
-  background-image: linear-gradient(90deg,
-    rgba(255,255,255,0.5) 0%, rgba(255,255,255,0.1) 30%,
-    rgba(0,0,0,0.02) 80%, rgba(0,0,0,0.05) 100%);
-  background-color: transparent;
-  animation: pillarPulse 8s ease-in-out infinite;
-}
-
-@keyframes pillarPulse {
-  0%, 100% { background-color: transparent; }
-  50% { background-color: color-mix(in srgb, var(--accent) 12%, transparent); }
-}
-
-.wb-pillar:nth-child(2n) { animation-delay: 1.2s; animation-duration: 9s; }
-.wb-pillar:nth-child(3n) { animation-delay: 2.5s; animation-duration: 11s; }
-.wb-pillar:nth-child(5n) { animation-delay: 0.5s; animation-duration: 7s; }
-.wb-pillar:nth-child(7n) { animation-delay: 4.2s; animation-duration: 13s; }
-
-/* 3. Softening pass — melts the pleats into the colour field. */
-.wb-soften {
-  position: absolute;
-  inset: 0;
-  -webkit-backdrop-filter: blur(16px);
-  backdrop-filter: blur(16px);
-}
-
-/* 4. Edge pass — a second set of pleats in overlay blend restores a hint of
-   pillar definition the blur removed. */
-.wb-pillars-edge {
-  mix-blend-mode: overlay;
-  opacity: 0.6;
-}
-.wb-pillars-edge .wb-pillar {
-  border-right: 1px solid rgba(255,255,255,0.4);
-  background: linear-gradient(90deg,
-    transparent 0%, rgba(255,255,255,0.1) 80%, rgba(255,255,255,0.5) 100%);
-}
-
-/* 5. Grain. */
-.wb-noise {
-  position: absolute;
-  inset: 0;
-  opacity: 0.05;
-  mix-blend-mode: multiply;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-}
-
-/* Dark themes: same field, turned down — mirrors SEKURA's dark:opacity-20. */
-:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"]) .welcome-blobs {
-  --wb-strength: 0.3;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .wb-blob { animation: none; }
 }
 
 .welcome-content {
@@ -13389,47 +13160,6 @@ body,
 .cascade-chip:active {
   transform: translateY(0);
   box-shadow: none;
-}
-
-/* ============================================================
-   OPERATOR — clean professional slate (structural layer).
-   Deliberately minimal. The palette in colors_and_type.css does
-   almost all the work; the only structural touches here are a
-   crisp accent bar on the active session (IDE-style) and a
-   confident accent send button. No overlays, no markers, no
-   forced type — clean is the whole brief. Everything else
-   inherits the app's normal, well-tuned layout. Works as-is on
-   mobile; nothing here is width-gated because there's nothing
-   heavy to scale back.
-   ============================================================ */
-
-/* Active session: a clean accent bar down the left edge, like a
-   selected file in a modern editor's sidebar. */
-[data-theme="operator"] .chatrow.active {
-  box-shadow: inset 2px 0 0 var(--accent);
-}
-
-/* Composer focus ring picks up the azure accent instead of the
-   default's — a small, tasteful theme signature. */
-[data-theme="operator"] .composer:focus-within {
-  border-color: color-mix(in srgb, var(--accent) 60%, var(--border-strong));
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35), 0 0 0 3px var(--accent-subtle);
-}
-
-/* User bubble: solid azure, matching the theme accent (the base
-   rule hardcodes iMessage blue, which would clash). */
-[data-theme="operator"] .bubble.user {
-  background: linear-gradient(135deg, #4D9EFF 0%, #2F7FE6 100%) !important;
-  color: #FFFFFF !important;
-  box-shadow: none !important;
-}
-
-/* Matching user avatar — azure glyph on the inset surface, same
-   convention the other dark themes use. */
-[data-theme="operator"] .avatar.user {
-  background: var(--bg-inset);
-  color: var(--accent);
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
 /* Neumorphic theme user bubble: embossed and soft, matching the UI */
@@ -13784,6 +13514,30 @@ body,
 
 .permission-item-icon.check {
   color: #2ea44f;
+}
+
+/* Soft mode's reason for stopping: header line + a short list in the body. */
+.revealer-card-stats.perm-soft-reason {
+  color: color-mix(in srgb, var(--warning) 70%, var(--fg-muted));
+}
+
+.permissions-soft-reasons {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.permissions-soft-reasons-title {
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: var(--ls-wide);
+  text-transform: uppercase;
+}
+
+.permissions-soft-reasons .permission-item {
+  border-color: color-mix(in srgb, var(--warning) 28%, var(--border-subtle));
 }
 
 .permissions-options {
@@ -14599,47 +14353,6 @@ body,
 }
 
 /* Replace the generic soft welcome field with a survey overlay. */
-[data-theme="cartograph"] .welcome-blobs {
-  --wb-strength: 0.7;
-  opacity: var(--wb-strength);
-  background-image:
-    radial-gradient(circle at 50% 38%, transparent 0 118px, rgba(88, 226, 208, 0.16) 119px 120px, transparent 121px),
-    linear-gradient(rgba(88, 226, 208, 0.09) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(88, 226, 208, 0.09) 1px, transparent 1px);
-  background-size: auto, 32px 32px, 32px 32px;
-  -webkit-mask-image: radial-gradient(circle at 50% 42%, #000 0 36%, transparent 78%);
-  mask-image: radial-gradient(circle at 50% 42%, #000 0 36%, transparent 78%);
-  animation: cartograph-grid-drift 36s linear infinite;
-}
-
-[data-theme="cartograph"] .welcome-blobs .wb-blob {
-  border-radius: 0;
-  filter: none;
-  opacity: 0.18;
-  animation: cartograph-bearing 18s linear infinite;
-}
-
-[data-theme="cartograph"] .welcome-blobs .wb-blob-a {
-  width: 70%; height: 2px; top: 39%; left: 15%;
-  background: var(--accent);
-}
-
-[data-theme="cartograph"] .welcome-blobs .wb-blob-b {
-  width: 2px; height: 70%; top: 8%; left: 50%;
-  background: var(--accent);
-  animation-direction: reverse;
-}
-
-[data-theme="cartograph"] .welcome-blobs .wb-blob-c {
-  width: 12px; height: 12px; top: 37.5%; left: calc(50% - 6px);
-  border: 2px solid #FF6B4A;
-  background: transparent;
-  opacity: 0.9;
-}
-
-[data-theme="cartograph"] .welcome-blobs :is(.wb-pillars, .wb-soften, .wb-noise) {
-  display: none;
-}
 
 @keyframes cartograph-grid-drift {
   from { background-position: 0 0, 0 0, 0 0, 0 0; }
@@ -14675,9 +14388,7 @@ body,
   [data-theme="cartograph"] .brand::before,
   [data-theme="cartograph"] .bubble,
   [data-theme="cartograph"] .composer::after,
-  [data-theme="cartograph"] .avatar-mark,
-  [data-theme="cartograph"] .welcome-blobs,
-  [data-theme="cartograph"] .welcome-blobs .wb-blob {
+  [data-theme="cartograph"] .avatar-mark {
     animation: none !important;
   }
 }
@@ -15242,42 +14953,6 @@ body,
   filter: drop-shadow(0 12px 28px rgba(0, 0, 0, 0.38));
 }
 
-[data-theme="cartograph"] .welcome-blobs {
-  --wb-strength: 1;
-  opacity: 1;
-  background: none;
-  -webkit-mask-image: radial-gradient(ellipse 72% 62% at 50% 42%, #000 0 35%, transparent 78%);
-  mask-image: radial-gradient(ellipse 72% 62% at 50% 42%, #000 0 35%, transparent 78%);
-  animation: none;
-}
-
-[data-theme="cartograph"] .welcome-blobs .wb-blob {
-  filter: none;
-  animation: none;
-}
-
-[data-theme="cartograph"] .welcome-blobs .wb-blob-a {
-  display: none;
-}
-
-[data-theme="cartograph"] .welcome-blobs .wb-blob-b {
-  top: 3%;
-  left: 18%;
-  width: 64%;
-  height: 68%;
-  border-radius: 50%;
-  opacity: 0.34;
-  background: radial-gradient(ellipse at center, rgba(111, 145, 148, 0.20), rgba(65, 85, 89, 0.055) 42%, transparent 72%);
-}
-
-[data-theme="cartograph"] .welcome-blobs .wb-blob-c {
-  display: none;
-}
-
-[data-theme="cartograph"] .welcome-blobs :is(.wb-pillars, .wb-soften, .wb-noise) {
-  display: none;
-}
-
 [data-theme="cartograph"] .welcome-suggest-btn {
   border-radius: 18px;
   background: linear-gradient(145deg, rgba(255, 255, 255, 0.052), rgba(255, 255, 255, 0.022));
@@ -15450,8 +15125,7 @@ body,
   [data-theme="cartograph"] .welcome-content,
   [data-theme="cartograph"] .welcome-logo-wrap::before,
   [data-theme="cartograph"] .welcome-logo-wrap::after,
-  [data-theme="cartograph"] .welcome-suggest-btn,
-  [data-theme="cartograph"] .welcome-blobs .wb-blob {
+  [data-theme="cartograph"] .welcome-suggest-btn {
     animation: none !important;
     filter: none !important;
   }
@@ -15844,37 +15518,6 @@ body,
   transform: rotate(-4deg);
 }
 
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs {
-  --wb-strength: 1;
-  opacity: 1;
-  background: none;
-  -webkit-mask-image: none;
-  mask-image: none;
-}
-
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs :is(.wb-pillars, .wb-soften, .wb-noise) {
-  display: none;
-}
-
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs .wb-blob {
-  top: 46%;
-  left: 54%;
-  right: auto;
-  bottom: auto;
-  background: transparent;
-  filter: none;
-  opacity: 1;
-  border-style: solid;
-  border-width: 1px;
-  will-change: transform;
-}
-
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs .wb-blob-a,
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs .wb-blob-b,
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs .wb-blob-c {
-  display: none;
-}
-
 @keyframes aperture-focus-ring {
   to { transform: rotate(360deg); }
 }
@@ -15916,13 +15559,8 @@ body,
   -webkit-backdrop-filter: none;
 }
 
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) body.remote-client .welcome-blobs .wb-blob {
-  animation: none;
-}
-
 @media (prefers-reduced-motion: reduce) {
   :is([data-theme="aperture"], [data-theme="aperture-dark"]) .bubble-row:has(.bubble-meta.streaming) .avatar:has(.avatar-mark)::after,
-  :is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs .wb-blob,
   :is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-suggest-btn {
     animation: none !important;
   }
@@ -16516,39 +16154,6 @@ body,
 }
 
 /* Three slow focus planes replace the previous orbit illustration. */
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs {
-  --wb-strength: 1;
-  opacity: 1;
-  background: none;
-  -webkit-mask-image: none;
-  mask-image: none;
-}
-
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs :is(.wb-pillars, .wb-soften, .wb-noise) {
-  display: none;
-}
-
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs .wb-blob {
-  right: auto;
-  bottom: auto;
-  border: 0;
-  border-radius: 0;
-  filter: none;
-  opacity: 1;
-  will-change: transform;
-}
-
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs .wb-blob-a {
-  display: none;
-}
-
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs .wb-blob-b {
-  display: none;
-}
-
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs .wb-blob-c {
-  display: none;
-}
 
 @keyframes aperture-plane-b {
   from { transform: translateY(-14px); }
@@ -16747,14 +16352,9 @@ body,
   -webkit-backdrop-filter: none;
 }
 
-:is([data-theme="aperture"], [data-theme="aperture-dark"]) body.remote-client .welcome-blobs .wb-blob {
-  animation: none;
-}
-
 @media (prefers-reduced-motion: reduce) {
   :is([data-theme="aperture"], [data-theme="aperture-dark"]) .bubble,
   :is([data-theme="aperture"], [data-theme="aperture-dark"]) .bubble-row:has(.bubble-meta.streaming) .avatar:has(.avatar-mark)::after,
-  :is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-blobs .wb-blob,
   :is([data-theme="aperture"], [data-theme="aperture-dark"]) .welcome-suggest-btn {
     animation: none !important;
     clip-path: none;
@@ -17542,7 +17142,7 @@ pre.code-card.streaming-plain code {
   background: var(--info-subtle);
 }
 
-:is([data-theme="dark"], [data-theme="dim"], [data-theme="aurora"], [data-theme="nebula"], [data-theme="operator"], [data-theme="velvet"], [data-theme="cartograph"], [data-theme="aperture-dark"]) .composer {
+:is([data-theme="dark"], [data-theme="dim"], [data-theme="opal"], [data-theme="cartograph"], [data-theme="aperture-dark"]) .composer {
   --composer-bg: color-mix(in srgb, var(--bg-raised) 88%, transparent);
 }
 
@@ -17933,20 +17533,6 @@ pre.code-card.streaming-plain code {
   color: var(--accent);
   opacity: 1;
   transform: translateX(3px);
-}
-
-[data-theme] .welcome-blobs {
-  --wb-strength: 1;
-  opacity: 1;
-  background:
-    radial-gradient(circle at 15% 16%, var(--welcome-field-a), transparent 30%),
-    radial-gradient(circle at 86% 78%, var(--welcome-field-b), transparent 28%);
-  -webkit-mask-image: none;
-  mask-image: none;
-}
-
-[data-theme] .welcome-blobs :is(.wb-blob, .wb-pillars, .wb-soften, .wb-noise) {
-  display: none;
 }
 
 @keyframes welcome-index-enter {
@@ -18720,8 +18306,7 @@ body.remote-client::after {
   will-change: auto;
 }
 
-body.remote-client .app::after,
-body.remote-client .welcome-blobs {
+body.remote-client .app::after {
   display: none;
 }
 
@@ -18741,8 +18326,7 @@ body.remote-client :is(
   .cost-widget,
   .ctx-gauge,
   .toast,
-  .link-popover,
-  .wb-soften
+  .link-popover
 ) {
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
@@ -18799,11 +18383,6 @@ body.remote-client .chat-scroll {
   --composer-bg: rgba(39, 35, 37, 0.96);
   --composer-border: rgba(175, 175, 175, 0.10);
   --composer-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035), 0 14px 38px rgba(0, 0, 0, 0.30);
-}
-
-[data-theme="amaranth"] .welcome-blobs {
-  --welcome-field-a: rgba(138, 26, 48, 0.18);
-  --welcome-field-b: rgba(175, 175, 175, 0.07);
 }
 
 [data-theme="amaranth"] :is(.chip.on, .toolbar-overflow-menu .chip.on, .preview-overflow-menu .chip.on) {
@@ -18888,12 +18467,6 @@ body.remote-client .chat-scroll {
 [data-theme="folio"] .topbar { background: var(--bg); border-bottom: 1px solid var(--border); box-shadow: none; }
 [data-theme="folio"] .brand-title { font-family: var(--font-display); font-weight: 500; letter-spacing: -.04em; }
 [data-theme="folio"] .welcome-title { font-family: var(--font-display); font-weight: 400; letter-spacing: -.055em; }
-[data-theme="folio"] .welcome-blobs { --wb-a: var(--accent-subtle); --wb-b: var(--border-strong); --wb-c: var(--accent); background: none; filter: none; opacity: .25; overflow: hidden; }
-[data-theme="folio"] .welcome-blobs .wb-blob { display: block; filter: none; mix-blend-mode: multiply; animation: folio-settle 1.4s ease-out both; }
-[data-theme="folio"] .welcome-blobs .wb-blob-a { top: 6%; left: 3%; width: 20%; height: 36%; border-radius: 50% 50% 4% 4%; transform: rotate(-18deg); }
-[data-theme="folio"] .welcome-blobs .wb-blob-b { top: 52%; right: 3%; width: 19%; height: 35%; border-radius: 3% 55% 3% 55%; transform: rotate(22deg); animation-delay: .1s; }
-[data-theme="folio"] .welcome-blobs .wb-blob-c { bottom: 14%; left: 8%; width: 65px; height: 65px; border-radius: 50%; animation-delay: .2s; }
-[data-theme="folio"] .welcome-blobs :is(.wb-pillars, .wb-soften, .wb-noise) { display: none; }
 [data-theme="folio"] :is(.btn, .iconbtn, .chip, .cascade-chip) { box-shadow: none; border-radius: 6px 14px 6px 14px; transition: background .18s ease, transform .18s ease; }
 [data-theme="folio"] :is(.btn, .iconbtn):hover { transform: translateY(-1px); }
 [data-theme="folio"] .chatrow.active { background: var(--accent-subtle); border-radius: 4px 16px 16px 4px; box-shadow: inset 3px 0 var(--accent); }
@@ -18908,7 +18481,6 @@ body.remote-client .chat-scroll {
 [data-theme="folio"] :is(.modal, .drawer, .popover, .palette) { background: var(--bg-raised); border-radius: 12px 24px 12px 24px; }
 @keyframes folio-settle { from { translate: 0 16px; opacity: 0; } to { translate: 0 0; opacity: 1; } }
 @media (prefers-reduced-motion: reduce) {
-  [data-theme="folio"] .welcome-blobs .wb-blob { animation: none; }
   [data-theme="folio"] :is(.btn, .iconbtn, .chip, .cascade-chip) { transition: none; transform: none; }
 }
 .appearance-custom { gap: 12px; }
@@ -18929,22 +18501,20 @@ html[data-custom-ink="light"] .brand .brand-mark-dark { display: block; }
 
 /* Task outcomes and recorded file review. */
 .turn-changes { background: var(--bg-raised); border-radius: 12px 4px 12px 12px; }
-.turn-changes .tc-head { padding: 9px 13px; flex-wrap: wrap; }
+/* Compact: title, check word and actions share one header row; files below. */
+.turn-changes .tc-head { padding: 5px 6px 5px 11px; gap: 8px; flex-wrap: wrap; }
 .turn-changes .tc-title { flex-wrap: wrap; }
-.turn-changes .tc-verification { margin-left: auto; color: var(--fg-muted); }
-.turn-changes .tc-verification.passed { color: var(--success); }
+.turn-changes .tc-verification { display: inline-flex; align-items: center; gap: 3px; color: var(--fg-faint); font-size: 11px; }
+.turn-changes .tc-verification:empty { display: none; }
+.turn-changes .tc-verification.passed { color: color-mix(in srgb, var(--success) 80%, var(--fg-muted)); }
 .turn-changes .tc-verification.failed { color: var(--danger); }
-.turn-changes .tc-verification.partial { color: var(--warning); }
-.turn-changes .tc-file { flex-wrap: wrap; padding: 7px 13px; }
+.turn-changes .tc-file { flex-wrap: wrap; padding: 4px 11px; }
 .turn-changes .tc-name { min-width: 0; overflow-wrap: anywhere; }
-.turn-changes .tc-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 9px 13px; border-top: 1px solid var(--border-subtle); }
-.turn-changes :is(.tc-review, .tc-file-open) { border: 1px solid var(--border-strong); border-radius: 7px; padding: 5px 10px; background: var(--bg-raised); color: var(--fg); cursor: pointer; font: inherit; }
-.turn-changes .tc-review { background: var(--fg); color: var(--bg-raised); }
-.turn-changes .tc-file-open { font-size: 11px; }
-.turn-changes .tc-openfolder { margin-left: 0; }
-.turn-changes .tc-checks { padding: 7px 13px; border-top: 1px solid var(--border-subtle); }
-.turn-changes .tc-checks summary { cursor: pointer; color: var(--fg-muted); }
-.turn-changes .tc-checks :is(p, li) { overflow-wrap: anywhere; color: var(--fg-muted); margin: 6px 0; }
+.turn-changes .tc-actions { display: flex; align-items: center; gap: 4px; margin-left: auto; }
+.turn-changes :is(.tc-review, .tc-file-open) { border: 1px solid var(--border-strong); border-radius: 6px; padding: 2px 8px; background: transparent; color: var(--fg-muted); cursor: pointer; font: inherit; font-size: 11px; }
+.turn-changes :is(.tc-review, .tc-file-open):hover { color: var(--fg); border-color: var(--accent); background: var(--accent-subtle); }
+.turn-changes :is(.tc-openfolder, .tc-undo) { margin-left: 0; padding: 3px 5px; border-color: transparent; font-size: 13px; }
+.turn-changes .tc-fail { padding: 5px 11px; border-top: 1px solid var(--border-subtle); color: var(--danger); font-size: 11px; overflow-wrap: anywhere; }
 .turn-changes [hidden] { display: none; }
 .task-review-dialog { width: min(960px, calc(100vw - 24px)); max-height: calc(100dvh - 32px); padding: 0; border: 1px solid var(--border-strong); border-radius: 16px; background: var(--bg-raised); color: var(--fg); box-shadow: var(--shadow-lg); }
 .task-review-dialog::backdrop { background: rgba(0, 0, 0, .6); }
@@ -19119,4 +18689,3 @@ html[data-custom-ink="light"] .brand .brand-mark-dark { display: block; }
 #revealer-deck :is(button, .revealer-card-icon, .permission-item-icon, .file-icon) .ph {
   font-size: 13px;
 }
-

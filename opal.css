@@ -1,0 +1,201 @@
+/* ============================================================
+   OPAL — structural layer (palette lives in colors_and_type.css).
+   Black opal: the stone is still and near-monochrome; the colour
+   is play-of-color, and it only ever shows as thin light.
+   - shapes are polished cabochons: the composer becomes a full
+     capsule, the send button a round pearl, bubbles soft drops;
+   - the active session carries a tiny turning opal; everything
+     else stays pearl on stone (no rainbow rims or glows);
+   - the welcome heading sits over a barely-there breath of light.
+   Loaded last and scoped through #app so the flat workspace shell
+   (workspace-shell.css / workbench.css) doesn't sand the shapes off.
+   ============================================================ */
+
+@property --opal-turn {
+  syntax: "<angle>";
+  inherits: true;
+  initial-value: 0deg;
+}
+
+@keyframes opal-turn {
+  to { --opal-turn: 360deg; }
+}
+
+@keyframes opal-breathe {
+  0%, 100% { opacity: 0.05; transform: translate(-50%, -50%) scale(1); }
+  50%      { opacity: 0.09; transform: translate(-50%, -50%) scale(1.04); }
+}
+
+@keyframes opal-glint {
+  0%, 100% { filter: drop-shadow(0 0 5px rgba(111, 182, 255, 0.55)); }
+  25%      { filter: drop-shadow(0 0 5px rgba(124, 235, 198, 0.55)); }
+  50%      { filter: drop-shadow(0 0 5px rgba(255, 158, 116, 0.55)); }
+  75%      { filter: drop-shadow(0 0 5px rgba(255, 134, 184, 0.55)); }
+}
+
+[data-theme="opal"] body {
+  background: var(--bg-gradient) fixed, var(--bg);
+}
+
+/* ---- chrome: still stone, no glass ---- */
+[data-theme="opal"] #app :is(.sidebar, .topbar) {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[data-theme="opal"] #app .sidebar {
+  background: var(--bg-sunken);
+  border-right-color: var(--border-subtle);
+}
+
+[data-theme="opal"] #app :is(.section-head, .settings-section-title) {
+  color: var(--fg-subtle);
+  letter-spacing: 0.14em;
+}
+
+[data-theme="opal"] #app :is(input, textarea, select):not(#composer-input):focus {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border-strong));
+  box-shadow: 0 0 0 3px var(--accent-subtle);
+}
+
+/* Active session: a tiny opal cabochon instead of a flat accent dot. */
+[data-theme="opal"] #app .chatrow.active {
+  background: var(--bg-inset);
+  border-color: var(--border);
+  box-shadow: none;
+}
+
+[data-theme="opal"] #app .chatrow.active::before {
+  width: 8px;
+  height: 8px;
+  background: conic-gradient(from var(--opal-turn), var(--opal-stops));
+  box-shadow: 0 0 10px rgba(169, 180, 255, 0.35);
+  animation: opal-turn 9s linear infinite;
+}
+
+/* ---- messages ---- */
+/* Agent replies are text on the stone: no card. */
+[data-theme="opal"] #app .bubble.agent {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+[data-theme="opal"] #app .bubble.agent.quiet:hover {
+  box-shadow: none;
+}
+
+/* The user's message: a dark pearl drop. */
+[data-theme="opal"] #app .bubble.user {
+  background: var(--bg-inset) !important;
+  border: 1px solid var(--border-strong) !important;
+  border-radius: 20px 20px 6px 20px;
+  color: var(--fg) !important;
+  box-shadow: none !important;
+}
+
+[data-theme="opal"] #app .bubble.user:hover {
+  border-color: color-mix(in srgb, var(--fg) 18%, var(--border-strong)) !important;
+  box-shadow: none !important;
+}
+
+[data-theme="opal"] #app .bubble.user :is(p, strong, em, span) {
+  color: var(--fg) !important;
+  -webkit-text-fill-color: var(--fg) !important;
+}
+
+[data-theme="opal"] #app .bubble.user :is(code, pre) {
+  background: var(--bg-sunken) !important;
+  color: var(--accent-hover) !important;
+  -webkit-text-fill-color: var(--accent-hover) !important;
+}
+
+[data-theme="opal"] #app .avatar.user {
+  background: var(--bg-inset);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+}
+
+[data-theme="opal"] #app .bubble-row:has(.bubble-meta.streaming) .avatar-mark {
+  animation: opal-glint 4s ease-in-out infinite;
+}
+
+/* ---- composer: a full capsule (the notched corner, polished smooth) ---- */
+[data-theme="opal"] #app .composer-wrap > .composer {
+  border: 1px solid var(--border-strong) !important;
+  border-radius: 26px !important;
+  background: var(--bg-raised) !important;
+  box-shadow: 0 18px 50px -28px rgba(0, 0, 0, 0.9) !important;
+  transition: border-color 160ms ease, box-shadow 220ms ease !important;
+}
+
+[data-theme="opal"] #app .composer-wrap > .composer:focus-within {
+  border-color: color-mix(in srgb, var(--fg) 22%, var(--border-strong)) !important;
+  box-shadow: 0 18px 50px -28px rgba(0, 0, 0, 0.9) !important;
+}
+
+[data-theme="opal"] #app .revealer-deck {
+  border-top-left-radius: 25px;
+  border-top-right-radius: 25px;
+}
+
+/* Send: a round pearl that catches a little colour on hover. */
+[data-theme="opal"] #app :is(#btn-send, #btn-stop),
+[data-theme="opal"] #app .wb-act :is(#btn-send, #btn-stop) {
+  border-radius: 50% !important;
+}
+
+[data-theme="opal"] #app #btn-send:not(.queue-mode) {
+  color: #0A0B0F !important;
+  box-shadow: var(--btn-send-glow) !important;
+}
+
+[data-theme="opal"] #app #btn-send:not(.queue-mode):hover {
+  filter: brightness(1.06);
+}
+
+/* ---- code reads like the stone's flashes ---- */
+[data-theme="opal"] #app :is(.code-card, pre, .terminal, .backend-log-pre) {
+  background-color: var(--bg-sunken);
+  border-color: var(--border);
+}
+
+[data-theme="opal"] :is(.tok-keyword, .hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-literal) { color: #B8A6FF; }
+[data-theme="opal"] :is(.tok-string, .hljs-string, .hljs-addition) { color: #8FE8C4; }
+[data-theme="opal"] :is(.tok-number, .hljs-number) { color: #FFB48C; }
+[data-theme="opal"] :is(.tok-fn, .hljs-title, .hljs-title.function_) { color: #8CC8FF; }
+[data-theme="opal"] :is(.tok-comment, .hljs-comment, .hljs-quote) { color: #5F6474; font-style: italic; }
+[data-theme="opal"] :is(.tok-tag, .tok-attr, .hljs-attr, .hljs-property) { color: #FF9CC8; }
+[data-theme="opal"] :is(.tok-var, .hljs-variable) { color: #EFE08A; }
+
+/* ---- welcome: one faint stone of light behind the heading ---- */
+[data-theme="opal"] #app .wv-head {
+  position: relative;
+  isolation: isolate;
+}
+
+[data-theme="opal"] #app .wv-head::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  left: 50%;
+  top: 42%;
+  width: 180px;
+  height: 80px;
+  border-radius: 50%;
+  background: conic-gradient(from var(--opal-turn), var(--opal-stops));
+  filter: blur(44px);
+  pointer-events: none;
+  animation: opal-breathe 12s ease-in-out infinite, opal-turn 40s linear infinite;
+}
+
+[data-theme="opal"] #app .wv-title {
+  letter-spacing: -0.02em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="opal"] #app :is(.chatrow.active, .wv-head)::before,
+  [data-theme="opal"] #app .bubble-row:has(.bubble-meta.streaming) .avatar-mark {
+    animation: none;
+  }
+}

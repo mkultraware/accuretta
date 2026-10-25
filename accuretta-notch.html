@@ -5,341 +5,622 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Accuretta Notch</title>
 <style>
-@property --a { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
 :root {
   --ink: #000;
-  --text: #eceaf7;
-  --dim: #8c88a6;
+  --card: #0d0d12;
+  --card-2: #13131a;
+  --hair: rgba(255,255,255,.065);
   --line: rgba(255,255,255,.09);
+  --text: #ecebf3;
+  --dim: #8a8898;
+  --dim-2: #5d5b6b;
   --paper: #efeadf;
   --blue: #6f86ff;
-  --amber: #ffb547;
-  --risk: 255,181,71;
-  --risk-hi: 255,227,168;
-  --glow: .3;
-  --ok: #4ade9a;
-  --bad: #ff6b7f;
-  --spring: cubic-bezier(.34,1.38,.5,1);
+  --ok: #34d399;
+  --bad: #f4505e;
+  --amber: #f5a524;
+  --risk: 245,165,36;
+  --t-amber: 245,165,36;
+  --t-green: 52,211,153;
+  --t-red: 244,80,94;
+  --t-blue: 111,134,255;
+  --font: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Mono", "SF Mono", Consolas, ui-monospace, monospace;
+  --ease-out: cubic-bezier(.2,.8,.2,1);
 }
 * { box-sizing: border-box; margin: 0; }
 html, body { height: 100%; }
 body {
-  font: 13px/1.4 "SF Pro Text", "Inter", system-ui, sans-serif;
+  font: 13px/1.4 var(--font);
   color: var(--text);
   background: #16161d;
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
 }
+button { font: inherit; cursor: pointer; border: 0; color: inherit; background: none; padding: 0; }
+button:focus-visible { outline: 1.5px solid rgba(255,255,255,.55); outline-offset: 2px; }
+[hidden] { display: none !important; }
 
+/* ── Island ───────────────────────────────────────────────────────────────
+   Width, height and corner radius are driven from script (a spring when it
+   grows, an eased curve when it shrinks), never by CSS transitions. */
 .island {
-  position: fixed; top: 0; left: 50%; transform: translateX(-50%);
-  width: 200px; height: 34px;
+  position: absolute; top: 0; left: calc(50% - 98px);
+  width: 196px; height: 32px;
   background: var(--ink);
-  border-radius: 0 0 18px 18px;
-  overflow: hidden; cursor: pointer;
-  transition: width .5s var(--spring), height .5s var(--spring), border-radius .4s var(--spring), box-shadow .4s;
+  border-radius: 0 0 16px 16px;
+  overflow: hidden;
+  cursor: pointer;
   z-index: 10;
+  color-scheme: dark;
+  box-shadow: 0 10px 30px rgba(0,0,0,.0);
+  transition: box-shadow .5s ease, opacity .24s ease-out, transform .38s cubic-bezier(.22,1,.36,1);
 }
-.island[data-state="alert"]  { width: 540px; height: 44px; border-radius: 0 0 24px 24px; animation: wobble .7s var(--spring), glow 1.8s ease-in-out .7s infinite; }
-.island[data-state="gate"]   { width: 520px; height: 276px; border-radius: 0 0 32px 32px; cursor: default; animation: glow 1.8s ease-in-out infinite; }
-.island[data-state="prompt"] { width: 560px; height: 168px; border-radius: 0 0 32px 32px; cursor: default; box-shadow: 0 20px 50px rgba(70,110,255, calc(.25 * var(--glow))); }
-.island[data-state="prompt"][data-thread] { height: 318px; }
-.island[data-state="gate"][data-kind="registry"] { height: 334px; }
-.island[data-state="work"], .island[data-state="ready"] { width: 540px; height: 44px; border-radius: 0 0 24px 24px; }
+/* The host window only paints inside the island plus a 36 px margin (its
+   click-through region). The shadow must fade out completely inside that
+   margin, or Windows cuts it off in a hard rectangle around the island:
+   8 px drop + 22 px blur stays well within it. */
+.island[data-mode="expanded"] { cursor: default; box-shadow: 0 8px 22px rgba(0,0,0,.42), 0 0 0 1px rgba(255,255,255,.04); }
+/* slide up into the bezel instead of blinking out, and back down again */
+.island.is-leaving { transform: translateY(-104%); opacity: 0; transition: transform .3s cubic-bezier(.4,0,.2,1), opacity .26s ease-in; }
+.island.is-entering { transform: translateY(-104%); opacity: 0; transition: none; }
 
-@keyframes wobble { 0% { transform: translateX(-50%) scale(.82,.9); } 55% { transform: translateX(-50%) scale(1.04,1.02); } 100% { transform: translateX(-50%) scale(1); } }
-@keyframes glow { 0%,100% { box-shadow: 0 8px 24px rgba(var(--risk), calc(.10 * var(--glow))); } 50% { box-shadow: 0 10px 30px rgba(var(--risk), calc(.34 * var(--glow))); } }
-@keyframes spin { to { --a: 360deg; } }
-
-/* edge light: left, bottom and right only. The top border is clipped away. */
-.rim {
-  position: absolute; inset: 0; border-radius: inherit; padding: 1.5px; z-index: 3;
-  opacity: 0; transition: opacity .4s; pointer-events: none;
-  clip-path: inset(2px 0 0 0);
-  background:
-    conic-gradient(from var(--a), rgba(var(--risk),0) 0deg, rgba(var(--risk),0) 190deg, rgba(var(--risk),.5) 300deg, rgba(var(--risk-hi),.65) 332deg, rgba(var(--risk),0) 360deg),
-    linear-gradient(rgba(var(--risk),.10), rgba(var(--risk),.10));
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  mask-composite: exclude;
-  animation: spin 3.4s linear infinite;
+/* ── Views ────────────────────────────────────────────────────────────────
+   Every view is laid out at its final size, centred on the island, so the
+   island's edges reveal or clip it while it resizes and nothing reflows.
+   The outgoing view fades fast; the incoming one waits a beat, then settles. */
+.view {
+  position: absolute; opacity: 0; pointer-events: none;
+  transform: translateY(-3px) scale(.985); transform-origin: 50% 0;
+  transition: opacity .13s ease, transform .2s ease;
 }
-.island[data-state="alert"] .rim, .island[data-state="gate"] .rim { opacity: 1; }
-
-.view { position: absolute; inset: 0; opacity: 0; pointer-events: none; transition: opacity .2s; }
 .island[data-state="idle"] .v-idle, .island[data-state="off"] .v-idle,
-.island[data-state="alert"] .v-alert,
-.island[data-state="work"] .v-work,
-.island[data-state="ready"] .v-ready,
-.island[data-state="gate"] .v-gate,
-.island[data-state="prompt"] .v-prompt { opacity: 1; pointer-events: auto; transition: opacity .3s .15s; }
+.island[data-state="work"] .v-work, .island[data-state="alert"] .v-alert,
+.island[data-state="ready"] .v-ready, .island[data-state="home"] .v-home,
+.island[data-state="gate"] .v-gate, .island[data-state="prompt"] .v-prompt,
+.island[data-state="notice"] .v-notice, .island[data-state="drop"] .v-drop {
+  opacity: 1; pointer-events: auto; transform: none;
+  transition: opacity .26s ease .1s, transform .44s var(--ease-out) .1s;
+}
 
-.pill { display: flex; align-items: center; justify-content: space-between; height: 100%; padding: 0 16px 0 14px; }
-.pill .label { font-weight: 600; letter-spacing: .01em; }
-.pill .sub { color: var(--dim); font-size: 12px; margin-left: 8px; font-weight: 400; }
-.left { display: flex; align-items: center; gap: 10px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok); }
-.dot.amber { background: rgb(var(--risk)); box-shadow: 0 0 10px rgb(var(--risk)); animation: blink 1s infinite; }
-.dot.blue { background: var(--blue); box-shadow: 0 0 10px var(--blue); animation: blink 1s infinite; }
-@keyframes blink { 50% { opacity: .35; } }
+/* compact views: one 32px row at the top edge */
+.view.compact { top: 0; left: 50%; height: 32px; }
+.v-idle  { width: 196px; margin-left: -98px; }
+.v-work  { width: 440px; margin-left: -220px; }
+.v-alert { width: 372px; margin-left: -186px; }
+.v-ready { width: 340px; margin-left: -170px; }
 
-.island[data-state="off"] .v-idle .dot { background: #4a4858; box-shadow: none; }
-.island[data-state="off"] .v-idle .logo { opacity: .28; filter: grayscale(1); }
+.pill { display: flex; align-items: center; height: 32px; padding: 0 14px 0 13px; gap: 10px; white-space: nowrap; }
+.pill .label { font-weight: 600; font-size: 12.5px; letter-spacing: .005em; }
+.pill .sub { color: var(--dim); font-size: 12px; }
+.grow { flex: 1; min-width: 0; }
+.pill.wings { display: grid; grid-template-columns: minmax(0, 1fr) 150px auto; gap: 10px; padding: 0 16px 0 13px; }
+.wl, .wr { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.wl { grid-column: 1; grid-row: 1; }
+.pill.wings > span:not(.fx-trail) { grid-column: 2; grid-row: 1; }
+.wr { grid-column: 3; grid-row: 1; justify-content: flex-end; gap: 9px; }
 
-/* dot matrix: each dot has its own phase, speed and floor, so the light never moves as one block */
+#workSub { display: inline-block; max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; font: 11.5px/1.5 var(--mono); color: var(--dim); }
+#workSub.swap { animation: toolin .32s var(--ease-out); }
+/* While the agent works, a soft highlight travels across whatever it is
+   doing ("Reading main.py…", "compacting context"), left to right. */
+.island[data-state="work"] #workSub {
+  background-image: linear-gradient(100deg, #77758a 0%, #77758a 40%, #f4f3fa 50%, #77758a 60%, #77758a 100%);
+  background-size: 260% 100%; background-repeat: no-repeat;
+  -webkit-background-clip: text; background-clip: text;
+  color: transparent; -webkit-text-fill-color: transparent;
+  animation: worksheen 1.9s linear infinite;
+}
+.island[data-state="work"] #workSub.swap { animation: toolin .32s var(--ease-out), worksheen 1.9s linear infinite; }
+@keyframes worksheen { from { background-position: 100% 0; } to { background-position: 0% 0; } }
+@keyframes toolin { from { opacity: 0; transform: translateY(3px); } }
+
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px rgba(var(--t-green),.55); flex: none; }
+.dot.amber { background: var(--amber); box-shadow: 0 0 9px rgba(var(--t-amber),.6); animation: breathe 2.4s ease-in-out infinite; }
+@keyframes breathe { 50% { opacity: .45; } }
+.island[data-state="off"] .v-idle .dot { background: #3e3d4a; box-shadow: none; }
+.island[data-state="off"] #mark { opacity: .3 !important; filter: grayscale(1); }
+
+/* session dots in the idle pill: one per conversation that is working or waiting */
+.sdots { display: inline-flex; gap: 5px; align-items: center; }
+.sdots:empty { display: none; }
+.sdots:not(:empty) + .dot { display: none; }
+.sd { width: 6px; height: 6px; border-radius: 50%; background: var(--dim-2); }
+.sd.st-working { background: var(--blue); animation: breathe 1.8s ease-in-out infinite; }
+.sd.st-needs-you { background: var(--amber); }
+
+/* alert pill: a quiet amber hairline along the bottom edge, nothing that wobbles */
+.island::after {
+  content: ""; position: absolute; left: 18%; right: 18%; bottom: 0; height: 1.5px; border-radius: 2px;
+  background: linear-gradient(90deg, transparent, rgba(var(--t-amber),.9), transparent);
+  opacity: 0; transition: opacity .5s ease; pointer-events: none;
+}
+.island[data-state="alert"]::after { opacity: 1; animation: breathe 2.4s ease-in-out infinite; }
+
+/* ── The mark: one dot-matrix A that travels between views ─────────────────── */
+#mark {
+  position: absolute; left: 0; top: 0; width: 56px; height: 41.4px;
+  transform-origin: 50% 50%; pointer-events: none; z-index: 5;
+  will-change: transform;
+}
+#mark .logo { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.mglow {
+  position: absolute; left: 50%; top: 55%; width: 125%; height: 135%; transform: translate(-50%,-50%);
+  border-radius: 50%; background: radial-gradient(closest-side, rgba(var(--tone, var(--t-blue)), .16), transparent);
+  opacity: 0; transition: opacity .8s ease;
+}
+/* Only a faint tint, and only where the card's tone means something. */
+.island[data-state="gate"] #mark { --tone: var(--t-amber); }
+.island[data-state="notice"] #mark { --tone: var(--notice-tone, var(--t-green)); }
+.island[data-state="gate"] .mglow, .island[data-state="notice"] .mglow { opacity: .7; }
+.mslot { display: inline-block; flex: none; width: 26px; height: 19.2px; }
+.mslot.big { width: 52px; height: 38.4px; }
+
+/* dot behaviour: each dot has its own phase, speed and floor */
 .logo circle { transform-box: fill-box; transform-origin: center; }
 .island[data-busy] .logo circle { animation: twinkle var(--p) ease-in-out var(--d) infinite; }
-.island[data-state="alert"] .logo circle { animation-duration: calc(var(--p) * 2); }
 @keyframes twinkle {
-  0%, 100% { opacity: var(--lo); transform: scale(.82); }
-  9%  { opacity: 1; transform: scale(1.22); }
-  32% { opacity: .6; transform: scale(1); }
-  68% { opacity: var(--lo); transform: scale(.88); }
+  0%, 100% { opacity: var(--lo); transform: scale(.9); }
+  12% { opacity: 1; transform: scale(1.08); }
+  40% { opacity: .7; transform: none; }
 }
-
-/* model load: dots ignite along a diagonal, bottom left to top right, each with its own jitter */
 .island[data-loading][data-state] .logo circle { animation: powerup 2.6s ease-in-out calc(var(--k) * 1.6s) infinite both; }
 @keyframes powerup {
-  0%   { opacity: .14; transform: scale(.8); }
-  10%  { opacity: 1;   transform: scale(1.28); }
-  28%  { opacity: .75; transform: scale(1.02); }
-  75%  { opacity: .2;  transform: scale(.86); }
-  100% { opacity: .14; transform: scale(.8); }
+  0%, 100% { opacity: .16; transform: scale(.86); }
+  12% { opacity: 1; transform: scale(1.1); }
+  60% { opacity: .3; transform: scale(.92); }
 }
-.island[data-ready][data-state] .logo circle { animation: ready .7s ease-out calc(var(--k) * .35s) both; }
-@keyframes ready {
-  0%   { opacity: .5; transform: scale(.9); }
-  35%  { opacity: 1;  transform: scale(1.3); }
-  100% { opacity: 1;  transform: scale(1); }
+.island[data-ready][data-state] .logo circle { animation: ready .8s var(--ease-out) calc(var(--k) * .35s) both; }
+@keyframes ready { 0% { opacity: .45; transform: scale(.92); } 40% { opacity: 1; transform: scale(1.1); } 100% { opacity: 1; transform: none; } }
+.island[data-compact][data-state] .logo circle { animation: compact 1.3s cubic-bezier(.6,0,.3,1) var(--cd) both; }
+@keyframes compact { 0%, 100% { transform: none; } 40%, 58% { transform: translate(calc(var(--dx) * .5), calc(var(--dy) * .5)) scale(.6); opacity: .8; } }
+
+/* ── Expanded shell: header + body ───────────────────────────────────────── */
+.shell { position: absolute; top: 0; left: 50%; width: 640px; margin-left: -320px; height: 100%; pointer-events: none; }
+#header {
+  position: absolute; top: 8px; left: 0; right: 0; height: 30px; padding: 0 14px 0 12px;
+  display: flex; align-items: center; gap: 4px;
+  opacity: 0; transition: opacity .14s ease;
+  z-index: 3;   /* above the card surface, which reaches up behind it */
 }
+.island[data-mode="expanded"] #header { opacity: 1; pointer-events: auto; transition: opacity .3s ease .12s; }
+.tab { width: 32px; height: 24px; border-radius: 12px; display: grid; place-items: center; color: var(--dim); transition: background .18s, color .18s; }
+.tab:hover { background: rgba(255,255,255,.06); color: #c4c3cf; }
+.tab.on { background: #1b1b23; color: var(--text); }
+.tab svg, .hbtn svg { width: 15px; height: 15px; display: block; }
+.hright { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+.hbtn { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; color: var(--dim); transition: color .18s, background .18s; }
+.hbtn:hover { color: var(--text); background-color: rgba(255,255,255,.06); }
+.hbtn.off { color: var(--dim-2); }
+.stat { font: 11px/1 var(--mono); color: var(--dim); }
+.stat b { color: var(--text); font-weight: 500; }
+.ctx { display: inline-flex; }
+.ctx svg { display: block; }
+.ctx .trk { stroke: rgba(255,255,255,.12); }
+.ctx .arc { stroke: var(--paper); transition: stroke-dashoffset .8s cubic-bezier(.4,0,.2,1), stroke .3s; }
+.ctx.warn .arc { stroke: var(--amber); }
+.ctx.crit .arc { stroke: var(--bad); }
+
+.view.expanded { top: 42px; left: 10px; width: 620px; }
+
+/* auto-fold countdown: a hairline that drains toward the centre */
+#countdown {
+  position: absolute; left: 50%; bottom: 0; width: 140px; margin-left: -70px; height: 2px; border-radius: 2px;
+  background: rgba(255,255,255,.32); transform: scaleX(0); opacity: 0; pointer-events: none; z-index: 6;
+}
+
+/* ── Cards ─────────────────────────────────────────────────────────────── */
+/* ── The surface ──────────────────────────────────────────────────────────
+   Cards are not boxes. The surface is a halftone dot field drawn on
+   #field (see drawField): crisp at any pixel density, each dot sized and lit
+   by the light falling on it, dissolving into the island's black at every
+   edge. Cards themselves only lay out content. */
+.card { position: relative; border-radius: 18px; }
+#field {
+  position: absolute; top: 0; left: 0; pointer-events: none;
+  opacity: 0; transition: opacity .3s ease;
+}
+.island[data-mode="expanded"] #field { opacity: 1; transition: opacity .45s ease .05s; }
+
+.avatar-card { display: flex; gap: 16px; padding: 16px 18px 16px 16px; }
+.avatar-card > .mslot { margin-top: 2px; }
+.cbody { flex: 1; min-width: 0; position: relative; z-index: 1; display: flex; flex-direction: column; }
+.who { display: flex; align-items: center; gap: 8px; min-width: 0; height: 20px; }
+.who b { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.who .smeta { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sdot { width: 6px; height: 6px; border-radius: 50%; background: var(--dim-2); flex: none; }
+.sdot.st-working { background: var(--blue); animation: breathe 1.8s ease-in-out infinite; }
+.sdot.st-needs-you, .sdot.amber { background: var(--amber); }
+.sdot.st-finished, .sdot.green { background: var(--ok); }
+.sdot.st-failed, .sdot.red { background: var(--bad); }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 8px; white-space: nowrap;
+  padding: 7px 14px; border-radius: 999px; font-size: 12.5px; font-weight: 550;
+  transition: transform .12s ease, background .18s ease, color .18s ease, box-shadow .18s ease;
+}
+.btn:active { transform: scale(.96); }
+/* background-COLOR only: the shorthand on :hover would wipe the hold fill
+   image, and a held button is always a hovered one */
+.btn.pri { background-color: var(--paper); color: #15140f; }
+.btn.pri:hover { background-color: #fff; }
+.btn.sec { background-color: rgba(255,255,255,.075); color: var(--text); }
+.btn.sec:hover { background-color: rgba(255,255,255,.13); }
+.btn.ghost { color: var(--dim); padding-left: 8px; padding-right: 8px; }
+.btn.ghost:hover { color: var(--text); }
+.btn kbd { font: 600 10px/1 var(--mono); padding: 2px 5px; border-radius: 5px; opacity: .55; }
+.btn.pri kbd { border: 1px solid rgba(0,0,0,.35); }
+.btn.sec kbd { border: 1px solid rgba(255,255,255,.35); }
+.actions { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+
+/* hold-to-confirm (strict approvals, power). While held, an amber fill
+   sweeps across the button and the ring beside the label closes; let go
+   early and both ease back. Both finish exactly as the action fires. */
+[data-hold] { -webkit-user-select: none; user-select: none; touch-action: none; }
+.btn.pri {
+  position: relative;
+  background-image: linear-gradient(90deg, rgba(var(--risk), .62), rgba(var(--risk), .9));
+  background-repeat: no-repeat; background-size: 0% 100%;
+  transition: transform .12s ease, background-color .18s ease, background-size .28s cubic-bezier(.45,0,.2,1), box-shadow .3s ease;
+}
+.btn.pri.holding {
+  background-size: 100% 100%; transform: scale(.97);
+  box-shadow: 0 0 0 3px rgba(var(--risk), .18);
+  transition: transform .12s ease, background-size var(--hold) linear, box-shadow .3s ease;
+}
+.hring { width: 15px; height: 15px; flex: none; display: block; }
+.hring circle { fill: none; stroke-width: 2.4; }
+.hring .trk { stroke: rgba(21,20,15,.18); }
+.hring .arc {
+  stroke: #15140f; stroke-linecap: round; stroke-dasharray: 37.7; stroke-dashoffset: 37.7;
+  transform: rotate(-90deg); transform-origin: 50% 50%;
+  transition: stroke-dashoffset .28s cubic-bezier(.45,0,.2,1);
+}
+.holding .hring .arc { stroke-dashoffset: 0; transition: stroke-dashoffset var(--hold) linear; }
+.btn .hl-on { display: none; }
+.btn.holding .hl-on { display: inline; }
+.btn.holding .hl-off { display: none; }
+.icon-btn { background-image: linear-gradient(rgba(var(--t-red),.4), rgba(var(--t-red),.4)); background-repeat: no-repeat; background-position: center; background-size: 0 0; }
+.icon-btn.holding { color: var(--bad); animation: holdgrow var(--hold) linear forwards; }
+@keyframes holdgrow { to { background-size: 100% 100%; } }
+.hbtn.icon-btn:hover { color: var(--bad); }
+
+/* ── Home ─────────────────────────────────────────────────────────────────
+   One surface, two columns split by a hairline. Left: the session the notch
+   is pointed at — what it is, how far along, what it is doing now. Right:
+   everything else, as a quiet list. Nothing boxed inside the box. */
+/* the row is pinned to the card's height: a long session list scrolls
+   inside its column instead of growing past the island's edge */
+.card.home { display: grid; grid-template-columns: minmax(0, 1fr) 168px; grid-template-rows: 128px; height: 128px; }
+.now { display: flex; gap: 16px; padding: 16px 20px 12px 18px; min-width: 0; min-height: 0; overflow: hidden; }
+.now > .mslot { margin-top: 1px; }
+.nowbody { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+/* nothing in the column may be squeezed (the empty progress bar would
+   collapse to 0 px first) */
+.nowbody > * { flex: none; }
+.nowhead { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.nowhead b { font-size: 14px; font-weight: 600; letter-spacing: -.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nowhead .hbtn { width: 20px; height: 20px; margin-left: auto; flex: none; opacity: .7; }
+.nowhead .hbtn svg { width: 12px; height: 12px; }
+.nowmeta { display: flex; align-items: center; gap: 7px; margin-top: 3px; font-size: 11.5px; color: var(--dim); white-space: nowrap; min-width: 0; }
+.nowmeta span { overflow: hidden; text-overflow: ellipsis; }
+#hModel:empty, #hCount:empty { display: none; }
+#hModel:not(:empty) + #hCount:not(:empty)::before { content: "\00b7"; margin-right: 7px; color: var(--dim-2); }
+/* plan progress: one hairline segment per step */
+.prog { display: flex; gap: 3px; margin-top: 12px; height: 3px; }
+.prog:empty { display: none; }
+.prog i { flex: 1; border-radius: 2px; background: rgba(255,255,255,.09); transition: background .5s ease; position: relative; overflow: hidden; }
+.prog i.done { background: rgba(239,234,223,.7); }
+.prog i.cur { background: rgba(var(--t-blue),.35); }
+.prog i.cur::after {
+  content: ""; position: absolute; inset: 0; width: 40%;
+  background: linear-gradient(90deg, transparent, rgba(var(--t-blue),.9), transparent);
+  animation: progsweep 2.2s cubic-bezier(.45,0,.2,1) infinite;
+}
+@keyframes progsweep { from { transform: translateX(-100%); } to { transform: translateX(260%); } }
+.steps { margin-top: 9px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.step { font-size: 12.5px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.step.cur { color: var(--text); }
+.step.next { font-size: 11.5px; color: var(--dim-2); }
+.step.next em { font-style: normal; color: var(--dim); }
+.step.line { white-space: normal; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; line-height: 1.5; margin-top: -2px; }
+/* a slim rail: dot and name only (the dot already says the state; the
+   word is in the tooltip), split off by a hairline that fades at both ends */
+.others { position: relative; padding: 15px 6px 8px 12px; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.others::before {
+  content: ""; position: absolute; left: 0; top: 14px; bottom: 14px; width: 1px;
+  background: linear-gradient(to bottom, transparent, rgba(255,255,255,.08) 30%, rgba(255,255,255,.08) 70%, transparent);
+}
+.seg { display: flex; gap: 11px; padding: 0 6px; margin-bottom: 5px; }
+.seg button { font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--dim-2); transition: color .2s ease; }
+.seg button:hover { color: var(--dim); }
+.seg button.on { color: var(--text); }
+.pane {
+  flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 0;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 12px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 12px), transparent);
+}
+.srow { display: flex; align-items: center; gap: 8px; padding: 0 6px; height: 23px; flex: none; border-radius: 7px; text-align: left; min-width: 0; transition: background .15s; }
+.srow:hover { background: rgba(255,255,255,.045); }
+.srow .nm { flex: 1; min-width: 0; font-size: 11.5px; color: #cfcdd9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.srow .mt { display: none; }
+.srow .sdot { width: 5px; height: 5px; }
+.empty { color: var(--dim-2); font-size: 11.5px; padding: 4px 6px; }
+
+/* ── Approval gate ──────────────────────────────────────────────────────── */
+.tag { white-space: nowrap; flex: none; font-size: 10.5px; padding: 2px 8px; border-radius: 99px; border: 1px solid rgba(var(--t-amber),.4); color: rgb(var(--t-amber)); margin-left: auto; }
+.pager { display: inline-flex; align-items: center; color: var(--dim); font: 11px/1 var(--mono); flex: none; }
+.pg { color: var(--dim); padding: 0 5px; font-size: 14px; line-height: 1; }
+.pg:hover { color: var(--text); }
+.cmd {
+  margin-top: 10px; font: 12px/1.55 var(--mono); color: #d6d6ff;
+  background: rgba(0,0,0,.45); border: 1px solid var(--line); border-radius: 10px; padding: 8px 11px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.meta { display: flex; gap: 14px; margin-top: 8px; color: var(--dim); font-size: 11.5px; white-space: nowrap; overflow: hidden; }
+.meta em { font-style: normal; color: var(--text); }
+.meta em.warn { color: rgb(var(--t-amber)); }
+.diff { margin-top: 10px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: rgba(0,0,0,.45); font: 11.5px/1.7 var(--mono); }
+.dh { display: flex; justify-content: space-between; gap: 12px; padding: 4px 11px; color: var(--dim); border-bottom: 1px solid var(--line); white-space: nowrap; }
+.dh span:first-child { overflow: hidden; text-overflow: ellipsis; }
+.cnt u { text-decoration: none; color: #5fd48f; }
+.cnt s { text-decoration: none; color: #ff7d8d; }
+.dl { display: flex; gap: 10px; padding: 0 11px; white-space: nowrap; }
+.dl i { width: 14px; font-style: normal; text-align: right; color: #55526b; }
+.dl b { width: 8px; font-weight: 500; }
+.dl span { overflow: hidden; text-overflow: ellipsis; }
+.dl.del { background: rgba(255,90,110,.1); color: #ffb3bd; }
+.dl.add { background: rgba(70,210,130,.1); color: #a8f0c8; }
+
+/* ── Notice (finished / error) ───────────────────────────────────────────── */
+.ntitle { margin-top: 8px; font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ntext { margin-top: 3px; color: var(--dim); font-size: 12.5px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.ntext:empty { display: none; }
+
+/* ── Drop ───────────────────────────────────────────────────────────────── */
+.v-drop .card { min-height: 124px; }
+.dzone {
+  position: absolute; inset: 8px; border-radius: 13px; border: 1.5px dashed rgba(255,255,255,.16);
+  transition: border-color .3s ease, opacity .3s ease; pointer-events: none;
+}
+#dropCard[data-phase="over"] .dzone { border-color: rgba(var(--t-blue),.55); }
+#dropCard:not([data-phase="over"]) .dzone { opacity: 0; }
+.dphase { display: none; }
+#dropCard[data-phase="over"] .dp-over, #dropCard[data-phase="ready"] .dp-ready { display: flex; flex-direction: column; }
+.dtitle { font-size: 14px; font-weight: 600; margin-top: 2px; }
+.dtext { color: var(--dim); font-size: 12.5px; margin-top: 3px; }
+.fchip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 3px 9px 3px 7px; border-radius: 8px; background: rgba(255,255,255,.07); font-size: 11.5px; color: var(--text); }
+.fchip svg { width: 13px; height: 13px; flex: none; color: var(--dim); }
+.fchip span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ── Chat ───────────────────────────────────────────────────────────────── */
+/* The chat card never outgrows the island (MAX_H 500 = 42 header + 448 card
+   + 10 bottom): it is a column whose conversation takes what is left and
+   scrolls, while the composer and model row always keep their full size.
+   Without the cap, a long expanded history pushed the composer below the
+   island's edge. */
+.v-prompt .card { padding: 12px 12px 10px; display: flex; flex-direction: column; max-height: 448px; }
+.v-prompt .card > * { flex: none; }
+.v-prompt .card > .thread { flex: 0 1 auto; min-height: 0; }
+.thread {
+  display: none; flex-direction: column; gap: 7px; max-height: 300px; overflow-y: auto;
+  margin-bottom: 12px; padding: 2px 4px 0;
+}
+.island[data-thread] .thread { display: flex; }
+.island[data-expanded] .thread { max-height: none; }
+.msg.user { color: var(--dim); font-size: 12.5px; text-align: right; }
+/* one bubble per question: the live one, or a history entry's inner text
+   (never both the entry and its text, which drew a bubble in a bubble) */
+.msg.user:not(.arch):not(:empty), .msg.arch.user > div {
+  align-self: flex-end; max-width: 80%; background: rgba(255,255,255,.06); color: #d9d8e2;
+  padding: 5px 11px; border-radius: 12px; text-align: left;
+}
+.msg.user:empty { display: none; }
+/* loaded history (double-click the thread): each earlier exchange gets room
+   to breathe, and reads a step quieter than the live turn below it */
+.msg.arch.user { margin-top: 12px; display: flex; justify-content: flex-end; }
+.msg.arch.user:first-child { margin-top: 0; }
+.msg.arch.user > div { color: #b9b8c4; }
+.msg.arch.assistant { font-size: 12.5px; line-height: 1.6; color: rgba(236,235,243,.62); white-space: pre-wrap; }
+.msg.agent { font-size: 13px; line-height: 1.6; white-space: pre-wrap; color: rgba(236,235,243,.82); }
+.msg.agent .w { animation: wfade .45s ease-out both; }
+@keyframes wfade { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+.cap { margin-top: 6px; color: var(--dim-2); font-size: 11px; }
+.attach { margin: 0 2px 8px; }
+.promptbox {
+  display: flex; align-items: center; gap: 10px; background: rgba(0,0,0,.5);
+  border: 1px solid var(--line); border-radius: 14px; padding: 7px 7px 7px 11px; transition: border-color .25s;
+}
+.promptbox:focus-within { border-color: rgba(255,255,255,.26); }
+.promptbox input { flex: 1; min-width: 0; background: none; border: 0; outline: 0; color: var(--text); font: inherit; font-size: 13.5px; }
+.promptbox input::placeholder { color: #66647a; }
+.send { width: 30px; height: 30px; border-radius: 10px; background: var(--paper); display: grid; place-items: center; transition: background .15s, transform .12s; flex: none; }
+.send:hover { background: #fff; }
+.send:active { transform: scale(.94); }
+.send .sico { position: relative; display: block; width: 14px; height: 14px; }
+.send .sico svg { position: absolute; inset: 0; transition: opacity .2s ease, transform .32s var(--ease-out); }
+.send .ico-stop { opacity: 0; transform: scale(.4) rotate(-60deg); }
+.send.is-stop .ico-send { opacity: 0; transform: scale(.4) rotate(60deg); }
+.send.is-stop .ico-stop { opacity: 1; transform: none; }
+.row { display: flex; align-items: center; justify-content: space-between; padding-top: 9px; }
+.row .right { display: flex; align-items: center; gap: 8px; }
+.hint { color: var(--dim); font-size: 11.5px; }
+.hint.ok { color: var(--ok); }
+.hint.bad { color: var(--bad); }
+.hint.ok::before { content: "\2713  "; }
+.rowleft { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.model { position: relative; overflow: hidden; display: inline-flex; align-items: center; gap: 7px; padding: 4px 9px 4px 9px; border-radius: 99px; background: rgba(255,255,255,.04); border: 1px solid var(--line); font-size: 11.5px; transition: border-color .15s; max-width: 260px; }
+.model #modelName { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.model:hover, .island[data-menu] .model { border-color: rgba(255,255,255,.25); }
+.model svg { color: var(--dim); flex: none; }
+.model .chev { transition: transform .3s var(--ease-out); }
+.island[data-menu] .model .chev { transform: rotate(180deg); }
 .model::after { content: ""; position: absolute; left: 0; width: 38%; bottom: 0; height: 1.5px; background: var(--paper); opacity: 0; }
 .island[data-loading] .model::after { opacity: .8; animation: slide 1.4s ease-in-out infinite; }
 @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(270%); } }
 .island[data-loading] #modelName { color: var(--dim); }
+.row .icon-btn, #convBtn { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; color: var(--dim); transition: color .15s, background .15s; }
+#convBtn:hover { color: var(--text); background: rgba(255,255,255,.06); }
 
-.card { padding: 46px 22px 20px; height: 100%; display: flex; flex-direction: column; }
-.head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.head h2 { font-size: 15px; font-weight: 650; }
-.head p { color: var(--dim); font-size: 12px; }
-.head .tag { margin-left: auto; }
-.head .icon-btn { margin-left: 6px; }
-.tag { white-space: nowrap; flex: none; font-size: 11px; padding: 3px 9px; border-radius: 99px; border: 1px solid rgba(var(--risk),.45); color: rgb(var(--risk)); }
-
-.cmd {
-  font: 12px/1.5 "JetBrains Mono", "SF Mono", ui-monospace, monospace;
-  background: #0f0f17; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; color: #cfd0ff;
+.menu {
+  display: none; position: absolute; left: 10px; right: 10px; bottom: 50px; z-index: 20;
+  padding: 4px; background: #101017; border: 1px solid var(--line); border-radius: 13px;
+  box-shadow: 0 12px 30px rgba(0,0,0,.5); max-height: 232px; overflow-y: auto; overscroll-behavior: contain;
 }
-.cmd b { color: rgb(var(--risk)); font-weight: 500; }
-.meta { display: flex; gap: 16px; margin: 10px 2px 0; color: var(--dim); font-size: 12px; }
-.meta em { font-style: normal; color: var(--text); }
-
-button { font: inherit; cursor: pointer; border: 0; color: var(--text); background: none; }
-button:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
-.actions { margin-top: auto; display: grid; grid-template-columns: auto auto 1fr; gap: 8px; align-items: stretch; }
-.btn { white-space: nowrap; padding: 10px 14px; border-radius: 12px; font-weight: 600; transition: transform .12s, background .15s, border-color .15s, color .15s; }
-.btn:active { transform: scale(.97); }
-.btn.quiet { color: var(--dim); font-weight: 500; }
-.btn.quiet:hover { color: var(--text); }
-.btn.outline { border: 1px solid rgba(255,255,255,.16); }
-.btn.outline:hover { border-color: rgba(255,107,127,.7); color: var(--bad); }
-.btn.solid { background-color: var(--paper); color: #14130f; display: inline-flex; justify-content: center; align-items: center; gap: 8px; box-shadow: inset 0 -2px 0 rgba(0,0,0,.18); }
-.btn.solid:hover { background-color: #fff; }
-.btn.solid kbd { font: 600 11px/1 ui-monospace, "SF Mono", monospace; padding: 3px 6px; border-radius: 6px; background: rgba(20,19,15,.12); color: #3b382e; }
-
-.icon-btn { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; color: var(--dim); transition: color .15s, background .15s; }
-.icon-btn:hover { color: var(--bad); background-color: rgba(255,107,127,.12); }
-
-.thread { display: none; flex: 1; min-height: 0; overflow-y: auto; flex-direction: column; gap: 6px; margin-bottom: 14px; padding: 6px 2px 0 4px;
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 16px); mask-image: linear-gradient(to bottom, transparent 0, #000 16px); }
-.island[data-thread] .thread { display: flex; }
-.msg.user { color: #6f6c86; font-size: 12.5px; }
-.msg.agent { font-size: 13px; line-height: 1.6; white-space: pre-wrap; color: rgba(236,234,247,.7); }
-.msg.agent .w { animation: wfade .4s ease-out both; }
-@keyframes wfade { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
-.cap { margin-top: 6px; color: #5a5770; font-size: 11px; }
-
-.promptbox { display: flex; align-items: center; gap: 10px; background: #0f0f17; border: 1px solid var(--line); border-radius: 16px; padding: 8px 8px 8px 12px; transition: border-color .2s; }
-.promptbox:focus-within { border-color: rgba(255,255,255,.35); }
-.promptbox input { flex: 1; background: none; border: 0; outline: 0; color: var(--text); font: inherit; font-size: 14px; }
-.promptbox input::placeholder { color: #6b6884; }
-.send { width: 32px; height: 32px; border-radius: 10px; background: var(--paper); display: grid; place-items: center; transition: background .15s, transform .12s; }
-.send:hover { background: #fff; }
-.send:active { transform: scale(.94); }
-/* send <-> stop morph: the arrow and the stop square cross-rotate in place
-   instead of the button snapping between two icons. */
-.send .sico { position: relative; display: block; width: 14px; height: 14px; }
-.send .sico svg { position: absolute; inset: 0; transition: opacity .2s ease, transform .3s cubic-bezier(.34,1.4,.64,1); }
-.send .ico-stop { opacity: 0; transform: scale(.3) rotate(-80deg); }
-.send.is-stop .ico-send { opacity: 0; transform: scale(.3) rotate(80deg); }
-.send.is-stop .ico-stop { opacity: 1; transform: none; }
-.row { display: flex; align-items: center; justify-content: space-between; margin-top: auto; padding-top: 12px; }
-.row .right { display: flex; align-items: center; gap: 8px; }
-.hint { color: var(--dim); font-size: 12px; }
-.hint.ok { color: var(--ok); }
-.hint.bad { color: var(--bad); }
-.hint.ok::before { content: "\2713  "; }
-
-.model { position: relative; overflow: hidden; display: inline-flex; align-items: center; gap: 7px; padding: 5px 9px 5px 10px; border-radius: 99px; background: #12121b; border: 1px solid var(--line); font-size: 12px; transition: border-color .15s; }
-.model:hover, .island[data-menu] .model { border-color: rgba(255,255,255,.28); }
-.model svg { color: var(--dim); }
-.model .chev { transition: transform .25s var(--spring); }
-.island[data-menu] .model .chev { transform: rotate(180deg); }
-
-.menu { display: none; margin-top: 8px; padding: 4px; background: #0f0f17; border: 1px solid var(--line); border-radius: 14px; }
-.island[data-menu] #menu, .island[data-conv] #convMenu { display: block; }
-/* Dropdowns FLOAT over the card instead of growing it: the host window is a
-   fixed canvas, so an in-flow menu on a full thread pushed its own bottom past
-   the island and the window clipped it to a sliver. */
-.v-prompt .card { position: relative; }
-.menu { position: absolute; left: 14px; right: 14px; bottom: 76px; margin: 0; z-index: 20; }
-.rowleft { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.opt { width: 100%; display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 10px; text-align: left; font-size: 12.5px; color: var(--dim); transition: background .12s, color .12s; }
-.opt:hover { background: #181826; color: var(--text); }
+.island[data-menu] #menu, .island[data-conv] #convMenu { display: block; animation: menuin .22s var(--ease-out); }
+@keyframes menuin { from { opacity: 0; transform: translateY(4px); } }
+.opt { width: 100%; display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 9px; text-align: left; font-size: 12px; color: var(--dim); transition: background .12s, color .12s; }
+.opt:hover { background: #1a1a24; color: var(--text); }
+.opt:disabled { opacity: .4; cursor: default; }
 .opt .chk { width: 12px; color: var(--paper); font-size: 12px; }
-.opt .nm { flex: 1; }
-.opt .mt { font-size: 11.5px; color: #66637d; }
+.opt .nm { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.opt .mt { font-size: 11px; color: #66637d; }
 .opt[aria-selected="true"] { color: var(--text); }
 
-.rt { display: flex; align-items: center; gap: 9px; }
-.ctx { display: inline-flex; }
-.ctx svg { display: block; }
-.ctx .trk { stroke: rgba(255,255,255,.14); }
-.ctx .arc { stroke: var(--paper); transition: stroke-dashoffset .8s cubic-bezier(.4,0,.2,1), stroke .3s; }
-.ctx.warn .arc { stroke: #ffb547; }
-.ctx.crit .arc { stroke: var(--bad); }
-.island[data-state="off"] .ctx { opacity: .3; }
+.island ::-webkit-scrollbar { width: 8px; height: 8px; }
+.island ::-webkit-scrollbar-track, .island ::-webkit-scrollbar-corner { background: transparent; }
+.island ::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+.island ::-webkit-scrollbar-thumb { background-color: rgba(255,255,255,.12); border: 2px solid rgba(0,0,0,0); border-radius: 99px; background-clip: padding-box; }
 
-#workSub { display: inline-block; max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; font: 11.5px/1.5 "JetBrains Mono", "SF Mono", ui-monospace, monospace; margin-left: 0; }
-#workSub.swap { animation: toolin .28s ease-out; }
-@keyframes toolin { from { opacity: 0; transform: translateY(3px); } }
-
-/* compaction: dots pull toward the center, hold, then spring back */
-.island[data-compact][data-state] .logo circle { animation: compact 1.3s cubic-bezier(.6,0,.3,1) var(--cd) both; }
-@keyframes compact {
-  0%       { transform: translate(0,0) scale(1); opacity: 1; }
-  38%, 58% { transform: translate(var(--dx), var(--dy)) scale(.55); opacity: .85; }
-  100%     { transform: translate(0,0) scale(1); opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  .island, .island *, .island::after { animation: none !important; transition-duration: .01s !important; }
 }
-
-.cmd { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.meta em.warn { color: rgb(var(--risk)); }
-.head > div { min-width: 0; }
-.head h2 { white-space: nowrap; }
-.head p { display: flex; align-items: center; white-space: nowrap; }
-.pg { color: var(--dim); padding: 0 7px; font-size: 14px; line-height: 1; }
-.pg:first-child { padding-left: 0; }
-.pg:hover { color: var(--text); }
-
-[data-hold] { -webkit-user-select: none; user-select: none; touch-action: none; }
-.btn.solid { background-image: linear-gradient(rgba(var(--risk), .5), rgba(var(--risk), .5)); background-repeat: no-repeat; background-size: 0% 100%; }
-.btn.solid.holding { animation: holdbar var(--hold) linear forwards; }
-@keyframes holdbar { to { background-size: 100% 100%; } }
-.icon-btn { background-image: linear-gradient(rgba(255,107,127,.45), rgba(255,107,127,.45)); background-repeat: no-repeat; background-position: center; background-size: 0 0; }
-.icon-btn.holding { color: var(--bad); animation: holdgrow var(--hold) linear forwards; }
-@keyframes holdgrow { to { background-size: 100% 100%; } }
-
-[hidden] { display: none !important; }
-.pill.wings { display: grid; grid-template-columns: 1fr 190px 1fr; padding: 0 20px 0 18px; }
-.wl, .wr { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.wr { justify-content: flex-end; gap: 9px; }
-.wr .sub { margin: 0; }
-
-.strip { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; font: 11.5px/1 "JetBrains Mono", "SF Mono", ui-monospace, monospace; color: var(--dim); }
-.strip b { color: var(--text); font-weight: 500; }
-.strip i { width: 1px; height: 11px; background: rgba(255,255,255,.16); }
-.strip .tw { display: inline-flex; align-items: center; gap: 10px; }
-.chips { margin-left: auto; display: flex; gap: 6px; }
-.chip { padding: 3px 8px; border-radius: 7px; background: #15151d; color: var(--dim); font: 11px/1.2 "SF Pro Text", "Inter", system-ui, sans-serif; }
-
-.diff { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #0c0c13; font: 12px/1.7 "JetBrains Mono", "SF Mono", ui-monospace, monospace; }
-.dh { display: flex; justify-content: space-between; gap: 12px; padding: 6px 12px; color: var(--dim); border-bottom: 1px solid var(--line); white-space: nowrap; }
-.dh span:first-child { overflow: hidden; text-overflow: ellipsis; }
-.cnt u { text-decoration: none; color: #5fd48f; }
-.cnt s { text-decoration: none; color: #ff7d8d; }
-.dl { display: flex; gap: 10px; padding: 0 12px; white-space: nowrap; }
-.dl i { width: 14px; font-style: normal; text-align: right; color: #55526b; }
-.dl b { width: 8px; font-weight: 500; }
-.dl span { overflow: hidden; text-overflow: ellipsis; }
-.dl.del { background: rgba(255,90,110,.12); color: #ffb3bd; }
-.dl.add { background: rgba(70,210,130,.12); color: #a8f0c8; }
-
-@media (max-width: 500px) { .island[data-state="gate"], .island[data-state="prompt"] { width: 94vw; } }
-@media (prefers-reduced-motion: reduce) { .island, .island *, .rim { animation: none !important; transition-duration: .01s !important; } }
 </style>
 </head>
 <body>
 
-<div class="island" id="island" data-state="idle" role="group" tabindex="0" aria-label="Accuretta">
-  <div class="rim"></div>
+<div class="island" id="island" data-state="idle" data-mode="compact" role="group" tabindex="0" aria-label="Accuretta">
+  <canvas id="field" aria-hidden="true"></canvas>
 
-  <div class="view v-idle"><div class="pill">
-    <svg class="logo" data-cols="11" width="26" height="19"></svg>
-    <span class="dot"></span>
+  <!-- compact -->
+  <div class="view compact v-idle"><div class="pill">
+    <span class="mslot"></span><span class="grow"></span>
+    <span class="sdots" id="sDots"></span><span class="dot"></span>
   </div></div>
 
-  <div class="view v-alert"><div class="pill wings">
-    <div class="wl"><svg class="logo" data-cols="11" width="28" height="20"></svg><span class="label">Approval needed</span></div>
-    <span></span>
-    <div class="wr"><span class="sub" id="alertSub">1 gate</span><span class="dot amber"></span></div>
-  </div></div>
-
-  <div class="view v-work"><div class="pill wings">
-    <div class="wl"><svg class="logo" data-cols="11" width="28" height="20"></svg><span class="sub" id="workSub">thinking</span></div>
+  <div class="view compact v-work"><div class="pill wings">
+    <div class="wl"><span class="mslot"></span><span class="sub" id="workSub">thinking</span></div>
     <span></span>
     <div class="wr"></div>
   </div></div>
 
-  <div class="view v-ready"><div class="pill wings">
-    <div class="wl"><svg class="logo" data-cols="11" width="28" height="20"></svg><span class="label">Model ready</span></div>
-    <span></span>
-    <div class="wr"><span class="sub" id="readySub"></span><span class="dot"></span></div>
+  <div class="view compact v-alert"><div class="pill">
+    <span class="mslot"></span><span class="label">Approval needed</span><span class="grow"></span>
+    <span class="sub" id="alertSub">1 gate</span><span class="dot amber"></span>
   </div></div>
 
-  <div class="view v-gate"><div class="card">
-    <div class="strip"><b id="gStep"></b><i></i><span>ctx <b id="sCtx">34%</b></span><span class="tw" id="sTpsWrap"><i></i><span><b id="sTps">38</b> t/s</span></span><span class="chips"><span class="chip" id="gModel"></span><span class="chip" id="gTarget"></span></span></div>
-    <div class="head">
-      <svg class="logo" data-cols="14" width="42" height="30"></svg>
-      <div><h2>Approval gate</h2><p id="gSub">Agent wants to run a command</p></div>
-      <span class="tag" id="gTag">Command</span>
-      <button class="icon-btn" data-act="power" aria-label="Shut down agent" title="Shut down agent"></button>
-    </div>
-    <div class="cmd" id="gCmdBox"><b>$</b> <span id="gCmd"></span></div>
-    <div class="diff" id="gDiff" hidden></div>
-    <div class="meta"><span>Scope <em id="gScope"></em></span><span>Writes <em id="gWrites"></em></span></div>
-    <div class="actions">
-      <button class="btn quiet" data-act="ask">Ask agent</button>
-      <button class="btn outline" data-act="deny">Deny</button>
-      <button class="btn solid" id="approveBtn" data-act="approve">Approve <kbd>&#9166;</kbd></button>
-    </div>
+  <div class="view compact v-ready"><div class="pill">
+    <span class="mslot"></span><span class="label">Model ready</span><span class="grow"></span>
+    <span class="sub" id="readySub"></span><span class="dot"></span>
   </div></div>
 
-  <div class="view v-prompt"><div class="card">
-    <div class="thread" id="thread">
-      <div class="msg user" id="userMsg"></div>
-      <div class="msg agent"><div id="agentMsg"></div><p class="cap">Mock reply. Nothing ran.</p></div>
-    </div>
-    <div class="promptbox">
-      <svg class="logo" data-cols="11" width="30" height="22"></svg>
-      <input id="q" type="text" placeholder="Tell Accuretta what to do" autocomplete="off" aria-label="Prompt">
-      <button class="send" id="send" aria-label="Send"><span class="sico"><svg class="ico-send" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#14130f" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg><svg class="ico-stop" width="14" height="14" viewBox="0 0 24 24" fill="#14130f" aria-hidden="true"><rect x="6.4" y="6.4" width="11.2" height="11.2" rx="2.8"/></svg></span></button>
-    </div>
-    <div class="row">
-      <div class="rowleft">
-        <button class="model" id="model" aria-haspopup="listbox" aria-expanded="false" aria-label="Change model">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg>
-          <span id="modelName"></span>
-          <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
-        </button>
-        <button class="icon-btn" id="convBtn" aria-haspopup="listbox" aria-expanded="false" aria-label="Conversations" title="Conversations"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H9l-5 4z"/><path d="M8 9h8M8 12h5"/></svg></button>
+  <!-- expanded -->
+  <div class="shell">
+    <div id="header">
+      <button class="tab" data-tab="home" aria-label="Home" title="Home"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10.5 12 4l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5.5h-5V20H5a1 1 0 0 1-1-1z"/></svg></button>
+      <button class="tab" data-tab="chat" aria-label="Chat" title="Chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5h14a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-8l-5 4v-4H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1z"/></svg></button>
+      <button class="tab" data-tab="new" aria-label="New session" title="New session"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>
+      <div class="hright">
+        <span class="stat" id="sTpsWrap" hidden><b id="sTps">0</b> t/s</span>
+        <span class="ctx" title="Context"></span>
+        <button class="hbtn" id="soundBtn" data-act="sound" aria-label="Sound" title="Sound"></button>
+        <button class="hbtn" data-act="open-main" aria-label="Open in main app" title="Open in main app"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6M20 4l-8.5 8.5M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/></svg></button>
+        <button class="hbtn icon-btn" data-act="power" aria-label="Shut down agent" title="Shut down agent"></button>
       </div>
-      <div class="right"><span class="ctx"></span><span class="hint" id="hint">Enter sends</span><button class="icon-btn" data-act="power" aria-label="Shut down agent" title="Shut down agent"></button></div>
     </div>
-    <div class="menu" id="menu" role="listbox" aria-label="Local models"></div>
-    <div class="menu" id="convMenu" role="listbox" aria-label="Conversations"></div>
-  </div></div>
+
+    <div class="view expanded v-home"><div class="card home">
+      <section class="now">
+        <span class="mslot big"></span>
+        <div class="nowbody">
+          <div class="nowhead"><b id="hTitle">Accuretta</b>
+            <button class="hbtn" data-act="open-main" aria-label="Open in main app" title="Open in main app"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 16 16 8M9 8h7v7"/></svg></button></div>
+          <div class="nowmeta"><span class="sdot" id="hDot"></span><span id="hModel"></span><span id="hCount"></span></div>
+          <div class="prog" id="hProg"></div>
+          <div class="steps" id="hSteps"><div class="step line">Ready when you are.</div></div>
+        </div>
+      </section>
+      <section class="others">
+        <div class="seg" role="tablist"><button class="on" data-pane="sessList">Sessions</button><button data-pane="decList">Approvals</button></div>
+        <div class="pane" id="sessList"><div class="empty">No other sessions</div></div>
+        <div class="pane" id="decList" hidden><div class="empty">Nothing approved yet</div></div>
+      </section>
+    </div></div>
+
+    <div class="view expanded v-gate"><div class="card wash avatar-card">
+      <span class="mslot big"></span>
+      <div class="cbody">
+        <div class="who"><span class="sdot amber"></span><b id="gWho">Accuretta</b><span class="smeta" id="gSub">needs permission</span>
+          <span class="tag" id="gTag">Command</span><span class="pager" id="gPager"></span></div>
+        <div class="cmd" id="gCmdBox"><span id="gCmd"></span></div>
+        <div class="diff" id="gDiff" hidden></div>
+        <div class="meta"><span id="gStep"></span><span>Scope <em id="gScope"></em></span><span>Writes <em id="gWrites"></em></span><span id="gTarget"></span><span id="gModel" hidden></span></div>
+        <div class="actions">
+          <button class="btn sec" data-act="deny">Deny <kbd>N</kbd></button>
+          <button class="btn pri" id="approveBtn" data-act="approve">Allow <kbd>Y</kbd></button>
+          <button class="btn sec" id="alwaysBtn" data-act="always" hidden>Always</button>
+          <span class="grow"></span>
+          <button class="btn ghost" data-act="ask">Ask agent</button>
+        </div>
+      </div>
+    </div></div>
+
+    <div class="view expanded v-prompt"><div class="card">
+      <div class="thread" id="thread">
+        <div class="msg user" id="userMsg"></div>
+        <div class="msg agent"><div id="agentMsg"></div><p class="cap">Mock reply. Nothing ran.</p></div>
+      </div>
+      <div class="attach" id="attach" hidden><span class="fchip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg><span id="attachName"></span><button class="pg" data-act="unattach" aria-label="Remove file">&times;</button></span></div>
+      <div class="promptbox">
+        <span class="mslot"></span>
+        <input id="q" type="text" placeholder="Tell Accuretta what to do" autocomplete="off" aria-label="Prompt">
+        <button class="send" id="send" aria-label="Send"><span class="sico"><svg class="ico-send" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#14130f" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg><svg class="ico-stop" width="14" height="14" viewBox="0 0 24 24" fill="#14130f" aria-hidden="true"><rect x="6.4" y="6.4" width="11.2" height="11.2" rx="2.8"/></svg></span></button>
+      </div>
+      <div class="row">
+        <div class="rowleft">
+          <button class="model" id="model" aria-haspopup="listbox" aria-expanded="false" aria-label="Change model">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg>
+            <span id="modelName"></span>
+            <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+          </button>
+          <button id="convBtn" aria-haspopup="listbox" aria-expanded="false" aria-label="Conversations" title="Switch conversation"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4.5h4a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-1v2.5l-2.6-2.5"/><path d="M5.5 8h8a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H9l-3.5 3v-3a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2z"/></svg></button>
+        </div>
+        <div class="right"><span class="hint" id="hint"></span></div>
+      </div>
+      <div class="menu" id="menu" role="listbox" aria-label="Local models"></div>
+      <div class="menu" id="convMenu" role="listbox" aria-label="Conversations"></div>
+    </div></div>
+
+    <div class="view expanded v-notice"><div class="card wash avatar-card" id="noticeCard" data-tone="green">
+      <span class="mslot big"></span>
+      <div class="cbody">
+        <div class="who"><span class="sdot" id="nDot"></span><b id="nWho">Accuretta</b><span class="smeta" id="nSub"></span></div>
+        <div class="ntitle" id="nTitle"></div>
+        <div class="ntext" id="nText"></div>
+        <div class="actions" id="nActions"></div>
+      </div>
+    </div></div>
+
+    <div class="view expanded v-drop"><div class="card wash avatar-card" id="dropCard" data-phase="over">
+      <span class="dzone"></span>
+      <span class="mslot big"></span>
+      <div class="cbody">
+        <div class="dphase dp-over"><div class="dtitle">Drop it here</div><div class="dtext">Accuretta will read the file with you.</div></div>
+        <div class="dphase dp-ready">
+          <span class="fchip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg><span id="dropName"></span></span>
+          <div class="dtitle" style="margin-top:8px">Ready. What should Accuretta do with it?</div>
+          <div class="actions"><button class="btn pri" data-act="drop-ask">Ask about it</button><button class="btn sec" data-act="drop-cancel">Cancel</button></div>
+        </div>
+      </div>
+    </div></div>
+  </div>
+
+  <div id="mark"><span class="mglow"></span><svg class="logo" data-cols="24"></svg></div>
+  <div id="countdown"></div>
 </div>
 
 <script>
+'use strict';
 const MODELS = [
   { name: 'Qwen 3.8 27B', meta: 'vision' },
   { name: 'Qwen3 35B-A3B', meta: 'MoE' },
@@ -347,17 +628,21 @@ const MODELS = [
 ];
 const MOCK_REPLY = 'Scan finished on 10.0.0.12. Three ports are open: SSH on 22 (OpenSSH 8.9), plus HTTP on 80 and HTTPS on 443 (both nginx 1.18.0). I made no changes.\n\nThe nginx version looks old. I suggest I compare it with known advisories next. This step only reads data, so it needs no approval.';
 const MOCK_GATES = [
-  { cmd: 'curl -sI http://10.0.0.12', kind: 'command', step: '2 of 7', target: '10.0.0.12' },
-  { cmd: 'nmap -sV -p 22,80,443 10.0.0.12', kind: 'command', step: '3 of 7', target: '10.0.0.12' },
-  { cmd: 'reg add "HKCU\\Software\\LabTest" /v Flag /t REG_DWORD /d 1 /f', kind: 'registry', step: '5 of 7', writes: 'registry', target: '10.0.0.12', path: 'HKCU\\Software\\LabTest', diff: [['-', 'Flag  REG_DWORD  0'], ['+', 'Flag  REG_DWORD  1']] }
+  { cmd: 'curl -sI http://10.0.0.12', kind: 'command', step: '2 of 7', target: '10.0.0.12', who: 'Lab scan' },
+  { cmd: 'nmap -sV -p 22,80,443 10.0.0.12', kind: 'command', step: '3 of 7', target: '10.0.0.12', who: 'Lab scan', always: true },
+  { cmd: 'reg add "HKCU\\Software\\LabTest" /v Flag /t REG_DWORD /d 1 /f', kind: 'registry', step: '5 of 7', writes: 'registry', target: '10.0.0.12', who: 'Lab scan', path: 'HKCU\\Software\\LabTest', diff: [['-', 'Flag  REG_DWORD  0'], ['+', 'Flag  REG_DWORD  1']] }
 ];
 const KIND_LABEL = { command: 'Command', registry: 'Registry' };
 const HOLD_MS = { approve: 1000, power: 800 };
 const RING = 50.27;
-const POWER = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v8"/><path d="M6.4 6.6a8 8 0 1 0 11.2 0"/></svg>';
+const HOLD_RING = '<svg class="hring" viewBox="0 0 16 16" aria-hidden="true"><circle class="trk" cx="8" cy="8" r="6"/><circle class="arc" cx="8" cy="8" r="6"/></svg>';
+const POWER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v8"/><path d="M6.4 6.6a8 8 0 1 0 11.2 0"/></svg>';
 const RING_SVG = '<svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke-width="3"><circle class="trk" cx="10" cy="10" r="8"/><circle class="arc" cx="10" cy="10" r="8" stroke-linecap="round" stroke-dasharray="50.27" stroke-dashoffset="50.27" transform="rotate(-90 10 10)"/></svg>';
+const SOUND_ON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.2L12 5.5v13l-4.8-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg>';
+const SOUND_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.2L12 5.5v13l-4.8-4H4z"/><path d="m16 10 4 4M20 10l-4 4"/></svg>';
 
 const island = document.getElementById('island');
+const mark = document.getElementById('mark');
 const $ = (s) => document.querySelector(s);
 const cfg = { mockLoadMs: 6000, demo: true };
 let timer, streamTimer, loadTimer, readyTimer, compactTimer, toolTimers = [];
@@ -366,10 +651,640 @@ let gates = [], gi = 0, approvedAny = false, lastCmd = '';
 const hold = { t: null, el: null };
 
 const emit = (type, detail = {}) => island.dispatchEvent(new CustomEvent('notch', { detail: { type, ...detail } }));
+const state = () => island.dataset.state || 'idle';
 
 document.querySelectorAll('[data-act="power"]').forEach(b => { b.innerHTML = POWER; b.dataset.hold = HOLD_MS.power; b.title = 'Hold to shut down'; });
 document.querySelectorAll('.ctx').forEach(el => { el.innerHTML = RING_SVG; });
 
+// ── Sound ────────────────────────────────────────────────────────────────
+// Synthesized, never sampled: each cue is two soft, low mallet tones (a
+// sine with a faint, quickly fading FM overtone for the strike, a sine an
+// octave below for body), darkly low-passed and quiet, with a short room
+// behind them. Every voice ramps up from silence and decays exponentially to
+// -80 dB before it stops, so there is no click at the start and no hard cut
+// at the end.
+const Sound = (() => {
+  const N = { A3: 220, C4: 261.63, D4: 293.66, E4: 329.63, G4: 392, A4: 440, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25 };
+  const CUES = {
+    open:    { gain: .26, dur: .55, notes: [['A4', 0], ['E5', .06]] },
+    close:   { gain: .18, dur: .45, notes: [['E5', 0], ['A4', .05]] },
+    gate:    { gain: .32, dur: .9,  notes: [['D4', 0], ['A4', .1]] },
+    approve: { gain: .26, dur: .6,  notes: [['E4', 0], ['B4', .07]] },
+    deny:    { gain: .24, dur: .55, notes: [['D4', 0], ['A3', .08]] },
+    done:    { gain: .24, dur: .95, notes: [['G4', 0], ['D5', .09]] },
+    error:   { gain: .28, dur: .75, notes: [['E4', 0], ['C4', .1]] },
+    send:    { gain: .14, dur: .28, notes: [['A4', 0]] },
+    drop:    { gain: .22, dur: .55, notes: [['G4', 0], ['C5', .07]] },
+  };
+  let ctx = null, bus = null, muted = false, lastAt = 0;
+  try { muted = localStorage.getItem('accuretta.notch.sound') === 'off'; } catch (e) {}
+
+  function room(sec) {
+    const n = Math.floor(ctx.sampleRate * sec), buf = ctx.createBuffer(2, n, ctx.sampleRate);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = buf.getChannelData(ch);
+      for (let i = 0; i < n; i++) {
+        const t = i / n, fadeIn = Math.min(1, i / (ctx.sampleRate * .004));
+        d[i] = (Math.random() * 2 - 1) * Math.pow(1 - t, 3.4) * fadeIn;
+      }
+    }
+    return buf;
+  }
+  function init() {
+    if (ctx) return ctx;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    try { ctx = new AC(); } catch (e) { return null; }
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1900; lp.Q.value = .3;
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -20; comp.knee.value = 14; comp.ratio.value = 3; comp.attack.value = .005; comp.release.value = .3;
+    const master = ctx.createGain(); master.gain.value = .13;
+    const dry = ctx.createGain(); dry.gain.value = .86;
+    const wet = ctx.createGain(); wet.gain.value = .15;
+    const verb = ctx.createConvolver(); verb.buffer = room(1.5);
+    lp.connect(dry); dry.connect(comp);
+    lp.connect(verb); verb.connect(wet); wet.connect(comp);
+    comp.connect(master); master.connect(ctx.destination);
+    bus = lp;
+    return ctx;
+  }
+  function voice(freq, t0, dur, gain, bright) {
+    const car = ctx.createOscillator(); car.type = 'sine'; car.frequency.value = freq;
+    const mod = ctx.createOscillator(); mod.type = 'sine'; mod.frequency.value = freq * 2;
+    const depth = ctx.createGain();
+    depth.gain.setValueAtTime(freq * .35 * bright, t0);
+    depth.gain.exponentialRampToValueAtTime(freq * .005, t0 + .12);
+    mod.connect(depth); depth.connect(car.frequency);
+    const sub = ctx.createOscillator(); sub.type = 'sine'; sub.frequency.value = freq / 2;
+    const subGain = ctx.createGain(); subGain.gain.value = .3;
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0, t0);
+    env.gain.linearRampToValueAtTime(gain, t0 + .016);
+    env.gain.exponentialRampToValueAtTime(gain * .32, t0 + .14);
+    env.gain.exponentialRampToValueAtTime(.0001, t0 + dur);
+    car.connect(env); sub.connect(subGain); subGain.connect(env); env.connect(bus);
+    const stop = t0 + dur + .06;
+    for (const o of [car, mod, sub]) { o.start(t0); o.stop(stop); }
+  }
+  function play(name) {
+    const cue = CUES[name];
+    if (!cue || muted) return;
+    const now = performance.now();
+    if (now - lastAt < 180) return;         // one cue per gesture, never a pile-up
+    lastAt = now;
+    if (!init()) return;
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    const t0 = ctx.currentTime + .02;
+    for (const [note, at, g] of cue.notes) voice(N[note], t0 + at, cue.dur, cue.gain * (g || 1), cue.bright || 1);
+  }
+  function setMuted(on) {
+    muted = !!on;
+    try { localStorage.setItem('accuretta.notch.sound', muted ? 'off' : 'on'); } catch (e) {}
+    syncSoundBtn();
+  }
+  return { play, setMuted, get muted() { return muted; }, unlock: () => { if (init() && ctx.state === 'suspended') ctx.resume().catch(() => {}); } };
+})();
+function syncSoundBtn() {
+  const b = $('#soundBtn');
+  b.innerHTML = Sound.muted ? SOUND_OFF : SOUND_ON;
+  b.classList.toggle('off', Sound.muted);
+  b.title = Sound.muted ? 'Sound off' : 'Sound on';
+}
+syncSoundBtn();
+document.addEventListener('pointerdown', () => Sound.unlock(), { once: true, capture: true });
+
+// ── Motion ───────────────────────────────────────────────────────────────
+// A damped spring (ω = 2π / response, ζ = damping), integrated in small
+// steps so a dropped frame never destabilises it. Growing uses the spring;
+// shrinking uses a timed ease with no overshoot, so the island opens with a
+// settle and closes cleanly into the edge.
+class Spring {
+  constructor(v, response = .48, damping = .8) { this.value = v; this.target = v; this.vel = 0; this.configure(response, damping); }
+  configure(response, damping) { this.omega = 2 * Math.PI / response; this.zeta = damping; }
+  jump(v) { this.value = this.target = v; this.vel = 0; }
+  get settled() { return Math.abs(this.target - this.value) < .02 && Math.abs(this.vel) < .05; }
+  step(dt) {
+    const n = Math.max(1, Math.ceil(dt * 240)), h = dt / n;
+    for (let i = 0; i < n; i++) {
+      this.vel += (this.omega * this.omega * (this.target - this.value) - 2 * this.zeta * this.omega * this.vel) * h;
+      this.value += this.vel * h;
+    }
+    if (this.settled) { this.value = this.target; this.vel = 0; }
+  }
+}
+const closeEase = (t) => { // cubic-bezier(.45, 0, .2, 1)
+  let lo = 0, hi = 1, u = t;
+  const bx = (s) => 3 * (1 - s) * (1 - s) * s * .45 + 3 * (1 - s) * s * s * .2 + s * s * s;
+  for (let i = 0; i < 14; i++) { if (bx(u) < t) lo = u; else hi = u; u = (lo + hi) / 2; }
+  return 3 * (1 - u) * u * u + u * u * u;
+};
+class Tracked {
+  constructor(v) { this.s = new Spring(v); this.mode = 'idle'; }
+  get value() { return this.s.value; }
+  get target() { return this.s.target; }
+  get animating() { return this.mode !== 'idle'; }
+  jump(v) { this.s.jump(v); this.mode = 'idle'; }
+  springTo(v, response = .48, damping = .8) {
+    if (Math.abs(v - this.s.target) < .01 && this.mode !== 'curve') return;
+    this.s.configure(response, damping); this.s.target = v; this.mode = 'spring';
+  }
+  curveTo(v, ms = 340, now = performance.now()) {
+    if (Math.abs(v - this.s.target) < .01 && this.mode !== 'spring') return;
+    this.from = this.s.value; this.to = v; this.t0 = now; this.ms = ms;
+    this.s.target = v; this.s.vel = 0; this.mode = 'curve';
+  }
+  step(dt, now) {
+    if (this.mode === 'spring') { this.s.step(dt); if (this.s.settled) this.mode = 'idle'; }
+    else if (this.mode === 'curve') {
+      const p = Math.min(1, (now - this.t0) / this.ms);
+      this.s.value = this.from + (this.to - this.from) * closeEase(p);
+      if (p >= 1) this.mode = 'idle';
+    }
+  }
+}
+
+const COMPACT_W = { idle: 196, off: 196, work: 440, alert: 372, ready: 340 };
+const VIEW_OF = { idle: '.v-idle', off: '.v-idle', work: '.v-work', alert: '.v-alert', ready: '.v-ready',
+  home: '.v-home', gate: '.v-gate', prompt: '.v-prompt', notice: '.v-notice', drop: '.v-drop' };
+const EXP_W = 640, BODY_TOP = 42, PAD_B = 10, MAX_H = 500, MARK_W = 56, MARK_H = 41.4;
+const geo = { w: new Tracked(196), h: new Tracked(32), r: new Tracked(16) };
+// The mark moves on the SAME motion as the island (spring to grow, eased
+// curve to shrink), so it travels glued to the content instead of drifting
+// after it. Its size is tracked in px (the slot width), not as a ratio, so it
+// settles to the exact size instead of snapping the last few percent.
+const mk = { x: new Tracked(0), y: new Tracked(16), s: new Tracked(26) };
+let running = false, lastT = 0;
+
+const isCompact = (s) => s in COMPACT_W;
+const viewEl = (s) => island.querySelector(VIEW_OF[s] || '.v-idle');
+
+function targetGeom() {
+  const s = state();
+  if (isCompact(s)) return { w: COMPACT_W[s], h: 32, r: 16 };
+  const v = viewEl(s);
+  const h = Math.min(MAX_H, Math.ceil(BODY_TOP + (v ? v.offsetHeight : 124) + PAD_B));
+  return { w: EXP_W, h, r: 24 };
+}
+
+// Where the mark should sit: the active view's .mslot, in WINDOW space. Views
+// are centred on the island, so this point does not move while the island
+// resizes around it.
+function markTarget() {
+  const v = viewEl(state());
+  const slot = v && v.querySelector('.mslot');
+  if (!slot) return null;
+  let x = 0, y = 0, el = slot;
+  while (el && el !== island) { x += el.offsetLeft; y += el.offsetTop; el = el.offsetParent; }
+  const islandLeft = (window.innerWidth - island.offsetWidth) / 2;
+  return { x: islandLeft + x + slot.offsetWidth / 2, y: y + slot.offsetHeight / 2, s: slot.offsetWidth };
+}
+
+// A view CHANGE moves everything on one motion. A view that only grew (a
+// reply streaming in, a diff, a longer list) is different: its content has
+// already moved, so the island follows on a quick critically-damped spring
+// and the mark stays pinned to its slot — unless it is still mid-travel from
+// a view change, in which case it just travels to the slot's new spot.
+function retarget(instant = false, contentOnly = false) {
+  const t = targetGeom();
+  const m = markTarget();
+  if (contentOnly && !instant) {
+    for (const [v, to] of [[geo.w, t.w], [geo.h, t.h], [geo.r, t.r]]) {
+      if (v.mode === 'curve') v.curveTo(to); else v.springTo(to, .26, 1);
+    }
+    if (m) {
+      for (const [v, to] of [[mk.x, m.x], [mk.y, m.y], [mk.s, m.s]]) {
+        if (v.mode === 'curve') v.curveTo(to); else if (v.mode === 'spring') v.springTo(to); else v.jump(to);
+      }
+      applyGeom();
+    }
+    run();
+    return;
+  }
+  if (instant) {
+    geo.w.jump(t.w); geo.h.jump(t.h); geo.r.jump(t.r);
+    if (m) { mk.x.jump(m.x); mk.y.jump(m.y); mk.s.jump(m.s); }
+    applyGeom();
+    drawField();
+    island.classList.add('settled');
+    return;
+  }
+  const shrinking = t.w * t.h < geo.w.target * geo.h.target - 1;
+  const all = m ? [[geo.w, t.w], [geo.h, t.h], [geo.r, t.r], [mk.x, m.x], [mk.y, m.y], [mk.s, m.s]]
+              : [[geo.w, t.w], [geo.h, t.h], [geo.r, t.r]];
+  for (const [v, to] of all) { if (shrinking) v.curveTo(to); else v.springTo(to); }
+  run();
+}
+
+function applyGeom() {
+  const w = geo.w.value, h = geo.h.value, r = geo.r.value;
+  island.style.width = w + 'px';
+  island.style.height = h + 'px';
+  island.style.borderRadius = `0 0 ${r}px ${r}px`;
+  island.style.left = `calc(50% - ${w / 2}px)`;
+  const islandLeft = (window.innerWidth - w) / 2;
+  mark.style.transform = `translate(${(mk.x.value - islandLeft - MARK_W / 2).toFixed(2)}px, ${(mk.y.value - MARK_H / 2).toFixed(2)}px) scale(${(mk.s.value / MARK_W).toFixed(4)})`;
+}
+
+function run() {
+  if (running) return;
+  running = true;
+  island.classList.remove('settled');
+  lastT = performance.now();
+  requestAnimationFrame(frame);
+}
+function frame(now) {
+  const dt = Math.min(.05, Math.max(0, (now - lastT) / 1000));
+  lastT = now;
+  geo.w.step(dt, now); geo.h.step(dt, now); geo.r.step(dt, now);
+  mk.x.step(dt, now); mk.y.step(dt, now); mk.s.step(dt, now);
+  applyGeom();
+  drawField(now);
+  const busy = geo.w.animating || geo.h.animating || geo.r.animating || mk.x.animating || mk.y.animating || mk.s.animating;
+  if (busy) requestAnimationFrame(frame);
+  else { running = false; island.classList.add('settled'); }
+}
+// ── The surface: living fields ─────────────────────────────────────────
+// One canvas behind every expanded view, fixed at the largest island size and
+// centred on it, so a field holds still in window space while the island's
+// edges reveal or clip it. Each moment gets its own field:
+//   matrix    Home, and the chat at rest or while words stream in
+//   nebula    the agent is thinking: the A's light drifting out as smoke
+//   datafield a tool is running: flowing contour lines, data moving
+//   globe     a web tool is running: a wireframe globe with requests in flight
+//   topology  an approval: a slow network of nodes, amber, off to the right
+//   horizon   a finished turn (green) or an error (red): particles rising
+//   orbital   a file drop: a dotted sphere waiting to take the file
+// Fields crossfade into one another, and every frame is masked to nothing
+// before the island's edge, so the surface dissolves into the black.
+const field = document.getElementById('field');
+const FW = EXP_W, FH = MAX_H, FIELD_FADE_MS = 700;
+const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+const NEUTRAL = [200, 203, 222], VIOLET = [142, 126, 255], INDIGO = [70, 60, 205], PALE = [232, 233, 246];
+const AMBER = [245, 165, 36];
+let fctx = null, fdpr = 0, fieldTone = null, fieldLoop = 0, phase = '', dropPhase = 'over';
+let scene = null, prevScene = null, sceneAt = 0, prevAt = 0;
+const smooth = (t) => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t));
+const mixc = (a, b, k) => [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
+const rgba = (c, al) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${Math.max(0, al).toFixed(3)})`;
+const markLocal = (w) => ({ x: mk.x.value - (window.innerWidth - w) / 2, y: mk.y.value });
+const bodyOf = (h) => ({ top: BODY_TOP, h: Math.max(40, h - BODY_TOP) });
+// deterministic noise so a field looks the same every time it appears
+let seed = 7;
+const rand = () => ((seed = (seed * 16807) % 2147483647) - 1) / 2147483646;
+
+// Topology: points on a sphere (Fibonacci), each linked to its 3 nearest.
+const TOPO = (() => {
+  const n = 64, pts = [];
+  for (let i = 0; i < n; i++) {
+    const y = 1 - (i + .5) * 2 / n, r = Math.sqrt(1 - y * y), a = i * 2.39996;
+    pts.push([Math.cos(a) * r, y, Math.sin(a) * r]);
+  }
+  const edges = new Set();
+  pts.forEach((p, i) => {
+    pts.map((q, j) => [j, (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2])
+      .filter(([j]) => j !== i).sort((a, b) => a[1] - b[1]).slice(0, 3)
+      .forEach(([j]) => edges.add(i < j ? i + ',' + j : j + ',' + i));
+  });
+  return { pts, edges: [...edges].map(e => e.split(',').map(Number)) };
+})();
+// Horizon: grains packed toward the rim of a great arc.
+const GRAINS = (() => {
+  seed = 11;
+  const g = [];
+  for (let i = 0; i < 2600; i++) g.push([rand() * Math.PI, 1 - Math.pow(rand(), 2.4) * .24, rand() * 6.28, .4 + rand() * 1.6]);
+  return g;
+})();
+let nebCanvas = null;
+
+function project(x, y, z, ry, rx) {
+  const cy = Math.cos(ry), sy = Math.sin(ry), cx = Math.cos(rx), sx = Math.sin(rx);
+  const x1 = x * cy + z * sy, z1 = -x * sy + z * cy;
+  const y2 = y * cx - z1 * sx, z2 = y * sx + z1 * cx;
+  return [x1, y2, z2];
+}
+
+const SCENES = {
+  matrix(ctx, w, h, t, a) {
+    const S = 8, cols = Math.floor(FW / 2 / S), ox = (FW - w) / 2, b = bodyOf(h), m = markLocal(w);
+    const chat = state() === 'prompt';
+    // two slow lights wander the grid; the A spills its colour around it
+    const l1x = w * (.36 + .24 * Math.sin(t * .11)), l1y = b.top + b.h * (.45 + .28 * Math.sin(t * .07 + 1));
+    const l2x = w * (.7 + .2 * Math.cos(t * .09)), l2y = b.top + b.h * (.6 + .28 * Math.cos(t * .13));
+    const busy = island.hasAttribute('data-busy') && !reduceMotion;
+    const band = busy ? ((t / 4.2) % 1) * (w + 420) - 210 : -1e9;
+    const gain = (chat ? .55 : 1) * a;
+    for (let y = S / 2; y < h; y += S) {
+      for (let k = -cols; k <= cols; k++) {
+        const ix = FW / 2 + k * S - ox;
+        if (ix < -2 || ix > w + 2) continue;
+        const d1 = ((ix - l1x) ** 2 + (y - l1y) ** 2) / 22500, d2 = ((ix - l2x) ** 2 + (y - l2y) ** 2) / 14400;
+        const spill = Math.exp(-((ix - m.x) ** 2 + (y - m.y) ** 2) / 2704);
+        let I = .14 + Math.exp(-d1) * .5 + Math.exp(-d2) * .34 + spill * .6;
+        if (busy) { const d = (ix + (y - b.top) * .45 - band) / 52; I += Math.exp(-d * d) * .5; }
+        I = Math.min(1, I * gain);
+        if (I < .05) continue;
+        ctx.fillStyle = rgba(mixc(NEUTRAL, VIOLET, Math.min(1, spill * 1.2)), .05 + .45 * I);
+        ctx.beginPath(); ctx.arc(ix, y, .5 + 1.1 * I, 0, 6.2832); ctx.fill();
+      }
+    }
+  },
+
+  nebula(ctx, w, h, t, a) {
+    // A slow haze of the A's light: a few soft puffs drifting and swelling
+    // around a centre that wanders across the card, with darker eddies
+    // turning through them. Painted at half size and blurred on the way up,
+    // so it reads as smoke rather than blobs or bands, and kept faint.
+    const q = .5, b = bodyOf(h), m = markLocal(w);
+    if (!nebCanvas) nebCanvas = document.createElement('canvas');
+    const cw = Math.ceil(FW * q), ch = Math.ceil(FH * q);
+    if (nebCanvas.width !== cw) { nebCanvas.width = cw; nebCanvas.height = ch; }
+    const o = nebCanvas.getContext('2d');
+    o.setTransform(1, 0, 0, 1, 0, 0); o.clearRect(0, 0, cw, ch); o.setTransform(q, 0, 0, q, 0, 0);
+    o.globalCompositeOperation = 'lighter';
+    const breathe = .82 + .18 * Math.sin(t * .45);
+    const hubX = w * (.46 + .14 * Math.sin(t * .09)), hubY = b.top + b.h * (.5 + .12 * Math.cos(t * .11));
+    for (let i = 0; i < 8; i++) {
+      const ph = i * 1.71, ring = .25 + (i % 4) * .17;
+      // puffs orbit the wandering hub; the first two lean toward the A
+      const ang = ph + t * (.05 + (i % 3) * .018) * (i % 2 ? 1 : -1);
+      let px = hubX + Math.cos(ang) * w * ring * .55, py = hubY + Math.sin(ang) * b.h * ring * .7;
+      if (i < 2) { px += (m.x - px) * .45; py += (m.y - py) * .45; }
+      const r = (80 + 50 * Math.abs(Math.sin(ph * 2.1))) * (1 + .14 * Math.sin(t * .4 + ph));
+      const c = mixc(INDIGO, VIOLET, .5 + .5 * Math.sin(ph + t * .1));
+      const g = o.createRadialGradient(px, py, 0, px, py, r);
+      g.addColorStop(0, rgba(c, .2 * breathe)); g.addColorStop(.5, rgba(c, .08 * breathe)); g.addColorStop(1, rgba(c, 0));
+      o.fillStyle = g; o.fillRect(px - r, py - r, r * 2, r * 2);
+    }
+    o.globalCompositeOperation = 'destination-out';
+    for (let i = 0; i < 4; i++) {
+      const ph = i * 2.3 + 1, ang = ph + t * .07 * (i % 2 ? 1 : -1);
+      const px = hubX + Math.cos(ang) * w * .22, py = hubY + Math.sin(ang) * b.h * .3;
+      const r = 46 + 18 * Math.sin(t * .3 + ph);
+      const g = o.createRadialGradient(px, py, 0, px, py, r);
+      g.addColorStop(0, 'rgba(0,0,0,.32)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+      o.fillStyle = g; o.fillRect(px - r, py - r, r * 2, r * 2);
+    }
+    o.globalCompositeOperation = 'source-over';
+    ctx.save();
+    ctx.globalAlpha = a * (state() === 'prompt' ? .8 : 1);
+    ctx.filter = 'blur(10px)';
+    ctx.drawImage(nebCanvas, 0, 0, w * q, h * q, 0, 0, w, h);
+    ctx.restore();
+  },
+
+  datafield(ctx, w, h, t, a) {
+    // Contour lines of a slowly flowing surface, far rows faint and flat,
+    // near rows brighter and deeper.
+    const R = 24, b = bodyOf(h), gain = a * (state() === 'prompt' ? .8 : 1);
+    ctx.lineWidth = 1;
+    for (let r = 0; r < R; r++) {
+      const z = r / (R - 1);
+      const baseY = b.top + b.h * (.12 + .74 * z);
+      ctx.beginPath();
+      for (let x = -20; x <= w + 20; x += 9) {
+        const u = x / w;
+        const hgt = Math.sin(u * 5.1 + t * .55 + z * 2.1) * 13 + Math.sin(u * 11.3 - t * .8 + z * 4.3) * 4.5
+                  + Math.sin(u * 2.2 + t * .22 - z * 1.7) * 24;
+        const y = baseY + hgt * (.3 + .7 * z);
+        if (x === -20) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = rgba(mixc([150, 160, 255], PALE, z), (.09 + .36 * z) * gain);
+      ctx.stroke();
+    }
+  },
+
+  topology(ctx, w, h, t, a) {
+    const b = bodyOf(h), R = Math.min(128, b.h * .9), cx = w * .8, cy = b.top + b.h * .6;
+    const ry = t * .16, rx = .42, tone = AMBER;
+    const P = TOPO.pts.map(([x, y, z]) => {
+      const [X, Y, Z] = project(x, y, z, ry, rx), s = 3 / (3 - Z);
+      return [cx + X * R * s, cy + Y * R * s, (Z + 1) / 2];
+    });
+    ctx.lineWidth = .8;
+    for (const [i, j] of TOPO.edges) {
+      const p = P[i], q = P[j], k = (p[2] + q[2]) / 2;
+      ctx.strokeStyle = rgba(mixc(PALE, tone, .35), (.03 + .17 * k) * a);
+      ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
+    }
+    P.forEach(([x, y, k], i) => {
+      const pulse = Math.max(0, Math.sin(t * 1.1 + i * 2.39)) ** 24;   // a node now and then lights up
+      ctx.fillStyle = rgba(mixc(PALE, tone, .3 + .7 * pulse), (.12 + .5 * k + .4 * pulse) * a);
+      ctx.beginPath(); ctx.arc(x, y, .6 + 1.3 * k + 1.6 * pulse, 0, 6.2832); ctx.fill();
+    });
+  },
+
+  globe(ctx, w, h, t, a) {
+    // The agent is out on the web: a wireframe globe turning slowly, with a
+    // few requests arcing between points on it (a bright head and a fading
+    // trail), lifting off the surface mid-flight.
+    const b = bodyOf(h), R = Math.min(118, b.h * .8), cx = w * .78, cy = b.top + b.h * .56;
+    const ry = t * .2, rx = .38, gain = a * (state() === 'prompt' ? .85 : 1);
+    const col = [125, 145, 255], D = Math.PI / 180;
+    const P = (lat, lon, lift = 1) => {
+      const x = Math.cos(lat) * Math.cos(lon) * lift, y = -Math.sin(lat) * lift, z = Math.cos(lat) * Math.sin(lon) * lift;
+      const [X, Y, Z] = project(x, y, z, ry, rx);
+      return [cx + X * R, cy + Y * R, (Z / lift + 1) / 2];
+    };
+    const line = (pts) => {
+      for (let i = 1; i < pts.length; i++) {
+        const p0 = pts[i - 1], p1 = pts[i], k = (p0[2] + p1[2]) / 2;
+        ctx.strokeStyle = rgba(mixc(col, PALE, k * .5), (.02 + .24 * k) * gain);
+        ctx.beginPath(); ctx.moveTo(p0[0], p0[1]); ctx.lineTo(p1[0], p1[1]); ctx.stroke();
+      }
+    };
+    ctx.lineWidth = .8;
+    for (let lat = -60; lat <= 60; lat += 20) {
+      const pts = [];
+      for (let lon = 0; lon <= 360; lon += 8) pts.push(P(lat * D, lon * D));
+      line(pts);
+    }
+    for (let lon = 0; lon < 360; lon += 30) {
+      const pts = [];
+      for (let lat = -90; lat <= 90; lat += 8) pts.push(P(lat * D, lon * D));
+      line(pts);
+    }
+    // requests in flight
+    const ROUTES = [[[20, -40], [50, 70]], [[-10, 10], [35, 150]], [[45, -120], [-20, -10]], [[-35, 80], [15, -160]]];
+    const v = (lat, lon) => [Math.cos(lat * D) * Math.cos(lon * D), -Math.sin(lat * D), Math.cos(lat * D) * Math.sin(lon * D)];
+    ROUTES.forEach(([from, to], i) => {
+      const A = v(...from), B = v(...to);
+      const along = (u) => {
+        const x = A[0] + (B[0] - A[0]) * u, y = A[1] + (B[1] - A[1]) * u, z = A[2] + (B[2] - A[2]) * u;
+        const n = Math.hypot(x, y, z) || 1, lift = 1 + .24 * Math.sin(Math.PI * u);
+        const [X, Y, Z] = project(x / n * lift, y / n * lift, z / n * lift, ry, rx);
+        return [cx + X * R, cy + Y * R, (Z / lift + 1) / 2];
+      };
+      const head = reduceMotion ? .6 : ((t * .32 + i / ROUTES.length) % 1.25);   // a short rest between flights
+      if (head > 1) return;
+      for (let j = 0; j < 14; j++) {
+        const u0 = head - j * .022, u1 = head - (j + 1) * .022;
+        if (u1 < 0) break;
+        const p0 = along(u0), p1 = along(u1), k = (p0[2] + p1[2]) / 2;
+        ctx.strokeStyle = rgba(mixc(col, PALE, .7), (1 - j / 14) * (.15 + .55 * k) * gain);
+        ctx.lineWidth = 1.3;
+        ctx.beginPath(); ctx.moveTo(p0[0], p0[1]); ctx.lineTo(p1[0], p1[1]); ctx.stroke();
+      }
+      const hp = along(head);
+      ctx.fillStyle = rgba(PALE, (.35 + .6 * hp[2]) * gain);
+      ctx.beginPath(); ctx.arc(hp[0], hp[1], 1.1 + hp[2], 0, 6.2832); ctx.fill();
+      ctx.lineWidth = .8;
+    });
+  },
+
+  horizon(ctx, w, h, t, a, age) {
+    // a great arc of grains rising into view, dense at its rim
+    const tone = fieldTone || [52, 211, 153], b = bodyOf(h);
+    const R = w * .6, rise = (1 - smooth(Math.min(1, age / 1600))) * 46;
+    const cx = w * .5, cy = h + R * .24 + rise;
+    const col = mixc(PALE, tone, .55), spin = reduceMotion ? 0 : t * .012;
+    for (const [th, rr, ph, sz] of GRAINS) {
+      const ang = Math.PI + ((th + spin) % Math.PI);
+      const x = cx + Math.cos(ang) * R * rr, y = cy + Math.sin(ang) * R * rr * .62;
+      if (y > h || y < b.top - 12 || x < 0 || x > w) continue;
+      const rim = (rr - .76) / .24;
+      const tw = .6 + .4 * Math.sin(t * 1.7 + ph);
+      ctx.fillStyle = rgba(col, (.08 + .62 * rim) * tw * a);
+      ctx.fillRect(x, y, sz * .85, sz * .85);
+    }
+  },
+
+  orbital(ctx, w, h, t, a) {
+    // a sphere drawn in rings of dots, breathing; two thin orbits around it
+    const b = bodyOf(h), held = dropPhase === 'ready';
+    const R = Math.min(72, b.h * .42) * (held ? .92 : 1), cx = w * .74, cy = b.top + b.h * .5;
+    const tone = VIOLET;
+    for (let i = 1; i < 18; i++) {
+      const phi = i / 18 * Math.PI;
+      for (let j = 0; j < 64; j++) {
+        const th = j / 64 * 6.2832 + t * .22;
+        const wob = 1 + .085 * Math.sin(3 * th + t * 1.1) * Math.sin(2 * phi + t * .7);
+        const [X, Y, Z] = project(Math.sin(phi) * Math.cos(th) * wob, Math.cos(phi) * wob, Math.sin(phi) * Math.sin(th) * wob, 0, .38);
+        const k = (Z + 1) / 2;
+        ctx.fillStyle = rgba(mixc(tone, PALE, k * .5), (.04 + (held ? .5 : .34) * k) * a);
+        ctx.fillRect(cx + X * R, cy + Y * R, 1.1, 1.1);
+      }
+    }
+    ctx.lineWidth = .7;
+    for (let i = 0; i < 2; i++) {
+      ctx.strokeStyle = rgba(mixc(tone, PALE, .4), .1 * a);
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, R * (1.35 + i * .22), R * (.34 + i * .1), t * (.18 + i * .07) + i * 1.2, 0, 6.2832);
+      ctx.stroke();
+    }
+  },
+};
+
+const FIELD_TEXT = '.nowhead b, .nowmeta, .steps .step, .seg, .srow .nm, .empty, .task-row, .who b, .who .smeta, '
+  + '.ntitle, .ntext, .meta, .msg, #liveStatus, .dtitle, .dtext, .hint';
+const textRange = document.createRange();
+
+function sceneFor() {
+  const s = state();
+  if (s === 'home') return 'matrix';
+  if (s === 'gate') return 'topology';
+  if (s === 'notice') return 'horizon';
+  if (s === 'drop') return 'orbital';
+  if (s === 'prompt') {
+    const live = island.dataset.turn === 'live' || island.hasAttribute('data-busy');
+    if (live && phase === 'thinking') return 'nebula';
+    if (live && phase === 'web') return 'globe';          // fetching, searching, scanning the net
+    if (live && phase === 'tool') return 'datafield';
+    return 'matrix';                       // at rest, or words streaming in
+  }
+  return null;
+}
+
+function drawField(now = performance.now()) {
+  const expanded = island.dataset.mode === 'expanded';
+  if (!expanded && !geo.h.animating) return;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  if (dpr !== fdpr || !fctx) {
+    fdpr = dpr;
+    field.width = Math.round(FW * dpr); field.height = Math.round(FH * dpr);
+    field.style.width = FW + 'px'; field.style.height = FH + 'px';
+    fctx = field.getContext('2d');
+  }
+  const ctx = fctx, w = geo.w.value, h = geo.h.value, ox = (FW - w) / 2;
+  field.style.left = (-ox) + 'px';
+  const want = expanded ? sceneFor() : scene;
+  if (want !== scene) { prevScene = scene; prevAt = sceneAt; scene = want; sceneAt = now; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, FW, FH);
+  if (h < BODY_TOP + 16) return;
+  ctx.translate(ox, 0);
+  const t = reduceMotion ? 0 : now / 1000;
+  const k = smooth(Math.min(1, (now - sceneAt) / FIELD_FADE_MS));
+  if (prevScene && k < 1) SCENES[prevScene](ctx, w, h, t, 1 - k, now - prevAt);
+  if (scene) SCENES[scene](ctx, w, h, t, k, now - sceneAt);
+  // Text always sits on clean black: every line of text in the view clears
+  // the field behind it, with a soft edge, so the field lives in the gaps
+  // and margins and never under the words.
+  const view = viewEl(state());
+  if (view && expanded) {
+    const ir = island.getBoundingClientRect();
+    ctx.globalCompositeOperation = 'destination-out';
+    // smoke is soft already: a crisp cut-out reads as a dark box, so the
+    // clearing behind text there is wider and gentler
+    const soft = scene === 'nebula';
+    ctx.filter = soft ? 'blur(14px)' : 'blur(6px)';
+    ctx.fillStyle = soft ? 'rgba(0,0,0,.5)' : 'rgba(0,0,0,.92)';
+    for (const el of view.querySelectorAll(FIELD_TEXT)) {
+      if (!el.offsetParent) continue;            // hidden pane / empty row
+      textRange.selectNodeContents(el);
+      for (const r of textRange.getClientRects()) {
+        if (r.width < 1) continue;
+        ctx.fillRect(r.left - ir.left - 7, r.top - ir.top - 3, r.width + 14, r.height + 6);
+      }
+    }
+    ctx.filter = 'none';
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  // dissolve every edge into the island's black (and stay clear of the header)
+  ctx.globalCompositeOperation = 'destination-in';
+  const fx = Math.min(.2, 64 / w);
+  const gx = ctx.createLinearGradient(0, 0, w, 0);
+  gx.addColorStop(0, 'rgba(0,0,0,0)'); gx.addColorStop(fx, '#000'); gx.addColorStop(1 - fx, '#000'); gx.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = gx; ctx.fillRect(0, 0, w, h);
+  const top0 = 20 / h, top1 = Math.min(.45, 72 / h), bot1 = Math.max(top1 + .01, 1 - 46 / h), bot0 = Math.max(bot1 + .005, 1 - 4 / h);
+  const gy = ctx.createLinearGradient(0, 0, 0, h);
+  gy.addColorStop(0, 'rgba(0,0,0,0)'); gy.addColorStop(top0, 'rgba(0,0,0,0)'); gy.addColorStop(top1, '#000');
+  gy.addColorStop(bot1, '#000'); gy.addColorStop(Math.min(1, bot0), 'rgba(0,0,0,0)');
+  ctx.fillStyle = gy; ctx.fillRect(0, 0, w, h);
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+// While expanded the field lives (~30 fps; geometry frames draw it themselves).
+function syncFieldLoop() {
+  const want = island.dataset.mode === 'expanded' && !reduceMotion;
+  if (want && !fieldLoop) {
+    let last = 0;
+    const tick = (now) => {
+      if (island.dataset.mode !== 'expanded') { fieldLoop = 0; return; }
+      if (now - last > 33 && !running) { last = now; drawField(now); }
+      fieldLoop = requestAnimationFrame(tick);
+    };
+    fieldLoop = requestAnimationFrame(tick);
+  }
+  drawField();
+}
+new MutationObserver(syncFieldLoop).observe(island, { attributes: true, attributeFilter: ['data-busy', 'data-mode', 'data-state', 'data-turn'] });
+function setPhase(p) { phase = String(p || ''); }
+window.addEventListener('resize', () => retarget(true));
+// The island clips; it never scrolls. Focusing the chat field while the
+// island is still springing open would otherwise scroll the whole island to
+// reveal it, pushing the header out of view for good.
+island.addEventListener('scroll', () => { island.scrollTop = 0; island.scrollLeft = 0; });
+if (typeof ResizeObserver !== 'undefined') {
+  // Content growth (a streaming reply, a diff, a longer list) springs the
+  // island to the new height; a view that is not showing is ignored.
+  const ro = new ResizeObserver((entries) => {
+    const active = viewEl(state());
+    if (entries.some(e => e.target === active)) retarget(false, true);
+  });
+  document.querySelectorAll('.view.expanded').forEach(v => ro.observe(v));
+}
+
+// ── Dot-matrix A ─────────────────────────────────────────────────────────
 function inPoly(x, y, p) {
   let c = false;
   for (let i = 0, j = p.length - 1; i < p.length; j = i++) {
@@ -378,7 +1293,6 @@ function inPoly(x, y, p) {
   }
   return c;
 }
-
 const BIG = [[165, 990], [625, 315], [868, 298], [500, 878], [470, 888]];
 const SMALL = [[672, 648], [885, 645], [1112, 975], [862, 940]];
 const X0 = 150, Y0 = 285, W = 980, H = 725;
@@ -391,16 +1305,17 @@ function drawLogo(svg) {
     const x = X0 + (c + .5) * cell, y = Y0 + (r + .5) * cell;
     if (!inPoly(x, y, BIG) && !inPoly(x, y, SMALL)) continue;
     const t = (x - X0) / W, u = (y - Y0) / H;
-    const hue = 212 + t * 50 + u * 30, light = 66 - (1 - Math.abs(u - .65)) * 12;
+    const hue = 212 + t * 50 + u * 30, light = 72 - (1 - Math.abs(u - .65)) * 10;
     const k = ((1 - u) * .5 + t * .5) * .88 + Math.random() * .12;
     const mx = X0 + W / 2 - x, my = Y0 + H / 2 - y, cd = Math.hypot(mx, my) / W * .3;
-    const p = 1.3 + Math.random() * 2.1, d = -Math.random() * p, lo = (.12 + Math.random() * .3).toFixed(2);
-    out += `<circle cx="${x - X0}" cy="${y - Y0}" r="${cell * .36}" fill="hsl(${hue} 95% ${light}%)" style="--k:${k.toFixed(3)};--dx:${(mx * .6).toFixed(0)}px;--dy:${(my * .6).toFixed(0)}px;--cd:${cd.toFixed(2)}s;--p:${p.toFixed(2)}s;--d:${d.toFixed(2)}s;--lo:${lo}"/>`;
+    const p = 1.6 + Math.random() * 2.2, d = -Math.random() * p, lo = (.3 + Math.random() * .3).toFixed(2);
+    out += `<circle cx="${x - X0}" cy="${y - Y0}" r="${cell * .42}" fill="hsl(${hue} 95% ${light}%)" style="--k:${k.toFixed(3)};--dx:${(mx * .6).toFixed(0)}px;--dy:${(my * .6).toFixed(0)}px;--cd:${cd.toFixed(2)}s;--p:${p.toFixed(2)}s;--d:${d.toFixed(2)}s;--lo:${lo}"/>`;
   }
   svg.innerHTML = out;
 }
 document.querySelectorAll('.logo').forEach(drawLogo);
 
+// ── Status bits ──────────────────────────────────────────────────────────
 function setContext(p) {
   p = Math.max(0, Math.min(1, p));
   document.querySelectorAll('.ctx').forEach(el => {
@@ -409,8 +1324,6 @@ function setContext(p) {
     el.classList.toggle('crit', p >= .9);
     el.title = `Context ${Math.round(p * 100)}%`;
   });
-  const c = $('#sCtx');
-  if (c) c.textContent = Math.round(p * 100) + '%';
 }
 setContext(.34);
 
@@ -436,13 +1349,89 @@ function compact() {
   compactTimer = setTimeout(() => island.removeAttribute('data-compact'), 1800);
 }
 
-const normGate = (g) => ({ cmd: '', kind: 'command', scope: 'lab-net', step: '', writes: 'none', target: '', ...g });
-
 const esc = (t) => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+// ── Home ─────────────────────────────────────────────────────────────────
+const STATE_WORDS = { working: 'working', 'needs-you': 'needs you', finished: 'finished', interrupted: 'interrupted', stopped: 'stopped', failed: 'failed', ready: '' };
+
+// {title, model, state, steps: [{title, status}], line}
+function setSession(o = {}) {
+  $('#hTitle').textContent = o.title || 'Accuretta';
+  $('#hModel').textContent = o.model || '';
+  $('#hDot').className = 'sdot' + (o.state ? ' st-' + o.state : '');
+  const steps = Array.isArray(o.steps) ? o.steps : [];
+  const box = $('#hSteps'), prog = $('#hProg');
+  box.textContent = '';
+  const add = (cls, text, lead) => {
+    const row = document.createElement('div');
+    row.className = 'step ' + cls;
+    if (lead) { const em = document.createElement('em'); em.textContent = lead + ' '; row.appendChild(em); }
+    row.appendChild(document.createTextNode(text));
+    box.appendChild(row);
+  };
+  if (steps.length) {
+    let cur = steps.findIndex(s => s.status === 'active');
+    if (cur < 0) cur = steps.findIndex(s => s.status !== 'done');
+    const done = steps.filter(s => s.status === 'done').length;
+    // Reuse the segments so a step finishing fills in instead of redrawing.
+    while (prog.children.length > steps.length) prog.lastChild.remove();
+    while (prog.children.length < steps.length) prog.appendChild(document.createElement('i'));
+    steps.forEach((s, i) => { prog.children[i].className = s.status === 'done' ? 'done' : (i === cur ? 'cur' : ''); });
+    if (cur < 0) {
+      $('#hCount').textContent = `${steps.length} of ${steps.length} done`;
+      add('cur', o.line && o.state !== 'working' ? o.line : 'Every step is done.');
+    } else {
+      $('#hCount').textContent = `step ${Math.min(done + 1, steps.length)} of ${steps.length}`;
+      add('cur', steps[cur].title);
+      if (steps[cur + 1]) add('next', steps[cur + 1].title, 'Next');
+    }
+  } else {
+    $('#hCount').textContent = '';
+    prog.textContent = '';
+    add('line', o.line || 'Ready when you are.');
+  }
+  // A lone status dot with nothing beside it says nothing.
+  $('.nowmeta').hidden = !o.model && !$('#hCount').textContent && !o.state;
+}
+
+// [{id, title, state, current}] — the bound session is already the left
+// column, so the list holds everything else.
+function setSessions(list = []) {
+  const box = $('#sessList');
+  box.textContent = '';
+  const others = list.filter(s => !s.current);
+  if (!others.length) box.innerHTML = '<div class="empty">No other sessions</div>';
+  for (const s of others.slice(0, 6)) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'srow';
+    b.dataset.sid = s.id;
+    b.innerHTML = `<span class="sdot st-${esc(s.state || 'ready')}"></span><span class="nm"></span><span class="mt"></span>`;
+    b.querySelector('.nm').textContent = s.title || s.id;
+    b.querySelector('.mt').textContent = STATE_WORDS[s.state] || '';
+    b.title = STATE_WORDS[s.state] ? `${s.title || s.id} — ${STATE_WORDS[s.state]}` : (s.title || s.id);
+    box.appendChild(b);
+  }
+  const dots = $('#sDots');
+  dots.textContent = '';
+  for (const s of list.filter(x => x.state === 'working' || x.state === 'needs-you').slice(0, 4)) {
+    const d = document.createElement('span');
+    d.className = 'sd st-' + s.state;
+    dots.appendChild(d);
+  }
+}
+
+function showPane(id) {
+  document.querySelectorAll('.seg button').forEach(b => b.classList.toggle('on', b.dataset.pane === id));
+  document.querySelectorAll('.others .pane').forEach(p => { p.hidden = p.id !== id; });
+}
+
+// ── Gates ────────────────────────────────────────────────────────────────
+const normGate = (g) => ({ cmd: '', kind: 'command', scope: 'lab-net', step: '', writes: 'none', target: '', ...g });
 
 function renderDiff(g) {
   let a = 0, b = 0;
-  const rows = g.diff.map(([op, text]) => {
+  const rows = g.diff.slice(0, 8).map(([op, text]) => {
     const n = op === '-' ? ++a : ++b;
     return `<div class="dl ${op === '-' ? 'del' : 'add'}"><i>${n}</i><b>${op}</b><span>${esc(text)}</span></div>`;
   }).join('');
@@ -456,50 +1445,64 @@ function renderDiff(g) {
   box.innerHTML = `<div class="dh"><span>${esc(g.path || '')}</span><span class="cnt">${cnt}</span></div>${rows}`;
 }
 
+const strictGate = (g) => g.kind === 'registry' || !!g.critical;
+
 function renderGate() {
   const g = gates[gi];
   if (!g) return;
-  $('#gTag').textContent = KIND_LABEL[g.kind] || KIND_LABEL.command;
+  $('#gTag').textContent = KIND_LABEL[g.kind] || g.tagLabel || KIND_LABEL.command;
   $('#gCmd').textContent = g.cmd;
+  $('#gCmdBox').title = g.cmd;
+  $('#gWho').textContent = g.who || 'Accuretta';
+  // Soft approval mode says why it stopped for this one.
+  $('#gSub').textContent = g.why ? `asks: it ${g.why}` : 'needs permission';
+  $('#gSub').title = g.why || '';
   const reg = g.kind === 'registry';
-  // Any gate can carry diff rows now: registry queries get their best-effort
-  // read-only diff, write/edit gates get the +/− preview from the bridge.
+  // Any gate can carry diff rows: registry queries get their best-effort
+  // read-only diff, write/edit gates get the +/- preview from the bridge.
   const hasDiff = Array.isArray(g.diff) && g.diff.length > 0;
   island.dataset.kind = reg ? 'registry' : 'command';
   $('#gCmdBox').hidden = reg && hasDiff;
   $('#gDiff').hidden = !hasDiff;
   if (hasDiff) renderDiff(g);
-  $('#gModel').textContent = MODELS[modelIdx].name;
+  $('#gModel').textContent = MODELS[modelIdx] ? MODELS[modelIdx].name : '';
   $('#gTarget').textContent = g.target;
   $('#gTarget').hidden = !g.target;
   $('#gScope').textContent = g.scope;
-  $('#gStep').textContent = g.step;
+  $('#gStep').textContent = g.step ? `Step ${g.step}` : '';
+  $('#gStep').hidden = !g.step;
   const w = $('#gWrites');
   w.textContent = g.writes;
   w.classList.toggle('warn', g.writes !== 'none');
-  $('#gSub').innerHTML = gates.length > 1
-    ? `<button class="pg" data-act="prev" aria-label="Previous gate">&#8249;</button>${gi + 1} of ${gates.length}<button class="pg" data-act="next" aria-label="Next gate">&#8250;</button>`
-    : 'Agent wants to run a command';
-  const ap = $('#approveBtn'), strict = g.kind === 'registry';
+  $('#gPager').innerHTML = gates.length > 1
+    ? `<button class="pg" data-act="prev" aria-label="Previous request">&#8249;</button>${gi + 1}/${gates.length}<button class="pg" data-act="next" aria-label="Next request">&#8250;</button>`
+    : '';
+  const ap = $('#approveBtn'), strict = strictGate(g);
   ap.dataset.hold = strict ? HOLD_MS.approve : '';
-  ap.innerHTML = strict ? 'Hold to approve <kbd>&#9166;</kbd>' : 'Approve <kbd>&#9166;</kbd>';
+  ap.innerHTML = strict
+    ? '<span class="hl-off">Hold to allow</span><span class="hl-on">Allowing</span>' + HOLD_RING
+    : 'Allow <kbd>Y</kbd>';
+  const al = $('#alwaysBtn');
+  al.hidden = !g.always || strict;
+  al.textContent = g.alwaysLabel || 'Always';
+  al.title = g.alwaysLabel || 'Allow this kind of action for the rest of the session';
 }
 
 function updateAlert() {
-  $('#alertSub').textContent = gates.length === 1 ? '1 gate' : `${gates.length} gates`;
+  $('#alertSub').textContent = gates.length === 1 ? '1 request' : `${gates.length} requests`;
 }
 
 function addGate(g) {
-  if (island.dataset.state === 'off') return;
+  if (state() === 'off') return;
   gates.push(normGate(g));
-  const s = island.dataset.state;
+  const s = state();
   if (s === 'gate') renderGate();
   else if (s === 'alert') updateAlert();
   else {
-    // The gate interrupts whatever the owner was looking at. A conversation
-    // that was open comes back once the gate resolves.
+    // The request opens straight to its card and stays until answered. A
+    // conversation that was open comes back once it resolves.
     if (s === 'prompt') island.dataset.prevPrompt = '1';
-    setState('alert');
+    setState('gate');
   }
 }
 
@@ -509,28 +1512,21 @@ function navGate(d) {
   renderGate();
 }
 
-// After the LAST gate resolves the island must return to where the owner came
-// from — or straight back to the working pill while a turn is still running.
-// Dropping to the idle dot mid-task read as "the agent is done", then
-// flickered back to work a beat later when the next tool fired.
+// After the LAST gate resolves the island returns to where the owner came
+// from, or straight back to the working pill while a turn is still running.
 function gateSettleTarget() {
   const resume = island.dataset.prevPrompt === '1';
   delete island.dataset.prevPrompt;
-  if (resume) {
-    island.removeAttribute('data-panel');
-    const tp = document.getElementById('taskPanel');
-    if (tp) tp.remove();
-    return 'prompt';
-  }
+  if (resume) return 'prompt';
   return island.dataset.turn === 'live' ? 'work' : 'idle';
 }
 
-function resolveGate(decision) {
+function resolveGate(decision, always = false) {
   if (!gates.length) return;
   const [g] = gates.splice(gi, 1);
   if (decision === 'approve') { approvedAny = true; lastCmd = g.cmd; }
-  emit(decision, { gate: g });
-  if (gates.length) { gi = Math.min(gi, gates.length - 1); renderGate(); return; }
+  emit(decision, { gate: g, always: !!always });
+  if (gates.length) { gi = Math.min(gi, gates.length - 1); renderGate(); retarget(false, true); return; }
   gi = 0;
   if (approvedAny) {
     approvedAny = false;
@@ -538,6 +1534,7 @@ function resolveGate(decision) {
   } else setState(gateSettleTarget());
 }
 function approve() { resolveGate('approve'); }
+function approveAlways() { resolveGate('approve', true); }
 function deny() { resolveGate('deny'); }
 function powerOff() { setState('off'); emit('power'); }
 const ACTS = { approve, power: powerOff };
@@ -556,17 +1553,86 @@ function holdCancel() {
   hold.el = null;
 }
 
+// ── Notices (finished / error) ───────────────────────────────────────────
+const TONES = { green: 'var(--t-green)', red: 'var(--t-red)', amber: 'var(--t-amber)', blue: 'var(--t-blue)' };
+// {tone, who, sub, title, text, actions: [{label, act, primary}]}
+function notice(o = {}) {
+  const tone = TONES[o.tone] ? o.tone : 'green';
+  island.style.setProperty('--notice-tone', TONES[tone]);
+  fieldTone = { green: [52, 211, 153], red: [244, 80, 94], amber: [245, 165, 36], blue: [111, 134, 255] }[tone];
+  $('#noticeCard').dataset.tone = tone;
+  $('#nDot').className = 'sdot ' + tone;
+  $('#nWho').textContent = o.who || 'Accuretta';
+  $('#nSub').textContent = o.sub || '';
+  $('#nTitle').textContent = o.title || '';
+  $('#nText').textContent = o.text || '';
+  const acts = $('#nActions');
+  acts.textContent = '';
+  for (const a of (o.actions && o.actions.length ? o.actions : [{ label: 'OK', act: 'ok', primary: true }])) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn ' + (a.primary ? 'pri' : 'sec');
+    b.dataset.nact = a.act;
+    b.textContent = a.label;
+    acts.appendChild(b);
+  }
+  // A pending approval owns the screen; the notice waits behind it.
+  if (gates.length) return;
+  Sound.play(tone === 'red' ? 'error' : 'done');
+  setState('notice');
+}
+
+function restTarget() {
+  if (gates.length) return 'alert';
+  return island.dataset.turn === 'live' ? 'work' : 'idle';
+}
+
+// ── Auto-fold ────────────────────────────────────────────────────────────
+// Home and notices fold back to the pill once the pointer has been on them
+// and left: a hairline drains for FOLD_MS first. One that arrives while the
+// owner is away stays put until they have seen it.
+const AUTO_FOLD = new Set(['home', 'notice']);
+const FOLD_MS = 12000;
+let pointerInside = false, visitedSinceOpen = false, foldTimer = 0;
+function cancelFold() {
+  clearTimeout(foldTimer); foldTimer = 0;
+  const bar = $('#countdown');
+  bar.style.transition = 'opacity .25s ease';
+  bar.style.opacity = '0';
+}
+function startFold() {
+  cancelFold();
+  const bar = $('#countdown');
+  bar.style.transition = 'none';
+  bar.style.transform = 'scaleX(1)';
+  bar.style.opacity = '1';
+  void bar.offsetWidth;
+  bar.style.transition = `transform ${FOLD_MS}ms linear, opacity .3s ease`;
+  bar.style.transform = 'scaleX(0)';
+  foldTimer = setTimeout(() => { foldTimer = 0; if (AUTO_FOLD.has(state()) && !pointerInside) setState(restTarget()); }, FOLD_MS);
+}
+function setPointerInside(v) {
+  v = !!v;
+  if (v === pointerInside) return;
+  pointerInside = v;
+  if (v) { visitedSinceOpen = true; cancelFold(); }
+  else if (AUTO_FOLD.has(state()) && visitedSinceOpen) startFold();
+}
+island.addEventListener('pointerenter', () => setPointerInside(true));
+island.addEventListener('pointerleave', () => setPointerInside(false));
+
+// ── Models ───────────────────────────────────────────────────────────────
 function renderMenu() {
-  $('#modelName').textContent = MODELS[modelIdx].name;
+  $('#modelName').textContent = MODELS[modelIdx] ? MODELS[modelIdx].name : '';
   $('#menu').innerHTML = MODELS.map((m, i) =>
-    `<button class="opt" role="option" data-i="${i}" aria-selected="${i === modelIdx}"><span class="chk">${i === modelIdx ? '&#10003;' : ''}</span><span class="nm">${m.name}</span><span class="mt">${m.meta}</span></button>`
+    `<button class="opt" role="option" data-i="${i}" aria-selected="${i === modelIdx}"><span class="chk">${i === modelIdx ? '&#10003;' : ''}</span><span class="nm">${esc(m.name)}</span><span class="mt">${esc(m.meta || '')}</span></button>`
   ).join('');
 }
 renderMenu();
 
-// Anchor a floating dropdown just above the bottom row it belongs to. The
-// menu overlays the thread instead of expanding the card, so a full thread or
-// a long list can never push it outside the fixed host window.
+// Anchor a floating dropdown just above the bottom row it belongs to. It
+// overlays the thread instead of growing the card, so it never leaves the
+// fixed host window.
 function positionMenu(menu) {
   if (!menu) return;
   const card = document.querySelector('.v-prompt .card');
@@ -574,8 +1640,6 @@ function positionMenu(menu) {
   if (!card || !row) return;
   const c = card.getBoundingClientRect();
   const r = row.getBoundingClientRect();
-  // Clamp to the space above the row so the floating menu can never poke out
-  // of the card (and therefore out of the fixed host window); it scrolls.
   menu.style.maxHeight = Math.max(60, Math.round(r.top - c.top - 12)) + 'px';
   menu.style.bottom = Math.max(8, Math.round(c.bottom - r.top + 6)) + 'px';
 }
@@ -595,7 +1659,7 @@ const setHint = (text, cls = '') => { const h = $('#hint'); h.className = ('hint
 
 function loadModel() {
   clearTimeout(loadTimer); clearTimeout(readyTimer);
-  if (island.dataset.state === 'ready') setState('idle');
+  if (state() === 'ready') setState('idle');
   island.removeAttribute('data-ready');
   island.removeAttribute('data-loading');
   void island.offsetWidth;
@@ -615,14 +1679,32 @@ function modelReady() {
   $('#q').placeholder = 'Tell Accuretta what to do';
   setHint(`${name} ready`, 'ok');
   emit('modelready', { model: name });
-  if (island.dataset.state === 'idle') { $('#readySub').textContent = name; setState('ready'); }
+  if (state() === 'idle') { $('#readySub').textContent = name; setState('ready'); }
   readyTimer = setTimeout(() => {
     island.removeAttribute('data-ready');
-    setHint('Enter sends');
-    if (island.dataset.state === 'ready') setState('idle');
+    setHint('');
+    if (state() === 'ready') setState('idle');
   }, 2800);
 }
 
+function modelFailed(msg = 'Load failed') {
+  if (!island.hasAttribute('data-loading')) return;
+  clearTimeout(loadTimer);
+  island.removeAttribute('data-loading');
+  $('#q').placeholder = 'Tell Accuretta what to do';
+  setHint(msg, 'bad');
+  emit('modelfailed', { model: MODELS[modelIdx].name });
+  readyTimer = setTimeout(() => setHint(''), 3500);
+}
+
+function setModels(list, active = 0) {
+  if (!Array.isArray(list) || !list.length) return;
+  MODELS.splice(0, MODELS.length, ...list);
+  modelIdx = Math.max(0, Math.min(active, MODELS.length - 1));
+  renderMenu();
+}
+
+// ── Chat ─────────────────────────────────────────────────────────────────
 function stream(text) {
   const el = $('#agentMsg');
   el.textContent = ''; island.setAttribute('data-busy', '');
@@ -644,26 +1726,9 @@ function removeGate(id) {
   if (i < 0) return;
   gates.splice(i, 1);
   if (gi >= gates.length) gi = Math.max(0, gates.length - 1);
-  const s = island.dataset.state;
+  const s = state();
   if (!gates.length) { if (s === 'gate' || s === 'alert') setState(gateSettleTarget()); return; }
-  if (s === 'gate') renderGate(); else if (s === 'alert') updateAlert();
-}
-
-function setModels(list, active = 0) {
-  if (!Array.isArray(list) || !list.length) return;
-  MODELS.splice(0, MODELS.length, ...list);
-  modelIdx = Math.max(0, Math.min(active, MODELS.length - 1));
-  renderMenu();
-}
-
-function modelFailed(msg = 'Load failed') {
-  if (!island.hasAttribute('data-loading')) return;
-  clearTimeout(loadTimer);
-  island.removeAttribute('data-loading');
-  $('#q').placeholder = 'Tell Accuretta what to do';
-  setHint(msg, 'bad');
-  emit('modelfailed', { model: MODELS[modelIdx].name });
-  readyTimer = setTimeout(() => setHint('Enter sends'), 3500);
+  if (s === 'gate') { renderGate(); retarget(false, true); } else if (s === 'alert') updateAlert();
 }
 
 function beginReply(userText) {
@@ -682,19 +1747,61 @@ function appendReply(chunk) {
 }
 function endReply() { island.removeAttribute('data-busy'); }
 
+function setAttachment(a) {
+  $('#attach').hidden = !a;
+  $('#attachName').textContent = a ? a.name : '';
+  $('#q').placeholder = a ? `Ask about ${a.name}` : 'Tell Accuretta what to do';
+}
+
+// ── State ────────────────────────────────────────────────────────────────
+// Sound is for what needs you: a request arriving (here), and a turn
+// finishing or failing (notice() and the wiring). Opening, closing, sending,
+// approving and dropping are your own actions and stay silent.
+function soundFor(prev, s) {
+  if (!prev || prev === s) return;
+  if (s === 'gate' && prev !== 'alert') Sound.play('gate');
+}
+
+function syncTabs() {
+  const s = state();
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on',
+    (t.dataset.tab === 'home' && s === 'home') || (t.dataset.tab === 'chat' && s === 'prompt')));
+}
+
+function toggleDemoConv() {
+  const menu = $('#convMenu');
+  if (island.hasAttribute('data-conv')) { island.removeAttribute('data-conv'); return; }
+  closeMenu();
+  const rows = [['New session', '', true], ['Lab scan', 'working'], ['Refactor billing', 'needs you'], ['Weekly digest', 'finished']];
+  menu.innerHTML = rows.map(([nm, mt, sel]) =>
+    `<button class="opt" role="option" aria-selected="${!!sel}"><span class="chk">${sel ? '&#10003;' : ''}</span><span class="nm">${esc(nm)}</span><span class="mt">${esc(mt)}</span></button>`).join('');
+  island.setAttribute('data-conv', '');
+  positionMenu(menu);
+}
+
 function setState(s) {
+  if (cfg.demo) island.removeAttribute('data-conv');
   clearTimeout(timer); clearTimeout(streamTimer);
   toolTimers.forEach(clearTimeout); toolTimers = [];
   closeMenu();
-  island.dataset.state = s;
-  island.toggleAttribute('data-busy', s === 'work' || s === 'alert');
+  const prev = island.dataset.state;
   if (s === 'off') { island.removeAttribute('data-thread'); gates = []; gi = 0; approvedAny = false; }
   if (s === 'alert' || s === 'gate') {
     if (!gates.length) { if (!cfg.demo) return setState('idle'); gates.push(normGate(MOCK_GATES[1])); }
     gi = Math.min(gi, gates.length - 1);
-    if (s === 'gate') renderGate(); else updateAlert();
   }
-  if (s === 'prompt') setTimeout(() => $('#q').focus(), 350);
+  island.dataset.state = s;
+  island.dataset.mode = isCompact(s) ? 'compact' : 'expanded';
+  island.toggleAttribute('data-busy', s === 'work' || s === 'alert');
+  if (s === 'gate') renderGate(); else if (s === 'alert') updateAlert();
+  if (s === 'prompt') setTimeout(() => $('#q').focus({ preventScroll: true }), 120);
+  if (s !== 'drop') $('#dropCard').dataset.phase = 'over';
+  cancelFold();
+  visitedSinceOpen = pointerInside;
+  syncTabs();
+  soundFor(prev, s);
+  retarget();
+  if (s === 'home' && prev !== 'home') emit('home');
 }
 
 function showReply() {
@@ -702,7 +1809,9 @@ function showReply() {
   $('#agentMsg').textContent = '';
   island.setAttribute('data-thread', '');
   setState('prompt');
-  timer = setTimeout(() => stream(MOCK_REPLY), 500);
+  setPhase('thinking');
+  island.setAttribute('data-busy', '');
+  timer = setTimeout(() => { setPhase('composing'); stream(MOCK_REPLY); }, 2200);
 }
 
 function runApproved() {
@@ -716,26 +1825,97 @@ function runApproved() {
 }
 
 function dismiss() {
-  const s = island.dataset.state;
+  const s = state();
   if (s === 'gate') setState('alert');
-  else if (s === 'prompt') {
-    // Folding the card while the agent is still working lands on the working
-    // pill, not the idle dot — the next tool_start would only bounce it back.
-    setState(gates.length ? 'alert' : (island.dataset.turn === 'live' ? 'work' : 'idle'));
-  }
+  else if (s === 'prompt' || s === 'home' || s === 'notice') setState(restTarget());
+  else if (s === 'drop') { dropFile = null; setState(restTarget()); }
 }
 
+// ── File drop ────────────────────────────────────────────────────────────
+// Without a handler, a file dropped on a WebView navigates the whole page to
+// it. Every drag is claimed; files dropped on the island open the drop card.
+let dragDepth = 0, dropFile = null;
+const hasFiles = (e) => !!(e.dataTransfer && [...(e.dataTransfer.types || [])].includes('Files'));
+document.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = hasFiles(e) ? 'copy' : 'none';
+});
+document.addEventListener('dragenter', (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault();
+  dragDepth++;
+  const s = state();
+  if (s === 'drop' || s === 'gate' || s === 'off') return;
+  $('#dropCard').dataset.phase = 'over';
+  dropPhase = 'over';
+  setState('drop');
+});
+document.addEventListener('dragleave', (e) => {
+  if (!hasFiles(e)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth && state() === 'drop' && $('#dropCard').dataset.phase === 'over') setState(restTarget());
+});
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (!f || state() !== 'drop') { if (state() === 'drop') setState(restTarget()); return; }
+  dropFile = f;
+  $('#dropName').textContent = f.name;
+  $('#dropCard').dataset.phase = 'ready';
+  dropPhase = 'ready';
+  retarget(false, true);
+});
+function dropAsk() {
+  if (!dropFile) return setState(restTarget());
+  const f = dropFile;
+  dropFile = null;
+  setAttachment({ name: f.name });
+  emit('file', { file: f });
+  island.removeAttribute('data-thread');
+  setState('prompt');
+}
+
+// ── Input ────────────────────────────────────────────────────────────────
 island.addEventListener('click', (e) => {
-  const s = island.dataset.state;
+  const s = state();
   if (!e.target.closest('.menu, .model')) closeMenu();
   const h = e.target.closest('[data-hold]');
   if (h && h.dataset.hold) return;
+  const tab = e.target.closest('.tab')?.dataset.tab;
+  if (tab === 'home') return setState('home');
+  if (tab === 'chat') return setState('prompt');
+  if (tab === 'new') {
+    emit('new');
+    if (cfg.demo) { island.removeAttribute('data-thread'); setState('prompt'); }
+    return;
+  }
+  const pane = e.target.closest('.seg button')?.dataset.pane;
+  if (pane) return showPane(pane);
+  const row = e.target.closest('.srow');
+  if (row) return emit('pick', { id: row.dataset.sid });
+  const nact = e.target.closest('[data-nact]')?.dataset.nact;
+  if (nact) {
+    if (nact === 'read') return setState('prompt');
+    if (nact !== 'ok') emit('notice-act', { act: nact });
+    return setState(restTarget());
+  }
   const act = e.target.closest('[data-act]')?.dataset.act;
   if (act === 'approve') return approve();
+  if (act === 'always') return approveAlways();
   if (act === 'deny') return deny();
   if (act === 'prev' || act === 'next') return navGate(act === 'next' ? 1 : -1);
   if (act === 'ask') return setState('prompt');
+  if (act === 'sound') { Sound.setMuted(!Sound.muted); if (!Sound.muted) Sound.play('send'); return; }
+  if (act === 'open-main') return emit('open-main');
+  if (act === 'drop-ask') return dropAsk();
+  if (act === 'drop-cancel') { dropFile = null; return setState(restTarget()); }
+  if (act === 'unattach') { setAttachment(null); return emit('unattach'); }
   if (e.target.closest('#model')) return island.hasAttribute('data-menu') ? closeMenu() : openMenu();
+  // Wired, the bridge wiring owns this button (and stops the click before it
+  // gets here). The standalone preview shows a sample list instead.
+  if (cfg.demo && e.target.closest('#convBtn')) return toggleDemoConv();
+  if (cfg.demo && e.target.closest('#convMenu .opt')) { island.removeAttribute('data-conv'); return; }
   // Scope to the MODEL menu: the conversations dropdown reuses .opt and must
   // not be parsed as a model index (dataset.i is undefined there).
   const opt = e.target.closest('#menu .opt');
@@ -745,7 +1925,8 @@ island.addEventListener('click', (e) => {
     if (i !== modelIdx) { modelIdx = i; renderMenu(); loadModel(); emit('model', { model: MODELS[modelIdx].name }); }
     return;
   }
-  if (s === 'idle') setState('prompt');
+  if (s === 'idle' || s === 'ready') setState('home');
+  else if (s === 'work') setState('prompt');
   else if (s === 'alert') setState('gate');
   else if (s === 'off') { setState('idle'); emit('wake'); }
 });
@@ -760,13 +1941,17 @@ document.addEventListener('pointercancel', holdCancel);
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { if (!closeMenu()) dismiss(); return; }
-  const inGate = island.dataset.state === 'gate';
-  if (inGate && !e.target.closest('input')) {
-    if (e.key === 'ArrowRight') navGate(1);
-    if (e.key === 'ArrowLeft') navGate(-1);
-    if (e.key === 'Enter' && !e.repeat && !e.target.closest('button')) {
+  const inField = !!(e.target.closest && e.target.closest('input, textarea'));
+  if (state() === 'gate' && !inField && !e.ctrlKey && !e.altKey && !e.metaKey) {
+    const k = e.key.toLowerCase();
+    if (k === 'arrowright') navGate(1);
+    if (k === 'arrowleft') navGate(-1);
+    if (k === 'n' && !e.repeat) return deny();
+    if (k === 'a' && !e.repeat && !$('#alwaysBtn').hidden) return approveAlways();
+    if ((k === 'y' || (k === 'enter' && !e.target.closest('button'))) && !e.repeat) {
       const b = $('#approveBtn');
       if (b.dataset.hold) holdStart(b, approve); else approve();
+      return;
     }
   }
   if ((e.key === 'Enter' || e.key === ' ') && !e.repeat) {
@@ -775,7 +1960,7 @@ document.addEventListener('keydown', (e) => {
   }
   if ((e.key === 'Enter' || e.key === ' ') && e.target === island) island.click();
 });
-document.addEventListener('keyup', (e) => { if (e.key === 'Enter' || e.key === ' ') holdCancel(); });
+document.addEventListener('keyup', (e) => { if (['Enter', ' ', 'y', 'Y'].includes(e.key)) holdCancel(); });
 document.addEventListener('click', (e) => {
   if (!e.composedPath().includes(island)) { closeMenu(); dismiss(); }
 });
@@ -786,12 +1971,11 @@ function send() {
   lastPrompt = v; $('#q').value = '';
   emit('send', { prompt: v, model: MODELS[modelIdx].name });
   // emit() is synchronous, so the wiring's send handler has already run by the
-  // next line: the notch's openReply has reopened the conversation card with
-  // the prompt echoed and the live status under it. Forcing the work pill here
-  // used to beat that and hide the whole thinking/tool phase behind a bar.
-  // Demo mode keeps its own rehearsal flow and needs the pill.
-  if (cfg.demo) setState('work');
+  // next line and opened the conversation card. Demo mode keeps its own
+  // rehearsal flow and needs the pill.
   if (!cfg.demo) return;
+  setAttachment(null);
+  setState('work');
   setContext(.41);
   runTools([[0, 'reading scope'], [650, 'whois 10.0.0.12'], [1300, 'planning step 3']]);
   timer = setTimeout(() => MOCK_GATES.forEach(g => addGate(g)), 2000);
@@ -799,7 +1983,17 @@ function send() {
 $('#send').addEventListener('click', send);
 $('#q').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
 
-window.notch = { setState, showReply, approve, deny, addGate, setTool, setContext, setStats, compact, loadModel, modelReady, modelFailed, removeGate, setModels, beginReply, appendReply, endReply, closeMenu, positionMenu, config: cfg };
+// ── Boot ─────────────────────────────────────────────────────────────────
+if (cfg.demo) {
+  setSession({ title: 'Lab scan', model: 'Qwen3 27B', state: 'working',
+    steps: [{ title: 'Read the scope', status: 'done' }, { title: 'Fingerprint 10.0.0.12', status: 'done' },
+            { title: 'Compare nginx with advisories', status: 'active' }, { title: 'Write the report', status: 'pending' }] });
+  setSessions([{ id: 'a', title: 'Lab scan', state: 'working', current: true }, { id: 'b', title: 'Refactor billing', state: 'needs-you' },
+               { id: 'c', title: 'Weekly digest', state: 'finished' }]);
+}
+retarget(true);
+
+window.notch = { setState, showReply, approve, deny, addGate, setTool, setContext, setStats, compact, loadModel, modelReady, modelFailed, removeGate, setModels, beginReply, appendReply, endReply, closeMenu, positionMenu, setSession, setSessions, notice, setAttachment, setPointerInside, retarget, setPhase, sound: (n) => Sound.play(n), get state() { return state(); }, config: cfg };
 </script>
 </body>
 </html>

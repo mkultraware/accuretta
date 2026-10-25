@@ -114,14 +114,18 @@ def _acquire_single_instance(lock_port: int = 8799) -> bool:
 # sync with the actual palette luminance, including the softer and pastel sets.
 _LIGHT_THEMES = {"", "light", "soft", "pastel", "retro", "neumorphic", "neobrutalism", "aperture", "folio"}
 _KNOWN_THEMES = {
-    "light", "dark", "dim", "retro", "aurora", "nebula", "operator",
+    "light", "dark", "dim", "retro", "opal",
     "neumorphic", "neobrutalism", "aperture", "aperture-dark", "atelier", "soft",
-    "pastel", "velvet", "cartograph", "amaranth", "folio",
+    "pastel", "cartograph", "amaranth", "folio",
 }
 _THEME_ALIASES = {
     "neobrutalism": "amaranth",
     "neobrutalism-dark": "amaranth",
     "kinetic": "aperture",
+    "aurora": "opal",
+    "nebula": "opal",
+    "operator": "opal",
+    "velvet": "opal",
 }
 
 
@@ -213,7 +217,7 @@ def _read_app_version() -> str:
             return m.group(1)
     except Exception:
         pass
-    return "0.8.3"
+    return "1.0.0"
 
 
 def _signal_field_js() -> str:
@@ -245,15 +249,17 @@ def _is_dark(hex_color: str) -> bool:
 
 
 def _build_splash_html() -> str:
-    """Theme-aware boot splash, in the app's dot-matrix language.
+    """Theme-aware boot splash, in the notch's design language.
 
     The saved theme supplies the palette (bg / fg / muted / accent), so the
     splash opens in the theme the app was last closed in. The matrix A
-    (dot-matrix.js, inlined) is the progress indicator: its dots light from
-    bottom left to top right as boot advances, the next few pulse at the
-    front, and the whole A flashes once at 100%. Behind it, signal-field.js
-    draws the same twinkling dot pool as the welcome screen, so the hand-off
-    to the app reads as one surface.
+    (dot-matrix.js, inlined) powers on once along its diagonal, twinkles,
+    and flashes when the app is ready; it is the mark, not a progress bar.
+    Progress is the hairline stage segments under the wordmark (the notch
+    plan bar's language), beside a live status line (the work pill's sheen),
+    all sitting in a soft halo cleared out of the field. Behind it,
+    signal-field.js draws a halftone dot field that widens with progress and
+    sends the app off with a ripple and a rising horizon of grains.
     window.__splashStage(label, pct) stays the live progress contract.
     """
     theme = _read_saved_theme()
@@ -285,7 +291,7 @@ def _build_splash_html() -> str:
     body {{
       margin: 0; overflow: hidden; display: grid; place-items: center;
       color: var(--fg); background: var(--bg);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", sans-serif;
+      font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
       user-select: none; -webkit-font-smoothing: antialiased;
     }}
     #signal-field {{ position: absolute; inset: 0; z-index: 0; pointer-events: none; }}
@@ -293,75 +299,105 @@ def _build_splash_html() -> str:
     .lockup {{
       position: relative; z-index: 1;
       display: flex; flex-direction: column; align-items: center;
-      transform: translateY(-2vh);
+      transform: translateY(-3vh);
     }}
     .mark {{
       width: 120px; height: 90px; display: grid; place-items: center;
-      opacity: 0; animation: rise .6s var(--ease) .05s forwards;
+      opacity: 0; animation: rise .7s var(--ease) .05s forwards;
     }}
     .mx {{ width: 120px; height: 90px; overflow: visible; }}
     .mx circle {{
       transform-box: fill-box; transform-origin: center;
-      opacity: .13; transform: scale(.78);
-      transition: opacity .32s ease var(--lag, 0s), transform .32s var(--ease) var(--lag, 0s);
+      opacity: .12; transform: scale(.78);
+      transition: opacity .34s ease var(--lag, 0s), transform .4s var(--ease) var(--lag, 0s);
     }}
-    .mx circle.next {{ animation: frontier 1.3s ease-in-out var(--fd, 0s) infinite; }}
     .mx circle.lit {{
       opacity: 1; transform: none;
       animation: twinkle var(--p) ease-in-out calc(var(--d) + var(--lag, 0s)) infinite;
     }}
     body.ready .mx circle {{
       opacity: 1; transform: none;
-      animation: ready .7s var(--ease) calc(var(--k) * .35s) both;
+      animation: ready .8s var(--ease) calc(var(--k) * .35s) both;
     }}
     .logo-img {{ width: 64px; height: 64px; object-fit: contain; display: block; }}
     .logo-fallback {{ font-size: 44px; font-weight: 700; color: var(--accent); line-height: 1; }}
 
     h1 {{
-      margin: 22px 0 0;
-      font-size: 22px; line-height: 1.2; font-weight: 500; letter-spacing: -.02em;
-      opacity: 0; animation: rise .6s var(--ease) .14s forwards;
+      margin: 26px 0 0;
+      font-size: 24px; line-height: 1.15; font-weight: 600; letter-spacing: -.025em;
+      opacity: 0; animation: rise .7s var(--ease) .14s forwards;
     }}
-    .readout {{
-      display: flex; align-items: baseline; justify-content: center; gap: 8px;
-      min-height: 18px; margin-top: 10px;
-      font-size: 12px; color: var(--muted);
-      opacity: 0; animation: rise .6s var(--ease) .22s forwards;
+    /* The status line is live: a soft highlight sweeps across it while the
+       engine boots, the way the notch's work pill does, and each new stage
+       lifts in rather than swapping hard. */
+    .status-wrap {{
+      min-height: 18px; margin-top: 10px; display: flex; justify-content: center;
+      opacity: 0; animation: rise .7s var(--ease) .22s forwards;
     }}
-    #status {{ max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: opacity .15s ease; }}
-    #status.swap {{ opacity: 0; }}
-    .sep {{ opacity: .5; }}
-    .pct {{ font-variant-numeric: tabular-nums; color: var(--fg); opacity: .72; }}
+    #status {{
+      max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-size: 12.5px; color: var(--muted);
+      transition: opacity .16s ease, transform .16s ease;
+    }}
+    #status.shimmer {{
+      background-image: linear-gradient(100deg, var(--muted) 0%, var(--muted) 38%, var(--fg) 50%, var(--muted) 62%, var(--muted) 100%);
+      background-size: 260% 100%; background-repeat: no-repeat;
+      -webkit-background-clip: text; background-clip: text;
+      color: transparent; -webkit-text-fill-color: transparent;
+      animation: sheen 1.9s linear infinite;
+    }}
+    #status.swap {{ opacity: 0; transform: translateY(3px); }}
+    body.ready #status {{ animation: none; background-image: none; -webkit-text-fill-color: var(--fg); color: var(--fg); }}
+
+    /* Boot stages as hairline segments, the same language as the notch's
+       plan bar: done segments filled, the running one with a light sweep. */
+    .steps {{
+      display: flex; gap: 4px; width: 168px; height: 3px; margin-top: 16px;
+      opacity: 0; animation: rise .7s var(--ease) .3s forwards;
+    }}
+    .steps i {{
+      flex: 1; border-radius: 2px; position: relative; overflow: hidden;
+      background: color-mix(in srgb, var(--fg) 12%, transparent);
+      transition: background .5s ease;
+    }}
+    .steps i.done {{ background: color-mix(in srgb, var(--fg) 70%, transparent); }}
+    .steps i.cur {{ background: color-mix(in srgb, var(--accent) 35%, transparent); }}
+    .steps i.cur::after {{
+      content: ""; position: absolute; inset: 0; width: 45%;
+      background: linear-gradient(90deg, transparent, var(--accent), transparent);
+      animation: stepsweep 1.6s cubic-bezier(.45, 0, .2, 1) infinite;
+    }}
 
     .foot {{
       position: absolute; left: 0; right: 0; bottom: 22px; z-index: 1;
-      text-align: center; font-size: 11px; color: var(--muted); opacity: 0;
-      animation: fade .7s ease .5s forwards;
+      display: flex; justify-content: center;
+      font: 500 11px/1 "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+      letter-spacing: .04em; color: var(--muted); opacity: 0;
+      animation: fade .8s ease .55s forwards;
     }}
 
     @keyframes rise {{
       from {{ opacity: 0; transform: translateY(6px); }}
       to   {{ opacity: 1; transform: none; }}
     }}
-    @keyframes fade {{ to {{ opacity: .8; }} }}
+    @keyframes fade {{ to {{ opacity: .75; }} }}
+    @keyframes sheen {{ from {{ background-position: 100% 0; }} to {{ background-position: 0% 0; }} }}
+    @keyframes stepsweep {{ from {{ transform: translateX(-100%); }} to {{ transform: translateX(240%); }} }}
     @keyframes twinkle {{
-      0%, 100% {{ opacity: var(--lo); transform: scale(.88); }}
-      12% {{ opacity: 1; transform: scale(1.12); }}
-      40% {{ opacity: .8; transform: scale(1); }}
-    }}
-    @keyframes frontier {{
-      0%, 100% {{ opacity: .13; transform: scale(.78); }}
-      45% {{ opacity: .7; transform: scale(1.05); }}
+      0%, 100% {{ opacity: var(--lo); transform: scale(.9); }}
+      12% {{ opacity: 1; transform: scale(1.08); }}
+      40% {{ opacity: .8; transform: none; }}
     }}
     @keyframes ready {{
-      0%   {{ opacity: .6; transform: scale(.9); }}
-      35%  {{ opacity: 1;  transform: scale(1.3); }}
-      100% {{ opacity: 1;  transform: scale(1); }}
+      0%   {{ opacity: .6; transform: scale(.92); }}
+      35%  {{ opacity: 1;  transform: scale(1.16); }}
+      100% {{ opacity: 1;  transform: none; }}
     }}
     @media (max-height: 560px) {{ .lockup {{ transform: scale(.9); }} }}
     @media (prefers-reduced-motion: reduce) {{
       *, *::before, *::after {{ animation: none !important; transition-duration: .01ms !important; }}
-      .mark, h1, .readout, .foot {{ opacity: 1; transform: none; }}
+      .mark, h1, .status-wrap, .steps, .foot {{ opacity: 1; transform: none; }}
+      #status.shimmer {{ background-image: none; -webkit-text-fill-color: var(--muted); color: var(--muted); }}
     }}
   </style>
 </head>
@@ -371,17 +407,17 @@ def _build_splash_html() -> str:
   <main class="lockup">
     <div class="mark">{mark_html}</div>
     <h1>Accuretta</h1>
-    <div class="readout" aria-live="polite">
-      <span id="status">Preparing local runtime</span><span class="sep">·</span><span class="pct" id="pct">0%</span>
-    </div>
+    <div class="status-wrap" aria-live="polite"><span id="status" class="shimmer">Preparing local runtime</span></div>
+    <div class="steps" aria-hidden="true"><i class="cur"></i><i></i><i></i></div>
   </main>
 
   <footer class="foot">v{version}</footer>
 
 {scripts}  <script>
     (function () {{
-      // Order the A's dots along the notch's power-up diagonal (bottom left
-      // to top right) so progress fills the logo in that direction.
+      // The A is the mark, not a progress bar (the stage segments are). It
+      // powers on once along the notch's diagonal (bottom left to top
+      // right) as the splash appears, then simply twinkles.
       var svg = document.getElementById('mx');
       var dots = [];
       if (svg && window.AccDots) {{
@@ -394,40 +430,49 @@ def _build_splash_html() -> str:
           return {{ el: c, k: k }};
         }}).sort(function (a, b) {{ return a.k - b.k; }});
       }}
-      var shown = 0;
-      function paint(pct) {{
-        if (!dots.length) return;
-        var n = Math.round(Math.max(0, Math.min(1, pct / 100)) * dots.length);
+      function powerOn() {{
         for (var i = 0; i < dots.length; i++) {{
-          var el = dots[i].el;
-          // Newly lit dots cascade in order instead of popping at once.
-          if (i < n && !el.classList.contains('lit')) el.style.setProperty('--lag', ((i - shown) * .018).toFixed(3) + 's');
-          el.classList.toggle('lit', i < n);
-          var front = i >= n && i < n + 4;
-          el.classList.toggle('next', front);
-          if (front) el.style.setProperty('--fd', ((i - n) * .12).toFixed(2) + 's');
+          dots[i].el.style.setProperty('--lag', (.25 + dots[i].k * .9).toFixed(3) + 's');
+          dots[i].el.classList.add('lit');
         }}
-        shown = Math.max(shown, n);
-        if (pct >= 100) document.body.classList.add('ready');
+      }}
+      // Boot stages: the bridge (done once the engine is being waited on),
+      // the engine (done at 100%), and the workspace (the hand-off).
+      var STAGE_DONE = [55, 100, 101];
+      function steps(pct) {{
+        var segs = document.querySelectorAll('.steps i'), cur = -1;
+        for (var i = 0; i < segs.length; i++) {{
+          var done = pct >= STAGE_DONE[i];
+          if (!done && cur < 0) cur = i;
+          segs[i].className = done ? 'done' : (i === cur ? 'cur' : '');
+        }}
+      }}
+      function ready() {{
+        document.body.classList.add('ready');
+        var segs = document.querySelectorAll('.steps i');
+        for (var i = 0; i < segs.length; i++) segs[i].className = 'done';
+        if (window.AccuSignalField) window.AccuSignalField.ready();
       }}
       window.__splashReadyAt = performance.now();
       window.__splashStage = function (label, pct) {{
         var status = document.getElementById('status');
-        var readout = document.getElementById('pct');
         if (status && label && status.textContent !== label) {{
           status.classList.add('swap');
           setTimeout(function () {{
             status.textContent = label;
             status.classList.remove('swap');
-          }}, 150);
+          }}, 160);
         }}
         if (typeof pct === 'number') {{
           var value = Math.max(0, Math.min(100, pct));
-          if (readout) readout.textContent = Math.round(value) + '%';
-          paint(value);
+          steps(value);
+          if (window.AccuSignalField) window.AccuSignalField.setProgress(value / 100);
+          if (value >= 100) setTimeout(ready, 120);
         }}
       }};
-      paint(3);
+      powerOn();
+      steps(3);
+      if (window.AccuSignalField) window.AccuSignalField.setProgress(.03);
     }})();
   </script>
 </body></html>"""

@@ -69,6 +69,9 @@ cryptography>=41.0.0       # Certificate parsing for the authorized recon TLS au
 pywebview>=5.0              # Desktop app window; also supplies the bundled
                             # WebView2 .NET assemblies the notch overlay host
                             # (notch_host.py) uses for its transparent window
+pyobjc-framework-WebKit; sys_platform == "darwin"   # macOS notch host (notch_host_mac.py):
+pyobjc-framework-Quartz; sys_platform == "darwin"   # AppKit panel + WKWebView; pywebview
+                                                    # already pulls these in on macOS
 
 # ------------------------------------------------------------------------------
 # Remote bridge (Optional)
