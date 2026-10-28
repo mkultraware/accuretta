@@ -2488,6 +2488,9 @@ function connectEvents() {
       case "models:update":
         refreshModels();
         break;
+      case "settings:update":
+        refreshApprovalKeys();
+        break;
       case "steering_applied":
       case "steering_deferred":
         // Delivery receipt for a steer this notch sent (applied at the next
@@ -2646,8 +2649,17 @@ function onPlan(evt) {
   if (state() === "home") scheduleHome(80);
 }
 
+// The gate card's keys follow the owner's "Approve / Deny newest request"
+// shortcuts from Settings (Y and N when unset).
+async function refreshApprovalKeys() {
+  const s = await getJson("/api/settings");
+  const k = (s && s.keyboard_shortcuts) || {};
+  notch.setApprovalKeys({ approve: k.approve_pending || "", deny: k.deny_pending || "" });
+}
+
 // ---- hydrate ------------------------------------------------------------------
 (async () => {
+  await refreshApprovalKeys();
   await refreshModels();
   await refreshCtx("");
   const list = await getJson("/api/approvals");

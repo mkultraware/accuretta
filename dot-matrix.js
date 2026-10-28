@@ -274,7 +274,14 @@
     kick();
   }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
-  window.AccDots = { buildA, field };
+  // Is (t, u), as 0..1 across the A's artwork box, inside the A? Lets the
+  // splash's glyph field draw the same shape without a second copy of it.
+  function inA(t, u) {
+    const x = A_X0 + t * A_W, y = A_Y0 + u * A_H;
+    return inPoly(x, y, A_BIG) || inPoly(x, y, A_SMALL);
+  }
+
+  window.AccDots = { buildA, field, inA, A_ASPECT: A_W / A_H };
 
   // Static chrome: the preview's empty state.
   const previewA = document.getElementById("preview-empty-a");

@@ -338,6 +338,8 @@ class NotchHost:
         self.pointer_inside = False   # last value posted to the page
         self._wake_since = 0.0        # pointer resting on the wake strip since
         self._hover_reveal = False    # shown by a hover, not by the owner or an event
+        self.quiet = False            # tucked away by the hotkey: only approvals show it
+        self._quiet_gate_seen = False # the approval that popped it up reached the page
         self.hotkey_ok = False
         self._hotkey_failures = 0
         self.health_misses = 0
@@ -432,6 +434,7 @@ class NotchHost:
     # Cards the owner dismisses deliberately (or the page folds on its own
     # countdown): never tucked away by the host's idle timer.
     _HELD_STATES = ("alert", "gate", "prompt", "work", "home", "notice", "drop")
+    _QUIET_HOLD_STATES = ("alert", "gate", "prompt", "drop")
 
     def _island_screen_rect(self):
         if not self.island:
@@ -541,8 +544,11 @@ class NotchHost:
 
     def _toggle_island(self, reason: str = "") -> None:
         if self.visible:
+            # Until the hotkey brings it back, only a new approval may show it.
+            self.quiet = True
             self._request_collapse_and_hide(reason or "toggle")
         else:
+            self.quiet = False
             # Route through show_island: the page needs the "enter" message or it
             # keeps the `is-leaving` class, which parks the island above the top
             # screen edge at opacity 0. The window comes back but the owner sees
@@ -573,6 +579,15 @@ class NotchHost:
     def _auto_hide_check(self) -> None:
         if not self.visible or self.sticky:
             return
+        # Tucked away: an approval popped it up; leave once it is handled.
+        if self.quiet and not self._hide_at:
+            if self.island_state in ("alert", "gate"):
+                self._quiet_gate_seen = True
+            elif (self._quiet_gate_seen and self.island_state not in self._QUIET_HOLD_STATES
+                    and not self.pointer_inside):
+                self._quiet_gate_seen = False
+                self._request_collapse_and_hide("approval handled")
+                return
         # A pending gate, an open card, or a reply on screen must never be
         # tucked away on a timer: those are dismissed deliberately (Esc, a
         # click outside, or the hotkey). Nor is a pill the pointer rests on.
@@ -875,7 +890,8 @@ class NotchHost:
                                               time.monotonic() + HOVER_GRACE_S)
             self._wake_since = 0.0
             return
-        if self._leaving or not self._on_wake_strip(pt) or self._fullscreen_foreground():
+        if (self._leaving or self.quiet or not self._on_wake_strip(pt)
+                or self._fullscreen_foreground()):
             self._wake_since = 0.0
             return
         now = time.monotonic()
@@ -1049,9 +1065,15 @@ class NotchHost:
             self._auto_hide_check()
         elif kind == "notify":
             # Something worth surfacing popped up (gate, model, error): reveal
-            # the island even if the owner had it tucked away.
-            self.show_island(reason=str(msg.get("kind") or "notify"))
-            log(f"notify: {msg.get('kind')}")
+            # the island. Tucked away with the hotkey, only an approval does.
+            what = str(msg.get("kind") or "notify")
+            if self.quiet:
+                if what != "gate":
+                    log(f"notify ignored while tucked away: {what}")
+                    return
+                self._quiet_gate_seen = False
+            self.show_island(reason=what)
+            log(f"notify: {what}")
         elif kind == "open-url":
             # "Open in main app" from the notch. Restricted to the bridge's
             # own origin: the page must never become a shell-open primitive

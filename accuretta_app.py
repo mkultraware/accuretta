@@ -16,7 +16,7 @@ Package it into a single windowed .exe (no console) with PyInstaller:
     pyinstaller --noconfirm --windowed --name Accuretta ^
         --add-data "index.html;." --add-data "app.js;." --add-data "app.css;." ^
         --add-data "bridge-client.js;." --add-data "preview-runtime.js;." --add-data "appearance.js;." ^
-        --add-data "signal-field.js;." --add-data "dot-matrix.js;." --add-data "security-scan-field.js;." ^
+        --add-data "glyph-field.js;." --add-data "dot-matrix.js;." --add-data "security-scan-field.js;." ^
         --add-data "agent-orb.js;." --add-data "ui-refresh.css;." ^
         --add-data "assets;assets" ^
         --add-data "colors_and_type.css;." --add-data "manifest.webmanifest;." ^
@@ -217,15 +217,16 @@ def _read_app_version() -> str:
             return m.group(1)
     except Exception:
         pass
-    return "1.0.0"
+    return "1.0.1"
 
 
-def _signal_field_js() -> str:
-    """The splash-only dot field, inlined into the intro. The splash is a
-    self-contained HTML string with no http origin, so it can't <script src>
-    the bridge. '' if the file is missing (splash simply runs without it)."""
+def _glyph_field_js() -> str:
+    """The splash-only glyph field (the A in monospace characters), inlined
+    into the intro. The splash is a self-contained HTML string with no http
+    origin, so it can't <script src> the bridge. '' if the file is missing
+    (the splash falls back to the dot-matrix A)."""
     try:
-        return (bridge.ROOT / "signal-field.js").read_text(encoding="utf-8")
+        return (bridge.ROOT / "glyph-field.js").read_text(encoding="utf-8")
     except Exception:
         return ""
 
@@ -252,14 +253,14 @@ def _build_splash_html() -> str:
     """Theme-aware boot splash, in the notch's design language.
 
     The saved theme supplies the palette (bg / fg / muted / accent), so the
-    splash opens in the theme the app was last closed in. The matrix A
-    (dot-matrix.js, inlined) powers on once along its diagonal, twinkles,
-    and flashes when the app is ready; it is the mark, not a progress bar.
-    Progress is the hairline stage segments under the wordmark (the notch
-    plan bar's language), beside a live status line (the work pill's sheen),
-    all sitting in a soft halo cleared out of the field. Behind it,
-    signal-field.js draws a halftone dot field that widens with progress and
-    sends the app off with a ripple and a rising horizon of grains.
+    splash opens in the theme the app was last closed in. The mark is the
+    split A drawn in monospace glyphs (glyph-field.js, shape from the inlined
+    dot-matrix.js): it resolves along the notch's diagonal, then idles, and a
+    small section tag frames the part of the A for the current boot stage.
+    Corner HUD lines print the real boot clock, stage and grid. Progress is
+    still the hairline stage segments under the wordmark beside the live
+    status line. Without glyph-field.js the dot-matrix A is the mark; without
+    either, the PNG logo.
     window.__splashStage(label, pct) stays the live progress contract.
     """
     theme = _read_saved_theme()
@@ -269,15 +270,20 @@ def _build_splash_html() -> str:
     version = _read_app_version()
     dark = _is_dark(pal["bg"]) if pal["bg"].startswith("#") else theme not in _LIGHT_THEMES
     dm_l = "70%" if dark else "58%"
-    signal_js = _signal_field_js()
+    glyph_js = _glyph_field_js()
     matrix_js = _dot_matrix_js()
-    if matrix_js:
-        mark_html = '<svg class="mx" id="mx" aria-hidden="true"></svg>'
+    if matrix_js and glyph_js:
+        mark_html = '<div class="mark glyph" id="glyph-mark" aria-hidden="true"></div>'
+    elif matrix_js:
+        glyph_js = ""
+        mark_html = '<div class="mark"><svg class="mx" id="mx" aria-hidden="true"></svg></div>'
     else:
+        glyph_js = ""
         logo = _logo_data_uri(logo_theme)
-        mark_html = (f'<img src="{logo}" class="logo-img" alt="">' if logo
-                     else '<span class="logo-fallback">a</span>')
-    scripts = "".join(f"  <script>\n{js}\n  </script>\n" for js in (signal_js, matrix_js) if js)
+        mark_html = '<div class="mark">' + (f'<img src="{logo}" class="logo-img" alt="">' if logo
+                                            else '<span class="logo-fallback">a</span>') + '</div>'
+    # dot-matrix.js first: the glyph field reads the A's shape from it.
+    scripts = "".join(f"  <script>\n{js}\n  </script>\n" for js in (matrix_js, glyph_js) if js)
 
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
@@ -290,11 +296,24 @@ def _build_splash_html() -> str:
     html, body {{ width: 100%; height: 100%; }}
     body {{
       margin: 0; overflow: hidden; display: grid; place-items: center;
-      color: var(--fg); background: var(--bg);
+      color: var(--fg);
+      background: linear-gradient(180deg, var(--bg) 0%, var(--bg) 52%,
+                  color-mix(in srgb, var(--accent) 7%, var(--bg)) 100%) var(--bg);
       font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
       user-select: none; -webkit-font-smoothing: antialiased;
     }}
-    #signal-field {{ position: absolute; inset: 0; z-index: 0; pointer-events: none; }}
+    #glyph-field {{ position: absolute; inset: 0; z-index: 0; pointer-events: none; }}
+
+    /* Corner HUD: the boot's own numbers in small mono, like a specimen
+       plate's margin notes. Quiet enough to read as texture. */
+    .hud {{
+      position: absolute; top: 18px; z-index: 1;
+      font: 500 10.5px/1.65 "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+      letter-spacing: .06em; color: var(--muted); white-space: pre;
+      opacity: 0; animation: hud .9s ease .5s forwards;
+    }}
+    .hud-tl {{ left: 22px; }}
+    .hud-tr {{ right: 22px; text-align: right; }}
 
     .lockup {{
       position: relative; z-index: 1;
@@ -305,6 +324,9 @@ def _build_splash_html() -> str:
       width: 120px; height: 90px; display: grid; place-items: center;
       opacity: 0; animation: rise .7s var(--ease) .05s forwards;
     }}
+    /* The glyph A is painted by the canvas into this box. */
+    .mark.glyph {{ width: 320px; height: 237px; opacity: 1; animation: none; }}
+    .mark.glyph + h1 {{ margin-top: 30px; }}
     .mx {{ width: 120px; height: 90px; overflow: visible; }}
     .mx circle {{
       transform-box: fill-box; transform-origin: center;
@@ -381,6 +403,7 @@ def _build_splash_html() -> str:
       to   {{ opacity: 1; transform: none; }}
     }}
     @keyframes fade {{ to {{ opacity: .75; }} }}
+    @keyframes hud {{ to {{ opacity: .6; }} }}
     @keyframes sheen {{ from {{ background-position: 100% 0; }} to {{ background-position: 0% 0; }} }}
     @keyframes stepsweep {{ from {{ transform: translateX(-100%); }} to {{ transform: translateX(240%); }} }}
     @keyframes twinkle {{
@@ -397,15 +420,21 @@ def _build_splash_html() -> str:
     @media (prefers-reduced-motion: reduce) {{
       *, *::before, *::after {{ animation: none !important; transition-duration: .01ms !important; }}
       .mark, h1, .status-wrap, .steps, .foot {{ opacity: 1; transform: none; }}
+      .hud {{ opacity: .6; }}
       #status.shimmer {{ background-image: none; -webkit-text-fill-color: var(--muted); color: var(--muted); }}
     }}
   </style>
 </head>
 <body>
-  <canvas id="signal-field" aria-hidden="true"></canvas>
+  <canvas id="glyph-field" aria-hidden="true"></canvas>
+  <div class="hud hud-tl" aria-hidden="true">ACCURETTA  BOOT
+<span id="hud-clock">F 0000  00.00S</span>
+<span id="hud-stage">STAGE 01/03  3%</span></div>
+  <div class="hud hud-tr" aria-hidden="true">LOCAL RUNTIME / V{version}
+<span id="hud-grid">GRID</span></div>
 
   <main class="lockup">
-    <div class="mark">{mark_html}</div>
+    {mark_html}
     <h1>Accuretta</h1>
     <div class="status-wrap" aria-live="polite"><span id="status" class="shimmer">Preparing local runtime</span></div>
     <div class="steps" aria-hidden="true"><i class="cur"></i><i></i><i></i></div>
@@ -451,7 +480,7 @@ def _build_splash_html() -> str:
         document.body.classList.add('ready');
         var segs = document.querySelectorAll('.steps i');
         for (var i = 0; i < segs.length; i++) segs[i].className = 'done';
-        if (window.AccuSignalField) window.AccuSignalField.ready();
+        if (window.AccuGlyphField) window.AccuGlyphField.ready();
       }}
       window.__splashReadyAt = performance.now();
       window.__splashStage = function (label, pct) {{
@@ -466,13 +495,13 @@ def _build_splash_html() -> str:
         if (typeof pct === 'number') {{
           var value = Math.max(0, Math.min(100, pct));
           steps(value);
-          if (window.AccuSignalField) window.AccuSignalField.setProgress(value / 100);
+          if (window.AccuGlyphField) window.AccuGlyphField.setStage(value);
           if (value >= 100) setTimeout(ready, 120);
         }}
       }};
       powerOn();
       steps(3);
-      if (window.AccuSignalField) window.AccuSignalField.setProgress(.03);
+      if (window.AccuGlyphField) window.AccuGlyphField.setStage(3);
     }})();
   </script>
 </body></html>"""

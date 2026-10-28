@@ -82,3 +82,7 @@ AUDIT_AND_ROADMAP.md
 
 # internal test suite, not shipped to users
 tests/
+
+# launch videos and pages: large or one-off, kept local
+assets/social/*.mp4
+assets/social/v*-launch.html

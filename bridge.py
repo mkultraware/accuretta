@@ -7669,6 +7669,14 @@ def bridge_self_threat(cmd: str) -> str | None:
 
 _SOFT_PROMPT_KINDS = {"delete", "registry", "launch"}
 _SOFT_COMMAND_KINDS = {"powershell", "sandbox", "session", "git", "test"}
+# Tool kinds soft mode runs without asking: analysis tools that read, or write
+# only their own output. A kind not named here or handled by its own rule asks,
+# so a new tool can't slip through soft mode unreviewed.
+_SOFT_AUTO_KINDS = {
+    "analyze_pcap", "decompile_apk", "carve_file", "extract_archive", "extract_squashfs",
+    "event_log", "ghidra_analyze", "network_snapshot", "parse_event_log", "persistence_hunt",
+    "recon_s3", "save_skill", "secret_scan",
+}
 _MCP_SOFT_BLOCK = re.compile(r"delete|remove|drop|destroy|terminate|unregister", re.IGNORECASE)
 
 # git verbs that only read the repo: the only ones soft mode runs freely.
@@ -7788,17 +7796,22 @@ def _soft_command_needs_approval_raw(cmd: str) -> bool:
 #     path inside a workspace project or the temp folder (deletions inside a
 #     project, never a project or workspace root). Relative paths need an
 #     explicit `cd` first: the bridge's own cwd is the app folder;
-#   - Start-Process / Invoke-Item may open a document, not a program;
+#   - Start-Process / Invoke-Item may open a document, not a program, and may
+#     start a dev tool (python, node, npm, ...) in the background;
 #   - git may also clone, fetch, init and add;
-#   - copies and moves into system, startup, profile, .ssh or app folders ask.
+#   - copies and moves into system, startup, profile, .ssh or app folders ask;
+#   - code the command runs is read too (see "code a command runs" below).
 # Anything it cannot resolve (a path in an unknown variable, a pipeline-fed
 # Remove-Item) still asks.
 
+# Evaluators whose text can't be followed: iex, cmd /c, wsl, ... (PowerShell
+# -Command and, in the sandbox, bash -c are read like any other command).
 _SOFT_EVALUATOR_RE = re.compile(
     r"\b(?:iex|invoke-expression|invoke-command|wmic)\b|scriptblock\]::create|invokecommand\."
-    r"|\b(?:powershell|pwsh)(?:\.exe)?\b|\bcmd(?:\.exe)?\s+/[ckr]\b"
-    r"|\b(?:bash|sh|zsh|dash|ksh)(?:\.exe)?\s+-\w*c\b|\bwsl(?:\.exe)?\b",
+    r"|\bcmd(?:\.exe)?\s+/[ckr]\b|\bwsl(?:\.exe)?\b",
     re.IGNORECASE)
+_SOFT_HOST_SHELL_C_RE = re.compile(r"\b(?:bash|sh|zsh|dash|ksh)(?:\.exe)?\s+-\w*c\b", re.IGNORECASE)
+_SOFT_OPAQUE_HEADS = {"iex", "invoke-expression", "invoke-command", "wmic", "wsl"}
 
 # Patterns from the raw lists that the assessment resolves structurally
 # (deletions, file writes, redirects, launches); every other pattern in those
@@ -7968,10 +7981,11 @@ def _shell_code_view(cmd: str, posix: bool) -> tuple[str, list[str]]:
     return "".join(out), lits
 
 
-def _soft_split_commands(code: str, lits: list[str]) -> list[tuple[str, list[str]]]:
-    """(command word, argument tokens) for every simple command in the code
-    view, in order. Splits on ; | & newlines and braces/parens, and skips
-    leading keywords and wrappers (then, sudo, xargs, ...)."""
+def _soft_split_commands(code: str, lits: list[str]) -> list[tuple[str, list[str], str]]:
+    """(command word, argument tokens, head as written) for every simple
+    command in the code view, in order. Splits on ; | & newlines and
+    braces/parens, and skips leading keywords and wrappers (then, sudo,
+    xargs, ...)."""
     commands = []
     for chunk in re.split(r"\|\||&&|[;|&\n{}()]", code):
         tokens = chunk.split()
@@ -7982,7 +7996,8 @@ def _soft_split_commands(code: str, lits: list[str]) -> list[tuple[str, list[str
             quoted = re.fullmatch(r'"(\d+)"', head)
             if quoted:                       # & "Remove-Item" path, & "C:\tools\x.exe"
                 head = lits[int(quoted.group(1))]
-            commands.append((head.lower().rsplit("\\", 1)[-1].removesuffix(".exe"), tokens[1:]))
+            name = head.lower().replace("/", "\\").rsplit("\\", 1)[-1].removesuffix(".exe")
+            commands.append((name, tokens[1:], tokens[0]))
     return commands
 
 
@@ -8185,18 +8200,333 @@ def _soft_param_values(args: list[str], params: tuple[str, ...]) -> list[str]:
     return values
 
 
-def _soft_command_concerns(cmd: str, kind: str = "powershell", cwd: str | None = None) -> list[str]:
+# ---- code a command runs ------------------------------------------------------
+# The command line is only half the story when it runs code. Reading it alone
+# let `python -c "shutil.rmtree(...)"`, `node -e`, or a cleanup.py the model
+# had just written run without a question. Soft now reads that code too:
+#   - PowerShell scripts, `powershell -Command` text and, in the sandbox, shell
+#     scripts and `bash -c` text go through this same assessment;
+#   - Python and JavaScript (-c / -e code, heredocs and pipes into the
+#     interpreter, script files) are scanned for deletions, registry writes,
+#     shell commands that would ask on their own, and writes into protected
+#     folders. A deletion passes when the code runs from inside the workspace
+#     or temp (or works from its own folder there) and names no path outside;
+#   - code that can't be read (a missing or huge script, -EncodedCommand)
+#     asks.
+# A tripwire for a careless or misled model, not a sandbox: code that pulls its
+# damage from another module, or builds paths at runtime, still gets through.
+
+_SOFT_PY_NAME_RE = re.compile(r"python[\d.]*w?|py")
+_SOFT_JS_RUNNERS = {"node", "deno", "bun", "tsx", "ts-node"}
+_SOFT_PS_HOSTS = {"powershell", "pwsh"}
+_SOFT_SH_HOSTS = {"bash", "sh", "zsh", "dash", "ksh"}
+_SOFT_SCRIPT_EXTS = {".py": "python", ".pyw": "python", ".js": "js", ".mjs": "js", ".cjs": "js",
+                     ".ts": "js", ".mts": "js", ".ps1": "ps", ".sh": "sh", ".bash": "sh"}
+# Start-Process may run these in the background. Running them in the
+# foreground already passes, so this is the same check (their code is read).
+_SOFT_DEV_TOOLS = {"python", "python3", "pythonw", "py", "node", "deno", "bun", "tsx", "ts-node",
+                   "npm", "npx", "pnpm", "yarn", "uv", "uvicorn", "java", "dotnet", "go", "cargo"}
+_SOFT_SCRIPT_MAX_BYTES = 1_000_000
+
+_SOFT_CODE_DELETE_RES = {
+    "python": re.compile(r"\b(?:shutil\.rmtree|rmtree|os\.(?:remove|unlink|rmdir|removedirs)|send2trash)\b"
+                         r"|\.(?:unlink|rmdir)\s*\("),
+    "js": re.compile(r"\b(?:rmSync|rmdirSync|unlinkSync|rimraf|emptyDirSync|removeSync|Deno\.remove(?:Sync)?)\b"
+                     r"|\b(?:fse?|fsp|promises)\.(?:rm|rmdir|unlink|remove|emptyDir)\s*\("
+                     r"|(?<![.\w])(?:rm|rmdir|unlink)\s*\("),
+}
+_SOFT_CODE_WRITE_RES = {
+    "python": re.compile(r"\bopen\s*\([^)]*['\"][rbt+]*[wax]|\bwrite_(?:text|bytes)\b"
+                         r"|\bshutil\.(?:copy\w*|move)\b|\bos\.(?:rename|replace|symlink)\b"),
+    "js": re.compile(r"\b(?:writeFile|appendFile|copyFile|createWriteStream|cpSync|symlink)\w*"
+                     r"|\b(?:fse?|fsp|promises)\.(?:rename|cp|copy|move)\w*\s*\("),
+}
+_SOFT_CODE_SPAWN_RE = re.compile(
+    r"\b(?:subprocess|os\.system|os\.popen|Popen|child_process|execSync|execFileSync|spawnSync|"
+    r"execa|Deno\.Command|Bun\.spawn|shelljs)\b|(?<![.\w])(?:exec|spawn|execFile)\s*\(")
+# A destructive program as the first item of an argv list: ["rm", "-rf", x].
+_SOFT_CODE_ARGV_RE = re.compile(
+    r"[\[(,]\s*[rbuf]?['\"](?:rm|del|erase|rmdir|rd|remove-item|reg|regedit|schtasks|sc|taskkill|"
+    r"shutdown|format|diskpart|bcdedit|netsh|cipher|vssadmin|takeown|icacls)(?:\.exe)?['\"]",
+    re.IGNORECASE)
+_SOFT_CODE_REGISTRY_RE = re.compile(r"\bwinreg\.(?:SetValue\w*|DeleteKey\w*|DeleteValue|CreateKey\w*)")
+# Reaching for the home folder or a system folder through the environment.
+_SOFT_CODE_HOME_RE = re.compile(
+    r"\b(?:expanduser|Path\.home|homedir|USERPROFILE|APPDATA|LOCALAPPDATA|HOMEPATH|HOMEDRIVE|"
+    r"PROGRAMDATA|SYSTEMROOT|WINDIR|OneDrive|HOME)\b|['\"`]~[\\/]")
+_SOFT_CODE_SELF_DIR_RE = re.compile(r"__file__|__dirname|import\.meta|Deno\.mainModule|sys\.argv\[0\]")
+_SOFT_CODE_STRING_RE = re.compile(r"[rRbBuUfF]{0,2}(\"\"\"|'''|\"|'|`)(.*?)(?<!\\)\1", re.DOTALL)
+# Shell patterns that mean the same in code as on the command line; the rest
+# (redirects, Start-Process, kill, installs) are ordinary inside a program.
+_SOFT_CODE_SHELL_RES = [p for p in (*_SOFT_DESTRUCTIVE_RES, *_SOFT_ALWAYS_ASK_RES)
+                        if not any(w in p.pattern for w in (
+                            "kill(?:all)", "explorer", "pip3", "npm", "certutil", "download",
+                            "|\\s*(?:sh", "find\\b", "itemproperty"))]
+
+
+_SOFT_DOWNLOAD_RE = re.compile(
+    r"\b(?:iwr|irm|invoke-webrequest|invoke-restmethod|start-bitstransfer|wget|curl(?:\.exe)?)\b"
+    r"|\b(?:downloadfile|downloadstring)\b|-outfile\b", re.IGNORECASE)
+
+
+def _soft_local_path(resolved: tuple[str, str]) -> str:
+    """Where this side can open a resolved path (sandbox paths through
+    \\\\wsl.localhost)."""
+    zone, path = resolved
+    if zone == "guest":
+        return "\\\\wsl.localhost\\" + SANDBOX_DISTRO + path.replace("/", "\\")
+    return path
+
+
+def _soft_read_script(resolved: tuple[str, str] | None) -> str | None:
+    """Text of a script about to run, or None when it can't be read (missing,
+    unresolved, too large). A folder runs its entry file (index.js, the
+    package.json main, __main__.py)."""
+    if resolved is None:
+        return None
+    path = _soft_local_path(resolved)
+    if os.path.isdir(path):
+        main = None
+        try:
+            with open(os.path.join(path, "package.json"), encoding="utf-8") as f:
+                main = json.load(f).get("main")
+        except (OSError, ValueError, AttributeError):
+            pass
+        for name in filter(None, (main, "index.js", "index.mjs", "__main__.py")):
+            if os.path.isfile(os.path.join(path, name)):
+                path = os.path.join(path, name)
+                break
+    try:
+        if os.path.getsize(path) > _SOFT_SCRIPT_MAX_BYTES:
+            return None
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _soft_code_run(name: str, head: str, args: list[str], posix: bool) -> tuple[str, str, str | None] | None:
+    """What code a simple command runs: (language, how, token). `how` is
+    "inline" (token holds the code), "file" (token is the script path),
+    "command" (PowerShell -Command text), "stdin" or "opaque". None when the
+    command runs no code soft can read, e.g. `python -m http.server`."""
+    ext = os.path.splitext(name)[1]
+    if ext in _SOFT_SCRIPT_EXTS and not name.startswith("-"):
+        lang = _SOFT_SCRIPT_EXTS[ext]
+        return (lang, "file", head) if lang != "sh" or posix else None
+    if _SOFT_PY_NAME_RE.fullmatch(name):
+        lang, inline, valued = "python", {"-c"}, {"-x", "-w", "-q"}
+    elif name in _SOFT_JS_RUNNERS:
+        if name == "node" and any(a.lower() in ("-c", "--check") for a in args):
+            return None                      # syntax check only
+        lang, inline = "js", {"-e", "--eval", "-p", "--print"}
+        valued = {"-r", "--require", "--import", "--loader", "--input-type", "--env-file", "--conditions"}
+        if name in ("deno", "bun") and args:
+            sub = args[0].lower()
+            if sub == "eval":
+                return "js", "inline", next((a for a in args[1:] if not a.startswith("-")), None)
+            if sub == "run":
+                args = args[1:]
+            elif name == "deno" or os.path.splitext(sub)[1] not in _SOFT_SCRIPT_EXTS:
+                return None                  # deno fmt, bun install, bun x ...
+    elif name in _SOFT_PS_HOSTS:
+        i = 0
+        while i < len(args):
+            low = args[i].lower()
+            if low in ("-file", "-f"):
+                return "ps", "file", args[i + 1] if i + 1 < len(args) else None
+            if low in ("-command", "-c"):
+                return "ps", "command", " ".join(args[i + 1:])
+            if low in ("-encodedcommand", "-enc", "-e", "-ec"):
+                return "ps", "opaque", None
+            if low in ("-executionpolicy", "-ep", "-windowstyle", "-outputformat", "-inputformat",
+                       "-configurationname", "-version", "-psconsolefile", "-workingdirectory", "-wd"):
+                i += 2
+                continue
+            if not low.startswith("-"):
+                rest = " ".join(args[i:])
+                return ("ps", "file", args[i]) if name == "pwsh" else ("ps", "command", rest)
+            i += 1
+        return None
+    elif name in _SOFT_SH_HOSTS and posix:
+        for i, a in enumerate(args):
+            if re.fullmatch(r"-\w*c", a):
+                return "sh", "inline", args[i + 1] if i + 1 < len(args) else None
+            if not a.startswith("-"):
+                return "sh", "file", a
+        return None
+    else:
+        return None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        low = a.lower()
+        if low in inline:
+            return lang, "inline", args[i + 1] if i + 1 < len(args) else None
+        if lang == "python" and low == "-m":
+            return None
+        if a == "-":
+            return lang, "stdin", None
+        if low in valued:
+            i += 2
+            continue
+        if a.startswith("<"):                # heredoc / redirect feeding stdin
+            return lang, "stdin", None
+        if re.match(r"[\d*]?>|&>", a):       # output redirect: `2>&1`, `> out.txt`
+            i += 1 if re.search(r">.", a.lstrip("&")) or a.endswith("&1") else 2
+            continue
+        if not a.startswith("-"):
+            return lang, "file", a
+        i += 1
+    return (lang, "stdin", None) if not args else None
+
+
+def _soft_scan_code(code: str, lang: str, label: str, *, base_ok: bool, self_dir_ok: bool,
+                    posix: bool) -> list[str]:
+    """Concerns for Python or JavaScript source about to run. `base_ok`: the
+    process runs from inside the workspace or temp. `self_dir_ok`: the code's
+    own file sits there (it counts when the code builds paths from it)."""
+    concerns = []
+    strings = [m.group(2) for m in _SOFT_CODE_STRING_RE.finditer(code)]
+    outside, protected = [], []
+    for s in strings:
+        value = s.replace("\\\\", "\\").strip()
+        if not (re.match(r"^[a-zA-Z]:[\\/]|^\\\\|^~[\\/]", value) or (posix and value.startswith("/"))):
+            if value.startswith(".." + os.sep) or value.startswith("../") or value == "..":
+                outside.append(value)
+            continue
+        res = _soft_resolve('"0"', [value], {}, None, posix)
+        if _soft_protected(res):
+            protected.append(value)
+        if not _soft_target_ok(res, delete=False):
+            outside.append(value)
+    if _SOFT_CODE_DELETE_RES[lang].search(code):
+        here_ok = base_ok or (self_dir_ok and bool(_SOFT_CODE_SELF_DIR_RE.search(code)))
+        if outside:
+            concerns.append(f"{label} deletes files and names a path outside your workspace: {outside[0][:120]}")
+        elif _SOFT_CODE_HOME_RE.search(code):
+            concerns.append(f"{label} deletes files and reaches for your home or a system folder")
+        elif not here_ok:
+            concerns.append(f"{label} deletes files and runs from outside your workspace")
+    if protected and _SOFT_CODE_WRITE_RES[lang].search(code):
+        concerns.append(f"{label} writes into a protected folder: {protected[0][:120]}")
+    if _SOFT_CODE_REGISTRY_RE.search(code):
+        concerns.append(f"{label} changes the Windows registry")
+    if _SOFT_CODE_SPAWN_RE.search(code):
+        if _SOFT_CODE_ARGV_RE.search(code):
+            concerns.append(f"{label} runs a program that deletes or changes the system")
+        for s in strings:
+            hit = next((p for p in _SOFT_CODE_SHELL_RES if p.search(s)), None)
+            if hit:
+                concerns.append(f"{label} runs a shell command that {_soft_pattern_label(hit)}"
+                                if hit in _SOFT_ALWAYS_ASK_RES
+                                else f"{label} runs a shell command that deletes files")
+                break
+    return concerns
+
+
+def _soft_code_concerns(run: tuple[str, str, str | None], lits: list[str], variables: dict[str, str],
+                        cwd: str | None, posix: bool, kind: str, stdin_code: str | None,
+                        depth: int, command_text: str) -> list[str]:
+    """Concerns for the code one command runs (see _soft_code_run)."""
+    lang, how, token = run
+    if depth >= 3:
+        return ["runs code nested too deep to check"]
+    if how == "opaque":
+        return ["runs an encoded PowerShell command that can't be read"]
+    def literal(tok: str | None) -> str | None:
+        if tok is None:
+            return None
+        return re.sub(r'"(\d+)"', lambda m: lits[int(m.group(1))], tok)
+    if how == "file":
+        # The script resolves against the real process folder (the app folder
+        # on the host when nothing cd'd), unlike deletions, which need a cd.
+        res = _soft_resolve(token, lits, variables, cwd or (None if posix else os.getcwd()),
+                            posix) if token else None
+        shown = (lits[int(token[1:-1])] if token and re.fullmatch(r'"\d+"', token) else token) or "?"
+        label = f"script {os.path.basename(shown.replace('/', os.sep))}"
+        code = _soft_read_script(res)
+        if code is None and res is not None and not os.path.exists(_soft_local_path(res)):
+            # Not there yet: either the same command writes it (its text is
+            # in the command, so read that), downloads it, or it fails.
+            if _SOFT_DOWNLOAD_RE.search(command_text):
+                return [f"runs a script the same command downloads: {shown}"]
+            base = os.path.basename(res[1].replace("/", "\\").rsplit("\\", 1)[-1]).lower()
+            if command_text.lower().count(base) < 2:
+                return []
+            code, label = "\n".join(lits), f"{label} (written by this command)"
+        if code is None:
+            return [f"runs a script that can't be read: {shown}"]
+        sep = "/" if res[0] == "guest" else "\\"
+        script_dir = res[1].rsplit(sep, 1)[0] or sep
+        self_dir_ok = _soft_target_ok((res[0], script_dir), delete=False)
+    else:
+        code = stdin_code if how == "stdin" else literal(token)
+        if code is None:
+            return [f"runs {'Python' if lang == 'python' else 'code'} from input that can't be read"]
+        label = {"python": "the Python code", "js": "the JavaScript code",
+                 "ps": "powershell -Command", "sh": "bash -c"}[lang]
+        script_dir, self_dir_ok = None, False
+    if lang in ("ps", "sh"):
+        inner_kind = "sandbox" if lang == "sh" else ("session" if kind == "session" else "powershell")
+        preset = {"psscriptroot": script_dir} if lang == "ps" and script_dir else {}
+        inner = _soft_command_concerns(code, inner_kind, cwd, _depth=depth + 1, _vars=preset)
+        if how == "file":
+            # Build and helper scripts cd around and write to computed paths;
+            # inside a script only writes known to land outside still ask.
+            inner = [c for c in inner if not c.startswith("writes somewhere that can't be checked")]
+        return [f"{label}: {c}" for c in inner]
+    base_zone = "guest" if posix and cwd and cwd.startswith("/") else "host"
+    base_ok = bool(cwd) and _soft_target_ok((base_zone, cwd), delete=False)
+    return _soft_scan_code(code, lang, label, base_ok=base_ok, self_dir_ok=self_dir_ok, posix=posix)
+
+
+def _soft_delete_reason(res: tuple[str, str] | None, shown: str) -> str:
+    """Why a deletion target asks, in words that name what would be lost."""
+    if res is None:
+        return f"deletes something that can't be checked: {shown}"
+    if res[0] == "guest":
+        return f"deletes a top-level folder in the sandbox: {shown}"
+    path = res[1].rstrip("\\*")
+    for root in _workspace_roots():
+        depth = _soft_depth_under(path, root)
+        if depth == 0:
+            return f"deletes your whole workspace folder: {shown}"
+        if depth == 1:
+            if os.path.isdir(path) or not os.path.splitext(path)[1]:
+                return f"deletes a whole project folder: {shown}"
+            return f"deletes a file at the top of your workspace that isn't there yet: {shown}"
+        if depth >= 2:
+            return f"deletes something that can't be checked: {shown}"
+    if any(_soft_depth_under(path, root) == 0 for root in _soft_temp_roots()):
+        return f"deletes the whole temp folder: {shown}"
+    return f"deletes outside your workspace: {shown}"
+
+
+def _soft_command_concerns(cmd: str, kind: str = "powershell", cwd: str | None = None, *,
+                           code_out: list | None = None, _depth: int = 0,
+                           _vars: dict[str, str] | None = None) -> list[str]:
     """Why soft mode should ask before running this command line; empty when
-    it can run. See the section comment above for the rules."""
+    it can run. See the section comment above for the rules. Concerns that
+    come from code the command runs are also added to `code_out` (/goal gates
+    on those, since its own check only reads the command line)."""
     text = cmd or ""
     if not text.strip():
         return []
-    if _SOFT_EVALUATOR_RE.search(text):
-        if _soft_command_needs_approval_raw(text):
-            return ["passes text to another shell (cmd /c, bash -c, ...), so it can't be checked"]
-        return []
     posix = kind == "sandbox"
     code, lits = _shell_code_view(text, posix)
+    commands = _soft_split_commands(code, lits)
+    if (_SOFT_EVALUATOR_RE.search(code) or (not posix and _SOFT_HOST_SHELL_C_RE.search(code))
+            or any(name in _SOFT_OPAQUE_HEADS or (name == "cmd" and any(a.lower() in ("/c", "/k", "/r") for a in args))
+                   for name, args, _ in commands)):
+        # Merges and null-device redirects never write anything.
+        raw = re.sub(r"[\d*]?>&\d|[\d*]?>\s*(?:\$null|nul|/dev/null)(?![\w/])", " ", text, flags=re.IGNORECASE)
+        if _soft_command_needs_approval_raw(raw):
+            reasons = ["passes text to another shell (cmd /c, iex, ...), so it can't be checked"]
+            if code_out is not None:
+                code_out.extend(reasons)
+            return reasons
+        return []
     concerns: list[str] = []
     # Literals put back (separators blanked) for the argument-sensitive patterns.
     inlined = re.sub(r'"(\d+)"',
@@ -8207,12 +8537,35 @@ def _soft_command_concerns(cmd: str, kind: str = "powershell", cwd: str | None =
     if _SOFT_HTTP_DELETE_RE.search(text):
         concerns.append("sends an HTTP DELETE request")
 
-    variables = _soft_assignments(code, lits, posix)
+    variables = {**(_vars or {}), **_soft_assignments(code, lits, posix)}
     resolve = lambda tok: _soft_resolve(tok, lits, variables, cur_cwd, posix)  # noqa: E731
 
     def show(tok: str) -> str:
         m = re.fullmatch(r'"(\d+)",?', tok)
         return lits[int(m.group(1))] if m else tok
+
+    # Code fed on stdin: heredoc bodies (in order) and literals or variables
+    # piped straight into an interpreter.
+    heredocs = [lits[int(m.group(2))] for m in re.finditer(r"<<-?\s*(['\"]?)\w+\1[^\n]*\n\"(\d+)\"", code)]
+    piped = []
+    for m in re.finditer(r"(?:\"(\d+)\"|\$(\w+))\s*\|\s*(?:&\s*)?(?:python[\d.]*w?|py|node|deno|bun)(?:\.exe)?\b",
+                         code, re.IGNORECASE):
+        piped.append(lits[int(m.group(1))] if m.group(1) else variables.get(m.group(2).lower()))
+
+    def code_concerns(run, run_cwd, args) -> list[str]:
+        stdin_code = None
+        if run[1] == "stdin":
+            fed = any(a.startswith("<<") and not a.startswith("<<<") for a in args)
+            if fed and heredocs_left:
+                stdin_code = heredocs_left.pop(0)
+            elif piped:
+                stdin_code = piped.pop(0)
+            elif not args:
+                return []                    # a bare REPL start (session input)
+        found = _soft_code_concerns(run, lits, variables, run_cwd, posix, kind, stdin_code, _depth, text)
+        if code_out is not None:
+            code_out.extend(found)
+        return found
 
     # Redirects: drop stream merges and null-device targets, check the rest.
     cur_cwd = cwd
@@ -8230,7 +8583,8 @@ def _soft_command_concerns(cmd: str, kind: str = "powershell", cwd: str | None =
                                 else f"writes outside your workspace: {literal_target}")
 
     cur_cwd = cwd
-    for name, args in _soft_split_commands(code, lits):
+    heredocs_left = list(heredocs)
+    for name, args, head in commands:
         if name in _SOFT_CD_VERBS:
             dest = next((a for a in args if not a.startswith("-")), None)
             res = _soft_resolve(dest, lits, variables, cur_cwd, posix) if dest else None
@@ -8239,6 +8593,15 @@ def _soft_command_concerns(cmd: str, kind: str = "powershell", cwd: str | None =
         if name in ("popd", "pop-location"):
             cur_cwd = None
             continue
+        run = _soft_code_run(name, head, args, posix)
+        if (run and not posix and re.fullmatch(r'"\d+"', head)
+                and not re.search(r"(?:&|(?:^|[\s;(])\.)\s*" + re.escape(head), code)):
+            run = None                       # a bare string is output, not a call: $c.IndexOf("x.js")
+        if run:
+            concerns += code_concerns(run, cur_cwd, args)
+            continue
+        if any(a.startswith("<<") and not a.startswith("<<<") for a in args) and heredocs_left:
+            heredocs_left.pop(0)             # cat > file <<EOF: the body is data
         if name == "git":
             verb, rest = None, list(args)
             while rest:
@@ -8271,8 +8634,7 @@ def _soft_command_concerns(cmd: str, kind: str = "powershell", cwd: str | None =
                     sep = "/" if res[0] == "guest" else "\\"
                     res = (res[0], res[1].rstrip(sep) + sep + "*")
                 if not _soft_target_ok(res, delete=True):
-                    concerns.append(f"deletes something that can't be checked: {show(t)}" if res is None
-                                    else f"deletes outside a workspace project: {show(t)}")
+                    concerns.append(_soft_delete_reason(res, show(t)))
             continue
         if name in _SOFT_WRITE_VERBS and not posix:
             named, positional, _ = _soft_positional(args, ("-path", "-literalpath", "-filepath"))
@@ -8304,6 +8666,28 @@ def _soft_command_concerns(cmd: str, kind: str = "powershell", cwd: str | None =
         if name in _SOFT_OPEN_VERBS and not posix:
             named, positional, flags = _soft_positional(args, ("-filepath", "-path", "-literalpath"))
             target = (named or positional or [None])[0]
+            tool = show(target).lower().replace("/", "\\").rsplit("\\", 1)[-1].removesuffix(".exe") if target else ""
+            if tool in _SOFT_DEV_TOOLS and not flags & {"-verb", "-credential"}:
+                # A dev server or script in the background: check it as if run directly.
+                pieces, i = [], 0
+                while i < len(args):
+                    if args[i].lower() in ("-argumentlist", "-args"):
+                        j = i + 1
+                        while j < len(args) and not re.match(r"-[a-z]", args[j], re.IGNORECASE):
+                            pieces += [p for p in args[j].split(",") if p]
+                            j += 1
+                        break
+                    i += 1
+                values = [show(p) for p in pieces]
+                argline = values[0] if len(values) == 1 else " ".join(
+                    f'"{v}"' if " " in v and not v.startswith('"') else v for v in values)
+                workdir = _soft_param_values(args, ("-workingdirectory",))
+                wd_res = resolve(workdir[0]) if workdir else None
+                run_cwd = wd_res[1] if wd_res else (None if workdir else cur_cwd)
+                inner = _soft_command_concerns(f"{tool} {argline}", kind, run_cwd, code_out=code_out,
+                                               _depth=_depth + 1)
+                concerns += [f"background {tool}: {c}" for c in inner]
+                continue
             res = resolve(target) if target else None
             is_doc = bool(res) and os.path.splitext(res[1])[1].lower() in _SOFT_DOC_EXTS
             if flags & {"-argumentlist", "-args", "-verb"} or not is_doc:
@@ -8339,13 +8723,13 @@ def _soft_command_needs_approval(cmd: str, kind: str = "powershell", cwd: str | 
     return bool(_soft_command_concerns(cmd, kind, cwd))
 
 
-def _diff_preview_rows(old: str, new: str, max_rows: int = 8,
-                       max_chars: int = 96) -> tuple[list, int, int]:
-    """Small +N/−M preview for approval gates, as [op, text] row pairs.
+def _diff_preview_rows(old: str, new: str, max_rows: int = 400,
+                       max_chars: int = 160) -> tuple[list, int, int]:
+    """+N/−M preview for approval gates, as [op, text] row pairs.
 
-    Capped so the broadcast payload (and the notch's gate card) stay tiny:
-    at most max_rows rows are attached, but adds/dels count every changed
-    line. Pure difflib — no external diff process."""
+    The notch's gate card scrolls through these. Capped so the broadcast
+    payload stays bounded: at most max_rows rows are attached, but adds/dels
+    count every changed line. Pure difflib — no external diff process."""
     old_lines = str(old or "").splitlines()
     new_lines = str(new or "").splitlines()
     adds = dels = 0
@@ -8480,12 +8864,21 @@ def _parse_goal_command(text: str) -> tuple[str, str | None]:
     return rest, "on"
 
 
-def _goal_action_is_gated(kind, command: str) -> bool:
+def _goal_action_is_gated(kind, command: str, cwd: str | None = None) -> bool:
     """True when a request must keep its approval gate even under /goal: a
-    deletion/destructive kind, or a shell/git command line that deletes or
+    deletion/destructive kind, a shell/git command line that deletes or
     overwrites data (rm, del, format, reg delete, git reset --hard, force
-    push, ...)."""
-    return bool(kind in _GOAL_GATE_KINDS or _is_destructive_command(command or ""))
+    push, ...), or code it runs that soft mode would stop for."""
+    if kind in _GOAL_GATE_KINDS or _is_destructive_command(command or ""):
+        return True
+    if kind in _SOFT_COMMAND_KINDS and kind != "git":
+        code_concerns: list[str] = []
+        try:
+            _soft_command_concerns(command or "", kind, cwd, code_out=code_concerns)
+        except Exception:
+            return True
+        return bool(code_concerns)
+    return False
 
 
 def _apply_goal_latch(chat_id: str, on: bool) -> bool:
@@ -8615,7 +9008,7 @@ def request_approval(title: str, command: str, details: dict | None = None, time
             # soft/medium/hard mode. Critical, force_prompt and web-tainted requests were
             # already excluded above; destructive ones fall through to the normal gate.
             if _chat_in_goal_mode(_get_current_chat()):
-                if _goal_action_is_gated(kind, command):
+                if _goal_action_is_gated(kind, command, details.get("cwd")):
                     details.setdefault("goal_gated", True)
                 else:
                     return {"status": "goal-auto-approved", "decision": "approve",
@@ -8660,7 +9053,7 @@ def request_approval(title: str, command: str, details: dict | None = None, time
                         return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
                     # Shown on the approval card: why Soft stopped for this one.
                     details["soft_reasons"] = concerns[:4]
-                elif kind:
+                elif kind in _SOFT_AUTO_KINDS:
                     return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
     except Exception:
         pass
@@ -9529,10 +9922,16 @@ def tool_edit_file(args: dict) -> dict:
         diff_lines.append(f"- {a['old'][:50]}")
         diff_lines.append(f"+ {a['new'][:50]}")
     preview = "\n".join(diff_lines) if diff_lines else "(no preview)"
+    _ef_details = {"kind": "edit_file", "path": path, "edits": len(applied), "preview": preview}
+    # Full line diff for the approval card (the notch scrolls through it).
+    _diff_rows, _adds, _dels = _diff_preview_rows(text, modified)
+    if _diff_rows:
+        _ef_details["diff"] = _diff_rows
+        _ef_details["diff_counts"] = {"adds": _adds, "dels": _dels}
     approval = request_approval(
         title="Edit file",
         command=f'edit {len(applied)} location(s) in "{path}"',
-        details={"kind": "edit_file", "path": path, "edits": len(applied), "preview": preview},
+        details=_ef_details,
     )
     if approval.get("decision") != "approve":
         return {"error": f"user denied edit ({approval.get('status')})"}
@@ -23880,6 +24279,23 @@ def _mcp_start_async(name: str, server_config: dict) -> None:
                      daemon=True, name=f"mcp-start-{name}").start()
 
 
+def _mcp_tool_tokens(registered: list) -> int:
+    """Rough context cost of a server's tool definitions (name, description
+    and input schema as the model receives them), at ~4 characters a token.
+    Shown in the MCP popover; it's an estimate, not a tokenizer count."""
+    chars = 0
+    for name in registered:
+        spec = TOOLS.get(name)
+        if not spec:
+            continue
+        try:
+            chars += len(json.dumps({"name": name, "description": spec.get("description", ""),
+                                     "parameters": spec.get("parameters", {})}))
+        except (TypeError, ValueError):
+            chars += len(name) + len(str(spec.get("description", "")))
+    return (chars + 3) // 4
+
+
 def _mcp_list_servers() -> dict:
     out = {"file": _MCP_CONFIG_FILE.name, "servers": [], "error": ""}
     try:
@@ -23904,6 +24320,7 @@ def _mcp_list_servers() -> dict:
                 "state": state,
                 "error": st.get("error", "") if state == "error" else "",
                 "tools": st.get("tools", []) if state == "running" else [],
+                "tokens": _mcp_tool_tokens(st.get("registered") or []) if state == "running" else 0,
                 "stderr": (st.get("stderr") or [])[-12:] if state == "error" else [],
                 "started": st.get("started") or 0,
             })
@@ -34764,7 +35181,7 @@ MIME = {
 
 STATIC_WHITELIST = {
     "bridge-client.js", "preview-runtime.js",
-    "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css", "signal-field.js",
+    "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css", "glyph-field.js",
     "research-ui.js", "research-ui.css", "dropdown-menus.js",
     "security-scan-field.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css", "theme-flowlines.js",
     "dot-matrix.js", "workbench.css", "opal.css",
@@ -35084,7 +35501,7 @@ class Handler(BaseHTTPRequestHandler):
         live_ui_asset = name in {
             "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css",
             "research-ui.js", "research-ui.css", "dropdown-menus.js",
-            "signal-field.js", "security-scan-field.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css", "theme-flowlines.js",
+            "glyph-field.js", "security-scan-field.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css", "theme-flowlines.js",
             "dot-matrix.js", "workbench.css", "opal.css",
             "accuretta-notch.html", "notch-wire.js", "notch-markdown.js",
         }

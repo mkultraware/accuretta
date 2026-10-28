@@ -451,7 +451,8 @@
 .wb-meter-v { font: 500 10.5px/1 var(--font-mono); color: var(--fg-faint); }
 
 /* ---- replies ---- */
-.tool-line .wb-count {
+.tool-line .wb-count,
+.tcard-row .wb-count {
   margin-left: 2px;
   padding: 0 5px;
   border-radius: 4px;
@@ -1291,3 +1292,656 @@ body.wb-composer #toolbar-overflow-menu :is(#btn-attach-image, #btn-attach-file,
 #faq-page .faq-keys dd { margin: 0; }
 #faq-page .faq-keys kbd { display: inline-block; padding: 1px 6px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px; color: var(--fg); background: var(--bg-raised); font: 500 11.5px/1.6 var(--font-mono); }
 @media (max-width: 600px) { #faq-page .faq-keys { grid-template-columns: 1fr; gap: 2px; } #faq-page .faq-keys dd { margin-bottom: 8px; } }
+
+/* ---- tool card ----
+   One card per agent turn (app.js, tcard*). It always fills the reply
+   column, so changing labels never resize it. Collapsed: a single line, the
+   latest action, swapped in place by a short vertical tick. Expanded: every
+   call, four rows tall, earlier calls a scroll up; rows open for details. */
+.tcard {
+  --tc-row: 34px;
+  --tc-bg: color-mix(in srgb, var(--fg) 2.5%, var(--bg));
+  display: block;
+  width: 100%;
+  max-width: 720px;
+  margin: 6px 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--tc-bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  overflow: hidden;
+}
+/* The reply column aligns its children to the start, which would size the
+   card to its text; stretch its stack so the width is the column's. */
+.bubble-col > .tool-stack:has(> .tcard) { align-self: stretch; }
+.tcard-head,
+.tcard-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  cursor: pointer;
+  user-select: none;
+  transition: background var(--dur-fast, 120ms) var(--ease-out);
+}
+.tcard-head { height: 40px; padding: 0 12px; }
+.tcard-head:hover,
+.tcard-line:hover { background: color-mix(in srgb, var(--fg) 3.5%, transparent); }
+.tcard-head:focus-visible,
+.tcard-line:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset: -2px; }
+
+.tcard-icons { display: inline-flex; align-items: center; flex: 0 0 auto; }
+.tcard-ico {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  color: var(--fg-muted);
+}
+.tcard-ico svg { width: 100%; height: 100%; display: block; }
+.tcard-mono {
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+  font: 700 9.5px/1 var(--font-mono);
+}
+.tcard-icons:not(.stack) .tcard-ico { animation: tcard-pop 220ms var(--ease-out) both; }
+/* Summary heads overlap the tools' icons as small coins. */
+.tcard-icons.stack .tcard-ico {
+  width: 20px;
+  height: 20px;
+  padding: 3.5px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--fg) 7%, var(--tc-bg));
+  box-shadow: 0 0 0 1.5px var(--tc-bg);
+}
+.tcard-icons.stack .tcard-mono { padding: 0; font-size: 9px; }
+.tcard-icons.stack .tcard-ico + .tcard-ico { margin-left: -5px; }
+
+.tcard-title {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 20px;
+  overflow: hidden;
+}
+.tcard-tick {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  line-height: 20px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--fg-muted);
+}
+/* The shared .shimmer gradient doesn't repeat, so long labels go blank for
+   part of each sweep; inside the card it tiles seamlessly instead. */
+.tcard .shimmer {
+  background-repeat: repeat-x;
+  background-size: 200% 100%;
+  animation: tcard-shine 2.2s linear infinite;
+  font-weight: inherit;
+}
+.tcard-tick.in { animation: tcard-tick-in 240ms var(--ease-out) both; }
+.tcard-tick.out { animation: tcard-tick-out 200ms var(--ease-out) both; }
+
+.tcard-meta {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.tcard-head .tcard-meta { font-size: 12px; }
+.tcard-state {
+  display: grid;
+  place-items: center;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  color: var(--fg-faint);
+}
+.tcard-head .tcard-state:empty { display: none; }
+.tcard-state svg { width: 15px; height: 15px; display: block; }
+.tcard-spin {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, var(--fg) 18%, transparent);
+  border-top-color: var(--fg-muted);
+  animation: spin .8s linear infinite;
+}
+/* Rows carry their state on the row; the head carries it on its slot. */
+.tcard-row[data-state="done"] > .tcard-line .tcard-state,
+.tcard-head .tcard-state[data-state="done"] { color: var(--success, #3fb950); }
+.tcard-row[data-state="err"] > .tcard-line .tcard-state,
+.tcard-head .tcard-state[data-state="err"] { color: var(--warning, #d19a43); }
+.tcard-row[data-state="waiting"] > .tcard-line .tcard-state,
+.tcard-head .tcard-state[data-state="waiting"] { color: var(--accent); }
+
+.tcard-caret {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--fg-faint);
+  transition: transform 180ms var(--ease-out);
+}
+.tcard:not(.collapsed) > .tcard-head .tcard-caret,
+.tcard-row.open > .tcard-line .tcard-caret { transform: rotate(180deg); }
+
+/* Expand/collapse animates the real height (grid 0fr -> 1fr). */
+.tcard-body {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 220ms var(--ease-out);
+}
+.tcard.collapsed > .tcard-body { grid-template-rows: 0fr; }
+.tcard-inner { min-height: 0; overflow: hidden; }
+.tcard-list {
+  position: relative; /* rows' offsetTop is measured from here */
+  max-height: calc(var(--tc-row) * 4 + 12px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: 6px;
+  border-top: 1px solid var(--border-subtle);
+}
+/* Slim scrollbars for the card and the MCP popover: a rounded thumb in the
+   theme's ink, no arrows or track, a little stronger while hovered. The
+   ::-webkit rules are ignored by Chromium once scrollbar-width/-color are
+   set, so the standard properties only apply where -webkit isn't supported. */
+:is(.tcard-list, .mcp-pop-list, .tcard-note)::-webkit-scrollbar { width: 10px; height: 10px; }
+:is(.tcard-list, .mcp-pop-list, .tcard-note)::-webkit-scrollbar-track,
+:is(.tcard-list, .mcp-pop-list, .tcard-note)::-webkit-scrollbar-corner { background: transparent; }
+:is(.tcard-list, .mcp-pop-list, .tcard-note)::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+:is(.tcard-list, .mcp-pop-list, .tcard-note)::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+  background-color: color-mix(in srgb, var(--fg) 13%, transparent);
+}
+:is(.tcard-list, .mcp-pop-list, .tcard-note):hover::-webkit-scrollbar-thumb { background-color: color-mix(in srgb, var(--fg) 24%, transparent); }
+:is(.tcard-list, .mcp-pop-list, .tcard-note)::-webkit-scrollbar-thumb:hover { background-color: color-mix(in srgb, var(--fg) 36%, transparent); }
+@supports not selector(::-webkit-scrollbar) {
+  :is(.tcard-list, .mcp-pop-list, .tcard-note) { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent; }
+}
+.tcard-list.scrolled {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 22px);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 22px);
+}
+.tcard-row { animation: tcard-row-in 240ms var(--ease-out) both; }
+.tcard-line { height: var(--tc-row); padding: 0 8px; border-radius: 8px; }
+.tcard-row[data-state="running"] > .tcard-line { background: color-mix(in srgb, var(--fg) 4%, transparent); }
+.tcard-row[data-state="waiting"] > .tcard-line {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.tcard-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--fg);
+}
+.tcard-row:is([data-state="stopped"], [data-state="unchecked"]) .tcard-label { color: var(--fg-muted); }
+.tcard-label + .wb-count { flex: 0 0 auto; }
+
+.tcard-more {
+  padding: 4px 10px 10px 34px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.tcard-kv {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 3px 14px;
+  margin: 0;
+  font: 400 11px/1.5 var(--font-mono);
+}
+.tcard-kv dt { color: var(--fg-faint); }
+.tcard-kv dd { margin: 0; color: var(--fg-muted); overflow-wrap: anywhere; }
+.tcard-note { margin: 8px 0 0; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.tcard-note.err {
+  max-height: 180px;
+  overflow: auto;
+  color: color-mix(in srgb, var(--warning, #d19a43) 80%, var(--fg));
+  font: 400 11.5px/1.5 var(--font-mono);
+  white-space: pre-wrap;
+}
+.tcard-pre {
+  max-height: 160px;
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--bg-inset);
+  font: 400 11px/1.5 var(--font-mono);
+  white-space: pre-wrap;
+}
+.tcard-more .web-results { margin-top: 8px; }
+.tcard-where { margin: 8px 0 0; font-size: 11px; line-height: 1.4; color: var(--fg-faint); }
+.tcard-where code { margin-left: 6px; font: 400 10.5px var(--font-mono); }
+.tcard-extra:empty { display: none; }
+.tcard-extra { display: grid; gap: 6px; padding: 0 8px 8px; }
+
+@keyframes tcard-tick-in { from { opacity: 0; transform: translateY(70%); } }
+@keyframes tcard-tick-out { to { opacity: 0; transform: translateY(-70%); } }
+@keyframes tcard-row-in { from { opacity: 0; transform: translateY(4px); } }
+@keyframes tcard-pop { from { opacity: 0; transform: scale(.7); } }
+@keyframes tcard-shine { from { background-position: 200% 0; } to { background-position: 0 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .tcard-tick.in, .tcard-tick.out, .tcard-row, .tcard-icons .tcard-ico, .tcard .shimmer { animation: none; }
+  .tcard-body { transition: none; }
+}
+
+/* ---- MCP quick look ----
+   The MCP chip's popover (app.js, wbMcpPop*): every server at a glance with
+   its state, tool count and rough context cost. Configuring stays in the
+   MCP servers window; Edit / Add / Manage open it. */
+.mcp-pop {
+  position: fixed;
+  z-index: calc(var(--z-modal, 1000) + 8);
+  display: flex;
+  flex-direction: column;
+  width: min(400px, calc(100vw - 24px));
+  max-height: min(560px, calc(100vh - 80px));
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-lg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(-4px) scale(.985);
+  transform-origin: top right;
+  transition: opacity 140ms var(--ease-out), transform 160ms var(--ease-out);
+}
+.mcp-pop[hidden] { display: none; }
+.mcp-pop.open { opacity: 1; transform: none; }
+.mcp-pop-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 14px 14px 6px 18px;
+}
+.mcp-pop-title { display: inline-flex; align-items: center; gap: 9px; font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+.mcp-pop-title .ph { font-size: 17px; color: var(--fg-muted); }
+.mcp-pop-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  height: 30px;
+  padding: 0 13px;
+  border: 1px solid var(--border-strong, var(--border));
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg);
+  font: 500 12.5px/1 var(--font-sans);
+  cursor: pointer;
+  transition: background 120ms var(--ease-out), border-color 120ms var(--ease-out);
+}
+.mcp-pop-btn:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.mcp-pop-btn:disabled { opacity: .55; cursor: progress; }
+.mcp-pop-btn[hidden] { display: none; }
+.mcp-pop-btn .ph { font-size: 13px; }
+.mcp-pop-sum { padding: 2px 18px 14px; border-bottom: 1px solid var(--border-subtle); }
+.mcp-pop-sum:empty { display: none; }
+.mcp-pop-sumline { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 13px; color: var(--fg-muted); }
+.mcp-pop-sumline strong { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.mcp-pop-cap { font-size: 11.5px; color: var(--fg-faint); white-space: nowrap; }
+.mcp-pop-bar {
+  display: flex;
+  gap: 2px;
+  height: 6px;
+  margin-top: 9px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  overflow: hidden;
+}
+.mcp-pop-bar i { display: block; flex: 0 0 auto; background: color-mix(in srgb, var(--fg) 42%, transparent); }
+.mcp-pop-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.mcp-pop-row + .mcp-pop-row { border-top: 1px solid var(--border-subtle); }
+.mcp-pop-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 60px;
+  padding: 8px 12px 8px 18px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 120ms var(--ease-out);
+}
+.mcp-pop-line:hover { background: color-mix(in srgb, var(--fg) 3.5%, transparent); }
+.mcp-pop-line:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset: -2px; }
+.mcp-pop-ico {
+  display: grid;
+  place-items: center;
+  flex: 0 0 26px;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  font: 700 12px/1 var(--font-mono);
+}
+.mcp-pop-row[data-tone="off"] .mcp-pop-ico { background: color-mix(in srgb, var(--fg) 8%, transparent); color: var(--fg-muted); }
+.mcp-pop-name { display: flex; flex-direction: column; gap: 3px; flex: 1 1 auto; min-width: 0; }
+.mcp-pop-name strong { overflow: hidden; font-size: 14px; font-weight: 600; white-space: nowrap; text-overflow: ellipsis; }
+.mcp-pop-name small { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--fg-muted); white-space: nowrap; }
+.mcp-pop-name small span { color: var(--fg-faint); }
+.mcp-pop-name small .ph { font-size: 13px; }
+.mcp-pop-row[data-tone="ok"] small .ph { color: var(--success, #3fb950); }
+.mcp-pop-row[data-tone="err"] small .ph { color: var(--danger, #e5534b); }
+.mcp-pop-row[data-tone="busy"] small .ph { color: var(--accent); animation: spin 1s linear infinite; }
+.mcp-pop-row[data-tone="off"] small .ph { color: var(--fg-faint); }
+.mcp-pop-count { font-size: 13px; color: var(--fg-muted); white-space: nowrap; }
+.mcp-pop-tok { min-width: 36px; font-size: 13.5px; font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+.mcp-pop-caret { flex: 0 0 auto; font-size: 13px; color: var(--fg-faint); transition: transform 160ms var(--ease-out); }
+.mcp-pop-row.open .mcp-pop-caret { transform: rotate(180deg); }
+.mcp-pop-more { padding: 0 16px 14px 56px; animation: tcard-row-in 200ms var(--ease-out) both; }
+.mcp-pop-err { margin: 0 0 10px; font-size: 12px; line-height: 1.45; color: color-mix(in srgb, var(--danger, #e5534b) 80%, var(--fg)); overflow-wrap: anywhere; }
+.mcp-pop-note { margin: 0 0 10px; font-size: 12px; color: var(--fg-muted); }
+.mcp-pop-tools { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 12px; padding: 0; list-style: none; }
+.mcp-pop-tools li {
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+  color: var(--fg-muted);
+  font: 400 11px/1.4 var(--font-mono);
+}
+.mcp-pop-actions { display: flex; align-items: center; gap: 10px; }
+.mcp-pop-actions code {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg-faint);
+  font: 400 11px/1.4 var(--font-mono);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.mcp-pop-actions .mcp-pop-btn { height: 28px; padding: 0 11px; }
+.mcp-pop-empty { display: grid; gap: 4px; margin: 0; padding: 22px 18px; font-size: 12.5px; line-height: 1.45; color: var(--fg-muted); }
+.mcp-pop-empty strong { color: var(--fg); font-size: 13px; }
+.mcp-pop-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 18px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 11.5px;
+  color: var(--fg-faint);
+}
+.mcp-pop-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--fg-muted);
+  font: 500 12.5px/1 var(--font-sans);
+  cursor: pointer;
+}
+.mcp-pop-link:hover { color: var(--fg); }
+#wb-chip-mcp[aria-expanded="true"] { color: var(--fg); border-color: var(--border-strong); }
+@media (prefers-reduced-motion: reduce) {
+  .mcp-pop, .mcp-pop-more { transition: none; animation: none; }
+  .mcp-pop-row[data-tone="busy"] small .ph { animation: none; }
+}
+
+/* ---- sidebar: a floating card, and an icon rail when collapsed ----
+   Expanded, the sidebar is a card inset from the window edge: brand header,
+   the two primary actions, quiet uppercase section labels whose tools show
+   while the sidebar is hovered, and one row of utilities at the foot.
+   Collapsed, it stays as a slim rail of the same actions as icons rather
+   than disappearing. Phones keep their own full-screen sessions layout. */
+.side-foot-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-muted);
+}
+@media (min-width: 601px) {
+  #app > .sidebar {
+    width: 252px;
+    height: calc(100% - 16px);
+    margin: 8px 0 8px 8px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--fg) 2%, var(--bg-sunken));
+  }
+  #app > .sidebar .brand {
+    padding: 12px 10px 12px 14px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  #app > .sidebar .brand-subtitle { display: none; }
+  #app > .sidebar .brand-row { align-items: center; gap: 9px; }
+  #app > .sidebar .brand-row .brand-mark { width: 22px; height: 22px; }
+  #app > .sidebar .brand-title { font-size: 15px; font-weight: 650; letter-spacing: -.02em; }
+  #app > .sidebar .brand .v {
+    padding: 2px 6px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--fg) 6%, transparent);
+    color: var(--fg-faint);
+    font: 500 10px/1.3 var(--font-mono);
+  }
+
+  #app > .sidebar .workspace-nav { gap: 2px; padding: 10px 8px 4px; }
+  #app > .sidebar .workspace-nav-action {
+    min-height: 34px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--fg-muted);
+    font: 500 13.5px/1 var(--font-sans);
+    transition: background 120ms var(--ease-out), color 120ms var(--ease-out);
+  }
+  #app > .sidebar .workspace-nav-action:hover { background: color-mix(in srgb, var(--fg) 5%, transparent); color: var(--fg); }
+  #app > .sidebar .workspace-nav-new { color: var(--fg); }
+  #app > .sidebar .workspace-nav-new > .ph { color: var(--accent); }
+  #app > .sidebar .workspace-nav-action kbd {
+    padding: 2px 6px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 5px;
+    background: transparent;
+    color: var(--fg-faint);
+    font: 500 10px/1.2 var(--font-mono);
+  }
+
+  /* Section labels: small, uppercase and quiet. */
+  #app > .sidebar .sidebar-scroll > .section-head {
+    padding: 14px 8px 4px 18px;
+    color: var(--fg-faint);
+    font: 600 10.5px/1.2 var(--font-sans);
+    letter-spacing: .07em;
+    text-transform: uppercase;
+  }
+  #app > .sidebar .wb-explorer-toggle { font: inherit; letter-spacing: inherit; text-transform: inherit; color: inherit; }
+  #app > .sidebar .section-head .iconbtn { transition: opacity 140ms var(--ease-out); }
+  #app > .sidebar:not(:hover):not(:focus-within) .section-head .iconbtn:not([aria-pressed="true"]):not([aria-expanded="true"]) { opacity: 0; }
+
+  /* Session rows: the active one is a filled pill, as in a nav list. */
+  #app > .sidebar .chatrow.wb-row { min-height: 32px; border-radius: 8px; }
+  #app > .sidebar .chatrow.wb-row:hover { background: color-mix(in srgb, var(--fg) 4.5%, transparent); }
+  #app > .sidebar .chatrow.wb-row.active { background: color-mix(in srgb, var(--fg) 8%, transparent); }
+  #app > .sidebar .chatrow.wb-row.active::before { display: none; }
+
+  #app > .sidebar .side-foot { padding: 8px 10px 10px; }
+  #app > .sidebar .side-foot-actions { gap: 2px; margin-top: 8px; padding-top: 8px; border-top-color: var(--border-subtle); }
+  #app > .sidebar .side-foot-actions .iconbtn { width: 32px; height: 32px; border-radius: 8px; }
+
+  /* ---- the rail ---- */
+  #app.sidebar-collapsed > .sidebar { display: flex; width: 56px; }
+  #app.sidebar-collapsed > .sidebar .brand { padding: 14px 0 10px; border-bottom: 0; }
+  #app.sidebar-collapsed > .sidebar .brand-row { flex-direction: column; gap: 12px; }
+  #app.sidebar-collapsed > .sidebar :is(.brand-title, .brand .v, .brand-row .grow) { display: none; }
+  #app.sidebar-collapsed > .sidebar .workspace-nav {
+    justify-items: center;
+    gap: 4px;
+    margin: 0 10px;
+    padding: 10px 0;
+    border-top: 1px solid var(--border-subtle);
+  }
+  #app.sidebar-collapsed > .sidebar .workspace-nav-action { width: 36px; height: 36px; min-height: 36px; padding: 0; justify-content: center; }
+  #app.sidebar-collapsed > .sidebar .workspace-nav-action :is(span, kbd) { display: none; }
+  #app.sidebar-collapsed > .sidebar .workspace-nav-new { background: color-mix(in srgb, var(--fg) 7%, transparent); }
+  #app.sidebar-collapsed > .sidebar .sidebar-scroll > :not(.side-foot) { display: none; }
+  #app.sidebar-collapsed > .sidebar .side-foot { margin-top: auto; padding: 8px 0 12px; }
+  #app.sidebar-collapsed > .sidebar .side-meta-row { display: none; }
+  #app.sidebar-collapsed > .sidebar .side-foot-actions { flex-direction: column; gap: 4px; margin: 0; padding: 0; border: 0; }
+  #app.sidebar-collapsed > .sidebar .side-foot-actions .grow { display: none; }
+  #app.sidebar-collapsed > .sidebar :is(.side-foot-actions .iconbtn, #btn-toggle-sidebar) { width: 36px; height: 36px; border-radius: 9px; }
+}
+
+/* Meters: bars in the expanded sidebar, ring gauges in the rail. */
+.wb-meter-ring { display: none; }
+@media (min-width: 601px) {
+  /* One surface and one edge for both floating panels (sidebar, top bar).
+     The theme's subtle border is near-invisible on dark backgrounds, so the
+     edge is a light tint of the text color, which reads in every theme. */
+  #app { --sb-bg: color-mix(in srgb, var(--fg) 2%, var(--bg-sunken)); --sb-edge: color-mix(in srgb, var(--fg) 9%, transparent); }
+  #app > .sidebar { background: var(--sb-bg); border-color: var(--sb-edge); }
+  #app.sidebar-collapsed > .sidebar .wb-meters { justify-items: center; gap: 8px; padding: 0 0 10px; }
+  #app.sidebar-collapsed > .sidebar .wb-meter { display: block; }
+  #app.sidebar-collapsed > .sidebar .wb-meter > :not(.wb-meter-ring) { display: none; }
+  #app.sidebar-collapsed > .sidebar .wb-meter-ring {
+    --c: var(--accent);
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background:
+      radial-gradient(closest-side, var(--sb-bg) 78%, transparent 80%),
+      conic-gradient(var(--c) calc(var(--p, 0) * 1%), color-mix(in srgb, var(--fg) 11%, transparent) 0);
+    color: var(--fg-muted);
+    font: 600 9px/1 var(--font-mono);
+    letter-spacing: -.02em;
+    font-variant-numeric: tabular-nums;
+  }
+  #app.sidebar-collapsed > .sidebar .wb-meter-ring[data-level="warn"] { --c: var(--warning); }
+  #app.sidebar-collapsed > .sidebar .wb-meter-ring[data-level="crit"] { --c: var(--danger); color: var(--fg); }
+  /* counts (tokens today) have no fill: a plain hairline circle */
+  #app.sidebar-collapsed > .sidebar .wb-meter[data-m="today"] .wb-meter-ring {
+    background: none;
+    box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--fg) 11%, transparent);
+  }
+
+  /* The top bar floats like the sidebar card: same inset, radius, border
+     and surface, so the two read as one family instead of a square strip
+     butting against a rounded panel. */
+  #app > .center { grid-template-rows: 56px auto minmax(0, 1fr); }
+  #app .topbar {
+    height: 48px;
+    margin: 8px 8px 0;
+    padding: 0 10px 0 14px;
+    border: 1px solid var(--sb-edge);
+    border-radius: 14px;
+    /* beats the old glass rule, which is !important */
+    background: var(--sb-bg) !important;
+  }
+  #app .topbar .iconbtn { border-radius: 8px; }
+}
+
+/* ---- one ground, floating panels ----
+   The page background runs behind everything; the sidebar, top bar and
+   right-hand panel float on it as cards with the same inset, radius, edge
+   and surface. The chat pane used to paint itself --bg-raised, which showed
+   as a grey box in the gap around the floating top bar. */
+@media (min-width: 601px) {
+  #app > .center { background: var(--bg); }
+
+  #app > .preview {
+    height: calc(100% - 16px);
+    margin: 8px 8px 8px 0;
+    border: 1px solid var(--sb-edge);
+    border-radius: 14px;
+    background: var(--sb-bg);
+    overflow: hidden;
+  }
+  /* header lines up with the top bar: same 48px height */
+  #app .preview-head {
+    min-height: 48px;
+    height: 48px;
+    padding: 0 8px 0 14px;
+    border-bottom: 1px solid var(--sb-edge);
+    background: transparent !important; /* beats the old glass rule */
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+  #app .preview-head .title { gap: 8px; font: 600 13px/1 var(--font-sans); }
+  #app .preview-head .title > .ph { font-size: 16px; color: var(--fg-muted); }
+  #app .preview-head > .iconbtn,
+  #app .preview-head .preview-overflow-wrap > .iconbtn { width: 30px; height: 30px; border-radius: 8px; }
+
+  /* Preview / Code: a quiet segmented control, active segment as a pill */
+  #app .preview-toggle {
+    gap: 2px;
+    padding: 2px;
+    border: 0;
+    border-radius: 9px;
+    background: color-mix(in srgb, var(--fg) 6%, transparent);
+  }
+  #app .preview-toggle button {
+    padding: 5px 11px;
+    border-radius: 7px;
+    font: 500 12px/1 var(--font-sans);
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--fg-muted);
+  }
+  #app .preview-toggle button:hover { color: var(--fg); }
+  #app .preview-head .preview-toggle button.active {
+    background: var(--sb-bg);
+    color: var(--fg);
+    box-shadow: 0 0 0 1px var(--sb-edge), 0 1px 2px rgba(0, 0, 0, .12);
+  }
+
+  #app .version-bar { border-bottom: 1px solid var(--sb-edge); background: transparent; }
+
+  /* terminal tabs: the sidebar's row language, icon-only until active */
+  #app .term-tabs-header {
+    height: 42px;
+    gap: 2px;
+    padding: 0 6px 0 8px;
+    border-top: 1px solid var(--sb-edge);
+    border-bottom: 1px solid var(--sb-edge);
+    background: transparent;
+  }
+  #app .term-tab {
+    height: 30px;
+    padding: 0 10px;
+    border-radius: 8px;
+    color: var(--fg-muted);
+    font: 500 12px/1 var(--font-sans);
+    transition: background 120ms var(--ease-out), color 120ms var(--ease-out);
+  }
+  #app .term-tab:not(.active) { width: 30px; padding: 0; justify-content: center; }
+  #app .term-tab:hover { background: color-mix(in srgb, var(--fg) 5%, transparent); color: var(--fg); }
+  #app .term-tab .ph { font-size: 15px; }
+  #app .term-tab.active {
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+    color: var(--fg);
+    font-weight: 500;
+  }
+  #app .term-tab.active .ph { color: var(--accent); }
+  #app .term-tab.active::after { display: none; }
+  #app .term-tabs-header .iconbtn { width: 30px; height: 30px; border-radius: 8px; }
+}
+@media (min-width: 601px) {
+  /* the card's own edge is the divider now; the resize handle shows only
+     while hovered or dragged */
+  #app .preview-resizer::before { border-left-color: transparent; }
+  #app .preview-resizer:hover::before,
+  #app .preview-resizer.dragging::before { border-left: 2px solid var(--accent); }
+}

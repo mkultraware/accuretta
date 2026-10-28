@@ -251,6 +251,9 @@ button:focus-visible { outline: 1.5px solid rgba(255,255,255,.55); outline-offse
 .btn kbd { font: 600 10px/1 var(--mono); padding: 2px 5px; border-radius: 5px; opacity: .55; }
 .btn.pri kbd { border: 1px solid rgba(0,0,0,.35); }
 .btn.sec kbd { border: 1px solid rgba(255,255,255,.35); }
+/* A chord is a row of tight keycaps (Ctrl 1, ⌃⌥ Y), never one long label. */
+.keys { display: inline-flex; align-items: center; gap: 2px; margin-left: -2px; }
+.keys kbd { min-width: 15px; text-align: center; padding: 2px 4px; }
 .actions { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
 
 /* hold-to-confirm (strict approvals, power). While held, an amber fill
@@ -365,6 +368,12 @@ button:focus-visible { outline: 1.5px solid rgba(255,255,255,.55); outline-offse
 .dh span:first-child { overflow: hidden; text-overflow: ellipsis; }
 .cnt u { text-decoration: none; color: #5fd48f; }
 .cnt s { text-decoration: none; color: #ff7d8d; }
+/* Eight lines show; the rest scroll inside the card. */
+.drows { max-height: calc(8 * 1.7em); overflow-y: auto; overscroll-behavior: contain;
+  scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.22) transparent; }
+.drows::-webkit-scrollbar { width: 6px; }
+.drows::-webkit-scrollbar-thumb { background: rgba(255,255,255,.22); border-radius: 3px; }
+.drows::-webkit-scrollbar-track { background: transparent; }
 .dl { display: flex; gap: 10px; padding: 0 11px; white-space: nowrap; }
 .dl i { width: 14px; font-style: normal; text-align: right; color: #55526b; }
 .dl b { width: 8px; font-weight: 500; }
@@ -556,8 +565,8 @@ button:focus-visible { outline: 1.5px solid rgba(255,255,255,.55); outline-offse
         <div class="diff" id="gDiff" hidden></div>
         <div class="meta"><span id="gStep"></span><span>Scope <em id="gScope"></em></span><span>Writes <em id="gWrites"></em></span><span id="gTarget"></span><span id="gModel" hidden></span></div>
         <div class="actions">
-          <button class="btn sec" data-act="deny">Deny <kbd>N</kbd></button>
-          <button class="btn pri" id="approveBtn" data-act="approve">Allow <kbd>Y</kbd></button>
+          <button class="btn sec" id="denyBtn" data-act="deny">Deny <span class="keys"><kbd>N</kbd></span></button>
+          <button class="btn pri" id="approveBtn" data-act="approve">Allow <span class="keys"><kbd>Y</kbd></span></button>
           <button class="btn sec" id="alwaysBtn" data-act="always" hidden>Always</button>
           <span class="grow"></span>
           <button class="btn ghost" data-act="ask">Ask agent</button>
@@ -1431,7 +1440,7 @@ const normGate = (g) => ({ cmd: '', kind: 'command', scope: 'lab-net', step: '',
 
 function renderDiff(g) {
   let a = 0, b = 0;
-  const rows = g.diff.slice(0, 8).map(([op, text]) => {
+  const rows = g.diff.map(([op, text]) => {
     const n = op === '-' ? ++a : ++b;
     return `<div class="dl ${op === '-' ? 'del' : 'add'}"><i>${n}</i><b>${op}</b><span>${esc(text)}</span></div>`;
   }).join('');
@@ -1442,10 +1451,52 @@ function renderDiff(g) {
     : `<u>+${b}</u> <s>-${a}</s>`;
   const box = $('#gDiff');
   box.title = g.cmd;
-  box.innerHTML = `<div class="dh"><span>${esc(g.path || '')}</span><span class="cnt">${cnt}</span></div>${rows}`;
+  box.innerHTML = `<div class="dh"><span>${esc(g.path || '')}</span><span class="cnt">${cnt}</span></div><div class="drows">${rows}</div>`;
 }
 
 const strictGate = (g) => g.kind === 'registry' || !!g.critical;
+
+// ── Approval keys ────────────────────────────────────────────────────────
+// The owner's "Approve / Deny newest request" shortcuts from Settings
+// (chords like "Ctrl+Digit1", the same form app.js records), else Y and N.
+const IS_MAC = /Mac/i.test(navigator.platform || navigator.userAgent || '');
+const approvalKeys = { approve: '', deny: '' };
+const MOD_CAPS = IS_MAC
+  ? { Ctrl: '⌃', Alt: '⌥', Shift: '⇧', Meta: '⌘' }
+  : { Ctrl: 'Ctrl', Alt: 'Alt', Shift: '⇧', Meta: 'Win' };
+const KEY_CAPS = { Space: 'Space', Slash: '/', Backslash: '\\', BracketLeft: '[', BracketRight: ']',
+  Semicolon: ';', Quote: "'", Comma: ',', Period: '.', Minus: '-', Equal: '=' };
+function keyCap(part) {
+  if (MOD_CAPS[part]) return MOD_CAPS[part];
+  if (KEY_CAPS[part]) return KEY_CAPS[part];
+  if (/^Key[A-Z]$/.test(part)) return part.slice(3);
+  if (/^Digit[0-9]$/.test(part)) return part.slice(5);
+  return part.replace(/^Arrow(Up|Down|Left|Right)$/, (_, d) => ({ Up: '↑', Down: '↓', Left: '←', Right: '→' }[d]));
+}
+// One small keycap per key; on a Mac the modifier symbols share one cap.
+function keycaps(chord, fallback) {
+  const parts = (chord || fallback).split('+');
+  const key = parts.pop();
+  const caps = IS_MAC && parts.length ? [parts.map(keyCap).join('')] : parts.map(keyCap);
+  caps.push(keyCap(key));
+  return `<span class="keys">${caps.map(c => `<kbd>${esc(c)}</kbd>`).join('')}</span>`;
+}
+function chordFromEvent(e) {
+  if (!e.code || /^(Control|Alt|Shift|Meta)(Left|Right)$/.test(e.code)) return '';
+  return [e.ctrlKey && 'Ctrl', e.altKey && 'Alt', e.shiftKey && 'Shift', e.metaKey && 'Meta', e.code]
+    .filter(Boolean).join('+');
+}
+// A set chord must match exactly (by key position, as Settings records it);
+// the plain defaults take the bare letter on any layout.
+function pressed(e, chord, fallback) {
+  if (chord) return chordFromEvent(e) === chord;
+  return !e.ctrlKey && !e.altKey && !e.metaKey && e.key.toLowerCase() === keyCap(fallback).toLowerCase();
+}
+function setApprovalKeys(keys) {
+  approvalKeys.approve = String((keys && keys.approve) || '');
+  approvalKeys.deny = String((keys && keys.deny) || '');
+  renderGate();
+}
 
 function renderGate() {
   const g = gates[gi];
@@ -1481,7 +1532,8 @@ function renderGate() {
   ap.dataset.hold = strict ? HOLD_MS.approve : '';
   ap.innerHTML = strict
     ? '<span class="hl-off">Hold to allow</span><span class="hl-on">Allowing</span>' + HOLD_RING
-    : 'Allow <kbd>Y</kbd>';
+    : 'Allow ' + keycaps(approvalKeys.approve, 'KeyY');
+  $('#denyBtn').innerHTML = 'Deny ' + keycaps(approvalKeys.deny, 'KeyN');
   const al = $('#alwaysBtn');
   al.hidden = !g.always || strict;
   al.textContent = g.alwaysLabel || 'Always';
@@ -1942,17 +1994,24 @@ document.addEventListener('pointercancel', holdCancel);
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { if (!closeMenu()) dismiss(); return; }
   const inField = !!(e.target.closest && e.target.closest('input, textarea'));
-  if (state() === 'gate' && !inField && !e.ctrlKey && !e.altKey && !e.metaKey) {
+  if (state() === 'gate' && !inField) {
+    const plain = !e.ctrlKey && !e.altKey && !e.metaKey;
     const k = e.key.toLowerCase();
-    if (k === 'arrowright') navGate(1);
-    if (k === 'arrowleft') navGate(-1);
-    if (k === 'n' && !e.repeat) return deny();
-    if (k === 'a' && !e.repeat && !$('#alwaysBtn').hidden) return approveAlways();
-    if ((k === 'y' || (k === 'enter' && !e.target.closest('button'))) && !e.repeat) {
+    if (pressed(e, approvalKeys.deny, 'KeyN')) {
+      e.preventDefault();
+      if (!e.repeat) deny();
+      return;
+    }
+    if (pressed(e, approvalKeys.approve, 'KeyY') || (plain && k === 'enter' && !e.target.closest('button'))) {
+      e.preventDefault();
+      if (e.repeat) return;
       const b = $('#approveBtn');
       if (b.dataset.hold) holdStart(b, approve); else approve();
       return;
     }
+    if (plain && k === 'arrowright') navGate(1);
+    if (plain && k === 'arrowleft') navGate(-1);
+    if (plain && k === 'a' && !e.repeat && !$('#alwaysBtn').hidden) return approveAlways();
   }
   if ((e.key === 'Enter' || e.key === ' ') && !e.repeat) {
     const h = e.target.closest && e.target.closest('[data-hold]');
@@ -1960,7 +2019,13 @@ document.addEventListener('keydown', (e) => {
   }
   if ((e.key === 'Enter' || e.key === ' ') && e.target === island) island.click();
 });
-document.addEventListener('keyup', (e) => { if (['Enter', ' ', 'y', 'Y'].includes(e.key)) holdCancel(); });
+document.addEventListener('keyup', (e) => {
+  // Letting go of any key in the approve chord ends a hold.
+  const chord = approvalKeys.approve;
+  if (['Enter', ' '].includes(e.key)
+      || (chord ? e.code === chord.split('+').pop() || /^(Control|Alt|Shift|Meta)/.test(e.code)
+                : e.key.toLowerCase() === 'y')) holdCancel();
+});
 document.addEventListener('click', (e) => {
   if (!e.composedPath().includes(island)) { closeMenu(); dismiss(); }
 });
@@ -1993,7 +2058,7 @@ if (cfg.demo) {
 }
 retarget(true);
 
-window.notch = { setState, showReply, approve, deny, addGate, setTool, setContext, setStats, compact, loadModel, modelReady, modelFailed, removeGate, setModels, beginReply, appendReply, endReply, closeMenu, positionMenu, setSession, setSessions, notice, setAttachment, setPointerInside, retarget, setPhase, sound: (n) => Sound.play(n), get state() { return state(); }, config: cfg };
+window.notch = { setState, showReply, approve, deny, addGate, setApprovalKeys, setTool, setContext, setStats, compact, loadModel, modelReady, modelFailed, removeGate, setModels, beginReply, appendReply, endReply, closeMenu, positionMenu, setSession, setSessions, notice, setAttachment, setPointerInside, retarget, setPhase, sound: (n) => Sound.play(n), get state() { return state(); }, config: cfg };
 </script>
 </body>
 </html>

@@ -124,6 +124,15 @@
   }
 
   function syncSidebarToggle() {
+    // Collapsed, the sidebar is an icon rail and its own toggle expands it.
+    const railToggle = $("#btn-toggle-sidebar");
+    if (railToggle && !isMobile()) {
+      const label = app.classList.contains("sidebar-collapsed") ? "Expand sidebar" : "Collapse sidebar";
+      let keys = "";
+      try { keys = wbChordText("toggle_sidebar"); } catch {}
+      railToggle.title = keys ? `${label} (${keys})` : label;
+      railToggle.setAttribute("aria-label", label);
+    }
     const button = $("#btn-toggle-sidebar-m");
     const icon = button?.querySelector("i");
     if (!button || !icon) return;
@@ -1197,45 +1206,306 @@
   const _LOGO_PURPLE_D = "M225 135 L260 135 Q272 135 277.2 145.8 L332.8 261.2 Q338 272 326 272 L269 272 Q257 272 253.3 260.6 L216.7 146.4 Q213 135 225 135 Z";
   const AGENT_AVATAR_HTML = '<div class="avatar agent-avatar" role="img" aria-label="Agent" title="Agent"><canvas class="agent-orb" width="80" height="80" data-state="idle" aria-hidden="true"></canvas></div>';
 
-  // Render web-search chips into the head's chip strip. New searches replace
-  // the chip set with a fade-in instead of stacking.
-  function refreshHeadChips(group, results) {
+  // ---------- tool card ----------
+  // One card per agent turn, always the full width of the reply column, so
+  // changing labels never resize it. Collapsed (the default) it is a single
+  // line holding the latest action, replaced in place as the agent moves on.
+  // Expanded it lists every call: the newest four in view, earlier ones a
+  // scroll up. Each row opens to show the call's input and result. The root
+  // keeps .tool-group/.activity-group so turn-level code still finds it.
+  const TCARD_STATE_SVG = {
+    running: '<span class="tcard-spin" aria-hidden="true"></span>',
+    done: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.4l3 3 6-6.8"/></svg>',
+    err: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M8 4.9v3.5M8 11h.01"/></svg>',
+    stopped: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6"/><rect x="6" y="6" width="4" height="4" rx=".6" fill="currentColor" stroke="none"/></svg>',
+    unchecked: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M5.6 8h4.8"/></svg>',
+    waiting: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.9l5 1.9v3.9c0 3.1-2.1 5.3-5 6.4-2.9-1.1-5-3.3-5-6.4V3.8z"/></svg>',
+  };
+  const TCARD_HEAD_ICONS = 4;
+
+  function tcardIconKey(name) {
+    const mcp = /^mcp_([^_]+)_/.exec(name || "");
+    if (mcp) return `mcp:${mcp[1]}`;
+    return TOOL_ICON_MAP[name]?.run || "wrench";
+  }
+  function tcardIconHtml(key) {
+    if (key.startsWith("mcp:")) {
+      const server = key.slice(4);
+      return `<span class="tcard-ico tcard-mono" title="${esc(server)}">${esc((server[0] || "?").toUpperCase())}</span>`;
+    }
+    return `<span class="tcard-ico">${TOOL_SVG[key] || WRENCH_SVG}</span>`;
+  }
+  function tcardRowState(row) {
+    if (row.classList.contains("running")) return row.dataset.waiting === "true" ? "waiting" : "running";
+    for (const s of ["err", "stopped", "unchecked"]) if (row.classList.contains(s)) return s;
+    return "done";
+  }
+  function tcardDuration(ms) {
+    return ms < 1000 ? `${Math.max(1, Math.round(ms))}ms` : `${(ms / 1000).toFixed(1)}s`;
+  }
+
+  // One countable fact about a result for the row's right edge ("4 results",
+  // "+12 −3", "exit 1"); empty when nothing countable came back.
+  function tcardResultFact(res) {
+    if (!res || typeof res !== "object") return "";
+    const n = (v, one, many) => `${v} ${v === 1 ? one : many}`;
+    if (Array.isArray(res.results)) return n(res.results.length, "result", "results");
+    if (Array.isArray(res.entries)) return n(res.entries.length, "item", "items");
+    if (Array.isArray(res.rows)) return n(res.rows.length, "row", "rows");
+    if (Number.isFinite(res.match_count)) return n(res.match_count, "match", "matches");
+    if (Number.isFinite(res.added) || Number.isFinite(res.deleted)) return `+${res.added || 0} −${res.deleted || 0}`;
+    const exit = res.exit_code ?? res.exit ?? res.returncode;
+    if (exit !== undefined && exit !== null && exit !== "") return `exit ${exit}`;
+    return "";
+  }
+
+  // The failure text for an opened row, with its line breaks kept and the
+  // shell's boilerplate dropped so the actual message leads: PowerShell's
+  // "At line:1 char:1", the echoed "+ command" and "~~~~" underline, and the
+  // CategoryInfo / FullyQualifiedErrorId records.
+  const TCARD_ERROR_NOISE = /^\s*(?:At (?:line:\d+ char:\d+|[^\n]*:\d+ char:\d+)|\+\s*~+\s*$|~+\s*$|\+\s*(?:CategoryInfo|FullyQualifiedErrorId)\b|(?:CategoryInfo|FullyQualifiedErrorId)\s*:)/;
+  function tcardErrorText(res) {
+    const raw = res?.error ?? res?.message ?? res?.reason ?? res?.unavailable_reason
+      ?? res?.stderr ?? res?.output ?? res?.details ?? res?.detail;
+    if (raw == null || raw === "" || typeof raw !== "string") return toolFailureDetail(res);
+    const lines = raw.replace(/\r\n?/g, "\n").split("\n");
+    const kept = [];
+    let echo = false;
+    for (const line of lines) {
+      // "At line:1 char:1" is followed by "+ <the command>" lines; skip them too.
+      if (/^\s*At (?:line:\d+|[^\n]*:\d+) char:\d+/.test(line)) { echo = true; continue; }
+      if (echo && /^\s*\+/.test(line)) continue;
+      echo = false;
+      if (TCARD_ERROR_NOISE.test(line)) continue;
+      if (!line.trim() && (!kept.length || !kept[kept.length - 1].trim())) continue;
+      kept.push(line.replace(/\s+$/, ""));
+    }
+    while (kept.length && !kept[kept.length - 1].trim()) kept.pop();
+    const text = kept.slice(0, 14).join("\n") + (kept.length > 14 ? "\n…" : "");
+    return (text || raw.trim()).slice(0, 1400);
+  }
+
+  // The opened row: what was asked (arguments) and what came back. Built on
+  // open, so a long turn doesn't carry hidden markup for every call.
+  function tcardDetailHtml(row) {
+    const parts = [];
+    const args = row._args && typeof row._args === "object" ? row._args : {};
+    const keys = Object.keys(args).slice(0, 8);
+    if (keys.length) {
+      parts.push(`<dl class="tcard-kv">${keys.map(k => {
+        let v = args[k];
+        if (typeof v === "string" && v.includes("\n")) v = `${v.split("\n").length} lines`;
+        else if (typeof v !== "string") { try { v = JSON.stringify(v); } catch { v = String(v); } }
+        v = String(v ?? "");
+        return `<dt>${esc(k)}</dt><dd>${esc(v.length > 220 ? `${v.slice(0, 220)}…` : v)}</dd>`;
+      }).join("")}</dl>`);
+    }
+    const res = row._result;
+    if (res !== undefined) {
+      if (toolResultFailed(res)) parts.push(`<pre class="tcard-note err">${esc(tcardErrorText(res))}</pre>`);
+      else if (row.dataset.name === "web_search" && res?.results?.length) parts.push(renderWebSearchChips(res.results));
+      if (res?.code_check?.status === "issues_found" && res.code_check.details) {
+        parts.push(`<pre class="tcard-pre">${esc(res.code_check.details)}</pre>`);
+      }
+      if (row.classList.contains("unchecked") && res?.reason) parts.push(`<p class="tcard-note">${esc(res.reason)}</p>`);
+    }
+    parts.push(`<p class="tcard-where">${esc(row.dataset.targetLabel || "")}<code>${esc(row.dataset.name || "tool")}</code></p>`);
+    return parts.join("");
+  }
+  function tcardToggleRow(row, open = !row.classList.contains("open")) {
+    const more = row.querySelector(".tcard-more");
+    const line = row.querySelector(".tcard-line");
+    if (!more || !line) return;
+    if (open) more.innerHTML = tcardDetailHtml(row);
+    more.hidden = !open;
+    row.classList.toggle("open", open);
+    line.setAttribute("aria-expanded", String(open));
+    // Bring opened details into the list's view without scrolling the chat.
+    const list = row.closest(".tcard-list");
+    if (open && list) {
+      const over = row.offsetTop + row.offsetHeight - (list.scrollTop + list.clientHeight) + 6;
+      if (over > 0) list.scrollTop += Math.min(over, row.offsetTop - list.scrollTop);
+    }
+  }
+
+  // Keep the newest row in view while the list is pinned to the bottom; a
+  // reader who scrolled up to look at history is left where they are.
+  function tcardFollow(list, force = false) {
+    if (!list || !(force || list._stick !== false)) return;
+    list.scrollTop = list.scrollHeight;
+    list._stick = true;
+  }
+
+  // Head title: a ticker. A new line slides up and the old one leaves, so a
+  // stream of actions reads as one line updating rather than text jumping.
+  function tcardTick(group, text, shimmer) {
+    const title = group.querySelector(".tcard-title");
+    if (!title) return;
+    const cur = title.querySelector(".tcard-tick:not(.out)");
+    if (cur && cur.textContent === text) {
+      cur.firstElementChild?.classList.toggle("shimmer", !!shimmer);
+      return;
+    }
+    const next = document.createElement("span");
+    next.className = "tcard-tick";
+    next.innerHTML = `<span class="${shimmer ? "shimmer" : ""}">${esc(text)}</span>`;
+    if (cur && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      cur.classList.add("out");
+      setTimeout(() => cur.remove(), 260);
+      next.classList.add("in");
+    } else {
+      title.textContent = "";
+    }
+    title.appendChild(next);
+  }
+
+  function tcardPaintRow(row) {
+    const st = tcardRowState(row);
+    if (row.dataset.state === st) return;
+    row.dataset.state = st;
+    const slot = row.querySelector(":scope > .tcard-line > .tcard-state");
+    if (slot) slot.innerHTML = TCARD_STATE_SVG[st];
+  }
+
+  function tcardSync(group) {
     if (!group) return;
-    const slot = group.querySelector(".tool-group-chips");
-    if (!slot) return;
-    if (!results || !results.length) return;
-    const max = 4;
-    const chips = results.slice(0, max).map(r => {
-      let host = "";
-      try { host = new URL(r.url).hostname.replace(/^www\./, ""); } catch {}
-      const label = host || r.url;
-      const fav = host && !state.settings.offline_active ? `https://icons.duckduckgo.com/ip3/${host}.ico` : "";
-      const favHtml = `<span class="tool-chip-fav">${TOOL_SVG.globe}${fav ? `<img src="${esc(fav)}" alt="" loading="lazy" onerror="this.style.display='none'">` : ""}</span>`;
-      return `<a class="tool-chip" href="${esc(r.url)}" target="_blank" rel="noopener noreferrer" title="${esc(r.title || r.url)}">${favHtml}<span>${esc(label)}</span></a>`;
-    }).join("");
-    const overflow = results.length - Math.min(max, results.length);
-    const more = overflow > 0 ? `<span class="tool-chip tool-chip-more">+${overflow}</span>` : "";
-    slot.hidden = false;
-    // Brief swap animation: fade out → swap → fade in.
-    slot.classList.remove("chips-in");
-    slot.classList.add("chips-out");
-    setTimeout(() => {
-      slot.innerHTML = chips + more;
-      slot.classList.remove("chips-out");
-      slot.classList.add("chips-in");
-    }, 140);
+    const head = group.querySelector(".tcard-head");
+    const rows = [...group.querySelectorAll(".tcard-row")];
+    rows.forEach(tcardPaintRow);
+    const live = group.classList.contains("live-activity");
+    const open = !group.classList.contains("collapsed");
+    const running = rows.filter(r => r.classList.contains("running"));
+    const waiting = running.some(r => r.dataset.waiting === "true");
+    const failed = rows.filter(r => r.classList.contains("err")).length;
+    const calls = rows.reduce((sum, r) => sum + (Number(r.dataset.count) || 1), 0);
+    const latest = running[running.length - 1] || rows[rows.length - 1];
+    // Collapsed while live, the head IS the latest row: its icon, label,
+    // fact and status. Otherwise it summarises with the tools' icons.
+    const single = live && !open;
+    let keys;
+    if (single) {
+      keys = latest ? [tcardIconKey(latest.dataset.name)] : ["wrench"];
+    } else {
+      keys = [];
+      rows.forEach(r => { const k = tcardIconKey(r.dataset.name); if (!keys.includes(k)) keys.push(k); });
+      keys = keys.slice(-TCARD_HEAD_ICONS);
+    }
+    const icons = group.querySelector(".tcard-icons");
+    const iconSig = `${single ? 1 : 0}|${keys.join(",")}`;
+    if (icons && icons.dataset.sig !== iconSig) {
+      icons.dataset.sig = iconSig;
+      icons.classList.toggle("stack", !single);
+      icons.innerHTML = keys.map(tcardIconHtml).join("");
+    }
+    const meta = head.querySelector(".tcard-meta");
+    let state = "";
+    const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+    if (single) {
+      const label = latest?.querySelector(".tcard-label")?.textContent || "Working…";
+      tcardTick(group, label, !!latest?.classList.contains("running"));
+      meta.textContent = running.length > 1 ? `${running.length} in parallel`
+        : latest?.querySelector(".tcard-meta")?.textContent || "";
+      state = latest ? tcardRowState(latest) : "running";
+    } else if (live) {
+      tcardTick(group, waiting ? "Waiting for approval" : `Using ${plural(calls, "tool")}`, false);
+      meta.textContent = running.length > 1 ? `${running.length} in parallel` : "";
+      state = waiting ? "waiting" : running.length ? "running" : "";
+    } else {
+      tcardTick(group, `Used ${plural(calls, "tool")}${failed ? ` · ${failed} failed` : ""}`, false);
+      meta.textContent = group._t0 && group._t1 ? tcardDuration(group._t1 - group._t0) : "";
+      state = failed ? "err" : "";
+    }
+    const slot = head.querySelector(".tcard-state");
+    if (slot && slot.dataset.state !== state) {
+      slot.dataset.state = state;
+      slot.innerHTML = state ? TCARD_STATE_SVG[state] : "";
+    }
+    group.classList.toggle("has-err", failed > 0);
+    const dropped = Number(group.closest(".bubble-row")?.dataset.dropped || 0);
+    head.title = dropped > 0 ? `${dropped} older messages were trimmed from context this turn` : "";
+  }
+
+  // Running rows show how long they have been going, so a long command reads
+  // as alive rather than stuck, and say when it has printed nothing for a
+  // minute or more (a buffered or wedged process looks exactly like that).
+  // One ticker per card, stopped once nothing in it is running.
+  const TCARD_QUIET_MS = 60000;
+  function tcardClock(ms) {
+    const sec = Math.floor(ms / 1000);
+    return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+  }
+  function tcardTickRunning(group) {
+    const now = Date.now();
+    let live = 0;
+    group.querySelectorAll(".tcard-row.running").forEach(row => {
+      const meta = row.querySelector(".tcard-meta");
+      if (!meta) return;
+      live++;
+      const elapsed = now - (Number(row.dataset.t0) || now);
+      if (row.dataset.waiting === "true" || elapsed < 2000) { meta.textContent = ""; return; }
+      let text = tcardClock(elapsed);
+      const lastOut = Number(row.dataset.lastOut) || 0;
+      const quiet = now - (lastOut || Number(row.dataset.t0) || now);
+      if (isCommandTool(row.dataset.name) && quiet >= TCARD_QUIET_MS) {
+        text += lastOut ? ` · no output for ${tcardClock(quiet)}` : " · no output yet";
+      }
+      meta.textContent = text;
+    });
+    return live;
+  }
+  function tcardStartTimer(group) {
+    if (!group || group._timer) return;
+    group._timer = setInterval(() => {
+      if (!group.isConnected || !tcardTickRunning(group)) {
+        clearInterval(group._timer);
+        group._timer = 0;
+      }
+      tcardSync(group);
+    }, 1000);
+  }
+
+  function tcardSetOpen(group, open) {
+    if (!group) return;
+    group.classList.toggle("collapsed", !open);
+    group.querySelector(".tcard-head")?.setAttribute("aria-expanded", String(open));
+    const caret = group.closest(".bubble-col")?.querySelector(".think-container.has-worklog .think-caret");
+    if (caret) caret.className = `ph ph-caret-${open ? "down" : "right"} think-caret`;
+    tcardSync(group);
+    if (open) requestAnimationFrame(() => tcardFollow(group.querySelector(".tcard-list"), true));
+  }
+
+  function wireToolCard(group) {
+    if (!group || group.dataset.wired === "true") return;
+    group.dataset.wired = "true";
+    const activate = (e) => {
+      if (e.target.closest("a, button, summary, .tcard-more")) return;
+      const line = e.target.closest(".tcard-line");
+      if (line) { tcardToggleRow(line.closest(".tcard-row")); return; }
+      if (e.target.closest(".tcard-head")) tcardSetOpen(group, group.classList.contains("collapsed"));
+    };
+    group.addEventListener("click", activate);
+    group.addEventListener("keydown", (e) => {
+      if ((e.key !== "Enter" && e.key !== " ") || !e.target.matches(".tcard-head, .tcard-line")) return;
+      e.preventDefault();
+      activate(e);
+    });
+    const list = group.querySelector(".tcard-list");
+    list?.addEventListener("scroll", () => {
+      list._stick = list.scrollHeight - list.scrollTop - list.clientHeight < 8;
+      list.classList.toggle("scrolled", list.scrollTop > 2);
+    }, { passive: true });
   }
 
   // Called when the agent turn fully ends (chat_end, stream done, or stop).
-  // Moves the tool group after the answer bubble and adds .done-pill so the
-  // strip reads as faded and detached rather than part of the answer.
+  // Settles the card into its "Used N tools" line and moves it after the
+  // answer bubble.
   function finalizeToolGroup(row) {
     if (!row) return;
     row._activityFinished = true;
     const stack = row.querySelector(".tool-stack");
     const bubble = row.querySelector(".bubble");
     if (!stack || !bubble) return;
-    
+
     // Clear active cards from revealer deck
     const deck = $("#revealer-deck");
     if (deck) {
@@ -1267,44 +1537,41 @@
           row.appendChild(secretRail);
         }
       }
-      
+
       deck.querySelectorAll('[data-card-type="writes"], [data-card-type="commands"], [data-card-type="mcp"]').forEach(c => c.remove());
       if (deck.children.length === 0) deck.innerHTML = "";
     }
-    
-    const group = stack.querySelector(".tool-group.activity-group");
+
+    const group = stack.querySelector(".tcard");
     if (!group) {
       stack.remove();
       return;
     }
 
     group.classList.remove("live-activity");
-    group.classList.add("done-pill", "collapsed");
-    group.querySelector(".activity-overflow")?.remove();
-    group.querySelectorAll(".tool-line.activity-older").forEach(line => line.classList.remove("activity-older"));
-    group.querySelectorAll(".tool-line.running").forEach(line => {
+    group.classList.add("done");
+    group._t1 = Date.now();
+    clearInterval(group._timer);
+    group._timer = 0;
+    group.querySelectorAll(".tcard-row.running").forEach(line => {
       line.classList.remove("running");
       line.classList.add(row._stopRequested ? "stopped" : "err");
-      line.querySelector(".tool-line-label")?.classList.remove("shimmer");
-      if (!line.querySelector(".tl-time")) {
-        line.insertAdjacentHTML("beforeend", '<span class="tl-time">stopped</span>');
-      }
+      line.querySelector(".tcard-label")?.classList.remove("shimmer");
+      const meta = line.querySelector(".tcard-meta");
+      if (meta && !meta.textContent) meta.textContent = "stopped";
     });
 
-    // Keep the compact event trail, then add the richer command/file cards for
-    // users who expand the finished work and want the details.
+    // Under the call list, the richer file/command/MCP cards for anyone who
+    // opens the finished work and wants the details.
     const activities = row._activities || { writes: [], commands: [], mcp: [] };
     let html = "";
     html += buildWritesCardHtml(activities.writes, true);
     html += buildCommandsCardHtml(activities.commands, true);
     html += buildMcpCardHtml(activities.mcp, true);
-    if (html) {
-      const body = group.querySelector(".tool-group-body");
-      const details = document.createElement("div");
-      details.className = "tool-detail-cards";
-      details.innerHTML = html;
-      body?.appendChild(details);
-      details.querySelectorAll(".revealer-card").forEach(card => {
+    const extra = group.querySelector(".tcard-extra");
+    if (html && extra) {
+      extra.innerHTML = html;
+      extra.querySelectorAll(".revealer-card").forEach(card => {
         const head = card.querySelector(".revealer-card-head");
         head?.addEventListener("click", () => card.classList.toggle("collapsed"));
         card.querySelectorAll(".btn-preview-file").forEach(btn => {
@@ -1321,81 +1588,50 @@
       });
     }
 
-    updateToolGroupHead(stack);
+    tcardSetOpen(group, $("#app")?.dataset.activityDetail === "detailed");
     const col = bubble.parentNode;
     if (col && bubble.nextSibling !== stack) col.insertBefore(stack, bubble.nextSibling);
   }
 
-  function wireToolGroupToggle(group) {
-    const head = group?.querySelector(".tool-group-head");
-    if (!head || head.dataset.wired === "true") return;
-    head.dataset.wired = "true";
-    const toggle = () => {
-      group.classList.toggle("collapsed");
-      head.setAttribute("aria-expanded", String(!group.classList.contains("collapsed")));
-    };
-    head.addEventListener("click", toggle);
-    head.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
-      event.preventDefault();
-      toggle();
-    });
-  }
-
   function ensureToolActivityGroup(stack) {
     if (!stack) return null;
-    let group = stack.querySelector(".tool-group.activity-group");
+    let group = stack.querySelector(".tcard");
     if (group) return group;
+    const open = $("#app")?.dataset.activityDetail === "detailed";
     group = document.createElement("div");
-    group.className = "tool-group activity-group live-activity";
+    group.className = `tool-group activity-group tcard live-activity${open ? "" : " collapsed"}`;
     group.innerHTML = `
-      <div class="tool-group-head" role="button" tabindex="0" aria-expanded="true">
-        <span class="tool-group-icon spinning">${WRENCH_SVG}</span>
-        <span class="tool-group-activity">Working…</span>
-        <span class="tool-group-summary" hidden></span>
-        <span class="tool-group-chips" hidden></span>
-        <i class="ph ph-caret-down chevron" aria-hidden="true"></i>
+      <div class="tcard-head" role="button" tabindex="0" aria-expanded="${open}">
+        <span class="tcard-icons" aria-hidden="true"></span>
+        <span class="tcard-title" aria-live="polite"></span>
+        <span class="tcard-meta"></span>
+        <span class="tcard-state"></span>
+        <i class="ph ph-caret-down tcard-caret" aria-hidden="true"></i>
       </div>
-      <div class="tool-group-body" role="status" aria-live="polite"></div>`;
+      <div class="tcard-body"><div class="tcard-inner">
+        <div class="tcard-list" role="log"></div>
+        <div class="tcard-extra"></div>
+      </div></div>`;
     stack.appendChild(group);
-    wireToolGroupToggle(group);
+    wireToolCard(group);
     return group;
   }
 
-  function syncLiveActivityRows(group) {
-    if (!group) return;
-    const body = group.querySelector(".tool-group-body");
-    if (!body) return;
-    const rows = [...body.children].filter(el => el.classList.contains("tool-line"));
-    // Failed rows are never folded: successes collapse to the newest three,
-    // but a failure buried in "N earlier actions" is invisible. Keyed on the
-    // structural .err class from finishToolActivity, not on text.
-    const failed = new Set(rows.filter(line => line.classList.contains("err")));
-    const foldable = rows.filter(line => !failed.has(line));
-    const visibleFoldable = new Set(foldable.slice(-3));
-    let hiddenCount = 0;
-    rows.forEach(line => {
-      const hide = !failed.has(line) && !visibleFoldable.has(line);
-      line.classList.toggle("activity-older", hide);
-      if (hide) hiddenCount++;
-    });
-    let overflow = body.querySelector(".activity-overflow");
-    if (hiddenCount === 0) {
-      overflow?.remove();
-      return;
-    }
-    if (!overflow) {
-      overflow = document.createElement("div");
-      overflow.className = "activity-overflow";
-      body.prepend(overflow);
-    }
-    overflow.textContent = `${hiddenCount} earlier action${hiddenCount === 1 ? "" : "s"}`;
+  function tcardRowHtml(name, label) {
+    return `<div class="tcard-line" role="button" tabindex="0" aria-expanded="false">`
+      + tcardIconHtml(tcardIconKey(name))
+      + `<span class="tcard-label shimmer">${esc(label)}</span>`
+      + `<span class="tcard-meta"></span>`
+      + `<span class="tcard-state"></span>`
+      + `<i class="ph ph-caret-down tcard-caret" aria-hidden="true"></i></div>`
+      + `<div class="tcard-more" hidden></div>`;
   }
 
   function startToolActivity(stack, toolCards, evt) {
     const group = ensureToolActivityGroup(stack);
-    const body = group?.querySelector(".tool-group-body");
-    if (!group || !body) return null;
+    const list = group?.querySelector(".tcard-list");
+    if (!group || !list) return null;
+    if (!group._t0) group._t0 = Date.now();
     const key = String(evt.call_id || `activity-${(stack._activitySeq = (stack._activitySeq || 0) + 1)}`);
     const existing = toolCards.get(key);
     if (existing) return existing;
@@ -1403,19 +1639,21 @@
     // The same tool on the same file right after a clean finish (a rewrite,
     // a re-read) folds into the previous row as "×N" instead of stacking
     // identical lines. Failures always keep their own row.
-    const prev = body.lastElementChild;
+    const prev = list.lastElementChild;
     const samePath = String(evt.arguments?.path || "");
-    if (prev && prev.classList.contains("tool-line") && prev.classList.contains("done")
+    if (prev && prev.classList.contains("tcard-row") && prev.classList.contains("done")
         && samePath && prev.dataset.path === samePath && prev.dataset.name === (evt.name || "tool")) {
       const count = (Number(prev.dataset.count) || 1) + 1;
       prev.dataset.count = String(count);
       prev.dataset.callId = String(evt.call_id || "");
       prev.dataset.t0 = String(Date.now());
-      prev.classList.remove("done");
+      prev.classList.remove("done", "has-code-findings");
       prev.classList.add("running");
-      prev.querySelector(".tl-time")?.remove();
-      prev.querySelector(".code-check-details")?.remove();
-      const prevLabel = prev.querySelector(".tool-line-label");
+      prev._args = evt.arguments || {};
+      delete prev._result;
+      prev.querySelector(".tcard-meta").textContent = "";
+      if (prev.classList.contains("open")) tcardToggleRow(prev, true);
+      const prevLabel = prev.querySelector(".tcard-label");
       if (prevLabel) { prevLabel.textContent = label; prevLabel.classList.add("shimmer"); }
       let badge = prev.querySelector(".wb-count");
       if (!badge) {
@@ -1424,14 +1662,14 @@
         prevLabel?.after(badge);
       }
       badge.textContent = `×${count}`;
+      delete prev.dataset.lastOut;
       toolCards.set(key, prev);
-      const activityEl = group.querySelector(".tool-group-activity");
-      if (activityEl) activityEl.textContent = label;
-      updateToolGroupHead(stack);
+      tcardSync(group);
+      tcardStartTimer(group);
       return prev;
     }
     const line = document.createElement("div");
-    line.className = "tool-line running";
+    line.className = "tcard-row running";
     line.dataset.name = evt.name || "tool";
     line.dataset.callId = String(evt.call_id || "");
     line.dataset.path = String(evt.arguments?.path || "");
@@ -1439,30 +1677,32 @@
     line.dataset.targetLabel = evt.name?.startsWith("mcp_") ? "Connected tool"
       : evt.name?.startsWith("sandbox_") ? "WSL guest"
       : state.executionTarget && state.executionTarget !== "host" ? "Selected remote computer" : "This PC";
-    line.innerHTML = `${toolIconHtml(evt.name, "run") || WRENCH_SVG}<span class="tool-line-label shimmer">${esc(label)}</span>`;
-    body.appendChild(line);
+    line._args = evt.arguments || {};
+    line.innerHTML = tcardRowHtml(evt.name, label);
+    list.appendChild(line);
     toolCards.set(key, line);
-    const activity = group.querySelector(".tool-group-activity");
-    if (activity) activity.textContent = label;
-    syncLiveActivityRows(group);
-    // Refresh the head now so the parallel marker appears with the first of a
+    // Refresh the head now so the parallel count appears with the first of a
     // batch's calls, not only after the first result lands.
-    updateToolGroupHead(stack);
+    tcardSync(group);
+    tcardFollow(list);
+    tcardStartTimer(group);
     return line;
   }
 
   function findToolActivity(stack, toolCards, evt) {
     const callId = String(evt.call_id || "");
     if (callId && toolCards.has(callId)) return toolCards.get(callId);
-    return [...(stack?.querySelectorAll(".tool-line.running") || [])]
+    return [...(stack?.querySelectorAll(".tcard-row.running") || [])]
       .find(line => !evt.name || line.dataset.name === evt.name) || null;
   }
 
   function setToolActivityLabel(stack, toolCards, evt, label) {
     const line = findToolActivity(stack, toolCards, evt);
-    const text = line?.querySelector(".tool-line-label");
-    if (line) line.dataset.waiting = String(/waiting.*approval/i.test(label || ""));
+    if (!line) return;
+    line.dataset.waiting = String(/waiting.*approval/i.test(label || ""));
+    const text = line.querySelector(".tcard-label");
     if (text && label) text.textContent = label;
+    tcardSync(line.closest(".tcard"));
   }
 
   function finishToolActivity(stack, toolCards, evt) {
@@ -1472,129 +1712,33 @@
     const unchecked = evt.name === "check_syntax" && evt.result?.check_status === "unchecked";
     line.classList.remove("running");
     line.classList.add(unchecked ? "unchecked" : isErr ? "err" : "done");
-    if (unchecked && evt.result.reason) line.title = evt.result.reason;
-    if (!isErr && evt.result?.code_check?.status === "issues_found") {
-      line.classList.add("has-code-findings");
-      const details = document.createElement("details");
-      details.className = "code-check-details";
-      const summary = document.createElement("summary");
-      summary.textContent = "Code check details";
-      const text = document.createElement("pre");
-      text.textContent = evt.result.code_check.details || "";
-      details.append(summary, text);
-      line.appendChild(details);
-    }
-    const label = line.querySelector(".tool-line-label");
+    line.dataset.waiting = "false";
+    line._result = evt.result;
+    if (!isErr && evt.result?.code_check?.status === "issues_found") line.classList.add("has-code-findings");
+    const label = line.querySelector(".tcard-label");
     if (label) {
       label.classList.remove("shimmer");
       label.textContent = toolResultLabel(evt.name, evt.result);
     }
     if (isErr) {
       const detail = toolFailureDetail(evt.result);
-      if (detail) {
-        line.title = detail;
-        line.setAttribute("aria-label", `${label?.textContent || "Tool unavailable"}. Details: ${detail}`);
-      }
+      if (detail) line.setAttribute("aria-label", `${label?.textContent || "Tool unavailable"}. Details: ${detail}`);
     }
     const elapsed = line.dataset.t0 ? Date.now() - Number(line.dataset.t0) : 0;
-    if (elapsed > 0) {
-      // A merged "×N" row shows the total time of all its runs.
-      const total = (Number(line.dataset.totalMs) || 0) + elapsed;
-      line.dataset.totalMs = String(total);
-      const duration = total < 1000 ? `${total}ms` : `${(total / 1000).toFixed(1)}s`;
-      line.querySelector(".tl-time")?.remove();
-      line.insertAdjacentHTML("beforeend", `<span class="tl-time">${duration}</span>`);
-    }
+    // A merged "×N" row shows the total time of all its runs.
+    const total = (Number(line.dataset.totalMs) || 0) + Math.max(0, elapsed);
+    line.dataset.totalMs = String(total);
+    const meta = line.querySelector(".tcard-meta");
+    if (meta) meta.textContent = [tcardResultFact(evt.result), total > 0 ? tcardDuration(total) : ""].filter(Boolean).join(" · ");
+    if (line.classList.contains("open")) tcardToggleRow(line, true);
     const callId = String(evt.call_id || "");
     if (callId) toolCards.delete(callId);
-    syncLiveActivityRows(line.closest(".tool-group"));
+    tcardSync(line.closest(".tcard"));
     return line;
   }
 
   function updateToolGroupHead(stack) {
-    const group = stack.querySelector(".tool-group");
-    if (!group) return;
-    const cards = group.querySelectorAll(".tool-line");
-    const running = group.querySelectorAll(".tool-line.running");
-    const done = group.querySelectorAll(".tool-line.done").length;
-    const err = group.querySelectorAll(".tool-line.err").length;
-    const icon = group.querySelector(".tool-group-icon");
-    const activity = group.querySelector(".tool-group-activity");
-    const summary = group.querySelector(".tool-group-summary");
-    // Parallel marker: while several calls from one reply run at the same time,
-    // show the count; drop it as soon as the batch drains.
-    let parallelBadge = group.querySelector(".tool-group-parallel");
-    const setParallel = (count) => {
-      if (count > 1) {
-        if (!parallelBadge) {
-          parallelBadge = document.createElement("span");
-          parallelBadge.className = "tool-group-parallel";
-          activity?.after(parallelBadge);
-        }
-        parallelBadge.textContent = `${count} in parallel`;
-      } else if (parallelBadge) {
-        parallelBadge.remove();
-        parallelBadge = null;
-      }
-    };
-    if (running.length > 0) {
-      icon?.classList.add("spinning");
-      // Activity stays as set by the tool_start label (the most recent one).
-      // Don't overwrite mid-run.
-      if (activity) activity.hidden = false;
-      if (summary) summary.hidden = true;
-      group.classList.remove("done-pill");
-      setParallel(running.length);
-    } else if (group.classList.contains("live-activity")) {
-      icon?.classList.remove("spinning");
-      if (activity) {
-        activity.hidden = false;
-        activity.textContent = "Reviewing results…";
-      }
-      if (summary) summary.hidden = true;
-      group.classList.remove("done-pill");
-      setParallel(0);
-    } else {
-      icon?.classList.remove("spinning");
-      if (activity) activity.hidden = true;
-      if (summary) summary.hidden = false;
-      group.classList.add("done-pill");
-      setParallel(0);
-      // Count commands separately so the summary reads "X tools · Y commands".
-      let cmd = 0, tools = 0;
-      cards.forEach(c => {
-        if (isCommandTool(c.dataset.name)) cmd++;
-        else tools++;
-      });
-      let html = "";
-      // Compressed-message count from the row, if any.
-      const row = group.closest(".bubble-row");
-      const dropped = row && row.dataset.dropped ? parseInt(row.dataset.dropped, 10) : 0;
-      if (dropped > 0) {
-        html += `<span class="summary-item"><i class="ph ph-arrows-in-line-horizontal"></i> ${dropped} msgs</span>`;
-      }
-      if (tools > 0) {
-        if (html) html += `<span class="dot-sep"></span>`;
-        html += `<span class="summary-item"><i class="ph ph-gear"></i> ${tools}</span>`;
-      }
-      if (cmd > 0) {
-        if (html) html += `<span class="dot-sep"></span>`;
-        html += `<span class="summary-item cmd-item">${TOOL_SVG.running_command} ${cmd}</span>`;
-      }
-      if (err > 0) {
-        if (html) html += `<span class="dot-sep"></span>`;
-        html += `<span class="summary-item err-item"><i class="ph ph-info"></i> ${err} issue${err === 1 ? "" : "s"}</span>`;
-        group.classList.add("has-err");
-      } else {
-        group.classList.remove("has-err");
-      }
-      
-      if (html) {
-        summary.innerHTML = html;
-      } else {
-        summary.textContent = `${done} step${done === 1 ? "" : "s"}`;
-      }
-    }
+    tcardSync(stack?.querySelector(".tcard"));
   }
 
   // File-kind wording for tool labels: "Reading the HTML file index.html…"
@@ -7093,7 +7237,7 @@
     }
     // Status line: tool running -> its own label; answer streaming ->
     // "Writing response"; reasoning only -> "Thinking…" / "Thinking about <file>".
-    const _toolRunning = ctx.toolStack && ctx.toolStack.querySelector(".tool-line.running");
+    const _toolRunning = ctx.toolStack && ctx.toolStack.querySelector(".tcard-row.running");
     if (!_toolRunning) {
       updateThinkLine(row, true, content.trim() ? "Writing response" : thinkingLabel());
     }
@@ -7444,6 +7588,8 @@
       renderCostWidget();
       scrollToBottom();
     } else if (evt.type === "tool_stream") {
+      const streaming = findToolActivity(toolStack, toolCards, evt);
+      if (streaming) streaming.dataset.lastOut = String(Date.now());
       const streamTarget = evt.target || (evt.name && evt.name.startsWith("sandbox_") ? "sandbox"
         : (["run_powershell", "run_tests"].includes(evt.name) ? "host" : ""));
       if (streamTarget === "host") {
@@ -7454,7 +7600,7 @@
     } else if (evt.type === "heartbeat") {
       // The active activity row already proves a long tool is alive. Keep the
       // overall header stable instead of repeating the same tool in two places.
-      if (row?.querySelector(".tool-line.running")) return;
+      if (row?.querySelector(".tcard-row.running")) return;
       const line = row && row.querySelector(".think-line");
       if (line && !line.classList.contains("done")) {
         const span = line.querySelector("span");
@@ -7561,16 +7707,7 @@
             }
           }
         }
-        // web_search: refresh the head's chip strip; each new search replaces the
-        // chips with a quick fade.
-        if (!isErr && evt.name === "web_search") {
-          const group = toolStack.querySelector(".tool-group");
-          refreshHeadChips(group, evt.result && evt.result.results);
-          // Also append the full chip list inside the body for when the user
-          // expands the group — useful when many sources came back.
-          const chips = renderWebSearchChips(evt.result && evt.result.results);
-          if (chips) completedActivity.insertAdjacentHTML("afterend", chips);
-        }
+        // web_search sources show when its row is opened (tcardDetailHtml).
         // network_snapshot: rich bar-chart card, mounted outside the tool group so it
         // stays visible while the group is collapsed (the default).
         if (!isErr && evt.name === "network_snapshot") {
@@ -10297,15 +10434,13 @@
     const secs = row._workStart ? Math.max(1, Math.round((Date.now() - row._workStart) / 1000)) : 0;
     if (title && secs > 0) {
       const fmt = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
-      const actions = [...group.querySelectorAll(".tool-line")]
-        .reduce((sum, line) => sum + (Number(line.dataset.count) || 1), 0);
-      title.textContent = `Worked for ${fmt}${actions ? ` · ${actions} action${actions === 1 ? "" : "s"}` : ""}`;
+      // The tool card underneath already says how many tools ran.
+      title.textContent = `Worked for ${fmt}`;
       title.classList.remove("shimmer");
     }
     think.classList.add("has-worklog");
-    group.classList.add("work-hidden");
     const caret = think.querySelector(".think-caret");
-    if (caret) caret.className = "ph ph-caret-right think-caret";
+    if (caret) caret.className = `ph ph-caret-${group.classList.contains("collapsed") ? "right" : "down"} think-caret`;
   }
 
   // ---------- versions / preview ----------
@@ -11876,10 +12011,10 @@
     const details = approval.details || {};
     const kind = String(details.kind || "");
     const path = String(details.path || "");
-    const candidates = [...row.querySelectorAll(".tool-line.running")].reverse();
+    const candidates = [...row.querySelectorAll(".tcard-row.running")].reverse();
     const line = candidates.find(item => (!kind || item.dataset.name === kind)
       && (!path || !item.dataset.path || item.dataset.path === path)) || candidates[0];
-    const label = line?.querySelector(".tool-line-label");
+    const label = line?.querySelector(".tcard-label");
     if (label) {
       if (decision === "pending") {
         const action = kind === "edit_file" ? `Edit ${shortPath(path)}`
@@ -11892,6 +12027,8 @@
       } else if (kind) {
         label.textContent = toolLabel(kind, details);
       }
+      line.dataset.waiting = String(decision === "pending");
+      tcardSync(line.closest(".tcard"));
     }
 
     const writes = row._activities?.writes || [];
@@ -18438,7 +18575,7 @@
         state.mobileTab = "chat";
         applyMobileTab();
       } else {
-        app.classList.add("sidebar-collapsed");
+        app.classList.toggle("sidebar-collapsed");
       }
     });
     // Mobile: switch to the sessions tab. Desktop: toggle the sidebar.
@@ -18931,12 +19068,9 @@
       // A completed work turn expands to the observed activity trail. Keep raw
       // scratchpad text out of this path: it is model-dependent and often noisy.
       if (container.classList.contains("has-worklog")) {
-        const group = container.closest(".bubble-col")?.querySelector(".tool-group");
-        const willOpen = !!group?.classList.contains("work-hidden");
-        if (group) {
-          group.classList.toggle("work-hidden", !willOpen);
-          group.classList.toggle("collapsed", !willOpen);
-        }
+        const group = container.closest(".bubble-col")?.querySelector(".tcard");
+        const willOpen = !!group?.classList.contains("collapsed");
+        if (group) tcardSetOpen(group, willOpen);
         content.classList.add("hidden");
         content.textContent = "";
         const caret = thinkHeader.querySelector(".think-caret");
@@ -19092,7 +19226,7 @@
     };
     hint($("#btn-palette"), "Command palette", "open_palette");
     hint($("#btn-toggle-preview"), "Toggle preview", "toggle_preview");
-    hint($("#btn-toggle-sidebar"), "Collapse sidebar", "toggle_sidebar");
+    syncSidebarToggle();
     hint($("#btn-wb-explorer"), "Show or hide the workspace folders", "toggle_explorer");
     hint($("#wb-sb-terminal"), "Toggle terminal", "toggle_terminal");
     const searchKbd = $("#btn-search-sessions kbd");
@@ -19659,9 +19793,18 @@
       const n = Number(s.tokens_today) || 0;
       rows.push(["Today", null, n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k tok` : `${n} tok`, "today"]);
     }
-    const html = rows.map(([label, frac, value, key]) => `<div class="wb-meter" data-m="${key}"><span class="wb-meter-k">${label}</span>`
-      + (frac == null ? `<span class="grow"></span>` : `<span class="wb-meter-bar"><i style="width:${Math.round(frac * 100)}%" data-level="${frac >= 0.9 ? "crit" : frac >= 0.75 ? "warn" : ""}"></i></span>`)
-      + `<span class="wb-meter-v">${esc(value)}</span></div>`).join("");
+    // Each meter also carries a ring (shown only in the collapsed rail): the
+    // fill as an arc with the percent inside, or just the value for counts.
+    const html = rows.map(([label, frac, value, key]) => {
+      const pct = frac == null ? 0 : Math.round(frac * 100);
+      const level = frac == null ? "" : frac >= 0.9 ? "crit" : frac >= 0.75 ? "warn" : "";
+      const short = frac == null ? value.replace(/\s*tok$/, "") : String(pct);
+      return `<div class="wb-meter" data-m="${key}" style="--p:${pct}" title="${esc(`${label} ${value}`)}">`
+        + `<span class="wb-meter-ring" data-level="${level}" aria-hidden="true"><b>${esc(short)}</b></span>`
+        + `<span class="wb-meter-k">${label}</span>`
+        + (frac == null ? `<span class="grow"></span>` : `<span class="wb-meter-bar"><i style="width:${pct}%" data-level="${level}"></i></span>`)
+        + `<span class="wb-meter-v">${esc(value)}</span></div>`;
+    }).join("");
     // cached string: reading innerHTML back on every streaming tick costs a serialize
     if (box._wbHtml !== html) { box._wbHtml = html; box.innerHTML = html; }
   }
@@ -20096,7 +20239,8 @@
     wbMcpRenderList();
     // Don't rebuild a form the user is typing into; just refresh its status.
     if (mcpUi.dirty) wbMcpRenderStatus(); else wbMcpRenderDetail();
-    if ((data.servers || []).some(s => s.state === "starting") && $("#mcp-window")?.classList.contains("open")) {
+    if (mcpPop.open) wbMcpPopRender();
+    if ((data.servers || []).some(s => s.state === "starting") && ($("#mcp-window")?.classList.contains("open") || mcpPop.open)) {
       mcpUi.poll = setTimeout(wbMcpLoad, 1200);
     }
   }
@@ -20219,6 +20363,172 @@
       return null;
     }
   }
+  // Saving a server with its env keys set to null keeps their stored values.
+  function wbMcpSetDisabled(s, disabled) {
+    const env = Object.fromEntries((s.env || []).map(v => [v.key, null]));
+    return wbMcpPost("/api/mcp/servers", { name: s.name, original: s.name, command: s.command, args: s.args, env, disabled },
+      disabled ? `${s.name} turned off` : `${s.name} is starting`);
+  }
+
+  // ---- MCP quick look ----
+  // The top-bar MCP chip opens this: every server at a glance (state, tool
+  // count and roughly what its tool definitions cost in context), with Retry
+  // and Turn on in place. Edit, Add server and Manage hand off to the full
+  // MCP servers window, which stays the one place servers are configured.
+  const mcpPop = { open: false, expanded: new Set() };
+
+  function wbMcpTokens(s) {
+    if (Number(s.tokens) > 0) return Number(s.tokens);
+    // Bridges older than the tokens field: estimate from names and descriptions.
+    return (s.tools || []).reduce((n, t) => n + 40 + Math.ceil((String(t.name || "").length + String(t.description || "").length) / 4), 0);
+  }
+  function wbFmtTokens(n) {
+    return n >= 1000 ? `${(n / 1000).toFixed(n >= 9950 ? 0 : 1)}k` : String(Math.round(n));
+  }
+  function wbMcpPopEl() {
+    let pop = $("#mcp-pop");
+    if (pop) return pop;
+    pop = document.createElement("section");
+    pop.id = "mcp-pop";
+    pop.className = "mcp-pop";
+    pop.hidden = true;
+    pop.setAttribute("role", "dialog");
+    pop.setAttribute("aria-label", "MCP servers");
+    pop.innerHTML = `<header class="mcp-pop-head"><span class="mcp-pop-title"><i class="ph ph-plugs" aria-hidden="true"></i>MCP servers</span>`
+      + `<button type="button" class="mcp-pop-btn" data-pop="add"><i class="ph ph-plus" aria-hidden="true"></i>Add server</button></header>`
+      + `<div class="mcp-pop-sum"></div><div class="mcp-pop-list" role="list"></div>`
+      + `<footer class="mcp-pop-foot"><button type="button" class="mcp-pop-link" data-pop="manage">Manage servers<i class="ph ph-arrow-up-right" aria-hidden="true"></i></button><span>Saved on this machine</span></footer>`;
+    document.body.appendChild(pop);
+    pop.addEventListener("click", wbMcpPopClick);
+    pop.addEventListener("keydown", (e) => {
+      if ((e.key === "Enter" || e.key === " ") && e.target.matches(".mcp-pop-line")) { e.preventDefault(); wbMcpPopClick(e); }
+    });
+    document.addEventListener("pointerdown", (e) => {
+      if (mcpPop.open && !e.target.closest("#mcp-pop, #wb-chip-mcp")) wbMcpPopClose();
+    }, true);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && mcpPop.open) { wbMcpPopClose(); $("#wb-chip-mcp")?.focus(); }
+    });
+    window.addEventListener("resize", () => { if (mcpPop.open) wbMcpPopPlace(); });
+    return pop;
+  }
+  function wbMcpPopPlace() {
+    const pop = $("#mcp-pop");
+    const chip = $("#wb-chip-mcp");
+    if (!pop || !chip) return;
+    const r = chip.getBoundingClientRect();
+    pop.style.top = `${Math.round(r.bottom + 8)}px`;
+    pop.style.right = `${Math.max(12, Math.round(window.innerWidth - r.right))}px`;
+  }
+  function wbMcpPopOpen() {
+    const pop = wbMcpPopEl();
+    mcpPop.open = true;
+    wbMcpPopPlace();
+    pop.hidden = false;
+    requestAnimationFrame(() => pop.classList.add("open"));
+    $("#wb-chip-mcp")?.setAttribute("aria-expanded", "true");
+    wbMcpPopRender();
+    wbMcpLoad();
+  }
+  function wbMcpPopClose() {
+    const pop = $("#mcp-pop");
+    if (!pop || !mcpPop.open) return;
+    mcpPop.open = false;
+    pop.classList.remove("open");
+    $("#wb-chip-mcp")?.setAttribute("aria-expanded", "false");
+    setTimeout(() => { if (!mcpPop.open) pop.hidden = true; }, 160);
+  }
+  function wbMcpPopStatus(st) {
+    return ({
+      running: ["ok", "ph-check-circle", "Connected"],
+      starting: ["busy", "ph-circle-notch", "Starting"],
+      error: ["err", "ph-warning-circle", "Error"],
+      disabled: ["off", "ph-pause-circle", "Off"],
+    })[st] || ["off", "ph-stop-circle", "Not running"];
+  }
+  function wbMcpPopRender() {
+    const pop = $("#mcp-pop");
+    if (!pop) return;
+    const data = mcpUi.data;
+    const sum = pop.querySelector(".mcp-pop-sum");
+    const list = pop.querySelector(".mcp-pop-list");
+    if (!data) {
+      sum.innerHTML = "";
+      list.innerHTML = `<p class="mcp-pop-empty">Loading servers…</p>`;
+      return;
+    }
+    const servers = data.servers || [];
+    const canEdit = data.can_edit !== false && !data.unavailable;
+    pop.querySelector('[data-pop="add"]').hidden = !canEdit;
+    if (data.unavailable) {
+      sum.innerHTML = "";
+      list.innerHTML = `<p class="mcp-pop-empty"><strong>MCP servers aren't available</strong>${esc(data.error || "")}</p>`;
+      return;
+    }
+    const running = servers.filter(s => s.state === "running");
+    const tools = running.reduce((n, s) => n + (s.tools || []).length, 0);
+    const tokens = running.reduce((n, s) => n + wbMcpTokens(s), 0);
+    const cap = Math.max(1, Number(state._ctxCapacity) || Number(state.settings?.num_ctx) || 32768);
+    sum.innerHTML = `<div class="mcp-pop-sumline"><span><strong>${tools}</strong> tool${tools === 1 ? "" : "s"} · <strong>≈${wbFmtTokens(tokens)}</strong> tokens of context</span>`
+      + `<span class="mcp-pop-cap">${cap >= 1024 ? `${Math.round(cap / 1024)}k` : cap} window</span></div>`
+      + `<div class="mcp-pop-bar" role="img" aria-label="MCP tools use about ${Math.round(tokens / cap * 100)}% of the context window">`
+      + running.map(s => {
+        const t = wbMcpTokens(s);
+        return `<i style="width:${Math.max(0.8, t / cap * 100).toFixed(2)}%" title="${esc(s.name)} · ≈${wbFmtTokens(t)} tokens"></i>`;
+      }).join("") + `</div>`;
+    if (!servers.length) {
+      list.innerHTML = `<p class="mcp-pop-empty"><strong>No MCP servers yet</strong>They give the agent extra tools: a browser, a database, Blender and so on.</p>`;
+      return;
+    }
+    list.innerHTML = servers.map(s => {
+      const [tone, icon, text] = wbMcpPopStatus(s.state);
+      const open = mcpPop.expanded.has(s.name);
+      const n = (s.tools || []).length;
+      let right = "";
+      if (s.state === "running") {
+        right = `<span class="mcp-pop-count">${n} tool${n === 1 ? "" : "s"}</span><strong class="mcp-pop-tok">${wbFmtTokens(wbMcpTokens(s))}</strong>`;
+      } else if (canEdit && (s.state === "error" || s.state === "stopped")) {
+        right = `<button type="button" class="mcp-pop-btn" data-pop="retry">${s.state === "error" ? "Retry" : "Start"}</button>`;
+      } else if (canEdit && s.state === "disabled") {
+        right = `<button type="button" class="mcp-pop-btn" data-pop="enable">Turn on</button>`;
+      }
+      const more = !open ? "" : `<div class="mcp-pop-more">`
+        + (s.state === "error" && s.error ? `<p class="mcp-pop-err">${esc(s.error)}</p>` : "")
+        + (n ? `<ul class="mcp-pop-tools">${s.tools.map(t => `<li title="${esc(t.description || "")}">${esc(t.name)}</li>`).join("")}</ul>`
+          : s.state === "running" ? `<p class="mcp-pop-note">This server offers no tools.</p>` : "")
+        + `<div class="mcp-pop-actions"><code>${esc([s.command, ...(s.args || [])].join(" "))}</code>`
+        + `<button type="button" class="mcp-pop-btn" data-pop="edit"><i class="ph ph-pencil-simple" aria-hidden="true"></i>${canEdit ? "Edit" : "Details"}</button></div></div>`;
+      return `<div class="mcp-pop-row${open ? " open" : ""}" data-name="${esc(s.name)}" data-tone="${tone}" role="listitem">`
+        + `<div class="mcp-pop-line" data-pop="toggle" role="button" tabindex="0" aria-expanded="${open}">`
+        + `<span class="mcp-pop-ico" aria-hidden="true">${esc((s.name[0] || "?").toUpperCase())}</span>`
+        + `<span class="mcp-pop-name"><strong>${esc(s.name)}</strong><small><i class="ph ${icon}" aria-hidden="true"></i>${text}<span>· ${s.remote ? "Remote" : "Local"}</span></small></span>`
+        + right + `<i class="ph ph-caret-down mcp-pop-caret" aria-hidden="true"></i></div>${more}</div>`;
+    }).join("");
+  }
+  async function wbMcpPopClick(e) {
+    const el = e.target.closest("[data-pop]");
+    if (!el) return;
+    const act = el.dataset.pop;
+    const name = el.closest(".mcp-pop-row")?.dataset.name || "";
+    if (act === "toggle") {
+      if (mcpPop.expanded.has(name)) mcpPop.expanded.delete(name); else mcpPop.expanded.add(name);
+      wbMcpPopRender();
+      $(`#mcp-pop .mcp-pop-row[data-name="${CSS.escape(name)}"] .mcp-pop-line`)?.focus();
+      return;
+    }
+    if (act === "add" || act === "manage" || act === "edit") {
+      wbMcpPopClose();
+      wbMcpOpen(act === "add" ? "__new" : act === "edit" ? name : "");
+      return;
+    }
+    const s = (mcpUi.data?.servers || []).find(x => x.name === name);
+    if (!s) return;
+    el.disabled = true;
+    const data = act === "retry" ? await wbMcpPost("/api/mcp/servers/restart", { name })
+      : act === "enable" ? await wbMcpSetDisabled(s, false) : null;
+    if (data) wbMcpApply(data); else el.disabled = false;
+  }
+
   function wbInitMcpWindow() {
     const win = $("#mcp-window");
     if (!win || win._wired) return;
@@ -20277,9 +20587,7 @@
         const data = await wbMcpPost("/api/mcp/servers/restart", { name: s.name });
         if (data) wbMcpApply(data);
       } else if (act === "toggle") {
-        const env = Object.fromEntries((s.env || []).map(v => [v.key, null]));
-        const data = await wbMcpPost("/api/mcp/servers", { name: s.name, original: s.name, command: s.command, args: s.args, env, disabled: !s.disabled },
-          s.disabled ? `${s.name} is starting` : `${s.name} turned off`);
+        const data = await wbMcpSetDisabled(s, !s.disabled);
         if (data) wbMcpApply(data);
       } else if (act === "delete") {
         const ok = await confirmModal({ title: `Remove ${s.name}?`, message: "Its process stops and its entry, including saved environment values, is deleted from bridge_mcp_config.json.", confirmText: "Remove", danger: true });
@@ -20423,7 +20731,9 @@
         + `<button class="wb-chip" id="wb-chip-skills" type="button" hidden><i class="ph ph-sparkle" aria-hidden="true"></i><span></span></button>`
         + `<button class="wb-chip wb-diffstat" id="wb-chip-diff" type="button" hidden></button>`;
       actions.prepend(chips);
-      $("#wb-chip-mcp").addEventListener("click", () => wbMcpOpen());
+      $("#wb-chip-mcp").setAttribute("aria-haspopup", "dialog");
+      $("#wb-chip-mcp").setAttribute("aria-expanded", "false");
+      $("#wb-chip-mcp").addEventListener("click", () => (mcpPop.open ? wbMcpPopClose() : wbMcpPopOpen()));
       $("#wb-chip-skills").addEventListener("click", () => {
         const input = $("#composer-input");
         if (!input) return;

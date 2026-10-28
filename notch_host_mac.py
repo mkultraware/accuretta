@@ -117,11 +117,16 @@ class IslandLogic:
     # countdown): never tucked away by the idle timer.
     HELD_STATES = ("alert", "gate", "prompt", "work", "home", "notice", "drop")
     CARD_STATES = ("gate", "prompt", "home", "notice", "drop")
+    # Tucked away with the hotkey ("quiet"): only an approval brings the island
+    # back, and it leaves again once nothing in these states needs the owner.
+    QUIET_HOLD_STATES = ("alert", "gate", "prompt", "drop")
 
     def __init__(self, ui):
         self.ui = ui
         self.visible = False
         self.sticky = False
+        self.quiet = False
+        self.quiet_gate_seen = False
         self.hover_reveal = False
         self.gate_visible_until = 0.0
         self.leaving = False
@@ -176,15 +181,21 @@ class IslandLogic:
         if self.visible:
             # Always a full toggle: shrink to the pill (the page's spring
             # plays), then retreat into the bezel. A pending approval stays
-            # pending on the bridge; it just isn't pinned open.
-            self.hide_at = now + self.COLLAPSE_HIDE_S
-            self.hide_reason = reason
-            self.ui.post({"type": "collapse"})
+            # pending on the bridge; it just isn't pinned open. Until the
+            # hotkey brings it back, only a new approval may show it.
+            self.quiet = True
+            self.collapse_and_hide(reason, now)
         else:
             # The page needs "enter" (via show) or it keeps `is-leaving` and
             # stays parked above the screen edge, invisible.
+            self.quiet = False
             self.sticky = True
             self.show(reason, now)
+
+    def collapse_and_hide(self, reason: str, now: float) -> None:
+        self.hide_at = now + self.COLLAPSE_HIDE_S
+        self.hide_reason = reason
+        self.ui.post({"type": "collapse"})
 
     # ---- page messages -----------------------------------------------------
     def on_page_message(self, msg: dict) -> None:
@@ -201,7 +212,13 @@ class IslandLogic:
                 self.revealed_once = True
                 self.show("first run")
         elif kind == "notify":
-            self.show(str(msg.get("kind") or "notify"))
+            what = str(msg.get("kind") or "notify")
+            if self.quiet:
+                if what != "gate":
+                    self.ui.log(f"notify ignored while tucked away: {what}")
+                    return
+                self.quiet_gate_seen = False
+            self.show(what)
         elif kind == "open-url":
             # "Open in main app". Only the bridge's own origin: the page must
             # never become a way to open arbitrary URLs.
@@ -236,7 +253,7 @@ class IslandLogic:
             if self.hover_reveal and on_wake_strip:
                 self.gate_visible_until = max(self.gate_visible_until, now + HOVER_GRACE_S)
             self.wake_since = None
-        elif self.leaving or not on_wake_strip or fullscreen:
+        elif self.leaving or not on_wake_strip or fullscreen or self.quiet:
             self.wake_since = None
         elif self.wake_since is None:
             self.wake_since = now
@@ -257,6 +274,15 @@ class IslandLogic:
             self.hide(reason, now)
         if self.leaving and now >= self.leave_started + self.LEAVE_SLIDE_S:
             self.finish_hide()
+
+        # tucked away: an approval popped it up; leave once it is handled
+        if self.quiet and self.visible and not self.sticky and not self.hide_at:
+            if self.island_state in ("alert", "gate"):
+                self.quiet_gate_seen = True
+            elif (self.quiet_gate_seen and self.island_state not in self.QUIET_HOLD_STATES
+                    and not self.pointer_inside):
+                self.quiet_gate_seen = False
+                self.collapse_and_hide("approval handled", now)
 
         # idle auto-hide
         if self.visible and not self.sticky:
@@ -293,8 +319,10 @@ class CarbonHotKey:
                 _fields_ = [("signature", ctypes.c_uint32), ("id", ctypes.c_uint32)]
 
             handler_t = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+            carbon.GetApplicationEventTarget.argtypes = []
             carbon.GetApplicationEventTarget.restype = ctypes.c_void_p
-            carbon.InstallEventHandler.argtypes = [ctypes.c_void_p, handler_t, ctypes.c_uint32,
+            # ItemCount is an unsigned long: 64 bits on every 64-bit Mac.
+            carbon.InstallEventHandler.argtypes = [ctypes.c_void_p, handler_t, ctypes.c_ulong,
                                                    ctypes.POINTER(EventTypeSpec), ctypes.c_void_p,
                                                    ctypes.POINTER(ctypes.c_void_p)]
             carbon.InstallEventHandler.restype = ctypes.c_int32
@@ -304,6 +332,7 @@ class CarbonHotKey:
             carbon.RegisterEventHotKey.restype = ctypes.c_int32
 
             def _handler(_call, _event, _data):
+                log("hotkey pressed")
                 try:
                     self.on_press()
                 except Exception as exc:
@@ -334,8 +363,8 @@ class CarbonHotKey:
                                             ctypes.byref(self._ref))
         if status == 0:
             self.ok = True
-            if self.failures:
-                log(f"hotkey registered after {self.failures} retries")
+            log("hotkey registered (Control+Option+N)"
+                + (f" after {self.failures} retries" if self.failures else ""))
             return True
         if not self.failures:
             log(f"hotkey registration failed (OSStatus {status}"
