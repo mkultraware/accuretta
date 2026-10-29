@@ -217,7 +217,7 @@ def _read_app_version() -> str:
             return m.group(1)
     except Exception:
         pass
-    return "1.0.1"
+    return "1.0.2"
 
 
 def _glyph_field_js() -> str:

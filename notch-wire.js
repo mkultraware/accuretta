@@ -1818,42 +1818,45 @@ function makeThinkStripper() {
 // — which it considered a perfectly good answer — landed as an empty card.
 const visibleFinalText = (raw) => {
   let s = String(raw == null ? "" : raw);
-  // A bare `response` line is the answer boundary; the text after the LAST
-  // one is the whole visible reply. Checked first, exactly like the bridge.
-  const bounds = [...s.matchAll(/(?:^|\n)[ \t]*response(?=[A-Za-z0-9<`])/gi)];
-  if (bounds.length) {
+  // A closing tag followed by an answer always wins. Chats saved by older
+  // bridge builds use a bare `response` line as the boundary instead; it counts
+  // only after a reasoning opener and only when no answer follows the last
+  // closing tag, exactly like the bridge.
+  const closes = [...s.matchAll(
+    /<\/(?:think|thinking|reasoning)>|<\|\/thinking\|>|\[\/(?:thought|thinking|reasoning|scratchpad)\]/gi)];
+  const lastClose = closes.length ? closes[closes.length - 1] : null;
+  const answerAfterClose = !!lastClose && s.slice(lastClose.index + lastClose[0].length).trim() !== "";
+  const firstOpen = s.search(/<(?:think|thinking|reasoning)>|<\|thinking\|>|\[(?:thought|thinking|reasoning|scratchpad)\]/i);
+  const bounds = firstOpen < 0 ? [] : [...s.matchAll(/\n[ \t]*response(?=[A-Za-z0-9<`])/g)]
+    .filter(b => b.index > firstOpen);
+  if (bounds.length && !answerAfterClose) {
     const b = bounds[bounds.length - 1];
     s = s.slice(b.index + b[0].length);
+  } else if (lastClose) {
+    s = s.slice(lastClose.index + lastClose[0].length);
   } else {
-    const closes = [...s.matchAll(
-      /<\/(?:think|thinking|reasoning)>|<\|\/thinking\|>|\[\/(?:thought|thinking|reasoning|scratchpad)\]/gi)];
-    if (closes.length) {
-      const c = closes[closes.length - 1];
-      s = s.slice(c.index + c[0].length);
-    } else {
-      const opener = /<(?:think|thinking|reasoning)>|<\|thinking\|>|\[(?:thought|thinking|reasoning|scratchpad)\]/i.exec(s);
-      if (opener) {
-        // Unclosed block: keep what came before it, then salvage the tail if
-        // the model rolled straight into output inside the block.
-        let visible = s.slice(0, opener.index);
-        const thinking = s.slice(opener.index);
-        const implicit = /<\/?tool_call>|<\|tool_call>|<call:[a-zA-Z0-9_\-]+>|\[TOOL_CALLS\]|```(?:tool_call|tool_code)/i.exec(thinking);
-        const resp = /\n\s*response(?:[ \t]*\r?\n)?/i.exec(thinking);
-        if (implicit && implicit.index > 0 && (!resp || implicit.index < resp.index)) {
-          visible += thinking.slice(implicit.index).replace(/<\/?tool_call>/gi, "");
-        } else if (resp && resp.index > 0) {
-          visible += thinking.slice(resp.index + resp[0].length);
-        }
-        s = visible;
+    const opener = /<(?:think|thinking|reasoning)>|<\|thinking\|>|\[(?:thought|thinking|reasoning|scratchpad)\]/i.exec(s);
+    if (opener) {
+      // Unclosed block: keep what came before it, then salvage the tail if
+      // the model rolled straight into output inside the block.
+      let visible = s.slice(0, opener.index);
+      const thinking = s.slice(opener.index);
+      const implicit = /<\/?tool_call>|<\|tool_call>|<call:[a-zA-Z0-9_\-]+>|\[TOOL_CALLS\]|```(?:tool_call|tool_code)/i.exec(thinking);
+      const resp = /\n\s*response(?:[ \t]*\r?\n)?/i.exec(thinking);
+      if (implicit && implicit.index > 0 && (!resp || implicit.index < resp.index)) {
+        visible += thinking.slice(implicit.index).replace(/<\/?tool_call>/gi, "");
+      } else if (resp && resp.index > 0) {
+        visible += thinking.slice(resp.index + resp[0].length);
       }
+      s = visible;
     }
   }
   s = s.replace(
     /<\/?(?:think|thinking|reasoning)>|<\|\/?thinking\|>|\[\/?(?:thought|thinking|reasoning|scratchpad)\]/gi, "");
-  // The bridge splices a bare `" response"` marker into the persisted text
-  // when content follows a reasoning stream. Strip it only when it is glued
-  // to the answer — never eat a real sentence that starts with "Response".
-  s = s.replace(/^\s*response(?=[A-Za-z0-9<`])/i, "");
+  // Older bridge builds left a bare lowercase `response` marker glued to the
+  // answer. Strip only that form, so a reply that opens with "ResponseEntity"
+  // or "Response codes" keeps its first word.
+  s = s.replace(/^\s*response(?=[A-Za-z0-9<`])/, "");
   return stripCascade(s).trim();
 };
 

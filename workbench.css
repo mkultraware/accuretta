@@ -1396,6 +1396,8 @@ body.wb-composer #toolbar-overflow-menu :is(#btn-attach-image, #btn-attach-file,
   white-space: nowrap;
 }
 .tcard-head .tcard-meta { font-size: 12px; }
+.tcard-meta .tc-add { color: var(--success); }
+.tcard-meta .tc-del { color: var(--danger); }
 .tcard-state {
   display: grid;
   place-items: center;

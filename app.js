@@ -1259,15 +1259,19 @@
     return "";
   }
 
+  // The row's right edge as HTML: a leading "+12 −3" in the diff colors.
+  function tcardMetaHtml(text) {
+    return esc(text).replace(/^\+(\d+) −(\d+)/, '<span class="tc-add">+$1</span> <span class="tc-del">−$2</span>');
+  }
+
   // The failure text for an opened row, with its line breaks kept and the
   // shell's boilerplate dropped so the actual message leads: PowerShell's
   // "At line:1 char:1", the echoed "+ command" and "~~~~" underline, and the
   // CategoryInfo / FullyQualifiedErrorId records.
   const TCARD_ERROR_NOISE = /^\s*(?:At (?:line:\d+ char:\d+|[^\n]*:\d+ char:\d+)|\+\s*~+\s*$|~+\s*$|\+\s*(?:CategoryInfo|FullyQualifiedErrorId)\b|(?:CategoryInfo|FullyQualifiedErrorId)\s*:)/;
   function tcardErrorText(res) {
-    const raw = res?.error ?? res?.message ?? res?.reason ?? res?.unavailable_reason
-      ?? res?.stderr ?? res?.output ?? res?.details ?? res?.detail;
-    if (raw == null || raw === "" || typeof raw !== "string") return toolFailureDetail(res);
+    const raw = toolFailureRaw(res);
+    if (raw == null || typeof raw !== "string") return toolFailureDetail(res);
     const lines = raw.replace(/\r\n?/g, "\n").split("\n");
     const kept = [];
     let echo = false;
@@ -1403,8 +1407,8 @@
     if (single) {
       const label = latest?.querySelector(".tcard-label")?.textContent || "Working…";
       tcardTick(group, label, !!latest?.classList.contains("running"));
-      meta.textContent = running.length > 1 ? `${running.length} in parallel`
-        : latest?.querySelector(".tcard-meta")?.textContent || "";
+      meta.innerHTML = running.length > 1 ? `${running.length} in parallel`
+        : latest?.querySelector(".tcard-meta")?.innerHTML || "";
       state = latest ? tcardRowState(latest) : "running";
     } else if (live) {
       tcardTick(group, waiting ? "Waiting for approval" : `Using ${plural(calls, "tool")}`, false);
@@ -1729,7 +1733,7 @@
     const total = (Number(line.dataset.totalMs) || 0) + Math.max(0, elapsed);
     line.dataset.totalMs = String(total);
     const meta = line.querySelector(".tcard-meta");
-    if (meta) meta.textContent = [tcardResultFact(evt.result), total > 0 ? tcardDuration(total) : ""].filter(Boolean).join(" · ");
+    if (meta) meta.innerHTML = tcardMetaHtml([tcardResultFact(evt.result), total > 0 ? tcardDuration(total) : ""].filter(Boolean).join(" · "));
     if (line.classList.contains("open")) tcardToggleRow(line, true);
     const callId = String(evt.call_id || "");
     if (callId) toolCards.delete(callId);
@@ -2002,11 +2006,21 @@
     }
   }
 
+  // The first failure field with text in it. A blank stderr must not hide the
+  // output after it, or the exit code of a command that ran and returned non-zero.
+  function toolFailureRaw(res) {
+    return [res?.error, res?.message, res?.reason, res?.unavailable_reason,
+      res?.stderr, res?.output, res?.details, res?.detail]
+      .find(v => v != null && (typeof v !== "string" || v.trim() !== ""));
+  }
+
   function toolFailureDetail(res) {
     res = res || {};
-    const raw = res.error ?? res.message ?? res.reason ?? res.unavailable_reason
-      ?? res.stderr ?? res.output ?? res.details ?? res.detail;
-    if (raw == null || raw === "") return "The requested tool could not be run.";
+    const raw = toolFailureRaw(res);
+    if (raw == null) {
+      const code = res.exit_code ?? res.exit;
+      return code != null ? `Exited with code ${code}.` : "The requested tool could not be run.";
+    }
     if (typeof raw === "string") return raw.slice(0, 600);
     try { return JSON.stringify(raw).slice(0, 600); } catch { return String(raw).slice(0, 600); }
   }
@@ -6139,7 +6153,8 @@
       const idle = Math.floor((Date.now() - lastActivity) / 1000);
       const total = Math.floor((Date.now() - started) / 1000);
       if (idle < 3) return;
-      const phase = line.dataset.phase === "writing" ? "Still writing response" : "Still thinking";
+      const phase = line.dataset.progressLabel
+        || (line.dataset.phase === "writing" ? "Still writing response" : "Still thinking");
       span.textContent = `${phase} · ${total}s`;
     }, 250);
 
@@ -6293,25 +6308,26 @@
     // (Qwen/DeepSeek/Nemotron) emit a bare </think> with no opener, sometimes
     // several times between tool rounds.
     //
-    // Boundary rule: Qwen3.x-family models (and the bridge's reasoning wrapper)
-    // separate thinking from the answer with a bare marker line, "\n response",
-    // the answer glued straight after:
+    // Boundary rule: a closing tag followed by an answer always wins. Chats saved
+    // by older bridge builds separate reasoning with a bare marker line instead,
+    // the answer glued straight after, sometimes with a closing tag after it:
     //     <think>planning...\n responseHere is the answer...
-    // A closing </think> can also arrive after the answer:
     //     <think>planning...\n responseHere is the answer...</think>
-    // Splitting at the last closing tag would demote the whole answer into the
-    // think block, so the last marker is the primary boundary; the closing tag
-    // only matters when there is no marker.
+    // The marker counts only after a reasoning opener and only when no answer
+    // follows the last closing tag, so an answer line like `ResponseEntity<T>`
+    // never splits the reply.
     //
     // Marker lookahead: the char after "response" must start the answer (a
     // letter, digit or tool-call block). A space or punctuation means ordinary
     // prose ("the response was..."), and a trailing "s" at a word boundary is the
     // plural; both are excluded.
+    const firstOpen = buf.search(/<(?:think|thinking|reasoning)>|<\|thinking\|>|\[(?:thought|thinking|reasoning|scratchpad)\]/i);
     const markerRe = /(?:\n\s*|\s+)response(?=[A-Za-z0-9<])(?![sS](?:\b|$))/gi;
     let lastMarker = -1;
     let lastMarkerEnd = -1;
     let mm;
-    while ((mm = markerRe.exec(buf)) !== null) {
+    while (firstOpen >= 0 && (mm = markerRe.exec(buf)) !== null) {
+      if (mm.index < firstOpen) continue;
       lastMarker = mm.index;
       lastMarkerEnd = mm.index + mm[0].length;
     }
@@ -6319,9 +6335,9 @@
     // A template may stream the boundary as its own line and send the answer in
     // the next delta; recognize that pending state right away, or the scratchpad
     // flashes as answer markdown.
-    if (lastMarker < 0) {
+    if (lastMarker < 0 && firstOpen >= 0) {
       const pendingMarker = /(?:^|\n)[ \t]*response[ \t]*$/i.exec(buf);
-      if (pendingMarker) {
+      if (pendingMarker && pendingMarker.index > firstOpen) {
         lastMarker = pendingMarker.index;
         lastMarkerEnd = buf.length;
       }
@@ -6331,10 +6347,11 @@
     let lastClose = -1;
     let m;
     while ((m = closeRe.exec(buf)) !== null) lastClose = m.index + m[0].length;
+    const answerAfterClose = lastClose >= 0 && buf.slice(lastClose).trim() !== "";
 
     let thinking = "";
     let content = "";
-    if (lastMarker >= 0) {
+    if (lastMarker >= 0 && !answerAfterClose) {
       thinking = buf.slice(0, lastMarker);
       content = buf.slice(lastMarkerEnd);
     } else if (lastClose >= 0) {
@@ -6477,17 +6494,28 @@
     return "Thinking…";
   }
 
+  function toolProgressLabel(evt) {
+    const name = String(evt.name || "tool");
+    const file = String(evt.path || "").split(/[\\/]/).pop();
+    const verb = name.includes("edit") ? "Editing" : /write|save/.test(name) ? "Writing" : "Preparing";
+    const lines = Number(evt.lines) || 0;
+    return `${verb} ${file || name.replaceAll("_", " ")} · ${lines} line${lines === 1 ? "" : "s"}`;
+  }
+
   function updateThinkLine(row, running, label) {
-    window.AccurettaOrb?.setState(row, running ? (label === "Writing response" ? "composing" : "thinking") : "idle");
+    const writing = /^Writing\b/.test(label || "");
+    window.AccurettaOrb?.setState(row, running ? (writing ? "composing" : "thinking") : "idle");
     const container = row.querySelector(".think-container");
     if (!container) return;
     const span = container.querySelector(".think-title");
     const icon = container.querySelector(".think-check-icon");
-    
+    // A tool_progress label stays until any other status replaces it.
+    if (!running || label !== container.dataset.progressLabel) delete container.dataset.progressLabel;
+
     if (running) {
       if (!container._thinkStart) container._thinkStart = Date.now();
       if (!container._phaseStart) container._phaseStart = Date.now();
-      container.dataset.phase = label === "Writing response" ? "writing" : "thinking";
+      container.dataset.phase = writing ? "writing" : "thinking";
       // Re-entering activity (a new thinking phase, or a tool after some answer
       // text): clear the finished look so the label shimmers again.
       container.classList.remove("done");
@@ -7437,6 +7465,12 @@
       // reasoning_content) — no tag parsing, no answer/thinking ambiguity.
       if (ctx.row) {
         ctx.row._channelThinking = true;
+        // Each model request in a turn thinks anew; mark where one ends so a
+        // harness cut and retry is visible instead of reading as one run-on block.
+        if (ctx.row._thinkBuf && evt.round !== ctx.row._thinkRound) {
+          ctx.row._thinkBuf += "\n\n[next round]\n\n";
+        }
+        ctx.row._thinkRound = evt.round;
         updateThinkLine(ctx.row, true, thinkingLabel());
       }
     } else if (evt.type === "thinking_delta") {
@@ -7596,6 +7630,15 @@
         appendTerminalText((evt.text || "") + "\n", false);
       } else if (streamTarget === "sandbox") {
         appendSandboxText((evt.text || "") + "\n", false, false);
+      }
+    } else if (evt.type === "tool_progress") {
+      // A tool call is still streaming its arguments, and nothing else shows until
+      // it is complete: name its target and size on the status line.
+      const line = row?.querySelector(".think-line");
+      if (line && !row.querySelector(".tcard-row.running")) {
+        const label = toolProgressLabel(evt);
+        line.dataset.progressLabel = label;
+        updateThinkLine(row, true, label);
       }
     } else if (evt.type === "heartbeat") {
       // The active activity row already proves a long tool is alive. Keep the
@@ -11907,6 +11950,15 @@
           <span class="permission-item-badge">HOST</span>
         </div>
       `;
+      if (details.code_preview) {
+        html += `
+          <div class="permission-item">
+            <span class="permission-item-icon warning"><i class="ph ph-code"></i></span>
+            <span class="permission-item-text">Python script it runs:
+<code>${esc(String(details.code_preview))}</code></span>
+          </div>
+        `;
+      }
     } else if (kind === "test") {
       const cmd = a.command || "";
       html += `
@@ -12255,7 +12307,7 @@
   const FOREIGN_EVENT_TYPES = new Set([
     "steering_applied", "steering_deferred", "delta", "thinking_start",
     "thinking_delta", "thinking_end", "command_requested", "command_spawned",
-    "command_finished", "command_not_executed", "tool_start", "tool_stream",
+    "command_finished", "command_not_executed", "tool_start", "tool_stream", "tool_progress",
     "heartbeat", "subagent_progress", "tool_result", "tool_dialect_warning", "tools_unavailable",
     "context_trimmed", "version_saved", "savings", "stats", "final",
     "research_update", "notice", "breach", "rt_phase", "rt_mission",
@@ -12268,7 +12320,7 @@
   // open a live row for a finished turn.
   const LIVE_FOREIGN_EVENT_TYPES = new Set([
     "delta", "thinking_start", "thinking_delta", "steering_applied",
-    "tool_start", "tool_stream", "command_requested", "command_spawned",
+    "tool_start", "tool_stream", "tool_progress", "command_requested", "command_spawned",
     "heartbeat",
   ]);
   let foreignTurn = null;   // { chatId, row, ctx, userMsg } while mirroring

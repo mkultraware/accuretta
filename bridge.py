@@ -2023,6 +2023,8 @@ DEFAULT_SETTINGS = {
     "subagent_max_tasks": 5,       # spawn_subagent batch cap (oversized batches are rejected, not truncated)
     "subagent_max_turns": 20,      # tool rounds per sub-agent before it must answer
     "max_tool_rounds": 120,        # how many tool-call rounds the model may run per user turn before forced stop
+    "debug_tool_parse_failures": False,  # keep raw model output of rounds whose tool call lost its arguments
+                                    # in data/tool_parse_failures.jsonl. Stores model output, so off by default.
     "preserve_prior_thinking": False,# replay prior <think> verbatim: bloats context + re-feeds doubt on long runs, so default off
     "summarize_history": True,      # rolling-summary compaction: fold the oldest turns into a summary
                                     # when the context overflows instead of deleting them. False silently
@@ -4228,6 +4230,21 @@ def _summary_output_budget(ctx_limit: int | None) -> int:
     return max(1536, min(_SUMMARY_MAX_OUTPUT_TOKENS, int(ctx_limit) // 8))
 
 
+def _call_digest(tc: dict) -> str:
+    """A tool call with the arguments that say what it touched, so a summary
+    can name the file or command behind each result."""
+    fn = tc.get("function") or {}
+    try:
+        args = json.loads(fn.get("arguments") or "{}")
+    except (TypeError, ValueError):
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+    shown = ", ".join(f"{k}={str(args[k])[:120]}"
+                      for k in ("path", "command", "code", "pattern", "url", "query") if args.get(k))
+    return f"{fn.get('name', '')}({shown})"
+
+
 def _render_msgs_for_summary(slice_msgs: list[dict]) -> str:
     def _excerpt(text: str, limit: int) -> str:
         if len(text) <= limit:
@@ -4247,12 +4264,16 @@ def _render_msgs_for_summary(slice_msgs: list[dict]) -> str:
         if role == "assistant":
             # Never feed internal reasoning to the summarizer: a fold would turn
             # tool-protocol deliberation into established state for later turns.
+            # Legacy marker-form reasoning is closed first; an unclosed block is
+            # reasoning to the end.
+            c = _close_think_marker(c)
             c = re.sub(r"<\s*think\s*>[\s\S]*?<\s*/\s*think\s*>", " ", c, flags=re.IGNORECASE)
-            c = re.sub(r"<\s*/?\s*think\s*>", " ", c, flags=re.IGNORECASE)
+            c = re.sub(r"<\s*think\s*>[\s\S]*$", " ", c, flags=re.IGNORECASE)
+            c = re.sub(r"<\s*/\s*think\s*>", " ", c, flags=re.IGNORECASE)
         if role == "tool":
             c = "[tool result] " + _excerpt(c, 4000)
         elif m.get("tool_calls"):
-            names = ", ".join((tc.get("function", {}) or {}).get("name", "") for tc in m.get("tool_calls", []))
+            names = ", ".join(_call_digest(tc) for tc in m.get("tool_calls", []))
             c = (_excerpt(c, 1600) + f" [called tools: {names}]").strip()
         else:
             c = _excerpt(c, 2400 if role == "user" else 1600)
@@ -9247,7 +9268,7 @@ _TRANSIENT_EVENT_TYPES = frozenset({"ctx_fill", "summary_folding"})
 # best-effort: never logged (one token per ring slot would flush approvals out
 # of the resume log in seconds) and dropped under backpressure rather than
 # evicting a durable event.
-_BEST_EFFORT_EVENT_TYPES = frozenset({"delta", "thinking_delta"})
+_BEST_EFFORT_EVENT_TYPES = frozenset({"delta", "thinking_delta", "tool_progress"})
 
 # Count of events discarded for a slow subscriber (queue full). Never removes
 # the subscriber; surfaced only so a persistent flood is observable.
@@ -9502,13 +9523,14 @@ def tool_read_file(args: dict) -> dict:
     # response says explicitly that repeating the same call returns the same chunk,
     # because models otherwise loop on read_file hoping for fresh bytes.
     offset = max(0, int(args.get("offset") or 0))
+    limit = max(0, int(args.get("limit") or 0))
     # 20KB chunk: enough for a function or a chunk of HTML, yet small enough that
     # the serialized result stays under the read_file result cap (32000) so
     # compress_tool_result never truncates it a second time. Keep the two in sync.
     BYTE_CAP = 20 * 1024
     try:
         try:
-            full_text = Path(path).read_text(encoding="utf-8")
+            full_text = Path(path).read_text(encoding="utf-8-sig")
         except UnicodeDecodeError:
             full_text = Path(path).read_bytes().decode("latin-1", errors="replace")
         total_size = len(full_text.encode("utf-8", errors="replace"))
@@ -9534,7 +9556,7 @@ def tool_read_file(args: dict) -> dict:
         end = offset
         for i in range(offset, total_lines):
             line_bytes = len(lines[i].encode("utf-8", errors="replace"))
-            if byte_count + line_bytes > BYTE_CAP and chunk_parts:
+            if (byte_count + line_bytes > BYTE_CAP or (limit and i - offset >= limit)) and chunk_parts:
                 break
             chunk_parts.append(lines[i])
             byte_count += line_bytes
@@ -9728,9 +9750,93 @@ def _with_code_check(result: dict, findings: str) -> dict:
     return result
 
 
+# Text files keep their own line endings and BOM. Path.write_text() on Windows
+# writes every "\n" as "\r\n", so one edit_file call on an LF file used to flip
+# every line ending: git showed the whole file as changed and LF-enforcing
+# formatters failed. Edits work on LF text; the original format is restored on
+# write.
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _decode_text_file(raw: bytes) -> tuple[str, str, bool]:
+    """(text with LF line endings, the file's line ending, whether it has a BOM)."""
+    bom = raw.startswith(_UTF8_BOM)
+    text = raw.decode("utf-8-sig")
+    eol = "\r\n" if text.count("\r\n") * 2 > text.count("\n") else "\n"
+    return text.replace("\r\n", "\n"), eol, bom
+
+
+def _encode_text_file(text: str, eol: str, bom: bool) -> bytes:
+    text = text.replace("\r\n", "\n")
+    if eol != "\n":
+        text = text.replace("\n", eol)
+    return (_UTF8_BOM if bom else b"") + text.encode("utf-8")
+
+
+def _new_file_eol(path: str) -> str:
+    """Line ending for a new file: CRLF for batch files, else what a sibling
+    with the same extension uses, else LF."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".bat", ".cmd"):
+        return "\r\n"
+    if ext:
+        try:
+            for sibling in sorted(Path(path).parent.glob(f"*{ext}"))[:5]:
+                if sibling.is_file():
+                    sample = sibling.read_bytes()[:65536]
+                    if b"\n" in sample:
+                        return "\r\n" if sample.count(b"\r\n") * 2 > sample.count(b"\n") else "\n"
+        except OSError:
+            pass
+    return "\n"
+
+
+def _closest_region(text: str, needle: str, context: int = 2, max_lines: int = 12) -> str:
+    """Numbered file lines that best match the first line of a missed old_text,
+    so the model can correct the edit without reading the whole file again."""
+    lines = text.splitlines()
+    want = needle.strip().splitlines() or [needle.strip()]
+    first = want[0].strip()
+    if not first:
+        return ""
+    best_i, best_score = -1, 0.0
+    for i, line in enumerate(lines):
+        score = difflib.SequenceMatcher(None, line.strip(), first).ratio()
+        if score > best_score:
+            best_i, best_score = i, score
+    if best_i < 0 or best_score < 0.6:
+        return ""
+    lo = max(0, best_i - context)
+    hi = min(len(lines), best_i + len(want) + context, lo + max_lines)
+    return "\n".join(f"{n + 1}: {lines[n]}" for n in range(lo, hi))
+
+
+# Content of a write the anti-clobber guard blocked, kept so a confirmed retry
+# with force=true does not have to send the whole file again. One per chat and
+# path; it expires after 30 minutes and goes with any successful write there.
+_blocked_writes: dict[tuple[str, str], tuple[float, str]] = {}
+_BLOCKED_WRITE_TTL_S = 1800
+
+
+def _blocked_write_key(path: str) -> tuple[str, str]:
+    return _get_current_chat() or "", os.path.normcase(normalize_path(path or ""))
+
+
+def _blocked_write(path: str) -> str | None:
+    key = _blocked_write_key(path)
+    entry = _blocked_writes.get(key)
+    if entry and time.time() - entry[0] > _BLOCKED_WRITE_TTL_S:
+        _blocked_writes.pop(key, None)
+        entry = None
+    return entry[1] if entry else None
+
+
 def tool_write_file(args: dict) -> dict:
     path = normalize_path(args.get("path") or "")
     content = args.get("content")
+    # Append adds a chunk at the end of the file, so a large file can be built
+    # in parts that each fit comfortably in one reply.
+    append = str(args.get("mode") or "overwrite").strip().lower() == "append"
     source_meta: dict = {}
     if not path:
         return {"error": "missing path"}
@@ -9746,6 +9852,10 @@ def tool_write_file(args: dict) -> dict:
             "language": block["language"],
             "message_index": block["message_index"],
         }
+    elif args.get("force") and not (isinstance(content, str) and content.strip()):
+        content = _blocked_write(path)
+        if content is not None:
+            source_meta = {"source": "blocked_write"}
     if not isinstance(content, str) or not content.strip():
         return {"error": "refused: content or source is empty or missing. No file was written."}
     if is_bridge_self_path(path):
@@ -9770,17 +9880,22 @@ def tool_write_file(args: dict) -> dict:
     if os.path.isfile(path) and not bool(args.get("force")):
         stale = ("" if _existing_len == 0 else _file_staleness(path))
         if stale:
+            _blocked_writes[_blocked_write_key(path)] = (time.time(), content)
+            while len(_blocked_writes) > 8:
+                _blocked_writes.pop(next(iter(_blocked_writes)))
             return {"error": (f"write blocked: this file exists and was {stale}. Call read_file on it "
                               f"first so you overwrite the CURRENT contents, not a stale assumption — "
                           f"then write_file again. If you truly mean to replace the whole file, pass "
-                              f"force=true."),
+                              f"force=true. To write the content you just sent, call write_file with "
+                              f"this path and force=true and leave out content."),
                     "path": path, "reason": stale}
     # Rewrite-loop breaker: refuse the Nth full rewrite of the same file in one
     # turn. The model can't verify a fresh version is better and spirals into
     # "let me rewrite from scratch"; this forces targeted edits instead.
     _npath = normalize_path(path)
     _prior = _write_count(_npath)
-    if os.path.isfile(path) and _prior >= REWRITE_LOOP_LIMIT and not bool(args.get("force_rewrite")):
+    if (not append and os.path.isfile(path) and _prior >= REWRITE_LOOP_LIMIT
+            and not bool(args.get("force_rewrite"))):
         return {"error": (f"rewrite loop blocked: you have already rewritten this file {_prior} time(s) this "
                           f"turn and it IS saved. STOP rewriting from scratch — you cannot verify a fresh "
                           f"version is better and you are spiralling. Instead: if a SPECIFIC thing is wrong, "
@@ -9795,36 +9910,45 @@ def tool_write_file(args: dict) -> dict:
             _old_for_diff = Path(path).read_text(encoding="utf-8", errors="replace")
     except Exception:
         _old_for_diff = ""
-    _diff_rows, _adds, _dels = _diff_preview_rows(_old_for_diff, content)
+    _diff_rows, _adds, _dels = _diff_preview_rows(
+        _old_for_diff, _old_for_diff + content if append else content)
     _wf_details = {"kind": "write_file", "path": path, "bytes": len(content.encode('utf-8'))}
+    if append:
+        _wf_details["mode"] = "append"
     if _diff_rows:
         _wf_details["diff"] = _diff_rows
         _wf_details["diff_counts"] = {"adds": _adds, "dels": _dels}
+    _verb = "Add-Content" if append else "Set-Content"
     approval = request_approval(
-        title="Write file",
-        command=f'Set-Content -Path "{path}" -Value <{len(content)} chars>',
+        title="Append to file" if append else "Write file",
+        command=f'{_verb} -Path "{path}" -Value <{len(content)} chars>',
         details=_wf_details,
     )
     if approval.get("decision") != "approve":
         return {"error": f"user denied write ({approval.get('status')})"}
     _undo_snapshot(path)
     try:
-        old_text = ""
+        old_text, eol, bom = "", _new_file_eol(path), False
         if os.path.isfile(path):
             try:
-                old_text = Path(path).read_text(encoding="utf-8")
-            except Exception:
-                pass
+                old_text, eol, bom = _decode_text_file(Path(path).read_bytes())
+            except (OSError, UnicodeDecodeError):
+                if append:
+                    return {"error": f"cannot append: {path} is not readable UTF-8 text. No file was written."}
+        content = content.replace("\r\n", "\n")
+        new_text = old_text + content if append else content
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(content, encoding="utf-8")
+        Path(path).write_bytes(_encode_text_file(new_text, eol, bom))
+        _blocked_writes.pop(_blocked_write_key(path), None)
         _undo_store.checkpoint(path)
         _record_file_read(path)  # our hash now matches what we just wrote
-        _record_write(_npath)    # count this rewrite for the loop-breaker
+        if not append:
+            _record_write(_npath)    # count this rewrite for the loop-breaker
 
         import difflib
         diff = list(difflib.unified_diff(
             old_text.splitlines(keepends=True),
-            content.splitlines(keepends=True),
+            new_text.splitlines(keepends=True),
             n=0
         ))
         added = 0
@@ -9837,9 +9961,12 @@ def tool_write_file(args: dict) -> dict:
                 
         lint_err = _run_linter(path)
         result = {"ok": True, "path": path, "bytes": len(content.encode("utf-8")), "added": added, "deleted": deleted}
+        if append:
+            result["mode"] = "append"
+            result["total_bytes"] = len(new_text.encode("utf-8"))
         _with_code_check(result, lint_err)
         result.update(source_meta)
-        if _write_count(_npath) >= 2:
+        if not append and _write_count(_npath) >= 2:
             result["warning"] = ("you have now rewritten this file from scratch. If it still isn't right, make a "
                                  "TARGETED edit_file fix next — do NOT rewrite the whole file again, you'll spiral.")
         return result
@@ -9871,8 +9998,8 @@ def tool_edit_file(args: dict) -> dict:
         return {"error": f"not a file: {path}"}
 
     try:
-        text = Path(path).read_text(encoding="utf-8")
-    except Exception as e:
+        text, eol, bom = _decode_text_file(Path(path).read_bytes())
+    except (OSError, UnicodeDecodeError) as e:
         return {"error": f"read failed: {e}"}
 
     applied = []
@@ -9880,8 +10007,11 @@ def tool_edit_file(args: dict) -> dict:
     modified = text
 
     for i, edit in enumerate(edits):
-        old = edit.get("old_text", "")
-        new = edit.get("new_text", "")
+        if not isinstance(edit, dict):
+            errors.append(f"edit {i}: each edit must be an object with old_text and new_text")
+            continue
+        old = str(edit.get("old_text", edit.get("old_string", "")) or "").replace("\r\n", "\n")
+        new = str(edit.get("new_text", edit.get("new_string", "")) or "").replace("\r\n", "\n")
         if not old:
             errors.append(f"edit {i}: old_text is empty")
             continue
@@ -9893,13 +10023,17 @@ def tool_edit_file(args: dict) -> dict:
             if old_stripped and old_stripped != old:
                 count = modified.count(old_stripped)
                 if count == 1:
-                    modified = modified.replace(old_stripped, new, 1)
+                    # The file keeps its own whitespace around the match, so the
+                    # replacement drops the model's: "\t" + "    x" mixed tabs and spaces.
+                    modified = modified.replace(old_stripped, new.strip(), 1)
                     applied.append({"edit": i, "match": "fuzzy", "old": old[:60], "new": new[:60]})
                     continue
                 elif count > 1:
                     errors.append(f"edit {i}: fuzzy match '{old[:40]}' appears {count} times — ambiguous")
                     continue
-            errors.append(f"edit {i}: '{old[:40]}' not found in file")
+            hint = _closest_region(modified, old)
+            errors.append(f"edit {i}: '{old[:40]}' not found in file"
+                          + (f". Closest lines in the file now:\n{hint}" if hint else ""))
             continue
         elif count > 1:
             errors.append(f"edit {i}: '{old[:40]}' appears {count} times — must be unique")
@@ -9952,7 +10086,7 @@ def tool_edit_file(args: dict) -> dict:
             elif line.startswith('-') and not line.startswith('---'):
                 deleted += 1
 
-        Path(path).write_text(modified, encoding="utf-8")
+        Path(path).write_bytes(_encode_text_file(modified, eol, bom))
         _undo_store.checkpoint(path)
         _record_file_read(path)  # keep our hash current after our own edit
 
@@ -10545,12 +10679,73 @@ def _kill_current_command(chat_id: str) -> bool:
         return False
 
 
-def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000) -> dict:
+# Model-facing commands run inside a small wrapper. Windows PowerShell 5.1
+# reads BOM-less UTF-8 files as ANSI and writes the pipe in the OEM code page,
+# so non-ASCII text came back garbled; the prelude makes both UTF-8. The status
+# line reports $? and $LASTEXITCODE: with -Command the process exit code follows
+# $? of the last statement, so a program that succeeded but wrote to a
+# redirected stderr (`node x 2>&1`) came back as exit 1.
+_PS_STATUS = "__ACCURETTA_STATUS__"
+_PS_ERROR_ID_RE = re.compile(r"FullyQualifiedErrorId\s*:\s*([\w.,]+)")
+
+
+def _ps_script(cmd: str) -> str:
+    return (
+        "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n"
+        "$OutputEncoding = [Text.UTF8Encoding]::new($false)\n"
+        "$PSDefaultParameterValues['Get-Content:Encoding'] = 'UTF8'\n"
+        "$PSDefaultParameterValues['Select-String:Encoding'] = 'UTF8'\n"
+        "$global:LASTEXITCODE = 0\n"
+        f"{cmd}\n"
+        f"$__accOk = $?; Write-Output \"{_PS_STATUS}$__accOk;$LASTEXITCODE\""
+    )
+
+
+def _ps_outcome(stdout: str, stderr: str, returncode: int) -> tuple[str, bool, int]:
+    """(stdout without the status line, success, exit code) of a wrapped command.
+
+    The last program's own exit code wins. Error records that are only a
+    program's stderr lines (NativeCommandError) do not make a run fail."""
+    head, sep, tail = stdout.rpartition(_PS_STATUS)
+    if not sep:
+        return stdout, returncode == 0, returncode
+    ps_ok, _, code_txt = tail.strip().partition(";")
+    code_txt = code_txt.strip()
+    program_code = int(code_txt) if code_txt.lstrip("-").isdigit() else 0
+    if program_code:
+        return head, False, program_code
+    if ps_ok == "True":
+        return head, True, 0
+    ids = _PS_ERROR_ID_RE.findall(head + stderr)
+    if ids and all(i.startswith("NativeCommandError") for i in ids):
+        return head, True, 0
+    return head, False, returncode or 1
+
+
+def _default_command_cwd() -> str:
+    """The folder a host command runs in when the model names none: the chat's
+    branch worktree or project, else the first workspace folder."""
+    try:
+        chat = (get_chats().get("chats", {}) or {}).get(_get_current_chat()) or {}
+        for meta in (_github_worktree_metadata(chat.get("github_worktree")),
+                     _project_workspace_metadata(chat.get("project_workspace"))):
+            if meta and os.path.isdir(meta["path"]):
+                return normalize_path(meta["path"])
+    except Exception:
+        pass
+    for folder in get_workspace().get("folders", []) or []:
+        if isinstance(folder, str) and folder.strip() and os.path.isdir(folder):
+            return normalize_path(folder)
+    return os.getcwd()
+
+
+def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000,
+                    cwd: str | None = None, wrap: bool = False) -> dict:
     t_start = time.time()
     stream_chat_id = _current_chat_id.get() or _get_current_chat()
     stream_tool_name = _execution_tool_name("run_powershell")
     stream_call_id = _current_tool_call_id.get()
-    process_cwd = os.getcwd()
+    process_cwd = cwd or os.getcwd()
     powershell_exe = _trusted_windows_binary("WindowsPowerShell", "v1.0", "powershell.exe")
     if not powershell_exe:
         return _execution_not_run(
@@ -10559,8 +10754,11 @@ def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000) -> di
         )
     try:
         proc = subprocess.Popen(
-            [powershell_exe, "-NoProfile", "-NonInteractive", "-Command", cmd],
+            [powershell_exe, "-NoProfile", "-NonInteractive", "-Command",
+             _ps_script(cmd) if wrap else cmd],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8" if wrap else None, errors="replace" if wrap else None,
+            cwd=process_cwd,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except Exception as e:
@@ -10588,6 +10786,8 @@ def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000) -> di
         try:
             for line in iter(pipe.readline, ""):
                 sink.append(line)
+                if wrap and _PS_STATUS in line:
+                    continue
                 _emit_tool_stream(stream_tool_name, line.rstrip("\n\r"), stream_chat_id,
                                   target="host", call_id=stream_call_id)
             pipe.close()
@@ -10630,15 +10830,22 @@ def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000) -> di
             killed = proc in _killed_procs
         if proc.returncode is not None and proc.returncode < 0:
             killed = True
+        ok, exit_code = proc.returncode == 0, proc.returncode
+        if wrap and not (timed_out or killed):
+            stdout, ok, exit_code = _ps_outcome(stdout, stderr, proc.returncode)
         result = {
-            "ok": proc.returncode == 0,
-            "exit": proc.returncode,
-            "exit_code": proc.returncode,
+            "ok": ok,
+            "exit": exit_code,
+            "exit_code": exit_code,
             "stdout": stdout,
             "stderr": stderr,
             "executed": True,
             "execution_target": "host",
         }
+        if wrap and exit_code != proc.returncode:
+            result["powershell_exit_code"] = proc.returncode
+        if wrap:
+            result["cwd"] = process_cwd
         if timed_out:
             result["timed_out"] = True
             result["error"] = f"timeout after {timeout}s"
@@ -10650,7 +10857,7 @@ def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000) -> di
             "ts": int(t_start * 1000),
             "chat_id": stream_chat_id,
             "command": cmd,
-            "exit": proc.returncode,
+            "exit": exit_code,
             "ok": result["ok"],
             "duration_ms": duration_ms,
             "stdout": stdout,
@@ -10662,7 +10869,7 @@ def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000) -> di
             "call_id": stream_call_id,
         })
         _emit_execution_event("finished", "host", cmd, cwd=process_cwd,
-                              chat_id=stream_chat_id, exit_code=proc.returncode,
+                              chat_id=stream_chat_id, exit_code=exit_code,
                               killed=killed, timed_out=timed_out,
                               duration_ms=duration_ms)
         return result
@@ -10790,10 +10997,27 @@ def _host_command_executes_code(command: str) -> bool:
 
 
 def tool_run_powershell(args: dict) -> dict:
-    cmd = (args.get("command") or "").strip()
+    return _run_host_command(str(args.get("command") or ""), str(args.get("cwd") or ""),
+                             args.get("timeout", 120))
+
+
+def _run_host_command(cmd: str, requested_cwd: str, timeout, code_preview: str = "") -> dict:
+    """Guard, approve and run one model-requested PowerShell command.
+
+    code_preview is the script a launcher command runs (run_python). It comes
+    from the harness, never from model arguments, so the approval card cannot
+    show text the command does not run."""
+    cmd = (cmd or "").strip()
     if not cmd:
         return {"error": "empty command"}
-    process_cwd = os.getcwd()
+    requested_cwd = (requested_cwd or "").strip()
+    process_cwd = normalize_path(requested_cwd) if requested_cwd else _default_command_cwd()
+    if requested_cwd:
+        if not os.path.isdir(process_cwd):
+            return {"error": f"cwd is not a directory: {process_cwd}", "not_executed": True}
+        if not is_in_workspace(process_cwd):
+            return {"error": "cwd is outside the workspace. Add the folder in the Workspace panel.",
+                    "not_executed": True}
     _emit_execution_event("requested", "host", cmd, cwd=process_cwd)
 
     def not_run(message: str, reason: str, **details) -> dict:
@@ -10853,21 +11077,72 @@ def tool_run_powershell(args: dict) -> dict:
             return not_run(f"user denied registry edit ({approval.get('status')})",
                            "denied")
     else:
-        executes_code = _host_command_executes_code(cmd)
+        executes_code = bool(code_preview) or _host_command_executes_code(cmd)
         red_team_context = bool(_rt_authorized_mission(_rt_context_chat()))
+        details = {
+            "kind": "powershell",
+            "target": "host",
+            "executes_code": executes_code,
+            "red_team_context": red_team_context,
+        }
+        if code_preview:
+            details["code_preview"] = code_preview[:6000]
         approval = request_approval(
             title=("Host code execution" if executes_code else "Command on Windows host"),
             command=cmd,
-            details={
-                "kind": "powershell",
-                "target": "host",
-                "executes_code": executes_code,
-                "red_team_context": red_team_context,
-            },
+            details=details,
         )
         if approval.get("decision") != "approve":
             return not_run(f"user denied command ({approval.get('status')})", "denied")
-    return _run_powershell(cmd, timeout=int(args.get("timeout", 120)))
+    return _run_powershell(cmd, timeout=int(timeout or 120), cwd=process_cwd, wrap=True)
+
+
+def _python_launcher(cwd: str) -> list[str]:
+    """argv prefix for Python: the project's virtual environment when it has one,
+    else the py launcher, else python on PATH."""
+    for venv in (".venv", "venv", "env"):
+        candidate = Path(cwd) / venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if candidate.is_file():
+            return [str(candidate)]
+    launcher = shutil.which("py") if os.name == "nt" else None
+    if launcher:
+        return [launcher, "-3"]
+    found = shutil.which("python") or shutil.which("python3")
+    return [found] if found else []
+
+
+def tool_run_python(args: dict) -> dict:
+    """Run model-written Python from a temporary script file.
+
+    Python pasted into a PowerShell here-string breaks on `$`, quotes and
+    backticks. The script runs through the run_powershell path, so the same
+    approval rules apply and Soft mode reads the script file it runs."""
+    code = str(args.get("code") or "")
+    if not code.strip():
+        return {"error": "empty code", "not_executed": True}
+    for check in (bridge_self_threat, _catastrophic_cmd):
+        reason = check(code)
+        if reason:
+            return {"error": f"refused: this script {reason}.", "not_executed": True}
+    requested_cwd = str(args.get("cwd") or "").strip()
+    cwd = normalize_path(requested_cwd) if requested_cwd else _default_command_cwd()
+    launcher = _python_launcher(cwd)
+    if not launcher:
+        return {"error": "No Python interpreter was found. Install Python or create a .venv in the project.",
+                "not_executed": True}
+    script_dir = Path(tempfile.gettempdir()) / "accuretta-run-python"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    script = script_dir / f"run_{uuid.uuid4().hex[:12]}.py"
+    script.write_text(code, encoding="utf-8")
+    command = ('& "' + launcher[0] + '"' + "".join(f" {a}" for a in launcher[1:])
+               + f' -X utf8 "{script}"')
+    try:
+        return _run_host_command(command, requested_cwd, args.get("timeout", 120), code_preview=code)
+    finally:
+        try:
+            script.unlink()
+        except OSError:
+            pass
 
 
 _REMOTE_READ_ONLY_COMMANDS = {
@@ -11096,16 +11371,13 @@ def _remote_write_approved_payload(row: dict, path: str, payload: bytes,
 
 
 _CHAT_CODE_FENCE_RE = re.compile(r"```([^\r\n`]*)\r?\n([\s\S]*?)```", re.MULTILINE)
-_RESPONSE_BOUNDARY_RE = re.compile(
-    r"(?:^|\n)[ \t]*response(?=[A-Za-z0-9<`])", re.IGNORECASE)
 
 
 def _visible_assistant_text(text: str) -> str:
     """Mirror the UI reasoning boundary for exports and completion checks."""
-    raw = str(text or "")
-    boundaries = list(_RESPONSE_BOUNDARY_RE.finditer(raw))
-    if boundaries:
-        return raw[boundaries[-1].end():]
+    # Legacy marker-form reasoning is closed first, so an answer line such as
+    # `ResponseEntity<T> ok()` is never mistaken for the reasoning boundary.
+    raw = _close_think_marker(str(text or ""))
     close_re = re.compile(
         r"</(?:think|thinking|reasoning)>|<\|/thinking\|>|"
         r"\[/(?:thought|thinking|reasoning|scratchpad)\]",
@@ -11150,12 +11422,26 @@ def _visible_final_answer(text: str) -> str:
     return _strip_unparsed_tool_markup(_visible_assistant_text(text)).strip()
 
 
+# Assistant messages of the turn in progress, published by run_chat_turn before
+# it runs a round's tools, so write_file(source='visible_code_block') can copy a
+# fence from the current turn, including the reply that makes the call.
+_live_turn_messages: dict[str, list[dict]] = {}
+
+
+_FILE_IN_PARTS = ("write the file in parts: write_file with the first part (about 150 lines), "
+                  "then write_file mode='append' for each next part")
+
+
 def _recent_visible_code_blocks(chat_id: str, language: str = "") -> list[dict]:
     wanted = str(language or "").strip().lower()
     chat = (get_chats().get("chats", {}) or {}).get(chat_id) or {}
+    saved = [(i, m) for i, m in enumerate(chat.get("messages") or [])
+             if not m.get("_internal")]
+    live = [(len(chat.get("messages") or []) + i, m)
+            for i, m in enumerate(_live_turn_messages.get(chat_id) or [])]
     blocks: list[dict] = []
-    for message_index, message in enumerate(chat.get("messages") or []):
-        if (message.get("role") != "assistant" or message.get("_internal")
+    for message_index, message in saved + live:
+        if (message.get("role") != "assistant"
                 or not isinstance(message.get("content"), str)):
             continue
         visible = _visible_assistant_text(message.get("content") or "")
@@ -11169,8 +11455,47 @@ def _recent_visible_code_blocks(chat_id: str, language: str = "") -> list[dict]:
             blocks.append({
                 "content": match.group(2), "language": lang,
                 "info": info, "message_index": message_index,
+                "live": message_index >= len(chat.get("messages") or []),
             })
     return blocks
+
+
+# Fence languages and file extensions that name the same kind of code. A block is
+# refused only when both sides are known here and differ.
+_CODE_FAMILIES = {
+    "html": ("html", "htm", "xhtml"),
+    "css": ("css",),
+    "javascript": ("js", "javascript", "mjs", "cjs", "jsx", "ts", "typescript", "tsx"),
+    "python": ("py", "python", "python3", "pyw"),
+    "powershell": ("ps1", "psm1", "powershell", "pwsh"),
+    "shell": ("sh", "bash", "zsh"),
+    "batch": ("bat", "cmd", "batch"),
+    "json": ("json", "jsonc"),
+    "markdown": ("md", "markdown"),
+    "java": ("java",),
+    "csharp": ("cs", "csharp"),
+    "go": ("go", "golang"),
+    "rust": ("rs", "rust"),
+    "ruby": ("rb", "ruby"),
+    "sql": ("sql",),
+    "yaml": ("yaml", "yml"),
+    "c/c++": ("c", "h", "cpp", "cc", "cxx", "hpp", "c++"),
+}
+_CODE_FAMILY_OF = {name: family for family, names in _CODE_FAMILIES.items() for name in names}
+
+
+def _code_only_in_thinking(chat_id: str) -> bool:
+    """The reply that makes the call has a code fence in its thinking and none in view."""
+    live = _live_turn_messages.get(chat_id) or []
+    content = str(live[-1].get("content") or "") if live else ""
+    thinking, _ = _split_leading_think(_close_think_marker(content))
+    if "```" not in thinking:
+        return False
+    for match in _CHAT_CODE_FENCE_RE.finditer(_visible_assistant_text(content)):
+        info = (match.group(1) or "").strip()
+        if (info.split(None, 1)[0].lower() if info else "text") not in {"tool_code", "tool_call"}:
+            return False
+    return True
 
 
 def _visible_code_source(args: dict) -> tuple[dict, str]:
@@ -11181,14 +11506,26 @@ def _visible_code_source(args: dict) -> tuple[dict, str]:
         index = max(0, min(int(args.get("index") or 0), 50))
     except (ValueError, TypeError) as exc:
         return {}, str(exc)
-    blocks = _recent_visible_code_blocks(
-        _get_current_chat() or "", str(args.get("language") or ""))
+    chat_id = _get_current_chat() or ""
+    blocks = _recent_visible_code_blocks(chat_id, str(args.get("language") or ""))
+    write_it = "Pass the file text in content instead."
     if index >= len(blocks):
         return {}, (
             "No matching visible code block exists in this chat. "
-            f"Found {len(blocks)} matching blocks. Generate the complete file first, then retry."
+            f"Found {len(blocks)} matching blocks. {write_it}"
         )
-    return blocks[-1 - index], ""
+    block = blocks[-1 - index]
+    name = os.path.basename(str(args.get("path") or ""))
+    want = _CODE_FAMILY_OF.get(os.path.splitext(name)[1].lstrip(".").lower())
+    have = _CODE_FAMILY_OF.get(block["language"])
+    if want and have and want != have:
+        return {}, (f"refused: the newest visible code block is {block['language']}, but {name} "
+                    f"needs {want} code. No file was written. {write_it}")
+    if not block["live"] and _code_only_in_thinking(chat_id):
+        return {}, ("refused: this reply has its code only in your thinking, which is not visible "
+                    "and is not kept. The newest visible code block is from an earlier message, so "
+                    f"no file was written. {write_it}")
+    return block, ""
 
 
 def _cleanup_remote_staging(max_age_s: int = 86400) -> None:
@@ -16477,18 +16814,25 @@ _GREP_SKIP_DIRS = {
 _GREP_MAX_FILE_BYTES = 4 * 1024 * 1024
 
 
+def _grep_candidates(root: str):
+    """The file itself, or every file under a directory minus noise folders."""
+    if os.path.isfile(root):
+        yield root
+        return
+    for cur_dir, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _GREP_SKIP_DIRS]
+        for fn in filenames:
+            yield os.path.join(cur_dir, fn)
+
+
 def tool_grep_files(args: dict) -> dict:
-    """Recursive regex search across a directory tree. Returns matches with
-    file path, line number, and the matched line (truncated). Skips binary
-    files (null-byte heuristic) and obvious noise dirs (.git, node_modules).
-    Best for searching extracted firmware roots for keywords like 'system(',
-    'sprintf', auth strings, hardcoded creds, CGI handler names."""
+    """Regex search in one file or across a directory tree. Returns matches
+    with file path, line number and the matched line (truncated), optionally
+    with surrounding lines, or only the matching files. Skips binary files
+    (null-byte heuristic) and obvious noise dirs (.git, node_modules)."""
     root, err = _fw_check_path(args.get("path") or "")
     if err:
         return err
-    if not os.path.isdir(root):
-        return {"error": f"not a directory: {root}", "expected_type": "directory",
-                "actual_type": "file" if os.path.isfile(root) else "unknown"}
     pattern = args.get("pattern") or ""
     if not pattern:
         return {"error": "missing pattern"}
@@ -16496,6 +16840,8 @@ def tool_grep_files(args: dict) -> dict:
     case_insensitive = bool(args.get("case_insensitive"))
     max_matches = max(1, min(int(args.get("max_matches") or 200), 2000))
     max_files = max(1, min(int(args.get("max_files") or 5000), 50000))
+    context = max(0, min(int(args.get("context") or 0), 5))
+    files_only = bool(args.get("files_only"))
     flags = re.IGNORECASE if case_insensitive else 0
     try:
         rx = re.compile(pattern, flags)
@@ -16503,69 +16849,77 @@ def tool_grep_files(args: dict) -> dict:
         return {"error": f"bad regex: {e}"}
 
     matches: list[dict] = []
+    file_hits: list[dict] = []
     files_scanned = 0
     files_skipped_binary = 0
     files_skipped_size = 0
     truncated = False
 
     try:
-        for cur_dir, dirnames, filenames in os.walk(root):
-            # prune noise dirs in-place
-            dirnames[:] = [d for d in dirnames if d not in _GREP_SKIP_DIRS]
-            for fn in filenames:
-                if files_scanned >= max_files:
+        for fp in _grep_candidates(root):
+            if files_scanned >= max_files:
+                truncated = True
+                break
+            if glob_pat:
+                fn = os.path.basename(fp)
+                try:
+                    if not Path(fp).match(glob_pat) and not fnmatch.fnmatch(fn, glob_pat):
+                        continue
+                except Exception:
+                    if not fnmatch.fnmatch(fn, glob_pat):
+                        continue
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            if st.st_size > _GREP_MAX_FILE_BYTES:
+                files_skipped_size += 1
+                continue
+            # null-byte heuristic on first 4KB to skip binaries
+            try:
+                with open(fp, "rb") as f:
+                    sniff = f.read(4096)
+                if b"\x00" in sniff:
+                    files_skipped_binary += 1
+                    continue
+                with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.read().splitlines()
+            except Exception:
+                continue
+            files_scanned += 1
+            hits = [i for i, line in enumerate(lines) if rx.search(line)]
+            if not hits:
+                continue
+            if files_only:
+                file_hits.append({"path": fp, "count": len(hits)})
+                if len(file_hits) >= max_matches:
                     truncated = True
                     break
-                fp = os.path.join(cur_dir, fn)
-                if glob_pat:
-                    try:
-                        if not Path(fp).match(glob_pat) and not fnmatch.fnmatch(fn, glob_pat):
-                            continue
-                    except Exception:
-                        if not fnmatch.fnmatch(fn, glob_pat):
-                            continue
-                try:
-                    st = os.stat(fp)
-                except OSError:
-                    continue
-                if st.st_size > _GREP_MAX_FILE_BYTES:
-                    files_skipped_size += 1
-                    continue
-                # null-byte heuristic on first 4KB to skip binaries
-                try:
-                    with open(fp, "rb") as f:
-                        sniff = f.read(4096)
-                    if b"\x00" in sniff:
-                        files_skipped_binary += 1
-                        continue
-                    with open(fp, "r", encoding="utf-8", errors="replace") as f:
-                        for lineno, line in enumerate(f, start=1):
-                            if rx.search(line):
-                                matches.append({
-                                    "path": fp,
-                                    "line": lineno,
-                                    "text": line.rstrip("\n")[:400],
-                                })
-                                if len(matches) >= max_matches:
-                                    truncated = True
-                                    break
-                    files_scanned += 1
-                    if truncated:
-                        break
-                except Exception:
-                    continue
+                continue
+            for i in hits:
+                match = {"path": fp, "line": i + 1, "text": lines[i][:400]}
+                if context:
+                    match["before"] = [line[:400] for line in lines[max(0, i - context):i]]
+                    match["after"] = [line[:400] for line in lines[i + 1:i + 1 + context]]
+                matches.append(match)
+                if len(matches) >= max_matches:
+                    truncated = True
+                    break
             if truncated:
                 break
-        return {
+        result = {
             "root": root,
             "pattern": pattern,
-            "match_count": len(matches),
+            "match_count": sum(h["count"] for h in file_hits) if files_only else len(matches),
             "files_scanned": files_scanned,
             "files_skipped_binary": files_skipped_binary,
             "files_skipped_size": files_skipped_size,
             "truncated": truncated,
             "matches": matches,
         }
+        if files_only:
+            result["files"] = file_hits
+        return result
     except Exception as e:
         return {"error": str(e)}
 
@@ -23622,7 +23976,7 @@ def _full_test_run(command: str, output: str) -> bool:
 
 def tool_run_tests(args: dict) -> dict:
     command = str(args.get("command") or "").strip()
-    cwd = normalize_path(args.get("cwd", str(ROOT)))
+    cwd = normalize_path(str(args.get("cwd") or "") or _default_command_cwd())
     if not command:
         return {"error": "test command required"}
     _emit_execution_event("requested", "host", command, cwd=cwd)
@@ -23673,8 +24027,12 @@ def tool_run_tests(args: dict) -> dict:
     call_id = _current_tool_call_id.get()
     try:
         argv = shlex.split(command, posix=os.name != "nt")
+        # Windows looks a bare program name up next to python.exe, in the bridge's
+        # own folder and on PATH, never in cwd, so a project wrapper such as
+        # mvnw.cmd or gradlew.bat failed with WinError 2. cmd.exe searches cwd.
         proc = subprocess.Popen(
-            command if os.name == "nt" else argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            command if os.name == "nt" else argv, cwd=cwd, shell=os.name == "nt",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, creationflags=_NO_WINDOW,
         )
     except Exception as e:
@@ -24561,15 +24919,16 @@ TOOLS: dict[str, dict] = {
     },
     "run_tests": {
         "description": (
-            "Run a test command (e.g. pytest, npm test) directly on the Windows host and get a "
-            "structured summary of failures. Approval follows the selected access mode. To run a "
+            "Run a test command (e.g. pytest, npm test, mvnw.cmd test) directly on the Windows host "
+            "and get a structured summary of failures. It runs through cmd.exe, so a project "
+            "wrapper in cwd is found. Approval follows the selected access mode. To run a "
             "test inside the WSL guest instead, use sandbox_run."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Test command to execute."},
-                "cwd": {"type": "string", "description": "Directory to run tests in."},
+                "cwd": {"type": "string", "description": "Directory to run tests in. Default: the active project folder."},
                 "timeout": {"type": "integer", "description": "Timeout seconds, default 600, max 3600."}
             },
             "required": ["command"],
@@ -25048,7 +25407,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_list_directory,
     },
     "read_file": {
-        "description": "Read a file from the workspace. Returns up to a 64KB chunk per call. For larger files, use the `offset` parameter (line number) to paginate — the response includes `total_lines` and a hint with the next offset to call. Calling read_file with identical args returns the SAME chunk; use offset to advance. Works on text, code, markdown, and binary files (returns best-effort decoded text). PDFs are auto-extracted to plain text page-by-page (requires pypdf); scanned image-only PDFs return a notice instead of garbage.",
+        "description": "Read a file from the workspace. Returns up to a 20KB chunk per call, or `limit` lines. For larger files, use the `offset` parameter (line number) to paginate — the response includes `total_lines` and a hint with the next offset to call. Calling read_file with identical args returns the SAME chunk; use offset to advance. Works on text, code, markdown, and binary files (returns best-effort decoded text). PDFs are auto-extracted to plain text page-by-page (requires pypdf); scanned image-only PDFs return a notice instead of garbage.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -25057,18 +25416,20 @@ TOOLS: dict[str, dict] = {
                     "type": "integer",
                     "description": "0-indexed starting line. Default 0. To read the next chunk of a truncated response, pass the previous response's `offset + lines_returned` (or just follow the `hint` field).",
                 },
+                "limit": {"type": "integer", "description": "Maximum lines to return. Default: as many as fit in 20KB."},
             },
             "required": ["path"],
         },
         "fn": tool_read_file,
     },
     "write_file": {
-        "description": "Write or overwrite a workspace file. Approval follows the selected access mode. ONLY for new files or complete rewrites (>30 lines changed). For fixes to an existing file, prefer edit_file. Provide content for new text, or source='visible_code_block' to copy a prior visible chat fence losslessly without regenerating it.",
+        "description": "Write or overwrite a workspace file. Approval follows the selected access mode. ONLY for new files or complete rewrites (>30 lines changed). For fixes to an existing file, prefer edit_file. Provide content for new text, or source='visible_code_block' to copy a prior visible chat fence losslessly without regenerating it. mode='append' adds content at the end of the file, to build a long file in parts.",
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
                 "content": {"type": "string"},
+                "mode": {"type": "string", "enum": ["overwrite", "append"], "description": "overwrite (default) replaces the file; append adds content at its end, exactly as given."},
                 "source": {"type": "string", "enum": ["visible_code_block"], "description": "Copy a prior visible assistant code fence instead of sending content again."},
                 "language": {"type": "string", "description": "Optional fence language such as html when source is visible_code_block."},
                 "index": {"type": "integer", "description": "Newest matching visible block is 0, previous is 1."},
@@ -25154,16 +25515,42 @@ TOOLS: dict[str, dict] = {
         "fn": tool_delete_file,
     },
     "run_powershell": {
-        "description": "Run a PowerShell command on the Windows host. Approval follows the selected access mode; destructive or sensitive commands keep a gate. Its real process lifecycle is shown in the Host terminal.",
+        "description": (
+            "Run a Windows PowerShell 5.1 command on the Windows host. It starts in the active "
+            "project folder unless cwd is given. stdout and stderr return separately, so do not "
+            "add 2>&1. PowerShell 5.1 has no && or ||: separate commands with ; and check "
+            "$LASTEXITCODE. To read or search files, use read_file and grep_files; to run Python, "
+            "use run_python. Approval follows the selected access mode; destructive or sensitive "
+            "commands keep a gate. Its real process lifecycle is shown in the Host terminal."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
+                "cwd": {"type": "string", "description": "Folder to run in. Default: the active project folder."},
                 "timeout": {"type": "integer", "description": "seconds, default 120"},
             },
             "required": ["command"],
         },
         "fn": tool_run_powershell,
+    },
+    "run_python": {
+        "description": (
+            "Run a Python script on the Windows host. Write plain Python in `code`; do not wrap "
+            "it in PowerShell. It runs with the project's .venv when there is one, in the active "
+            "project folder unless cwd is given. stdout and stderr return separately. Approval "
+            "follows the selected access mode."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Complete Python source to run."},
+                "cwd": {"type": "string", "description": "Folder to run in. Default: the active project folder."},
+                "timeout": {"type": "integer", "description": "seconds, default 120"},
+            },
+            "required": ["code"],
+        },
+        "fn": tool_run_python,
     },
     "remote_shell": {
         "description": (
@@ -25901,19 +26288,20 @@ TOOLS: dict[str, dict] = {
     },
     "grep_files": {
         "description": (
-            "Recursive regex search across a directory tree. Returns matches "
-            "with file path, line number, and the matched line. Skips binaries "
-            "(null-byte heuristic) and noise dirs (.git, node_modules, etc). "
-            "Best for searching extracted firmware roots — find CGI handlers, "
-            "system()/sprintf calls, hardcoded creds, auth strings, etc."
+            "Search file contents with a Python regex, in one file or a whole folder tree. "
+            "Use this, not run_powershell or Select-String, to search code. Returns path, line "
+            "number and line text; context adds lines around each match; files_only lists only "
+            "the matching files. Skips binary files and noise folders (.git, node_modules)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "directory to search"},
+                "path": {"type": "string", "description": "file or directory to search"},
                 "pattern": {"type": "string", "description": "Python regex"},
-                "glob": {"type": "string", "description": "filename glob filter, e.g. *.cgi or *.sh"},
+                "glob": {"type": "string", "description": "file name filter, e.g. *.py or src/**/*.ts"},
                 "case_insensitive": {"type": "boolean", "description": "default false"},
+                "context": {"type": "integer", "description": "lines to show before and after each match, 0-5"},
+                "files_only": {"type": "boolean", "description": "list only the files that match, with counts"},
                 "max_matches": {"type": "integer", "description": "default 200, max 2000"},
                 "max_files": {"type": "integer", "description": "default 5000, max 50000"},
             },
@@ -26583,6 +26971,68 @@ def _truncation_envelope(result: Any, cap: int, original_chars: int) -> str:
     }, ensure_ascii=False)
 
 
+_PLAIN_RESULT_SHOWN = frozenset({
+    "ok", "exit", "exit_code", "stdout", "stderr", "executed", "execution_target", "cwd",
+    "content", "path", "offset", "lines_returned", "total_lines", "size", "truncated",
+    "next_offset", "hint", "matches", "files", "pattern", "root", "match_count", "files_scanned",
+    "files_skipped_binary", "files_skipped_size",
+})
+
+
+def _plain_tool_text(name: str, result: dict) -> str | None:
+    """Plain-text view of a successful file read, search or shell result.
+
+    As JSON, every quote, backslash and newline in code or command output is
+    escaped (about 14% more characters in real sessions), and the model has to
+    undo that before it copies text into edit_file's old_text. Other fields of
+    the result follow the header as "key: value" lines."""
+    if result.get("error"):
+        return None
+    if name == "read_file" and isinstance(result.get("content"), str) and "lines_returned" in result:
+        first = int(result.get("offset") or 0) + 1
+        last = first + int(result.get("lines_returned") or 0) - 1
+        head = f"[{result.get('path')} | lines {first}-{last} of {result.get('total_lines')}"
+        if result.get("truncated"):
+            head += f" | more: read_file offset={result.get('next_offset')}"
+        body = result["content"]
+    elif name == "grep_files" and isinstance(result.get("matches"), list):
+        head = (f"[grep {result.get('pattern')!r} in {result.get('root')} | "
+                f"{result.get('match_count', len(result['matches']))} matches, "
+                f"{result.get('files_scanned', '?')} files scanned"
+                + (" | truncated" if result.get("truncated") else ""))
+        lines: list[str] = []
+        if isinstance(result.get("files"), list):
+            lines = [f"{f.get('path')} ({f.get('count')})" for f in result["files"] if isinstance(f, dict)]
+        current = None
+        for m in result["matches"]:
+            if not isinstance(m, dict):
+                continue
+            if m.get("path") != current:
+                current = m.get("path")
+                lines.append(str(current))
+            line_no = int(m.get("line") or 0)
+            before = m.get("before") or []
+            lines += [f"  {line_no - len(before) + k}- {text}" for k, text in enumerate(before)]
+            lines.append(f"  {line_no}: {m.get('text')}")
+            lines += [f"  {line_no + 1 + k}- {text}" for k, text in enumerate(m.get("after") or [])]
+        body = "\n".join(lines) if lines else "(no matches)"
+    elif name in ("run_powershell", "run_python") and isinstance(result.get("stdout"), str):
+        head = f"[exit {result.get('exit_code')}" + (f" | cwd {result['cwd']}" if result.get("cwd") else "")
+        body = result["stdout"]
+        if result.get("stderr"):
+            body += ("" if not body or body.endswith("\n") else "\n") + "[stderr]\n" + result["stderr"]
+    else:
+        return None
+    extras = []
+    for key, value in result.items():
+        if key in _PLAIN_RESULT_SHOWN or value in (None, "", [], {}):
+            continue
+        shown = value if isinstance(value, (str, int, float, bool)) else json.dumps(
+            value, ensure_ascii=False, default=str)
+        extras.append(f"{key}: {str(shown)[:600]}")
+    return head + "]\n" + "".join(e + "\n" for e in extras) + body
+
+
 def compress_tool_result(name: str, result: Any, cap: int) -> str:
     """Serialize a tool result as JSON for the model, applying line-aware
     head/tail elision to known bulk fields BEFORE serializing. Errors are
@@ -26628,6 +27078,10 @@ def compress_tool_result(name: str, result: Any, cap: int) -> str:
         if len(ss) <= cap:
             return ss
         return _truncation_envelope(result, cap, len(s))
+
+    plain = _plain_tool_text(name, result)
+    if plain is not None:
+        return _elide_text(plain, cap)
 
     # HTTP results are the biggest single source of context bloat: one page can
     # carry a megabyte of boilerplate. Once the full response is in an evidence
@@ -26772,7 +27226,7 @@ _HOST_TARGET_TOOL_NAMES = {
     "list_directory", "find_files", "grep_files", "read_bytes", "file_inspect",
     "extract_archive", "project_map", "read_skeleton", "replace_ast_node",
     "find_references", "find_symbol", "check_syntax", "run_tests", "check_deps",
-    "run_powershell", "open_program", "network_snapshot", "parse_event_logs",
+    "run_powershell", "run_python", "open_program", "network_snapshot", "parse_event_logs",
     "persistence_hunt",
 }
 _REMOTE_TOOL_EQUIVALENTS = {
@@ -26943,6 +27397,7 @@ TOOLS["switch_execution_target"] = {
 _RT_SCOPE_AWARE_GENERIC_TOOLS = {"web_fetch", "web_view_image", "web_render", "audit_http_headers"}
 _RT_SCOPE_AWARE_COMMAND_TOOLS = {
     "run_powershell": "command",
+    "run_python": "code",
     "remote_shell": "command",
     "session_start": "command",
     "session_send": "input",
@@ -27140,7 +27595,7 @@ _CORE_TOOL_NAMES = {
     "read_file", "write_file", "edit_file", "delete_file", "list_directory",
     "find_files", "grep_files", "read_bytes", "file_inspect", "extract_archive",
     "project_map", "capability_report", "read_skeleton", "replace_ast_node", "find_references", "find_symbol",
-    "check_syntax", "run_tests", "check_deps", "run_powershell", "open_program",
+    "check_syntax", "run_tests", "check_deps", "run_powershell", "run_python", "open_program",
     # planning / memory / probe
     "update_plan", "record_finding", "list_findings", "pin_note", "unpin_note", "remember", "forget", "edit_memory", "search_memories",
     "list_more_tools", "compact_history", "save_skill", "switch_execution_target",
@@ -27160,7 +27615,7 @@ _SMALL_CTX_CORE_TOOL_NAMES = {
     # The irreducible coding loop. On <=16K windows the former 44-tool core
     # consumed most of the context before the first user token arrived.
     "project_map", "capability_report", "read_file", "write_file", "edit_file", "list_directory",
-    "find_files", "grep_files", "check_syntax", "run_tests", "run_powershell",
+    "find_files", "grep_files", "check_syntax", "run_tests", "run_powershell", "run_python",
     "update_plan", "record_finding", "list_findings", "pin_note", "unpin_note", "list_more_tools",
     "compact_history", "save_skill", "switch_execution_target", "git_status", "git_diff", "search_memories",
 }
@@ -27175,7 +27630,7 @@ _TINY_CTX_CORE_TOOL_NAMES = {
 _BALANCED_CORE_TOOL_NAMES = {
     "project_map", "capability_report", "read_file", "write_file", "edit_file",
     "list_directory", "find_files", "grep_files", "check_syntax", "run_tests",
-    "run_powershell", "update_plan", "pin_note", "unpin_note", "list_more_tools",
+    "run_powershell", "run_python", "update_plan", "pin_note", "unpin_note", "list_more_tools",
     "compact_history", "save_skill", "switch_execution_target", "git_status",
     "git_diff", "search_memories", "web_search", "web_fetch", "web_view_image", "web_render", "web_watch_video",
 }
@@ -28156,6 +28611,24 @@ def _normalize_tool_argument_shapes(name: str, arguments):
             if repaired is arguments:
                 repaired = dict(arguments)
             repaired[key] = wrapped["value"]
+        elif isinstance(wrapped, str) and wrapped.lstrip().startswith("["):
+            try:
+                parsed = json.loads(wrapped)
+            except ValueError:
+                continue
+            if isinstance(parsed, list):
+                if repaired is arguments:
+                    repaired = dict(arguments)
+                repaired[key] = parsed
+    # Small models often send one edit flat, sometimes with Claude Code's
+    # old_string/new_string names.
+    if _resolve_tool_name(name) == "edit_file" and not repaired.get("edits"):
+        old = repaired.get("old_text", repaired.get("old_string"))
+        new = repaired.get("new_text", repaired.get("new_string"))
+        if isinstance(old, str) and isinstance(new, str):
+            repaired = {k: v for k, v in repaired.items()
+                        if k not in ("old_text", "new_text", "old_string", "new_string")}
+            repaired["edits"] = [{"old_text": old, "new_text": new}]
     return repaired
 
 
@@ -28168,27 +28641,35 @@ def _normalize_tool_argument_shapes(name: str, arguments):
 # expires: text-tools mode is a real downgrade for capable models, so one bad
 # parse must not pin the process to it.
 _NATIVE_TOOLS_BROKEN_TTL_S = 1800
-_native_tools_broken_at: dict[str, float] = {}
+# Tools whose bulky argument (a file body or an edit list) is what the native
+# parser drops. Their loss switches only the current turn to text mode: a
+# plain read or search has no reason to start the next turn downgraded.
+_BULKY_ARG_TOOLS = frozenset({"write_file", "edit_file", "remote_write_file", "save_skill"})
+_native_tools_broken_at: dict[str, dict[str, float]] = {}   # model id -> tool -> time
 
 
-def _mark_native_tools_broken() -> None:
-    """Record that llama.cpp's native parser dropped args for the active model."""
+def _mark_native_tools_broken(tool_names) -> None:
+    """Record which tools lost their arguments in llama.cpp's native parser."""
     now = time.time()
     s = get_settings()
     for _mid in (s.get("model"), s.get("model_path"), _llama.loaded_model()):
         if _mid:
-            _native_tools_broken_at[str(_mid)] = now
+            marks = _native_tools_broken_at.setdefault(str(_mid), {})
+            for name in tool_names:
+                marks[str(name)] = now
 
 
 def _native_tools_broken() -> bool:
+    """True when a tool outside _BULKY_ARG_TOOLS recently lost its arguments
+    for the active model, so the next turn starts in text-tools mode."""
     now = time.time()
     s = get_settings()
     for _mid in (s.get("model"), s.get("model_path"), _llama.loaded_model()):
         if not _mid:
             continue
-        marked = _native_tools_broken_at.get(str(_mid))
-        if marked and now - marked < _NATIVE_TOOLS_BROKEN_TTL_S:
-            return True
+        for name, marked in (_native_tools_broken_at.get(str(_mid)) or {}).items():
+            if name not in _BULKY_ARG_TOOLS and now - marked < _NATIVE_TOOLS_BROKEN_TTL_S:
+                return True
     return False
 
 
@@ -28378,6 +28859,11 @@ _tool_url_history: dict[str, dict[str, dict]] = {}     # chat_id -> url_key -> {
 # streak breaker fires only when a signature keeps returning the same result
 # and nothing else moved in between.
 _tool_progress: dict[str, int] = {}                    # chat_id -> monotonic progress ticks
+# Consecutive calls per tool that never ran because their arguments were
+# missing or malformed. They return before the repeat bookkeeping, so without
+# this count a model that keeps losing its arguments is never stopped.
+_invalid_call_streaks: dict[str, dict[str, int]] = {}  # chat_id -> tool -> consecutive invalid calls
+INVALID_CALL_LIMIT = 2       # 2nd invalid call in a row to the same tool is refused.
 _FETCH_LIKE_TOOLS = frozenset({"web_fetch", "http_request"})
 TOOL_REPEAT_LIMIT = 3       # 4th SAME-RESULT call in a row gets refused.
 TOOL_REPEAT_HARD_LIMIT = 20  # absolute backstop for wobbly-output tools (below max_tool_rounds).
@@ -28403,6 +28889,38 @@ def _reset_tool_call_history(chat_id: str) -> None:
         _tool_url_history[chat_id] = {}
         _tool_family_history[chat_id] = {}
         _tool_progress[chat_id] = 0
+        _invalid_call_streaks[chat_id] = {}
+
+
+def _note_invalid_call(canon: str) -> int:
+    """Count one more consecutive invalid call to this tool; return the streak."""
+    chat_id = _get_current_chat()
+    with _tool_history_lock:
+        streaks = _invalid_call_streaks.setdefault(chat_id, {})
+        streaks[canon] = streaks.get(canon, 0) + 1
+        return streaks[canon]
+
+
+def _clear_invalid_call(canon: str) -> None:
+    with _tool_history_lock:
+        _invalid_call_streaks.get(_get_current_chat(), {}).pop(canon, None)
+
+
+def _invalid_call_result(canon: str, result: dict) -> dict:
+    """Mark a not-executed invalid call, refusing it once the streak is reached."""
+    streak = _note_invalid_call(canon)
+    result["invalid_streak"] = streak
+    if streak >= INVALID_CALL_LIMIT:
+        result["loop_breaker"] = True
+        result["error"] = (
+            f"refused: {canon} arrived without valid arguments {streak} times in a row. "
+            "Repeating the same call will fail the same way. " + result["error"])
+        if canon == "write_file":
+            result["error"] += " Instead, " + _FILE_IN_PARTS + "."
+        elif canon == "remote_write_file":
+            result["error"] += (" Instead, write the file in parts with remote_file_begin, "
+                                "remote_file_append and remote_file_commit.")
+    return result
 
 
 def _reserve_tool_family_call(canon: str) -> int:
@@ -28853,6 +29371,10 @@ def _missing_required_tool_args(name: str, args: Any) -> list[str]:
                 not isinstance(values[key], str) or values[key].strip())
                 for key in choice) for choice in choices):
             missing.extend(key for key in choices[0] if key not in missing)
+    # force=true right after a blocked write reuses that write's content.
+    if (canon == "write_file" and missing == ["content"] and values.get("force")
+            and _blocked_write(str(values.get("path") or "")) is not None):
+        return []
     return missing
 
 
@@ -28892,6 +29414,7 @@ def _invoke_tool_with_context(name: str, args: dict, call_id: str) -> dict:
 
 def invoke_tool(name: str, args: dict) -> dict:
     canon = _resolve_tool_name(name)
+    args = _normalize_tool_argument_shapes(canon, args)
     if _research_context()[1] and canon not in RESEARCH_TOOLS and canon != subagents.SPAWN_TOOL:
         return {"error": "Deep Research supports reading and evidence collection only.", "not_executed": True}
     if _offline_active and (canon.startswith(("web_", "recon_", "rt_", "browser_", "remote_", "mcp_", "sandbox_")) or canon in {"search_web", "fetch_url"}):
@@ -28949,15 +29472,15 @@ def invoke_tool(name: str, args: dict) -> dict:
             "loop_breaker": True,
         })
     if _invalid_tool_path(canon, args):
-        return _finish({
+        return _finish(_invalid_call_result(canon, {
             "error": "Action was not executed: the file path contains line breaks or a null character. "
                      "Check whether an example was mistaken for an action; follow the user's request.",
             "invalid_path": True,
             "not_executed": True,
-        })
+        }))
     missing = _missing_required_tool_args(canon, args)
     if missing:
-        return _finish({
+        return _finish(_invalid_call_result(canon, {
             "error": (
                 f"Tool call was not executed because required argument(s) are missing: "
                 f"{', '.join(missing)}. Re-emit the call with those values."
@@ -28965,7 +29488,7 @@ def invoke_tool(name: str, args: dict) -> dict:
             "tool": canon,
             "missing_arguments": missing,
             "not_executed": True,
-        })
+        }))
     _mission_chat = _rt_context_chat()
     if (_rt_passive_mission(_mission_chat)
             and canon not in _RT_PASSIVE_ALLOWED_TOOL_NAMES):
@@ -29113,6 +29636,7 @@ def invoke_tool(name: str, args: dict) -> dict:
         traceback.print_exc()
         result = {"error": str(e)}
     _record_tool_result(sig, result)
+    _clear_invalid_call(canon)
     _record_url_fetch(canon, args or {}, result)
     return _finish(result)
 
@@ -30498,6 +31022,25 @@ desktop enabled: use desktop_snapshot, then semantic desktop_invoke/set_value/sc
     return core
 
 
+def _text_tool_lines(chat_id: str) -> list[str]:
+    """One line per visible tool for text-tools mode, where no JSON schema is
+    sent: name, parameters with short types (* = required) and the first
+    sentence of the description."""
+    visible = _visible_tool_names(True, chat_id)
+    lines = []
+    for name, spec in _active_tools(True, chat_id).items():
+        if name not in visible:
+            continue
+        schema = spec.get("parameters") or {}
+        required = set(schema.get("required") or [])
+        params = ", ".join(
+            f"{k}{'*' if k in required else ''}:{str((v or {}).get('type', 'any'))[:3]}"
+            for k, v in (schema.get("properties") or {}).items())
+        summary = re.split(r"(?<=[.!?])\s", str(spec.get("description") or "").strip(), maxsplit=1)[0]
+        lines.append(f"- {name}({params})" + (f": {summary[:120]}" if summary else ""))
+    return lines
+
+
 def build_system_prompt(include_tools: bool, chat_mode: str = "agent",
                         include_tool_list: bool = True) -> str:
     """Build a token-efficient system prompt (target: < 1500 tokens).
@@ -30604,15 +31147,9 @@ you may occasionally append exactly one of these to the absolute end of your res
         if include_tool_list:
             # Lazy bundles apply here too: text-tools mode reads this list instead of the
             # wire schema, so it advertises the same core set as native mode.
-            visible = _visible_tool_names(True, _get_current_chat())
-            tool_lines = ["tools:"]
-            for name, t in _active_tools(True, _get_current_chat()).items():
-                if name not in visible:
-                    continue
-                params = t["parameters"].get("properties", {})
-                sig = ",".join(f"{k}:{v.get('type','any')[:3]}" for k, v in params.items())
-                tool_lines.append(f"- {name}({sig})")
-            tool_lines.append("- list_more_tools(bundle) — see/load specialized tool bundles")
+            tool_lines = ["tools (* = required):"] + _text_tool_lines(_get_current_chat())
+            if not any(line.startswith("- list_more_tools(") for line in tool_lines):
+                tool_lines.append("- list_more_tools(bundle) — see/load specialized tool bundles")
             parts.append("\n".join(tool_lines))
         # Parallel tool calls: run_chat_turn runs every call from one reply in one
         # concurrent round (8 workers), serializing same-file writes, commands and
@@ -30875,6 +31412,63 @@ def _is_gemma_model(name: str | None) -> bool:
     return "gemma" in (name or "").lower()
 
 
+# Text-tools mode call format. Gemma's trained dialect is a python call in a
+# ```tool_code``` fence. Other models (Qwen, Hermes lineage) are trained on the
+# <tool_call><function=...> XML form, which carries raw values without escaping.
+# The "TOOL CALLING" heading also ends the rolling-summary section for
+# _SUMMARY_SECTION_RE.
+_GEMMA_TOOL_CALL_PROMPT = (
+    "\n\nTOOL CALLING — IMPORTANT for this model:\n"
+    "to call a tool, output EXACTLY one python call inside a ```tool_code``` fence, then STOP:\n"
+    "```tool_code\n"
+    "read_file(path=\"C:/notes.txt\")\n"
+    "```\n"
+    "```tool_code\n"
+    "edit_file(path=\"C:/notes.txt\", "
+    "edits=[{\"old_text\": \"old line\", \"new_text\": \"new line\"}])\n"
+    "```\n"
+    "- list/object arguments (edits, files, tasks…) are ordinary JSON inside that same call:\n"
+    "  one call per fence, never split across fences, and never discuss this format in the\n"
+    "  visible answer. There is no separate rule for arrays — the same shape always works.\n"
+    "- use the tool names listed above; keyword args with real quotes. when calls are\n"
+    "  independent (several reads, a grep plus a status check), emit all their fences in\n"
+    "  one reply: they run together. dependent calls and same-file writes stay one per reply.\n"
+    "- for ordinary calls, do NOT wrap it in JSON, <tool_call> tags, or prose.\n"
+    "- if content already exists in a prior visible code fence, call write_file or "
+    "remote_write_file with source='visible_code_block'; NEVER repeat the full block.\n"
+    "- for a genuinely new large write_file/edit_file body that is not already visible, use "
+    "the <tool_call><function=NAME><parameter=KEY>raw value</parameter></function></tool_call> "
+    "form instead of a Python string so quotes and newlines remain lossless.\n"
+    "- after you emit the fence, wait for the tool result — never write \"done\"/\"saved\" "
+    "or narrate a result before the tool actually returns one.\n"
+    "- when a tool result comes back and the task has more steps, IMMEDIATELY emit the "
+    "next tool_code call. Do not stop to summarize, do not ask permission, do not say "
+    "what you will do — do it. Only write prose once the ENTIRE task is finished."
+)
+_XML_TOOL_CALL_PROMPT = (
+    "\n\nTOOL CALLING (text mode) for this model:\n"
+    "to call a tool, write one block in this exact form, then STOP and wait for the result:\n"
+    "<tool_call>\n<function=read_file>\n<parameter=path>\nC:/notes.txt\n</parameter>\n"
+    "</function>\n</tool_call>\n"
+    "- put raw values between the parameter tags. do not escape quotes, backslashes or newlines.\n"
+    "- list and object arguments are JSON inside their parameter, for example:\n"
+    "<parameter=edits>\n[{\"old_text\": \"old line\", \"new_text\": \"new line\"}]\n</parameter>\n"
+    "- use only the tool names listed above. independent calls (several reads, a search plus a "
+    "status check) may go in one reply as separate blocks: they run together. dependent calls "
+    "and writes to the same file go one per reply.\n"
+    "- if the content already exists in a visible code fence, call write_file or "
+    "remote_write_file with source='visible_code_block' instead of repeating it.\n"
+    "- never write \"done\" or \"saved\" before the tool result comes back.\n"
+    "- when a result comes back and the task has more steps, make the next call right away. "
+    "write prose only when the whole task is finished."
+)
+
+
+def _text_tools_prompt(gemma: bool) -> str:
+    """Call-format rules for text-tools mode, in the model family's own dialect."""
+    return _GEMMA_TOOL_CALL_PROMPT if gemma else _XML_TOOL_CALL_PROMPT
+
+
 def _warmup_tool_grammar() -> None:
     """Compile llama-server's tool-call grammar before the user's first real turn.
 
@@ -30909,6 +31503,25 @@ _TURN_BOUNDARY_STOPS = ["<|im_end|>", "<|im_start|>", "<|endoftext|>", "<|eot_id
 _TURN_BOUNDARY_RE = re.compile(
     r"<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|eot_id\|>|<\|end_of_text\|>"
 )
+# llama-server applies stop strings to tool-call arguments too, so sending them
+# on every request made a file that contains one of these markers (a chat
+# template, or this repository) impossible to write. They go out only for a
+# model that has actually run past its turn; the stream loop still cuts the
+# first runaway itself.
+_turn_boundary_seen: dict[str, float] = {}   # model id -> time a runaway was cut
+
+
+def _turn_boundary_stops() -> list[str]:
+    s = get_settings()
+    ids = (s.get("model"), s.get("model_path"), _llama.loaded_model())
+    return list(_TURN_BOUNDARY_STOPS) if any(str(m) in _turn_boundary_seen for m in ids if m) else []
+
+
+def _mark_turn_boundary_runaway() -> None:
+    s = get_settings()
+    for m in (s.get("model"), s.get("model_path"), _llama.loaded_model()):
+        if m:
+            _turn_boundary_seen[str(m)] = time.time()
 
 
 def _attach_session_state(messages: list[dict], body: str, role: str) -> list[dict]:
@@ -30940,6 +31553,82 @@ def _looks_unfinished(text: str, finish_reason: str = None) -> bool:
     return False
 
 
+def _log_tool_parse_failure(chat_id: str, round_no: int, native: bool, finish_reason,
+                            raw_answer: str, slots: dict) -> None:
+    """Opt-in (debug_tool_parse_failures): keep the raw output of a round whose
+    tool call lost its arguments, to see whether llama.cpp's parser or the model
+    dropped them. The saved chat cannot show this: call markup is stripped."""
+    try:
+        settings = get_settings()
+        if not settings.get("debug_tool_parse_failures"):
+            return
+        path = DATA / "tool_parse_failures.jsonl"
+        if path.exists() and path.stat().st_size > 5_000_000:
+            path.replace(path.with_name(path.name + ".1"))
+        record = {
+            "t": int(time.time()), "chat_id": chat_id, "round": round_no,
+            "model": str(settings.get("model") or ""), "native": native,
+            "finish_reason": finish_reason, "answer_tail": raw_answer[-4000:],
+            "native_calls": [{"name": slot.get("name"),
+                              "arguments": str(slot.get("arguments") or "")[:4000]}
+                             for _, slot in sorted(slots.items())],
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _is_invalid_call_result(content: Any) -> bool:
+    """True for the result of a call that never ran because its arguments
+    were missing or malformed."""
+    if not isinstance(content, str) or '"not_executed"' not in content:
+        return False
+    try:
+        result = json.loads(content)
+    except ValueError:
+        return False
+    return (isinstance(result, dict) and bool(result.get("not_executed"))
+            and bool(result.get("missing_arguments") or result.get("invalid_path")))
+
+
+def _drop_invalid_call_pairs(msgs: list[dict]) -> list[dict]:
+    """Messages to save for replay, without calls that never ran for lack of
+    valid arguments and without their error results.
+
+    A model copies the calls it sees in its history, so a saved run of empty
+    calls teaches the next turn to send more. The activity ledger still records
+    each failure. Results are matched to the assistant message before them,
+    because text-parsed call ids repeat across rounds."""
+    drop: set[tuple[int, str]] = set()
+    owner = -1
+    for i, m in enumerate(msgs):
+        if m.get("role") == "assistant":
+            owner = i
+        elif m.get("role") == "tool" and owner >= 0 and _is_invalid_call_result(m.get("content")):
+            drop.add((owner, str(m.get("tool_call_id") or "")))
+    if not drop:
+        return list(msgs)
+    out: list[dict] = []
+    owner = -1
+    for i, m in enumerate(msgs):
+        role = m.get("role")
+        if role == "assistant":
+            owner = i
+            calls = m.get("tool_calls") or []
+            kept = [tc for tc in calls if (i, str(tc.get("id") or "")) not in drop]
+            if len(kept) != len(calls):
+                m = {k: v for k, v in m.items() if k != "tool_calls"}
+                if kept:
+                    m["tool_calls"] = kept
+                elif not _visible_final_answer(m.get("content") or ""):
+                    continue
+        elif role == "tool" and (owner, str(m.get("tool_call_id") or "")) in drop:
+            continue
+        out.append(m)
+    return out
+
+
 def _graceful_server_failure(conversation: list[dict], start_len: int,
                              turn_id: str, reasons: list[str]) -> dict:
     """Build a final result that keeps the turn's completed tool work when
@@ -30949,7 +31638,7 @@ def _graceful_server_failure(conversation: list[dict], start_len: int,
     return {
         "role": "assistant",
         "content": f"(response lost — {notes})",
-        "_appended_intermediate": list(conversation[start_len:]),
+        "_appended_intermediate": _drop_invalid_call_pairs(conversation[start_len:]),
         "_build": "server-fault-v1",
         "_turn_id": turn_id,
         "_server_fault": True,
@@ -31196,13 +31885,18 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             pass
         force_no_think = False   # set when the thinking-budget enforcer aborts a runaway
         reasoning_seen_this_turn = False
-        budget_retries = 0       # cap how many times we force-stop thinking per turn
+        # Rounds in a row that ended with only thinking: cut by the guard, stopped at
+        # the output cap, or ended there. A round with an answer or a call resets it.
+        thinking_only_streak = 0
+        request_no = 0           # model requests this turn; tags thinking for the UI
         # A tools round hit the output cap (finish_reason "length"): the budget went
         # to reasoning and the <tool_call> body never got tokens. Force thinking off
         # next round so the tokens go to the call; greedy reasoners otherwise just
         # re-narrate the plan and hit the cap again.
         tool_cap_no_think = False
         arg_loss_retries = 0
+        # Text-tools turns already list the tools in the system prompt.
+        tool_card_sent = not native_tools
         conversation = list(messages)
         # Anything appended past this index is this turn's working memory
         # (intermediate assistant tool calls, tool results, nudges). It goes back via
@@ -31253,7 +31947,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 emit({"type": "notice", "note": "stopped by user", "quiet": True})
                 return {
                     "role": "assistant", "content": "", "_stopped": True,
-                    "_appended_intermediate": list(conversation[_start_len:]),
+                    "_appended_intermediate": _drop_invalid_call_pairs(conversation[_start_len:]),
                     "_turn_id": _turn_id,
                 }
             if _apply_task_updates(_steering.take(chat_id)):
@@ -31482,8 +32176,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # volatile session tail after it converts this into a new turn and
             # makes models restart the call from its first byte.
             if _tail_secs and not _carry_call:
-                _body = ("[SESSION STATE — live, re-sent every turn; hold these — "
-                         "do NOT drift off-task or undo them]\n" + "\n\n".join(_tail_secs))
+                # Neutral wording: "re-sent every turn" made models open their reasoning
+                # with "Session state has been resent" (30 of 368 logged rounds).
+                _body = ("[task state from the harness: follow it, stay on the task, do not undo it, "
+                         "and do not restate or comment on it]\n" + "\n\n".join(_tail_secs))
                 _role = "system" if _rt_trailing_system_ok() else "user"
                 trimmed = _attach_session_state(trimmed, _body, _role)
 
@@ -31532,6 +32228,9 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # zero the presence/frequency penalties, as coding agents do; IDE turns keep
             # the user's settings. Models whose vendor sampling is the agentic profile
             # (Sage-A1.5: temp 1.0 + presence 1.5; Nanbeige4.3: temp 1.0) keep theirs.
+            # The repeat penalty goes too: it pushes down every token seen in the last
+            # 64, and code and JSON repeat quotes, brackets, indentation and path parts
+            # on purpose. Both vendor profiles above run with it off.
             if use_tools and "vendor_agentic_sampling" not in _model_features():
                 try:
                     _t = float(payload.get("temperature", 0.4) or 0.0)
@@ -31540,6 +32239,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 payload["temperature"] = min(_t, 0.4)
                 payload["presence_penalty"] = 0.0
                 payload["frequency_penalty"] = 0.0
+                payload["repeat_penalty"] = 1.0
             elif not use_tools:
                 # Vendors with separate chat sampling (Nanbeige4.3: temp 0.6 for
                 # reasoning/chat vs 1.0 agentic) get it on turns without tools.
@@ -31557,16 +32257,21 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 _native_param = str(
                     reasoning_capability.get("native_parameter") or "reasoning_effort")
                 tpl_kwargs[_native_param] = _reasoning_cfg["native_effort"]
+            # Templates without the switch ignore it, so a round that should not think
+            # gets a tighter thinking guard below.
+            no_think_forced = False
             if force_no_think:
                 # Previous round blew the thinking budget — force a direct answer
                 # this round regardless of the model's default thinking mode.
                 tpl_kwargs["enable_thinking"] = False
                 force_no_think = False
+                no_think_forced = True
             if use_tools and tool_cap_no_think:
                 # A previous round hit the output cap while working with tools: skip
                 # thinking this round so the whole budget goes to the output, even for a
                 # model that thinks by default.
                 tpl_kwargs["enable_thinking"] = False
+                no_think_forced = True
             tb = _reasoning_cfg.get("budget")
             try:
                 tb_int = int(tb) if tb is not None else 2048
@@ -31591,8 +32296,11 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 _reasoning_cfg, reasoning_capability))
             # Hard turn-boundary stops for models that sail past their own end-of-turn
             # token (seen on Qwen3.6 Q4): llama-server halts as soon as one of these
-            # literal markers appears.
-            payload["stop"] = list(_TURN_BOUNDARY_STOPS)
+            # literal markers appears. Sent only once the model has done it (see
+            # _turn_boundary_stops).
+            _stops = _turn_boundary_stops()
+            if _stops:
+                payload["stop"] = _stops
             if use_tools and native_tools:
                 payload["tools"] = _round_tools
                 payload["tool_choice"] = "auto"
@@ -31630,6 +32338,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # path returns _graceful_server_failure(...) so the turn's completed tool work
             # is still persisted.
             resp = None
+            request_no += 1
             _transient_retries = 0
             _llama_retries = 0
             for _ctx_attempt in range(4):
@@ -31720,12 +32429,16 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             _set_cancel_resp(chat_id, resp)
 
             content_buf: list[str] = []
+            # The same stream split by channel: tool calls are parsed from the answer
+            # only, so a call the model merely mentions while thinking never runs.
+            reasoning_buf: list[str] = []
+            answer_buf: list[str] = []
             tool_calls_by_index: dict[int, dict] = {}
             last_stats: dict = {}
             finish_reason = None
             # Text-tools mode streams the model's <tool_call> XML as content. Keep it out
             # of the live bubble: after an opener, suppress deltas until a closer (or end
-            # of stream) and let extract_tool_calls parse full_text. If last round's call
+            # of stream) and let extract_tool_calls parse the answer. If last round's call
             # was truncated and carried over, start this round already inside the block,
             # since the model continues the body without an opener of its own.
             stream_tool_suppress = False
@@ -31750,10 +32463,17 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             think_stop_reason = ""
             _loop_buf: list[str] = []
             _loop_hits = 0
+            # Live progress for a tool call whose arguments are still streaming:
+            # nothing else shows until the call is complete.
+            call_progress: dict = {}
+            progress_scan_at = 0
             try:
                 _think_cap = int(_reasoning_cfg.get("budget") if _reasoning_cfg.get("budget") is not None else 2048)
             except Exception:
                 _think_cap = 2048
+            # The guard fires at 2.5x the budget, or at 1x (at least 1024 tokens) in a
+            # round that was asked not to think at all.
+            _think_ceiling = (max(_think_cap, 1024) if no_think_forced else _think_cap * 2.5)
 
             try:
                 for raw in resp:
@@ -31802,6 +32522,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     delta = ch.get("delta") or ch.get("message") or {}
                     # reasoning first — wrap as <think>…</think> for the UI
                     rpiece = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                    _rb = _TURN_BOUNDARY_RE.search(rpiece) if rpiece else None
+                    if _rb:
+                        rpiece = rpiece[:_rb.start()]
+                        runaway_stop = True
                     if rpiece:
                         if not reasoning_seen_this_turn:
                             reasoning_seen_this_turn = True
@@ -31819,18 +32543,20 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                                   "capability": observed_cap})
                         if not reasoning_open:
                             content_buf.append("<think>")
-                            emit({"type": "thinking_start"})
+                            reasoning_buf.append("<think>")
+                            emit({"type": "thinking_start", "round": request_no})
                             reasoning_open = True
                         content_buf.append(rpiece)
+                        reasoning_buf.append(rpiece)
                         emit({"type": "thinking_delta", "content": rpiece})
                         # The thinking budget is a soft target passed to the template; this is only
-                        # a runaway guard, firing at 2.5x the budget.
+                        # a runaway guard, firing at _think_ceiling tokens.
                         think_chars += len(rpiece)
                         # Degeneration loop detector: a stuck model (often a quantized MoE reasoner)
                         # repeats its own reasoning verbatim. Cheap immediate-repeat test on the last
                         # 24 chunks, only past 400 chars so "1. 2. 3." lists can't trip it. Loop cuts
-                        # share the budget_retries budget, so a model that loops twice is bounced to
-                        # the answer (or the turn ends).
+                        # count toward thinking_only_streak like budget cuts, so a model that keeps
+                        # looping ends the turn.
                         _loop_buf.append(rpiece)
                         if len(_loop_buf) > 24:
                             _loop_buf.pop(0)
@@ -31838,10 +32564,11 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             _loop_hits += 1
                         _in_loop = (_loop_hits >= 3 and think_chars > 400)
                         _over_budget = (
-                            _think_cap > 0 and budget_retries < 2
-                            and think_chars / CHARS_PER_TOKEN > _think_cap * 2.5)
-                        if (_over_budget or _in_loop) and budget_retries < 2:
+                            _think_cap > 0
+                            and think_chars / CHARS_PER_TOKEN > _think_ceiling)
+                        if _over_budget or _in_loop:
                             content_buf.append("</think>")
+                            reasoning_buf.append("</think>")
                             emit({"type": "thinking_end"})
                             reasoning_open = False
                             think_overflow = True
@@ -31850,6 +32577,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                                 print(f"[chat] reasoning loop detected at {think_chars} chars — "
                                       "forcing the answer", flush=True)
                             break
+                    if runaway_stop:
+                        break
                     piece = delta.get("content") or ""
                     if piece:
                         # A turn-boundary marker in the content means llama-server's stop didn't fire
@@ -31859,18 +32588,26 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             piece = piece[:_b.start()]
                             runaway_stop = True
                         if reasoning_open:
-                            content_buf.append(" response")
+                            content_buf.append("</think>")
+                            reasoning_buf.append("</think>")
                             emit({"type": "thinking_end"})
                             reasoning_open = False
                         if piece:
                             content_buf.append(piece)
+                            answer_buf.append(piece)
                             # Suppress raw <tool_call> XML in text-tools mode, keeping only the prose; the
-                            # call is parsed from full_text afterwards.
+                            # call is parsed from the answer afterwards.
                             if use_tools and not native_tools:
                                 _vn, stream_tool_suppress = _classify_tool_stream(
                                     piece, stream_tool_suppress)
                                 if _vn:
                                     emit({"type": "delta", "content": _vn})
+                                progress_scan_at += len(piece)
+                                if progress_scan_at >= 512:
+                                    progress_scan_at = 0
+                                    _open_call = _text_call_progress("".join(answer_buf))
+                                    if _open_call:
+                                        _maybe_emit_call_progress(emit, call_progress, "text", *_open_call)
                             else:
                                 emit({"type": "delta", "content": piece})
                         if runaway_stop:
@@ -31880,7 +32617,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     for tc in (delta.get("tool_calls") or []):
                         idx = tc.get("index", 0)
                         slot = tool_calls_by_index.setdefault(idx, {
-                            "id": tc.get("id") or f"call_{idx}",
+                            "id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
                             "name": "",
                             "arguments": "",
                         })
@@ -31896,6 +32633,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                                 slot["arguments"] = json.dumps(args_chunk, ensure_ascii=False)
                             else:
                                 slot["arguments"] += args_chunk
+                            _maybe_emit_call_progress(emit, call_progress, idx, slot["name"],
+                                                      slot["arguments"])
                     if obj.get("usage"):
                         u = obj["usage"]
                         last_stats.setdefault("eval_count", u.get("completion_tokens"))
@@ -31914,10 +32653,13 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         # draft-length choice (absent when spec is off).
                         last_stats.setdefault("draft_n", t.get("draft_n"))
                         last_stats.setdefault("draft_n_accepted", t.get("draft_n_accepted"))
+                if runaway_stop:
+                    _mark_turn_boundary_runaway()
                 # if the stream ended while still inside reasoning (no answer
                 # tokens came), close the channel so the UI can render it cleanly.
                 if reasoning_open:
                     content_buf.append("</think>")
+                    reasoning_buf.append("</think>")
                     emit({"type": "thinking_end"})
                     reasoning_open = False
                 if last_stats.get("eval_count") is not None:
@@ -32002,7 +32744,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     pass
                 partial = {"role": "assistant", "content": _dead_txt}
                 partial["_failed"] = True
-                partial["_appended_intermediate"] = list(conversation[_start_len:])
+                partial["_appended_intermediate"] = _drop_invalid_call_pairs(conversation[_start_len:])
                 partial["_build"] = _BUILD_TAG
                 partial["_turn_id"] = _turn_id
                 return partial
@@ -32025,7 +32767,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     pass
                 partial = {"role": "assistant", "content": "".join(content_buf)}
                 partial["_stopped"] = True
-                partial["_appended_intermediate"] = list(conversation[_start_len:])
+                partial["_appended_intermediate"] = _drop_invalid_call_pairs(conversation[_start_len:])
                 partial["_build"] = _BUILD_TAG
                 partial["_turn_id"] = _turn_id
                 return partial
@@ -32034,40 +32776,42 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 _carry_call = ""
                 continue
             # Thinking-budget enforcer tripped: we force-closed a runaway <think>
-            # block. Re-prompt ONCE (thinking disabled) feeding the planning tail
-            # back so the model continues straight into the answer.
+            # block. Re-prompt with thinking disabled so the model goes straight into
+            # the answer. Once the retries are spent, fall through: the thinking-only
+            # check below ends the turn.
             if think_overflow:
-                budget_retries += 1
+                thinking_only_streak += 1
                 rounds += 1
-                tail = "".join(content_buf)[-2000:]
-                stop_explanation = (
-                    "You reached the reasoning safety ceiling."
-                    if think_stop_reason == "budget"
-                    else "Your reasoning entered a repetition loop."
-                )
-                conversation.append({
-                    "role": "user",
-                    "content": (
-                        f"[automatic note] {stop_explanation} Stop thinking now and write "
-                        "the COMPLETE final answer directly — full code/prose, no <think> block, no more "
-                        "planning. Continue from your planning so far:\n" + tail
-                    ),
-                })
+                _retry = (thinking_only_streak <= _THINKING_ONLY_RETRIES
+                          and rounds < max_tool_rounds)
+                _then = "writing the answer now" if _retry else "stopping the turn"
                 if think_stop_reason == "budget":
                     approx_used = max(1, round(think_chars / CHARS_PER_TOKEN))
-                    safety_ceiling = max(1, math.ceil(_think_cap * 2.5))
+                    safety_ceiling = max(1, math.ceil(_think_ceiling))
                     note = (f"reasoning safety ceiling reached at ~{approx_used:,} tokens "
-                            f"({_think_cap:,} target; ~{safety_ceiling:,} ceiling) — writing the answer now")
+                            f"({_think_cap:,} target; ~{safety_ceiling:,} ceiling) — {_then}")
                 else:
-                    note = "repetitive reasoning loop stopped — writing the answer now"
+                    note = f"repetitive reasoning loop stopped — {_then}"
                 note_intervention("reasoning_guard")
                 emit({"type": "notice", "note": note, "quiet": True})
-                if rounds < max_tool_rounds:
+                if _retry:
+                    stop_explanation = (
+                        "You reached the reasoning safety ceiling."
+                        if think_stop_reason == "budget"
+                        else "Your reasoning entered a repetition loop."
+                    )
+                    conversation = _with_thinking_note(conversation, _start_len, _thinking_recovery_note(
+                        stop_explanation, "".join(reasoning_buf), use_tools))
                     force_no_think = True
                     continue
-                # too many rounds — fall through and finish with whatever we have
 
-            full_text = "".join(content_buf)
+            # Tool calls are detected, parsed and stripped in the answer only. The saved
+            # message is the reasoning block followed by that answer.
+            reasoning_text = "".join(reasoning_buf)
+            inline_think, answer_text = _split_leading_think("".join(answer_buf))
+            reasoning_text += inline_think
+            if use_tools and not tool_calls_by_index and not answer_text.strip():
+                reasoning_text, answer_text = _recover_trailing_calls(reasoning_text)
 
             # Carry-over merge: last round's <tool_call> was truncated and stashed, and
             # the model was told to continue it without reopening tags, so this round's
@@ -32075,7 +32819,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # the whole call.
             _continued_carried_call = bool(use_tools and not native_tools and _carry_call)
             if _continued_carried_call:
-                full_text = _merge_carried_tool_call(_carry_call, full_text)
+                answer_text = _merge_carried_tool_call(_carry_call, answer_text)
                 # Remove the transient assistant-prefill message. If the merged
                 # call is still incomplete, the guard below installs one updated
                 # prefill message. It must never be persisted as a separate turn.
@@ -32085,6 +32829,11 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 ]
                 _carry_call = ""
 
+            thinking_only = (not tool_calls_by_index and not _thinking_body(answer_text)
+                             and bool(think_overflow or _thinking_body(reasoning_text)))
+            if not thinking_only:
+                thinking_only_streak = 0
+
             # Mid-call truncation guard. When llama.cpp cuts the stream at the
             # token/thinking budget the reply can end inside a <tool_call>, and the
             # tolerant parser would write the partial `content` as a truncated file
@@ -32092,8 +32841,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # prefix. The fix is carry, not re-emit: a big file can exceed even the raised
             # budget, so store the partial and have the model continue the same call next
             # round.
-            if use_tools and _has_unclosed_tool_call(full_text):
-                _next_carry = _unclosed_tool_tail(full_text)
+            if use_tools and _has_unclosed_tool_call(answer_text):
+                _next_carry = _unclosed_tool_tail(answer_text)
                 _next_size = len(_next_carry)
                 if _continued_carried_call:
                     if _next_size <= carry_last_size + 16:
@@ -32124,7 +32873,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         native_tools = False
                     conversation.append({
                         "role": "assistant",
-                        "content": full_text,
+                        "content": reasoning_text + answer_text,
                         "_tool_call_prefill": True,
                     })
                     note_intervention("tool_call_repair")
@@ -32160,11 +32909,9 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         "role": "system" if _rt_trailing_system_ok() else "user",
                         "content": (
                             "[automatic recovery] The oversized tool call did not finish and was NOT "
-                            "executed. Do not restart the same full-file call. Write a small initial "
-                            "file with a unique insertion marker, then use bounded edit_file calls to "
-                            "replace that marker with one section plus the marker until the file is "
-                            "complete. Keep each call comfortably below the output limit. Continue now "
-                            "without explaining the recovery."
+                            "executed. Do not restart the same full-file call. Instead, "
+                            + _FILE_IN_PARTS + ". Keep each call comfortably below the output "
+                            "limit. Continue now without explaining the recovery."
                         ),
                     })
                     note_intervention("tool_call_repair")
@@ -32172,16 +32919,16 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                           "note": "oversized tool call stopped advancing; switching to smaller file edits"})
                     continue
 
-                dangling = _unclosed_tool_tail(full_text)
+                dangling = _unclosed_tool_tail(answer_text)
                 if dangling:
-                    full_text = full_text[:max(0, len(full_text) - len(dangling))].strip()
+                    answer_text = answer_text[:max(0, len(answer_text) - len(dangling))].strip()
                 _completed_tools = [item.get("name") for item in turn_tool_outcomes
                                     if item.get("ok")]
                 _completed_note = (
                     " A previous tool action did complete before the follow-up stalled."
                     if _completed_tools else " No tool action was executed from the incomplete call."
                 )
-                full_text = (full_text + "\n\n" if full_text else "") + (
+                answer_text = (answer_text + "\n\n" if answer_text else "") + (
                     "The oversized file operation stopped making progress, so I stopped the follow-up safely."
                     + _completed_note + " Retry the request and I will write the file in smaller sections."
                 )
@@ -32196,14 +32943,15 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 slot = tool_calls_by_index[idx]
                 if not slot.get("name"):
                     continue
-                args = repair_tool_args(slot.get("arguments", ""))
+                args = _normalize_tool_argument_shapes(
+                    slot["name"], repair_tool_args(slot.get("arguments", "")))
                 parsed_calls.append({"id": slot["id"], "name": slot["name"], "arguments": args})
 
             # llama.cpp sometimes keeps one argument (often `path`) while dropping a bulky
             # one (`content`), so repair each missing required field independently
             # instead of skipping recovery because the call isn't empty.
             _merge_fallback_used = False
-            if use_tools and parsed_calls and full_text:
+            if use_tools and parsed_calls and answer_text:
                 for _pc in parsed_calls:
                     _pc_args = _pc.get("arguments")
                     if not isinstance(_pc_args, dict):
@@ -32213,7 +32961,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         _pc.get("name") or "", _pc_args)
                     if not _missing:
                         continue
-                    for _fc in extract_tool_calls(full_text, python_calls=not native_tools):
+                    for _fc in extract_tool_calls(answer_text, python_calls=not native_tools):
                         _fname = (_fc.get("name") or _fc.get("tool") or "").lower()
                         _fargs = _fc.get("arguments")
                         if (_fname == (_pc.get("name") or "").lower()
@@ -32229,57 +32977,57 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             if _merge_fallback_used:
                 # the <tool_call> block is what produced the parsed args, so don't
                 # leak it into the bubble as raw text.
-                full_text = _strip_tool_markup(
-                    full_text,
+                answer_text = _strip_tool_markup(
+                    answer_text,
                     r"(?:<|&lt;|\\<)?tool_call(?:>|&gt;|\\>)?[\s\S]*?"
                     r"((?:<|&lt;|\\<)?/tool_call(?:>|&gt;|\\>)?|$)")
-                full_text = _strip_tool_markup(full_text, r"```tool_call[\s\S]*?(?:```|$)")
-                full_text = full_text.strip()
+                answer_text = _strip_tool_markup(answer_text, r"```tool_call[\s\S]*?(?:```|$)")
+                answer_text = answer_text.strip()
 
             # fallback: parse tool calls emitted in content (hermes/qwen/llama/mistral/named)
             if not parsed_calls and use_tools:
-                for c in extract_tool_calls(full_text, python_calls=not native_tools):
+                for c in extract_tool_calls(answer_text, python_calls=not native_tools):
                     name = c.get("name") or c.get("tool")
                     args = c.get("arguments") or c.get("args") or {}
                     if not isinstance(args, dict):
                         args = repair_tool_args(args)
                     if name:
                         parsed_calls.append({
-                            "id": f"call_{len(parsed_calls)}",
+                            "id": f"call_{uuid.uuid4().hex[:12]}",
                             "name": name,
                             "arguments": args,
                         })
                 if parsed_calls:
                     # Strip fallback tool-call blocks so they don't leak into the UI as clear text
-                    full_text = _strip_tool_markup(full_text, r"(?:<|&lt;|\\<)?tool_call(?:>|&gt;|\\>)?[\s\S]*?((?:<|&lt;|\\<)?/tool_call(?:>|&gt;|\\>)?|$)")
-                    full_text = _strip_tool_markup(full_text, r"```tool_call[\s\S]*?(?:```|$)")
+                    answer_text = _strip_tool_markup(answer_text, r"(?:<|&lt;|\\<)?tool_call(?:>|&gt;|\\>)?[\s\S]*?((?:<|&lt;|\\<)?/tool_call(?:>|&gt;|\\>)?|$)")
+                    answer_text = _strip_tool_markup(answer_text, r"```tool_call[\s\S]*?(?:```|$)")
                     # Gemma python-call fence (```tool_code``` / ```python``` that
                     # held a real call we just parsed) — drop it so the bubble
                     # doesn't show the raw call text.
                     for _nm in {c["name"] for c in parsed_calls}:
-                        full_text = re.sub(
+                        answer_text = re.sub(
                             r"```(?:tool_code|python)[\s\S]*?" + re.escape(_nm) + r"\s*\([\s\S]*?(?:```|$)",
-                            "", full_text, flags=re.IGNORECASE)
+                            "", answer_text, flags=re.IGNORECASE)
                         # bare/bracketed one-liner form of the same call
-                        full_text = re.sub(
+                        answer_text = re.sub(
                             r"^[ \t]*\[?\s*(?:print\()?\s*" + re.escape(_nm) + r"\s*\([^\n]*\)\s*\)?\s*\]?[ \t]*$",
-                            "", full_text, flags=re.IGNORECASE | re.MULTILINE)
-                    full_text = re.sub(r"\[TOOL_CALLS\][\s\S]*?(?:\]|$)", "", full_text, flags=re.IGNORECASE)
-                    if '"name"' in full_text or "'name'" in full_text or '"function"' in full_text or "'function'" in full_text:
-                        for s, e in reversed(_find_balanced_json_objects(_tool_text_view(full_text))):
-                            chunk = full_text[s:e]
+                            "", answer_text, flags=re.IGNORECASE | re.MULTILINE)
+                    answer_text = re.sub(r"\[TOOL_CALLS\][\s\S]*?(?:\]|$)", "", answer_text, flags=re.IGNORECASE)
+                    if '"name"' in answer_text or "'name'" in answer_text or '"function"' in answer_text or "'function'" in answer_text:
+                        for s, e in reversed(_find_balanced_json_objects(_tool_text_view(answer_text))):
+                            chunk = answer_text[s:e]
                             try:
                                 parsed = json.loads(chunk)
                                 if isinstance(parsed, dict) and (parsed.get("name") or parsed.get("function", {}).get("name")):
-                                    full_text = full_text[:s] + full_text[e:]
+                                    answer_text = answer_text[:s] + answer_text[e:]
                             except Exception:
                                 pass
-                    full_text = full_text.strip()
+                    answer_text = answer_text.strip()
 
                 # The model emitted tool-call syntax but nothing parsed: almost always a chat
                 # template / dialect mismatch, meaning the rest of the reply narrates a tool
                 # that never ran. Surface that to the UI.
-                if not parsed_calls and TOOL_SYNTAX_HINT_RE.search(_tool_text_view(full_text or "")):
+                if not parsed_calls and TOOL_SYNTAX_HINT_RE.search(_tool_text_view(answer_text or "")):
                     print(
                         "[tool] WARNING: model emitted tool-call syntax but "
                         "no dialect matched - likely chat-template mismatch",
@@ -32296,13 +33044,13 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     # Never persist malformed tool syntax as an ordinary
                     # assistant answer. Keep any surrounding prose, but hide
                     # the broken call body from the chat bubble.
-                    full_text = _strip_unparsed_tool_markup(full_text)
+                    answer_text = _strip_unparsed_tool_markup(answer_text)
 
             if _apply_task_updates(_steering.take(chat_id)):
                 _carry_call = ""
                 continue
             turn_tool_calls += len(parsed_calls)
-            assistant_msg = {"role": "assistant", "content": full_text}
+            assistant_msg = {"role": "assistant", "content": reasoning_text + answer_text}
             if parsed_calls:
                 assistant_msg["tool_calls"] = [
                     {
@@ -32344,6 +33092,32 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     )
                     _final_text = assistant_msg["content"]
                     terminal_error = assistant_msg["content"]
+                elif thinking_only:
+                    # Stopped at the output cap or ended inside the thinking. Guard cuts
+                    # retry above and only reach this once their retries are spent. Ask
+                    # again with thinking off; after that, end the turn so the model
+                    # cannot draft the same file over and over.
+                    if not think_overflow:
+                        thinking_only_streak += 1
+                        rounds += 1
+                    if (not think_overflow and thinking_only_streak <= _THINKING_ONLY_RETRIES
+                            and rounds < max_tool_rounds):
+                        conversation = _with_thinking_note(conversation, _start_len, _thinking_recovery_note(
+                            "Your previous reply hit the output limit while you were still thinking."
+                            if finish_reason == "length" else
+                            "Your previous reply had only thinking: no answer and no tool call.",
+                            reasoning_text, use_tools))
+                        force_no_think = True
+                        note_intervention("reasoning_guard")
+                        emit({"type": "notice", "quiet": True,
+                              "note": "reply had only thinking; asking again with thinking off"})
+                        continue
+                    completed = any(item.get("ok") for item in turn_tool_outcomes)
+                    terminal_error = (
+                        "The model kept planning in its thinking and never wrote an answer or a tool "
+                        f"call, so I stopped the turn after {thinking_only_streak} tries. "
+                        + ("A tool action earlier in this turn did complete." if completed
+                           else "Nothing was changed."))
                 elif not _final_text and empty_retries < 2:
                     empty_retries += 1
                     conversation.append({
@@ -32372,7 +33146,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 # a follow-up request so long reports don't end mid-sentence. At most 3
                 # continuations per turn.
                 if (finish_reason == "length" and auto_continues < 3
-                        and rounds < max_tool_rounds):
+                        and rounds < max_tool_rounds and not terminal_error):
                     auto_continues += 1
                     if use_tools:
                         # The budget was spent; the next round must NOT re-enter
@@ -32494,7 +33268,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 # and intermediate-assistant-with-tool-calls the loop appended.
                 # The caller persists these so the next user turn replays the
                 # full agentic context, not just the final bubble.
-                assistant_msg["_appended_intermediate"] = list(conversation[_start_len:])
+                assistant_msg["_appended_intermediate"] = _drop_invalid_call_pairs(conversation[_start_len:])
                 assistant_msg["_build"] = _BUILD_TAG
                 assistant_msg["_turn_id"] = _turn_id
                 if _carry_diag:
@@ -32530,6 +33304,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 return assistant_msg
 
             conversation.append(assistant_msg)
+            _live_turn_messages[chat_id] = list(conversation[_start_len:])
             # Required-args guard. Never execute a partial call. Native parsing
             # can preserve a path while losing only the large content field,
             # and text mode can also return an empty retry if the model spends
@@ -32550,6 +33325,11 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             if (_arg_loss and rounds < max_tool_rounds - 1
                     and arg_loss_retries < 2):
                 arg_loss_retries += 1
+                _log_tool_parse_failure(chat_id, rounds, native_tools, finish_reason,
+                                        "".join(answer_buf), tool_calls_by_index)
+                # None of this round's calls run, so none may stay in the history as
+                # an example: a small model copies the calls it sees.
+                conversation[-1] = {k: v for k, v in assistant_msg.items() if k != "tool_calls"}
                 _summary = "; ".join(
                     f"`{name}` missing {', '.join(fields)}"
                     for name, fields in _arg_loss)
@@ -32583,14 +33363,18 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         f"<parameter={_field}>", _placeholder, "</parameter>",
                     ])
                 _example_lines.extend(["</function>", "</tool_call>"])
+                _body_tip = ""
+                if any(_resolve_tool_name(name) in ("write_file", "remote_write_file")
+                       for name, _ in _arg_loss):
+                    _body_tip = "\nFor a long file, you can also " + _FILE_IN_PARTS + "."
                 conversation.append({
                     "role": "user",
                     "content": (
                         "[automatic note] The previous tool call was not executed because required "
                         "fields were lost: " + _summary + ". Re-emit the SAME call now using the "
-                        "text-parsed XML form below. Do not plan, explain, or place the file in chat. "
+                        "text-parsed XML form below. Do not plan or explain. "
                         "Begin with <tool_call> and include the actual values.\n" +
-                        "\n".join(_example_lines)
+                        "\n".join(_example_lines) + _body_tip
                     ),
                 })
                 if _bad_paths:
@@ -32607,10 +33391,21 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                       "note": ("A malformed file action was blocked. Regenerating the reply."
                                if _bad_paths else
                                "Tool arguments were incomplete. Retrying through the text parser.")})
-                # This model's native tool parsing is broken; remember it so later turns
-                # start in text-tools mode (see _mark_native_tools_broken).
+                # Remember which tools llama.cpp's native parser dropped arguments for, so
+                # later turns can start in text-tools mode (see _mark_native_tools_broken).
+                # A multiline path is a model mistake, not a parser loss.
                 if native_tools:
-                    _mark_native_tools_broken()
+                    _mark_native_tools_broken(
+                        {_resolve_tool_name(name) for name, fields in _arg_loss
+                         if fields != ["valid path"]})
+                    # Without the `tools` array the model no longer sees any schema, so the
+                    # first switch of the turn lists the tools it can still call.
+                    if not tool_card_sent:
+                        tool_card_sent = True
+                        conversation[-1]["content"] += (
+                            "\n\nNative tool calls are off for the rest of this turn. "
+                            "Tools you can call (* = required):\n"
+                            + "\n".join(_text_tool_lines(chat_id)))
                 # Stop sending the `tools` array for the rest of this turn: while it sees the
                 # schema the server keeps swallowing the <parameter> blocks. On the text path
                 # the XML call lands in content and extract_tool_calls decodes it.
@@ -32893,7 +33688,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     "further was run.")})
             except Exception:
                 pass
-        partial["_appended_intermediate"] = list(conversation[_start_len:]) if 'conversation' in locals() else []
+        partial["_appended_intermediate"] = _drop_invalid_call_pairs(conversation[_start_len:]) if 'conversation' in locals() else []
         partial["_build"] = (_BUILD_TAG if '_BUILD_TAG' in locals() else "")
         partial["_turn_id"] = _turn_id if '_turn_id' in locals() else ""
         return partial
@@ -32954,6 +33749,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             except Exception:
                 pass
         _chat_emitters.pop(chat_id, None)
+        _live_turn_messages.pop(chat_id, None)
         with _chat_live_activity_lock:
             _chat_live_activity.pop(chat_id, None)
         _unregister_cancel(chat_id)
@@ -32993,12 +33789,11 @@ def _strip_prior_thinking(text: str) -> str:
     return _PRIOR_THINK_RE.sub("", text).lstrip()
 
 
-# The stream loop stores a reasoning round as "<think>R\n responseA" (bare
-# " response" boundary, no </think>), so a model that answered on the
-# reasoning channel lands as "<think>R\n responseA</think>". _PRIOR_THINK_RE
-# needs a real closer, so this marker form is normalized first; otherwise the
-# model sees and copies the marker and llama-server keeps its answer on the
-# reasoning channel.
+# Chats saved before the stream loop closed reasoning with </think> hold
+# "<think>R\n responseA" (a bare " response" boundary), and a model that copied
+# that marker into its reasoning lands as "<think>R\n responseA</think>".
+# _PRIOR_THINK_RE needs a real closer, so this legacy form is normalized first;
+# otherwise the model sees and copies the marker.
 _THINK_MARKER_RE = re.compile(
     r"\n[ \t]*response(?=[A-Za-z0-9<`])(?![sS](?:\b|$))|\n[ \t]*response[ \t]*$")
 
@@ -33026,6 +33821,134 @@ def _close_think_marker(text: str) -> str:
     after = text[close + len("</think>"):] if close >= 0 else ""
     return (text[:body_at] + region[:m.start()] + "</think>"
             + region[m.end():] + after)
+
+
+# Models without a reasoning channel open their content with an inline <think>
+# block; an unclosed one is all reasoning.
+_LEADING_THINK_RE = re.compile(r"^\s*<think>(?:[\s\S]*?</think>|[\s\S]*$)", re.IGNORECASE)
+# One or more tool-call blocks that end the text, each free of a nested opener,
+# so a call merely mentioned earlier can never swallow the prose after it.
+_TRAILING_CALL_RUN_RE = re.compile(
+    r"(?:\s*(?:<tool_call>(?:(?!<tool_call>)[\s\S])*?(?:</tool_call>|$)"
+    r"|```tool_code\b(?:(?!```)[\s\S])*(?:```|$)))+\s*$",
+    re.IGNORECASE)
+
+
+def _split_leading_think(text: str) -> tuple[str, str]:
+    """Separate an inline <think> block that opens the content from the answer."""
+    match = _LEADING_THINK_RE.match(text or "")
+    if not match:
+        return "", text or ""
+    return match.group(0), text[match.end():]
+
+
+def _recover_trailing_calls(reasoning_text: str) -> tuple[str, str]:
+    """Move tool-call blocks that end the reasoning into the answer.
+
+    Some models emit their call before they close the reasoning block. Only a
+    run of call blocks with nothing after it moves; a call mentioned earlier in
+    the reasoning stays there and is never parsed."""
+    body = re.sub(r"</think>\s*$", "", reasoning_text or "", flags=re.IGNORECASE)
+    match = _TRAILING_CALL_RUN_RE.search(body)
+    if not match:
+        return reasoning_text, ""
+    kept = body[:match.start()].rstrip()
+    return (kept + "</think>" if kept else ""), body[match.start():].strip()
+
+
+# A write that streams for a minute shows nothing until the call is complete, so
+# the stream loop reports the target and size of a call while it arrives.
+_PROGRESS_PATH_RES = (
+    re.compile(r'"path"\s*:\s*"((?:[^"\\]|\\.)*)"'),
+    re.compile(r"<parameter=path>\s*(.*?)\s*</parameter>", re.DOTALL),
+    re.compile(r"\bpath\s*=\s*(?:\"([^\"\n]*)\"|'([^'\n]*)')"),
+)
+_TEXT_CALL_OPEN_RE = re.compile(r"<tool_call>|```tool_code", re.IGNORECASE)
+_TEXT_CALL_NAME_RE = re.compile(r"<function=([\w.-]+)>|\"name\"\s*:\s*\"([\w.-]+)\"|^\s*([\w.]+)\s*\(")
+
+
+def _text_call_progress(text: str) -> tuple[str, str] | None:
+    """Name and arguments so far of a text-mode tool call that is still open."""
+    opens = list(_TEXT_CALL_OPEN_RE.finditer(text))
+    if not opens:
+        return None
+    tail = text[opens[-1].end():]
+    closer = "</tool_call>" if opens[-1].group().startswith("<") else "```"
+    if closer in tail.lower():
+        return None
+    match = _TEXT_CALL_NAME_RE.search(tail)
+    name = next((g for g in match.groups() if g), "") if match else ""
+    return (name, tail) if name else None
+
+
+def _maybe_emit_call_progress(emit, sent: dict, key, name: str, raw: str) -> None:
+    """Emit tool_progress for a call of at least 1 KB, then every 5 lines or 2 KB."""
+    state = sent.setdefault(key, {"checked": 0, "lines": -1, "bytes": 0, "path": ""})
+    if not name or len(raw) < 1024 or len(raw) - state["checked"] < 256:
+        return
+    state["checked"] = len(raw)
+    path = ""
+    for regex in _PROGRESS_PATH_RES:
+        match = regex.search(raw)
+        if match:
+            path = next(g for g in match.groups() if g is not None)
+            if regex is _PROGRESS_PATH_RES[0]:
+                try:
+                    path = json.loads('"' + path + '"')
+                except ValueError:
+                    pass
+            break
+    lines = raw.count("\n") + raw.count("\\n")
+    if (state["lines"] >= 0 and lines < state["lines"] + 5 and path == state["path"]
+            and len(raw) - state["bytes"] < 2048):
+        return
+    state.update(lines=lines, bytes=len(raw), path=path)
+    emit({"type": "tool_progress", "name": _resolve_tool_name(name) or name, "path": path,
+          "lines": lines, "bytes": len(raw)})
+
+
+# Rounds in a row that may end with only thinking before the turn stops.
+_THINKING_ONLY_RETRIES = 2
+_NUMBERED_LINE_RE = re.compile(r"^[ \t]*\d{1,4}[:.]?[ \t]+\S", re.MULTILINE)
+
+
+def _thinking_body(text: str) -> str:
+    return re.sub(r"</?think>", "", text or "", flags=re.IGNORECASE).strip()
+
+
+def _thinking_draft(text: str) -> bool:
+    """True when the thinking holds a code draft: a fence or a run of numbered lines."""
+    return "```" in text or len(_NUMBERED_LINE_RE.findall(text)) >= 30
+
+
+def _thinking_recovery_note(cause: str, reasoning: str, use_tools: bool) -> str:
+    """The note that asks again after a round ended with only thinking.
+
+    A draft is not fed back: the model would continue it from the middle, or
+    write it out in the thinking again."""
+    body = _thinking_body(reasoning)
+    if _thinking_draft(body):
+        step = ("If the task is a file, call write_file now with the whole file in content; "
+                "for a long file, " + _FILE_IN_PARTS + ". Otherwise make the next tool call "
+                "now, or write the answer if the task is done." if use_tools else
+                "Write the complete answer now, directly in your reply.")
+        return (f"[automatic note] {cause} Your thinking held a draft, and thinking is not kept, so "
+                "the draft is gone. Do not draft again and do not count lines: a size such as "
+                f"\"300 lines\" is approximate. {step}")
+    # In a tool turn the work is usually not done: ordering a final answer here
+    # made the model stop mid-task.
+    step = ("Stop thinking now. If the task needs another action, make that tool call now; if the "
+            "task is done, write the final answer." if use_tools else
+            "Stop thinking now and write the COMPLETE final answer directly — full code/prose.")
+    return (f"[automatic note] {cause} {step} No <think> block, no more planning. "
+            "Continue from your planning so far:\n" + body[-2000:])
+
+
+def _with_thinking_note(conversation: list[dict], start: int, note: str) -> list[dict]:
+    """Swap this turn's earlier thinking note for a new one, so notes never stack."""
+    kept = [m for m in conversation[start:]
+            if not (isinstance(m, dict) and m.get("_thinking_note"))]
+    return conversation[:start] + kept + [{"role": "user", "content": note, "_thinking_note": True}]
 
 
 def _prior_thinking_mode(settings: dict | None = None) -> str:
@@ -37512,38 +38435,10 @@ class Handler(BaseHTTPRequestHandler):
                 "deletions and destructive actions still require the user, so when one is truly needed, do "
                 "it via the proper tool (the user will be asked) and continue. Report only when done or genuinely blocked."
             )
-        # Text-tools mode (Gemma): pin the exact shape we can parse (one python-form
-        # call in a tool_code fence) and never claim a tool ran unless a result came
-        # back.
+        # Text-tools mode: pin the exact shape we can parse, in the model family's own
+        # dialect, and never claim a tool ran unless a result came back.
         if not native_tools:
-            system_prompt += (
-                "\n\nTOOL CALLING — IMPORTANT for this model:\n"
-                "to call a tool, output EXACTLY one python call inside a ```tool_code``` fence, then STOP:\n"
-                "```tool_code\n"
-                "read_file(path=\"C:/notes.txt\")\n"
-                "```\n"
-                "```tool_code\n"
-                "edit_file(path=\"C:/notes.txt\", "
-                "edits=[{\"old_text\": \"old line\", \"new_text\": \"new line\"}])\n"
-                "```\n"
-                "- list/object arguments (edits, files, tasks…) are ordinary JSON inside that same call:\n"
-                "  one call per fence, never split across fences, and never discuss this format in the\n"
-                "  visible answer. There is no separate rule for arrays — the same shape always works.\n"
-                "- use the tool names listed above; keyword args with real quotes. when calls are\n"
-                "  independent (several reads, a grep plus a status check), emit all their fences in\n"
-                "  one reply: they run together. dependent calls and same-file writes stay one per reply.\n"
-                "- for ordinary calls, do NOT wrap it in JSON, <tool_call> tags, or prose.\n"
-                "- if content already exists in a prior visible code fence, call write_file or "
-                "remote_write_file with source='visible_code_block'; NEVER repeat the full block.\n"
-                "- for a genuinely new large write_file/edit_file body that is not already visible, use "
-                "the <tool_call><function=NAME><parameter=KEY>raw value</parameter></function></tool_call> "
-                "form instead of a Python string so quotes and newlines remain lossless.\n"
-                "- after you emit the fence, wait for the tool result — never write \"done\"/\"saved\" "
-                "or narrate a result before the tool actually returns one.\n"
-                "- when a tool result comes back and the task has more steps, IMMEDIATELY emit the "
-                "next tool_code call. Do not stop to summarize, do not ask permission, do not say "
-                "what you will do — do it. Only write prose once the ENTIRE task is finished."
-            )
+            system_prompt += _text_tools_prompt(any(_is_gemma_model(m) for m in _model_ids))
         msgs: list[dict] = [{"role": "system", "content": system_prompt}]
         # Replay the full stored history, including intermediate assistant turns
         # (with tool_calls) and tool results from prior agentic loops, so the model
@@ -41781,9 +42676,17 @@ class LlamaProcess:
             f"{self.WATCHDOG_MAX_CRASHES} in {delay:.0f}s",
             file=sys.stderr,
         )
+        # The exit code and the last output lines tell an out-of-memory kill from
+        # an assert or a bad flag; the record used to carry neither.
         try:
+            with self._lock:
+                code = self._proc.poll() if self._proc is not None else None
+            with self._log_lock:
+                tail = list(self._log_lines[-40:])
             _error_store.record("backend", "ModelServerCrash",
-                                f"llama-server died; restart attempt {attempt}", "llama-server")
+                                f"llama-server died (exit code {code}); restart attempt {attempt}",
+                                "llama-server",
+                                f"exit code: {code}\nlast llama-server output:\n" + "\n".join(tail))
         except Exception:
             pass
         try:
@@ -42403,34 +43306,14 @@ def _discord_strip_think(text: str) -> str:
     """Discord-only display filter: return the visible answer, hiding reasoning.
 
     Used only on the Discord reply path (_run_discord_turn) and mirrors the web
-    UI's splitThinking boundary (app.js): Qwen3-family templates separate
-    thinking from the answer with a bare " response" marker glued to the answer,
-    usually with no closing </think>, so stripping closed <think> pairs alone
-    leaks the reasoning."""
-    buf = text or ""
+    UI's splitThinking boundary (app.js). Chats saved by older builds separate
+    reasoning with a bare " response" marker and no closing </think>; that form
+    is closed first, so an answer line such as `ResponseEntity<T>` is never
+    taken for the boundary."""
+    buf = _close_think_marker(text or "")
     if not buf:
         return ""
-    # 1. Template boundary marker (primary). Newline form is case-insensitive
-    # (a line starting with response+glued answer is never prose); inline
-    # space form requires lowercase "response" so camelCase like ResponseTime
-    # is preserved. Both exclude "response was" (space after) and "responses".
-    _cands: list[tuple[int, int]] = []
-    for _m in re.finditer(r"\n\s*response(?=[A-Za-z0-9<])(?![sS](?:\b|$))", buf, flags=re.IGNORECASE):
-        _cands.append((_m.start(), _m.end()))
-    for _m in re.finditer(r"\s+response(?=[A-Za-z0-9<])(?![sS](?:\b|$))", buf):
-        _cands.append((_m.start(), _m.end()))
-    if not _cands:
-        if re.search(r"(?:^|\n)[ \t]*response[ \t]*$", buf, flags=re.IGNORECASE):
-            return ""
-    else:
-        _cands.sort()
-        content = buf[_cands[-1][1]:]
-        content = re.sub(
-            r"</?(?:think|thinking|reasoning)>|<\|\/?thinking\|>|\[/?(?:thought|thinking|reasoning|scratchpad)\]",
-            "", content, flags=re.IGNORECASE)
-        content = re.sub(r"<\s*/?\s*(?:think|thinking|reasoning)\s*>", "", content, flags=re.IGNORECASE)
-        return content.strip()
-    # 2. No marker: strip closed reasoning blocks, preserving surrounding prose.
+    # 1. Strip closed reasoning blocks, preserving surrounding prose.
     cleaned = buf
     cleaned = re.sub(r"<\s*think\s*>[\s\S]*?<\s*/\s*think\s*>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(
@@ -42447,7 +43330,7 @@ def _discord_strip_think(text: str) -> str:
             r"</?(?:think|thinking|reasoning)>|<\|\/?thinking\|>|\[/?(?:thought|thinking|reasoning|scratchpad)\]",
             "", cleaned, flags=re.IGNORECASE)
         return cleaned.strip()
-    # 3. Bare closer with no opener, e.g. "planning</think>Answer".
+    # 2. Bare closer with no opener, e.g. "planning</think>Answer".
     _closes = list(re.finditer(
         r"<\s*/\s*(?:think|thinking|reasoning)\s*>|<\|\s*/\s*thinking\s*\|>"
         r"|\[/\s*(?:thought|thinking|reasoning|scratchpad)\s*\]",
@@ -42458,7 +43341,7 @@ def _discord_strip_think(text: str) -> str:
             r"</?(?:think|thinking|reasoning)>|<\|\/?thinking\|>|\[/?(?:thought|thinking|reasoning|scratchpad)\]",
             "", tail, flags=re.IGNORECASE)
         return tail.strip()
-    # 4. Unclosed opener (in-flight thinking, no answer yet) -> prefix only.
+    # 3. Unclosed opener (in-flight thinking, no answer yet) -> prefix only.
     _open = re.search(
         r"<\s*(?:think|thinking|reasoning)\s*>|<\|\s*thinking\s*\|>"
         r"|\[(?:thought|thinking|reasoning|scratchpad)\]",
@@ -42553,6 +43436,8 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
                                   "treat as established facts — do not redo work or re-ask) ===\n" + _roll)
             system_prompt += ("\n\nWhen you fix a bug, settle a design decision, or the user states a constraint, "
                               "call pin_note to lock it in for this session so you never undo it or repeat the mistake.")
+            if _text_tools:
+                system_prompt += _text_tools_prompt(_gm)
             replay_from = int(chat.get("summary_through", 0) or 0)
         else:
             system_prompt = _DISCORD_FRIEND_PROMPT
