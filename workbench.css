@@ -1361,6 +1361,25 @@ body.wb-composer #toolbar-overflow-menu :is(#btn-attach-image, #btn-attach-file,
 .tcard-icons.stack .tcard-mono { padding: 0; font-size: 9px; }
 .tcard-icons.stack .tcard-ico + .tcard-ico { margin-left: -5px; }
 
+/* Icons are tinted by what the tool does (app.js TCARD_CATS). Each hue is
+   mixed toward the muted ink so it reads as a hint in every theme, and only
+   the icon carries it; labels stay neutral. MCP coins take their server's
+   own hue. */
+.tcard-ico { --tc-c: var(--fg-muted); color: var(--tc-c); transition: opacity .35s ease, color .35s ease; }
+.tcard-ico[data-cat="read"]  { --tc-c: color-mix(in oklab, #5b9cf5 72%, var(--fg-muted)); }
+.tcard-ico[data-cat="write"] { --tc-c: color-mix(in oklab, #4cbf82 72%, var(--fg-muted)); }
+.tcard-ico[data-cat="run"]   { --tc-c: color-mix(in oklab, #e2a345 72%, var(--fg-muted)); }
+.tcard-ico[data-cat="web"]   { --tc-c: color-mix(in oklab, #a07ef2 72%, var(--fg-muted)); }
+.tcard-ico[data-cat="sec"]   { --tc-c: color-mix(in oklab, #df73b0 72%, var(--fg-muted)); }
+.tcard-mono[data-cat="mcp"] {
+  --tc-c: color-mix(in oklab, hsl(var(--tc-h) 70% 62%) 78%, var(--fg-muted));
+  background: color-mix(in srgb, var(--tc-c) 18%, transparent);
+}
+/* A running row waits dimmed and lifts to full colour when it lands; a
+   failed one's icon turns the danger colour whatever its group. */
+.tcard-row:is([data-state="running"], [data-state="waiting"]) .tcard-ico { opacity: .5; }
+.tcard-row[data-state="err"] .tcard-ico { --tc-c: var(--danger); }
+
 .tcard-title {
   position: relative;
   flex: 1 1 auto;
@@ -1378,8 +1397,12 @@ body.wb-composer #toolbar-overflow-menu :is(#btn-attach-image, #btn-attach-file,
   color: var(--fg-muted);
 }
 /* The shared .shimmer gradient doesn't repeat, so long labels go blank for
-   part of each sweep; inside the card it tiles seamlessly instead. */
+   part of each sweep; inside the card it tiles seamlessly instead. The band
+   is a brighter step of the ink rather than the accent, so it reads as
+   "live" without competing with the tinted icons. */
 .tcard .shimmer {
+  background-image: linear-gradient(90deg,
+      var(--fg-muted) 0%, var(--fg-muted) 35%, var(--fg) 50%, var(--fg-muted) 65%, var(--fg-muted) 100%);
   background-repeat: repeat-x;
   background-size: 200% 100%;
   animation: tcard-shine 2.2s linear infinite;
@@ -1830,6 +1853,26 @@ body.wb-composer #toolbar-overflow-menu :is(#btn-attach-image, #btn-attach-file,
     font: 600 9px/1 var(--font-mono);
     letter-spacing: -.02em;
     font-variant-numeric: tabular-nums;
+  }
+  /* title on an arc over the ring: the svg is centred on the ring and spills
+     past it, and the margin makes room above for the lettering */
+  #app.sidebar-collapsed > .sidebar .wb-meter-ring { position: relative; margin-top: 9px; }
+  #app.sidebar-collapsed > .sidebar .wb-meter-arc {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 56px;
+    height: 56px;
+    transform: translate(-50%, -50%);
+    overflow: visible;
+    pointer-events: none;
+  }
+  #app.sidebar-collapsed > .sidebar .wb-meter-arc path { fill: none; }
+  #app.sidebar-collapsed > .sidebar .wb-meter-arc text {
+    fill: var(--fg-muted);
+    font: 600 7px var(--font-mono);
+    letter-spacing: .1em;
+    text-anchor: middle;
   }
   #app.sidebar-collapsed > .sidebar .wb-meter-ring[data-level="warn"] { --c: var(--warning); }
   #app.sidebar-collapsed > .sidebar .wb-meter-ring[data-level="crit"] { --c: var(--danger); color: var(--fg); }

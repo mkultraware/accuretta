@@ -217,7 +217,7 @@ def _read_app_version() -> str:
             return m.group(1)
     except Exception:
         pass
-    return "1.0.2"
+    return "1.0.3"
 
 
 def _glyph_field_js() -> str:
@@ -255,11 +255,10 @@ def _build_splash_html() -> str:
     The saved theme supplies the palette (bg / fg / muted / accent), so the
     splash opens in the theme the app was last closed in. The mark is the
     split A drawn in monospace glyphs (glyph-field.js, shape from the inlined
-    dot-matrix.js): it resolves along the notch's diagonal, then idles, and a
-    small section tag frames the part of the A for the current boot stage.
-    Corner HUD lines print the real boot clock, stage and grid. Progress is
-    still the hairline stage segments under the wordmark beside the live
-    status line. Without glyph-field.js the dot-matrix A is the mark; without
+    dot-matrix.js): it resolves along the notch's diagonal, then idles over
+    the New Session dot field, which ripples and fades at ready. Progress is
+    the hairline stage segments under the wordmark beside the live status
+    line. Without glyph-field.js the dot-matrix A is the mark; without
     either, the PNG logo.
     window.__splashStage(label, pct) stays the live progress contract.
     """
@@ -303,17 +302,6 @@ def _build_splash_html() -> str:
       user-select: none; -webkit-font-smoothing: antialiased;
     }}
     #glyph-field {{ position: absolute; inset: 0; z-index: 0; pointer-events: none; }}
-
-    /* Corner HUD: the boot's own numbers in small mono, like a specimen
-       plate's margin notes. Quiet enough to read as texture. */
-    .hud {{
-      position: absolute; top: 18px; z-index: 1;
-      font: 500 10.5px/1.65 "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
-      letter-spacing: .06em; color: var(--muted); white-space: pre;
-      opacity: 0; animation: hud .9s ease .5s forwards;
-    }}
-    .hud-tl {{ left: 22px; }}
-    .hud-tr {{ right: 22px; text-align: right; }}
 
     .lockup {{
       position: relative; z-index: 1;
@@ -403,7 +391,6 @@ def _build_splash_html() -> str:
       to   {{ opacity: 1; transform: none; }}
     }}
     @keyframes fade {{ to {{ opacity: .75; }} }}
-    @keyframes hud {{ to {{ opacity: .6; }} }}
     @keyframes sheen {{ from {{ background-position: 100% 0; }} to {{ background-position: 0% 0; }} }}
     @keyframes stepsweep {{ from {{ transform: translateX(-100%); }} to {{ transform: translateX(240%); }} }}
     @keyframes twinkle {{
@@ -420,18 +407,12 @@ def _build_splash_html() -> str:
     @media (prefers-reduced-motion: reduce) {{
       *, *::before, *::after {{ animation: none !important; transition-duration: .01ms !important; }}
       .mark, h1, .status-wrap, .steps, .foot {{ opacity: 1; transform: none; }}
-      .hud {{ opacity: .6; }}
       #status.shimmer {{ background-image: none; -webkit-text-fill-color: var(--muted); color: var(--muted); }}
     }}
   </style>
 </head>
 <body>
   <canvas id="glyph-field" aria-hidden="true"></canvas>
-  <div class="hud hud-tl" aria-hidden="true">ACCURETTA  BOOT
-<span id="hud-clock">F 0000  00.00S</span>
-<span id="hud-stage">STAGE 01/03  3%</span></div>
-  <div class="hud hud-tr" aria-hidden="true">LOCAL RUNTIME / V{version}
-<span id="hud-grid">GRID</span></div>
 
   <main class="lockup">
     {mark_html}

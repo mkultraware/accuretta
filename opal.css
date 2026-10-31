@@ -3,7 +3,7 @@
    Black opal: the stone is still and near-monochrome; the colour
    is play-of-color, and it only ever shows as thin light.
    - shapes are polished cabochons: the composer becomes a full
-     capsule, the send button a round pearl, bubbles soft drops;
+     capsule, the send button a pearl, bubbles soft drops;
    - the active session carries a tiny turning opal; everything
      else stays pearl on stone (no rainbow rims or glows);
    - the welcome heading sits over a barely-there breath of light.
@@ -139,12 +139,9 @@
   border-top-right-radius: 25px;
 }
 
-/* Send: a round pearl that catches a little colour on hover. */
-[data-theme="opal"] #app :is(#btn-send, #btn-stop),
-[data-theme="opal"] #app .wb-act :is(#btn-send, #btn-stop) {
-  border-radius: 50% !important;
-}
-
+/* Send: a pearl that catches a little colour on hover. Send and stop keep
+   the workbench's rounded squares (workbench.css), so "Steer" and the stop
+   ring read the same here as in every other theme. */
 [data-theme="opal"] #app #btn-send:not(.queue-mode) {
   color: #0A0B0F !important;
   box-shadow: var(--btn-send-glow) !important;

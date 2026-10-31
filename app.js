@@ -1228,12 +1228,33 @@
     if (mcp) return `mcp:${mcp[1]}`;
     return TOOL_ICON_MAP[name]?.run || "wrench";
   }
-  function tcardIconHtml(key) {
+  // What a tool does, for its icon's tint (workbench.css .tcard-ico[data-cat]).
+  // Checked in order, so security tools win over the generic read/run
+  // prefixes they share (read_bytes, sandbox_nmap). Unlisted tools (memory,
+  // plans, skills) stay neutral.
+  const TCARD_CATS = [
+    ["sec", /^(recon_|sandbox_(nmap|sqlmap)|yara_|binary_|binwalk_|ghidra_|disasm_|decompile_|scan_|jwt_|sql_injection|fuzz|cors_probe|audit_http|batch_probe|tcp_send|persistence_hunt|parse_ev|analyze_pcap|strings_dump|read_bytes|extract_squashfs|network_snapshot|file_inspect|carve_file|rt_|\w*finding)/],
+    ["web", /^(web_|http_request|observe_response)/],
+    ["write", /^(write_file|edit_file|patch_file|delete_file|replace_ast_node|remote_write_file|remote_file_|remote_copy_|extract_archive|git_(add|commit|reset|restore|checkout|branch|init))/],
+    ["run", /^(run_|sandbox_run|remote_shell|open_program|session_|desktop_|check_syntax|check_deps|git_(push|pull|fetch|clone))/],
+    ["read", /^(read_|list_directory|remote_list_directory|remote_read_file|grep_files|find_|project_map|git_(status|log|diff|show|remote))/],
+  ];
+  function tcardIconCat(name) {
+    const hit = TCARD_CATS.find(([, re]) => re.test(name || ""));
+    return hit ? hit[0] : "";
+  }
+  function tcardIconHtml(name) {
+    const key = tcardIconKey(name);
     if (key.startsWith("mcp:")) {
+      // Each MCP server keeps one hue, hashed from its name, so the same
+      // server always reads as the same coin.
       const server = key.slice(4);
-      return `<span class="tcard-ico tcard-mono" title="${esc(server)}">${esc((server[0] || "?").toUpperCase())}</span>`;
+      let h = 0;
+      for (const ch of server) h = (h * 31 + ch.charCodeAt(0)) % 360;
+      return `<span class="tcard-ico tcard-mono" data-cat="mcp" style="--tc-h:${h}" title="${esc(server)}">${esc((server[0] || "?").toUpperCase())}</span>`;
     }
-    return `<span class="tcard-ico">${TOOL_SVG[key] || WRENCH_SVG}</span>`;
+    const cat = tcardIconCat(name);
+    return `<span class="tcard-ico"${cat ? ` data-cat="${cat}"` : ""}>${TOOL_SVG[key] || WRENCH_SVG}</span>`;
   }
   function tcardRowState(row) {
     if (row.classList.contains("running")) return row.dataset.waiting === "true" ? "waiting" : "running";
@@ -1386,20 +1407,26 @@
     // Collapsed while live, the head IS the latest row: its icon, label,
     // fact and status. Otherwise it summarises with the tools' icons.
     const single = live && !open;
-    let keys;
+    // One icon per distinct glyph, keeping the first tool name that drew it
+    // so the icon gets that tool's tint.
+    let names;
     if (single) {
-      keys = latest ? [tcardIconKey(latest.dataset.name)] : ["wrench"];
+      names = [latest ? latest.dataset.name : ""];
     } else {
-      keys = [];
-      rows.forEach(r => { const k = tcardIconKey(r.dataset.name); if (!keys.includes(k)) keys.push(k); });
-      keys = keys.slice(-TCARD_HEAD_ICONS);
+      const seen = new Set();
+      names = [];
+      rows.forEach(r => {
+        const k = tcardIconKey(r.dataset.name);
+        if (!seen.has(k)) { seen.add(k); names.push(r.dataset.name); }
+      });
+      names = names.slice(-TCARD_HEAD_ICONS);
     }
     const icons = group.querySelector(".tcard-icons");
-    const iconSig = `${single ? 1 : 0}|${keys.join(",")}`;
+    const iconSig = `${single ? 1 : 0}|${names.join(",")}`;
     if (icons && icons.dataset.sig !== iconSig) {
       icons.dataset.sig = iconSig;
       icons.classList.toggle("stack", !single);
-      icons.innerHTML = keys.map(tcardIconHtml).join("");
+      icons.innerHTML = names.map(tcardIconHtml).join("");
     }
     const meta = head.querySelector(".tcard-meta");
     let state = "";
@@ -1623,7 +1650,7 @@
 
   function tcardRowHtml(name, label) {
     return `<div class="tcard-line" role="button" tabindex="0" aria-expanded="false">`
-      + tcardIconHtml(tcardIconKey(name))
+      + tcardIconHtml(name)
       + `<span class="tcard-label shimmer">${esc(label)}</span>`
       + `<span class="tcard-meta"></span>`
       + `<span class="tcard-state"></span>`
@@ -9495,7 +9522,11 @@
       const level = value ? Math.max(1, Math.ceil(Math.sqrt(value / peak) * 4)) : 0;
       const detail = `${date.toLocaleDateString(undefined, { dateStyle: "medium" })} · ${Number(day.turns).toLocaleString()} turns · ${usageCompactNumber(day.tokens)} tokens · ${usageDuration(day.elapsed_ms)}`;
       return `<button type="button" class="usage-day" data-level="${level}" data-day-index="${index}" data-detail="${esc(detail)}" style="grid-column:${col};grid-row:${(padding + index) % 7 + 1}" tabindex="${index === days.length - 1 ? 0 : -1}" aria-label="${esc(detail)}" title="${esc(detail)}"></button>`;
-    }).join("");
+    }).join("")
+      // Outline the slots before the first day and after today, so the
+      // partial first and last weeks don't leave the rows ragged.
+      + Array.from({ length: columns * 7 }, (_, slot) => slot).filter(slot => slot < padding || slot >= padding + days.length)
+        .map(slot => `<i class="usage-day is-outside" aria-hidden="true" style="grid-column:${Math.floor(slot / 7) + 1};grid-row:${slot % 7 + 1}"></i>`).join("");
     return `<section class="usage-panel usage-calendar-panel">
       <div class="usage-section-head"><div><span class="usage-eyebrow">Past year</span><h2>Your activity</h2></div><div class="usage-calendar-switch" role="group" aria-label="Activity measure"><button type="button" data-activity-metric="turns" aria-pressed="${usageHeatmapMetric === "turns"}">Turns</button><button type="button" data-activity-metric="tokens" aria-pressed="${usageHeatmapMetric === "tokens"}">Tokens</button></div></div>
       <div class="usage-calendar-summary"><span><strong>${activeDays}</strong> active days</span><span><strong>${streak}</strong> day current streak</span><span>${usageCompactNumber(days.reduce((sum, day) => sum + day.turns, 0))} recorded turns</span></div>
@@ -15816,20 +15847,53 @@
     renderUsageProfile();
   }
 
-  // Theme token -> [r, g, b], resolved through a probe element so var() and
-  // color-mix() chains come back as real colors.
+  // The share card wears the active theme, so a card reads like the app it
+  // came from. Theme token -> [r, g, b]: a probe resolves var() and
+  // color-mix() chains, then a 1px canvas turns any color syntax into bytes.
+  let usageColorCtx = null;
   function usageCardColor(varName, fallback) {
     const probe = document.createElement("span");
     probe.style.cssText = `position:absolute;visibility:hidden;color:var(${varName}, ${fallback})`;
     document.body.appendChild(probe);
     const value = getComputedStyle(probe).color;
     probe.remove();
-    const nums = (value.match(/-?[\d.]+/g) || []).map(Number);
-    if (/^color\(srgb/.test(value)) return nums.slice(0, 3).map(n => Math.round(n * 255));
-    return nums.length >= 3 ? nums.slice(0, 3) : [0, 0, 0];
+    if (!usageColorCtx) usageColorCtx = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
+    usageColorCtx.clearRect(0, 0, 1, 1);
+    usageColorCtx.fillStyle = fallback;
+    usageColorCtx.fillStyle = value;
+    usageColorCtx.fillRect(0, 0, 1, 1);
+    const [r, g, b] = usageColorCtx.getImageData(0, 0, 1, 1).data;
+    return [r, g, b];
   }
-  const usageRgb = (c) => `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
+  const usageRgb = (c, alpha = 1) => alpha >= 1 ? `rgb(${c[0]}, ${c[1]}, ${c[2]})` : `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${alpha})`;
   const usageMix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
+  function usageLuminance(c) {
+    const [r, g, b] = c.map(v => {
+      const s = v / 255;
+      return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  }
+  function usageContrast(a, b) {
+    const la = usageLuminance(a), lb = usageLuminance(b);
+    return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+  }
+
+  // Whole Monday-first weeks for the card's calendar: it starts on the first
+  // Monday and days still to come this week stay null, so the grid is a clean
+  // rectangle instead of a ragged first and last column.
+  function usageCardWeeks(days) {
+    if (!days.length) return [];
+    const first = new Date(`${days[0].day}T12:00:00`);
+    const skip = (7 - ((first.getDay() + 6) % 7)) % 7;
+    const weeks = [];
+    for (let i = skip; i < days.length; i += 7) {
+      const week = [];
+      for (let d = 0; d < 7; d += 1) week.push(days[i + d] || null);
+      weeks.push(week);
+    }
+    return weeks;
+  }
 
   // Copied confirmation: a thumbnail of the card that was just copied tilts
   // in under Share, an accent check draws itself, then it all fades away.
@@ -15865,118 +15929,283 @@
   async function shareUsageCard() {
     const data = state._usageData;
     if (!data) { toast("Usage stats are still loading.", "info", 1800); return; }
-    try { await document.fonts?.ready; } catch {}
     const totals = data.totals || {};
     const tokens = (Number(totals.input_tokens ?? data.savings?.tok_in) || 0) + (Number(totals.output_tokens ?? data.savings?.tok_out) || 0);
     const days = Array.isArray(data.activity?.days) ? data.activity.days : [];
     const activeDays = days.filter(day => day.turns > 0).length;
     const since = totals.since ? new Date(totals.since * 1000).toLocaleDateString(undefined, { month: "long", year: "numeric" }) : "";
+
+    // the active theme's palette, adjusted so small type stays legible
+    const bg = usageCardColor("--bg", "#111");
+    const fg = usageCardColor("--fg", "#eee");
+    // light text on a darker ground; retro's mid-grey with dark ink is light
+    const dark = usageLuminance(fg) > usageLuminance(bg);
+    const muted = usageCardColor("--fg-muted", dark ? "#aaa" : "#555");
+    const accent = usageCardColor("--accent", "#7c6cff");
+    const raised = usageCardColor("--bg-raised", "#1a1a1a");
     const c = {
-      bg: usageCardColor("--bg", "#111"), fg: usageCardColor("--fg", "#eee"),
-      muted: usageCardColor("--fg-muted", "#aaa"), faint: usageCardColor("--fg-faint", "#666"),
-      accent: usageCardColor("--accent", "#8b8cf8"), border: usageCardColor("--border-subtle", "#333"),
-      inset: usageCardColor("--bg-inset", "#1c1c1c"),
+      bg, fg, muted, accent,
+      backdrop: dark ? usageMix(bg, [0, 0, 0], 0.45) : usageMix(bg, fg, 0.08),
+      panel: usageContrast(raised, bg) < 1.04 ? usageMix(bg, fg, dark ? 0.045 : 0.035) : raised,
+      line: usageMix(bg, fg, dark ? 0.12 : 0.13),
+      faint: usageMix(usageCardColor("--fg-faint", "#666"), muted, 0.4),
+      ink: usageContrast(accent, bg) < 3 ? usageMix(accent, fg, 0.5) : accent,
     };
-    const font = getComputedStyle(document.body).fontFamily || "sans-serif";
-    const W = 720, H = 500, S = 2, PAD = 36, AV = 96;
+    const css = getComputedStyle(document.body);
+    const family = (name, fallback) => css.getPropertyValue(name).trim() || fallback;
+    const sans = family("--font-sans", `"Inter Tight", "Segoe UI", sans-serif`);
+    const mono = family("--font-mono", `"JetBrains Mono", Consolas, monospace`);
+    const display = family("--font-display", sans);
+    try {
+      await Promise.all([`600 30px ${sans}`, `500 14px ${sans}`, `600 120px ${display}`, `500 12px ${mono}`]
+        .map(font => document.fonts.load(font)));
+    } catch {}
+    const loadImage = src => new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = src;
+    });
+    const [logo, avatar] = await Promise.all([
+      loadImage("/assets/brand/logo-mark-dark.png").catch(() => null),
+      loadImage(state.settings.profile_avatar).catch(() => null),
+    ]);
+
+    // 16:9 so X, LinkedIn and Discord show it uncropped. Two columns on
+    // purpose: the numbers on the left, a profile plate on the right.
+    const W = 1200, H = 675, S = 2, M = 24;
+    const L = 72, LR = 720;
+    const PX = 768, PY = 48, PW = 384, PH = H - PY * 2;
+    const PC = PX + PW / 2;
     const canvas = document.createElement("canvas");
     canvas.width = W * S;
     canvas.height = H * S;
     const ctx = canvas.getContext("2d");
     ctx.scale(S, S);
-    const text = (str, x, y, size, weight, color, align = "left") => {
+    const text = (str, x, y, size, weight, color, { align = "left", font = sans, spacing = 0, alpha = 1 } = {}) => {
       ctx.font = `${weight} ${size}px ${font}`;
-      ctx.fillStyle = usageRgb(color);
+      ctx.fillStyle = usageRgb(color, alpha);
       ctx.textAlign = align;
+      ctx.letterSpacing = `${spacing}px`;
       ctx.fillText(str, x, y);
+      const width = ctx.measureText(str).width;
+      ctx.letterSpacing = "0px";
+      return width;
     };
-    // card
+    const hairline = (x0, y0, x1, y1) => {
+      ctx.fillStyle = usageRgb(c.line);
+      ctx.fillRect(x0, y0, Math.max(1, x1 - x0), Math.max(1, y1 - y0));
+    };
+    const glow = (x, y, radius, color, alpha) => {
+      const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius);
+      gradient.addColorStop(0, usageRgb(color, alpha));
+      gradient.addColorStop(1, usageRgb(color, 0));
+      ctx.fillStyle = gradient;
+      ctx.fillRect(x - radius, y - radius, radius * 2, radius * 2);
+    };
+
+    // backdrop: every pixel painted (transparent corners paste as white),
+    // with a faint dot matrix around the card
+    ctx.fillStyle = usageRgb(c.backdrop);
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = usageRgb(c.fg, dark ? 0.075 : 0.09);
+    for (let y = 6; y < H; y += 12) {
+      for (let x = 6; x < W; x += 12) {
+        ctx.beginPath();
+        ctx.arc(x, y, 0.7, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    // the card, lifted off the backdrop
+    const card = new Path2D();
+    card.roundRect(M, M, W - M * 2, H - M * 2, 28);
+    ctx.save();
+    ctx.shadowColor = `rgba(0, 0, 0, ${dark ? 0.5 : 0.14})`;
+    ctx.shadowBlur = 40;
+    ctx.shadowOffsetY = 14;
     ctx.fillStyle = usageRgb(c.bg);
-    ctx.beginPath();
-    ctx.roundRect(0, 0, W, H, 28);
-    ctx.fill();
-    // header: avatar, title, since
-    try {
-      const avatar = await new Promise((resolve, reject) => {
-        const img = new Image();
-        img.onload = () => resolve(img);
-        img.onerror = reject;
-        img.src = state.settings.profile_avatar;
+    ctx.fill(card);
+    ctx.restore();
+    ctx.save();
+    ctx.clip(card);
+    glow(L + 190, 250, 420, c.accent, dark ? 0.1 : 0.07);
+    ctx.restore();
+    ctx.strokeStyle = usageRgb(c.line);
+    ctx.lineWidth = 1;
+    ctx.stroke(card);
+
+    // ---- left column: who made it, the number, the year, the tagline ----
+    if (logo) ctx.drawImage(logo, L, 64, 40 * logo.naturalWidth / logo.naturalHeight, 40);
+    text("Accuretta", L + 70, 96, 30, 600, c.fg, { spacing: -0.6 });
+
+    text("TOKENS PROCESSED LOCALLY", L, 166, 11, 500, c.faint, { font: mono, spacing: 2.2 });
+    text(usageCompactNumber(tokens), L - 5, 284, 132, 600, c.fg, { font: display, spacing: -5 });
+    const claim = text("All on my own machine.", L, 326, 20, 500, c.muted);
+    text("No cloud, no API bill.", L + claim + 7, 326, 20, 500, c.ink);
+
+    // the calendar: whole weeks, Monday on top, one column per week
+    const weeks = usageCardWeeks(days);
+    const gridTop = 402;
+    const step = weeks.length ? (LR - L + 3) / weeks.length : 12;
+    const cell = step - 3;
+    const values = days.map(day => Number(day.turns) || 0);
+    const peak = Math.max(1, ...values);
+    const base = usageMix(c.bg, c.fg, dark ? 0.08 : 0.075);
+    const levels = [base, usageMix(base, c.accent, 0.3), usageMix(base, c.accent, 0.54), usageMix(base, c.accent, 0.78), c.accent];
+    const levelOf = (value, top) => value ? Math.max(1, Math.ceil(Math.sqrt(value / top) * 4)) : 0;
+    let lastMonth = -1;
+    let lastLabel = -9;
+    weeks.forEach((week, col) => {
+      const x = L + col * step;
+      const monday = week[0] && new Date(`${week[0].day}T12:00:00`);
+      if (monday && monday.getMonth() !== lastMonth) {
+        if (lastMonth !== -1 && col - lastLabel >= 3) {
+          text(monday.toLocaleDateString(undefined, { month: "short" }).toUpperCase(), x, gridTop - 10, 9.5, 500, c.faint, { font: mono, spacing: 1.2 });
+          lastLabel = col;
+        }
+        lastMonth = monday.getMonth();
+      }
+      week.forEach((day, row) => {
+        const y = gridTop + row * step;
+        ctx.beginPath();
+        ctx.roundRect(x, y, cell, cell, Math.min(3, cell * 0.25));
+        if (!day) {
+          // still to come this week: an outline keeps the rectangle whole
+          ctx.strokeStyle = usageRgb(c.line);
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          return;
+        }
+        ctx.fillStyle = usageRgb(levels[levelOf(Number(day.turns) || 0, peak)]);
+        ctx.fill();
       });
+    });
+    const gridBottom = gridTop + step * 7 - 3;
+    text("PAST YEAR", L, gridBottom + 24, 9.5, 500, c.faint, { font: mono, spacing: 1.6 });
+    const moreW = text("MORE", LR, gridBottom + 24, 9.5, 500, c.faint, { align: "right", font: mono, spacing: 1.2 });
+    const swatch = 10;
+    const legendX = LR - moreW - 10 - levels.length * (swatch + 3) + 3;
+    levels.forEach((level, i) => {
+      ctx.fillStyle = usageRgb(level);
+      ctx.beginPath();
+      ctx.roundRect(legendX + i * (swatch + 3), gridBottom + 15, swatch, swatch, 2);
+      ctx.fill();
+    });
+    text("LESS", legendX - 10, gridBottom + 24, 9.5, 500, c.faint, { align: "right", font: mono, spacing: 1.2 });
+
+    hairline(L, 548, LR, 549);
+    text("YOUR MODEL. YOUR MACHINE.", L, 584, 13, 600, c.fg, { font: mono, spacing: 3 });
+    text("github.com/mkultraware/accuretta", L, 606, 13, 500, c.muted, { font: mono });
+
+    // ---- right column: the profile plate ----
+    const plate = new Path2D();
+    plate.roundRect(PX, PY, PW, PH, 20);
+    ctx.fillStyle = usageRgb(c.panel);
+    ctx.fill(plate);
+    ctx.strokeStyle = usageRgb(c.line);
+    ctx.stroke(plate);
+    ctx.save();
+    ctx.clip(plate);
+    const AX = PC, AY = 186, AR = 78, RR = 102;
+    glow(AX, AY, 170, c.accent, dark ? 0.16 : 0.1);
+    ctx.restore();
+
+    // the year ring: 52 dots round the picture, one per week, oldest at the
+    // bottom left and running clockwise to this week, with a gap below right
+    const ring = weeks.slice(-52).map(week => week.reduce((sum, day) => sum + (Number(day?.turns) || 0), 0));
+    const ringPeak = Math.max(1, ...ring);
+    const ringBase = usageMix(c.panel, c.fg, dark ? 0.16 : 0.18);
+    const ringLevels = [ringBase, usageMix(ringBase, c.accent, 0.35), usageMix(ringBase, c.accent, 0.6), usageMix(ringBase, c.accent, 0.82), c.accent];
+    const arcStart = 200, arcSpan = 300;
+    const polar = (degrees, radius) => {
+      const a = (degrees - 90) * Math.PI / 180;
+      return [AX + Math.cos(a) * radius, AY + Math.sin(a) * radius];
+    };
+    ctx.beginPath();
+    ctx.arc(AX, AY, RR, (arcStart - 90) * Math.PI / 180, (arcStart + arcSpan - 90) * Math.PI / 180);
+    ctx.strokeStyle = usageRgb(c.line);
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ring.forEach((value, i) => {
+      const level = levelOf(value, ringPeak);
+      const [x, y] = polar(arcStart + arcSpan * i / Math.max(1, ring.length - 1), RR);
+      ctx.fillStyle = usageRgb(ringLevels[level]);
+      ctx.beginPath();
+      ctx.arc(x, y, level ? 2.2 + level * 0.6 : 1.7, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    if (ring.length) {
+      // this week, circled
+      const [x, y] = polar(arcStart + arcSpan, RR);
+      ctx.beginPath();
+      ctx.arc(x, y, 7.5, 0, Math.PI * 2);
+      ctx.strokeStyle = usageRgb(c.accent);
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+    const [gapX, gapY] = polar(arcStart + arcSpan + (360 - arcSpan) / 2, RR);
+    text("52 WK", gapX, gapY + 3.5, 9, 600, c.faint, { align: "center", font: mono, spacing: 1.4 });
+
+    // the picture, cropped square from its middle so it never stretches
+    ctx.beginPath();
+    ctx.arc(AX, AY, AR + 5, 0, Math.PI * 2);
+    ctx.fillStyle = usageRgb(c.panel);
+    ctx.fill();
+    if (avatar) {
+      const side = Math.min(avatar.naturalWidth, avatar.naturalHeight);
       ctx.save();
       ctx.beginPath();
-      // top right, opposite the headline number
-      ctx.arc(W - PAD - AV / 2, 36 + AV / 2, AV / 2, 0, Math.PI * 2);
+      ctx.arc(AX, AY, AR, 0, Math.PI * 2);
       ctx.clip();
-      ctx.drawImage(avatar, W - PAD - AV, 36, AV, AV);
+      ctx.drawImage(avatar, (avatar.naturalWidth - side) / 2, (avatar.naturalHeight - side) / 2, side, side, AX - AR, AY - AR, AR * 2, AR * 2);
       ctx.restore();
-      ctx.beginPath();
-      ctx.arc(W - PAD - AV / 2, 36 + AV / 2, AV / 2 + 1.5, 0, Math.PI * 2);
-      ctx.strokeStyle = usageRgb(c.accent);
-      ctx.lineWidth = 3;
-      ctx.stroke();
-    } catch {}
-    text("My local AI, on my machine", PAD, 58, 21, 650, c.fg);
-    text(`Accuretta${since ? ` · since ${since}` : ""}`, PAD, 80, 13, 500, c.muted);
-    // headline number
-    text(usageCompactNumber(tokens), PAD, 170, 66, 700, c.fg);
-    text("tokens processed locally", PAD, 196, 14, 500, c.muted);
-    // stats row
-    ctx.fillStyle = usageRgb(c.border);
-    ctx.fillRect(PAD, 220, W - PAD * 2, 1);
+    }
+    ctx.beginPath();
+    ctx.arc(AX, AY, AR + 1.5, 0, Math.PI * 2);
+    ctx.strokeStyle = usageRgb(c.accent);
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    if (since) {
+      text("RUNNING LOCAL SINCE", PC, 328, 9.5, 500, c.faint, { align: "center", font: mono, spacing: 1.8 });
+      text(since, PC, 352, 19, 600, c.fg, { align: "center", spacing: -0.3 });
+    }
+    hairline(PX + 32, 378, PX + PW - 32, 379);
     const stats = [
-      [usageDuration(totals.elapsed_ms), "autonomous time"],
-      [data.longest ? usageDuration(data.longest.elapsed_ms) : "—", "longest autonomous run"],
+      [usageDuration(totals.elapsed_ms), "working on its own"],
+      [data.longest ? usageDuration(data.longest.elapsed_ms) : "—", "longest solo run"],
       [usageCompactNumber(totals.turns), "model turns"],
       [String(activeDays), "active days"],
     ];
-    const colW = (W - PAD * 2) / stats.length;
     stats.forEach(([value, label], i) => {
-      text(value, PAD + colW * i, 252, 22, 650, c.fg);
-      text(label, PAD + colW * i, 272, 12, 500, c.muted);
+      const x = PX + 32 + (i % 2) * (PW - 64) / 2 + (i % 2 ? 18 : 0);
+      const y = 422 + Math.floor(i / 2) * 66;
+      text(value, x, y, 28, 600, c.fg, { spacing: -0.7 });
+      text(label, x, y + 21, 12.5, 500, c.muted);
     });
-    // activity matrix: the past year, Monday-first weeks like the page
-    text("PAST YEAR", PAD, 306, 10.5, 700, c.faint);
-    if (days.length) {
-      const first = new Date(`${days[0].day}T12:00:00`);
-      const padding = (first.getDay() + 6) % 7;
-      const columns = Math.ceil((padding + days.length) / 7);
-      const step = Math.min(12, (W - PAD * 2) / columns);
-      const cell = Math.max(3, step - 2);
-      const peak = Math.max(1, ...days.map(day => Number(day.turns) || 0));
-      const levels = [c.inset, usageMix(c.inset, c.accent, 0.32), usageMix(c.inset, c.accent, 0.55), usageMix(c.inset, c.accent, 0.78), c.accent];
-      days.forEach((day, index) => {
-        const value = Number(day.turns) || 0;
-        const level = value ? Math.max(1, Math.ceil(Math.sqrt(value / peak) * 4)) : 0;
-        const col = Math.floor((padding + index) / 7);
-        const row = (padding + index) % 7;
-        ctx.fillStyle = usageRgb(levels[level]);
-        ctx.beginPath();
-        ctx.roundRect(PAD + col * step, 316 + row * step, cell, cell, 2);
-        ctx.fill();
-      });
-    }
-    // footer: where to get it, with a scannable code
-    ctx.fillStyle = usageRgb(c.border);
-    ctx.fillRect(PAD, 418, W - PAD * 2, 1);
-    text("Run your own: download Accuretta", PAD, 450, 15, 650, c.fg);
-    text("github.com/mkultraware/accuretta", PAD, 472, 13, 500, c.accent);
+    hairline(PC, 394, PC + 1, 512);
+    hairline(PX + 32, 528, PX + PW - 32, 529);
+
+    // where to get it: a scannable code and a line of plain words
     try {
       if (typeof qrcode === "function") {
         const qr = qrcode(0, "M");
         qr.addData("https://github.com/mkultraware/accuretta");
         qr.make();
-        const qrImg = await new Promise((resolve, reject) => {
-          const img = new Image();
-          img.onload = () => resolve(img);
-          img.onerror = reject;
-          img.src = qr.createDataURL(4, 8);
-        });
+        const qrImg = await loadImage(qr.createDataURL(4, 8));
+        const QS = 64, QX = PX + PW - 32 - QS, QY = PH + PY - 24 - QS;
         ctx.fillStyle = "#fff";
         ctx.beginPath();
-        ctx.roundRect(W - PAD - 64, 426, 64, 64, 8);
+        ctx.roundRect(QX, QY, QS, QS, 9);
         ctx.fill();
-        ctx.drawImage(qrImg, W - PAD - 60, 430, 56, 56);
+        if (!dark) {
+          ctx.strokeStyle = usageRgb(c.line);
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+        ctx.drawImage(qrImg, QX + 4, QY + 4, QS - 8, QS - 8);
+        text("Run your own", PX + 32, QY + 27, 17, 600, c.fg, { spacing: -0.3 });
+        text("Scan to download Accuretta", PX + 32, QY + 48, 12.5, 500, c.muted);
       }
     } catch {}
     const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/png"));
@@ -19839,20 +20068,24 @@
     const v = s.vram || {};
     const ctx = ctxUse || computeCtxUsage();
     const rows = [];
-    if (v.total_gb > 0) rows.push(["VRAM", Math.min(1, v.used_gb / v.total_gb), `${v.used_gb}/${v.total_gb}G`, "vram"]);
-    rows.push(["Context", Math.min(1, ctx.pct), `${Math.round(ctx.pct * 100)}%`, "ctx"]);
+    if (v.total_gb > 0) rows.push(["VRAM", Math.min(1, v.used_gb / v.total_gb), `${v.used_gb}/${v.total_gb}G`, "vram", "VRAM"]);
+    rows.push(["Context", Math.min(1, ctx.pct), `${Math.round(ctx.pct * 100)}%`, "ctx", "CONTEXT"]);
     if (s.tokens_today != null) {
       const n = Number(s.tokens_today) || 0;
-      rows.push(["Today", null, n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k tok` : `${n} tok`, "today"]);
+      rows.push(["Today", null, n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k tok` : `${n} tok`, "today", "TOKENS"]);
     }
     // Each meter also carries a ring (shown only in the collapsed rail): the
     // fill as an arc with the percent inside, or just the value for counts.
-    const html = rows.map(([label, frac, value, key]) => {
+    // A short title curves over the top of the ring, on a circle sharing its
+    // centre (radius 19 = the 16px ring plus a 3px gap).
+    const html = rows.map(([label, frac, value, key, arc]) => {
       const pct = frac == null ? 0 : Math.round(frac * 100);
       const level = frac == null ? "" : frac >= 0.9 ? "crit" : frac >= 0.75 ? "warn" : "";
       const short = frac == null ? value.replace(/\s*tok$/, "") : String(pct);
       return `<div class="wb-meter" data-m="${key}" style="--p:${pct}" title="${esc(`${label} ${value}`)}">`
-        + `<span class="wb-meter-ring" data-level="${level}" aria-hidden="true"><b>${esc(short)}</b></span>`
+        + `<span class="wb-meter-ring" data-level="${level}" aria-hidden="true"><b>${esc(short)}</b>`
+        + `<svg class="wb-meter-arc" viewBox="-28 -28 56 56" focusable="false"><path id="wb-arc-${key}" d="M-19 0A19 19 0 0 1 19 0"/>`
+        + `<text><textPath href="#wb-arc-${key}" startOffset="50%">${arc}</textPath></text></svg></span>`
         + `<span class="wb-meter-k">${label}</span>`
         + (frac == null ? `<span class="grow"></span>` : `<span class="wb-meter-bar"><i style="width:${pct}%" data-level="${level}"></i></span>`)
         + `<span class="wb-meter-v">${esc(value)}</span></div>`;

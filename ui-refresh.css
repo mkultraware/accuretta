@@ -44,6 +44,7 @@ button.usage-day { cursor: pointer; }
 .usage-day[data-level="3"] { background: color-mix(in srgb, var(--accent) 73%, var(--bg-raised)); }
 .usage-day[data-level="4"] { background: var(--accent); }
 .usage-day.is-selected { border-color: var(--fg); }
+.usage-day.is-outside { background: transparent; border-color: color-mix(in srgb, var(--fg) 8%, transparent); }
 button.usage-day:hover { outline: 1px solid var(--fg); outline-offset: 1px; }
 .usage-calendar-panel button:focus-visible, .security-quieted-panel summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .usage-calendar-footer { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px; min-height: 36px; margin-top: 8px; color: var(--fg-muted); font-size: 11px; }

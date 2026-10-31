@@ -483,6 +483,12 @@ def cancel_chat(chat_id: str) -> bool:
                     pass
         except Exception:
             pass
+    # A tool can still be running when the model reply is cut (an nmap scan in
+    # the WSL guest ran out its full 600s timeout after Stop). Kill it too. A
+    # sandbox kill restarts the guest and can take ~30s, so keep it off the
+    # HTTP thread that answers Stop.
+    threading.Thread(target=_kill_current_command, args=(chat_id,),
+                     name="stop-kill", daemon=True).start()
     return True
 
 # thread pool for long-running tools so the HTTP worker stays responsive
@@ -4746,11 +4752,14 @@ def _maybe_roll_summary_unlocked(chat: dict, ctx_limit: int, force: bool = False
         # char-based tail estimate; both are roughly the same units and the trigger has
         # ~2K of slack under the trimmer ceiling. Old tool results stay live until a
         # fold preserves them, so count their full cost rather than the age-based stub.
+        # Old <think> blocks are stripped on the wire, so cost the wire view; the
+        # stored tail would fold at ~59% real fill on reasoning-heavy chats.
         _stub_cutoff = len(msgs) - _TOOL_RESULT_KEEP_RECENT
+        wire_tail = _thinking_wire_view(tail)
         tail_units = sum(_payload_msg_cost(m, through + i, _stub_cutoff,
                                            stub_old_tools=False)
-                         for i, m in enumerate(tail))
-        tail_tokens = tail_units * _conversation_token_scale(tail)
+                         for i, m in enumerate(wire_tail))
+        tail_tokens = tail_units * _conversation_token_scale(wire_tail)
         if max(real_fill, tail_tokens) <= trigger_limit:
             return False  # plenty of headroom — don't summarize yet
     # Fold oldest turns until the remaining RAW tail is ~KEEP_FRAC of ctx. Walk
@@ -6526,6 +6535,12 @@ class _CasualBrowserWorker:
             if "://" not in url:
                 url = "https://" + url
             parsed = urllib.parse.urlparse(url)
+            if parsed.scheme == "file":
+                return {"error": "file:// URLs are not allowed (http/https only). To render a local "
+                                 "file, serve its folder over HTTP in the background (run_powershell "
+                                 "`Start-Process python -ArgumentList '-m','http.server','8765' "
+                                 "-WorkingDirectory '<folder>' -WindowStyle Hidden`) and pass "
+                                 "http://127.0.0.1:8765/<file> instead."}
             if parsed.scheme not in {"http", "https"}:
                 return {"error": f"scheme {parsed.scheme or '(missing)'} is not allowed (http/https only)"}
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -32368,6 +32383,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                                                     token_scale=token_scale)
                         payload["messages"] = _sanitize_messages_for_openai(
                             trimmed, stub_old_tools=stub_old_tools)
+                        _log_compact(chat_id, f"overflow_retry: attempt={_ctx_attempt + 1} "
+                                              f"reserve={tighter} kept={len(trimmed)} "
+                                              f"conv_n={len(conversation)} scale={token_scale:.3f} "
+                                              f"last_fill={_last_prompt_tokens_by_chat.get(chat_id, 0)}")
                         _emit_ctx_fill()
                         note_intervention("context_retry")
                         emit({"type": "notice", "quiet": True,
@@ -32685,6 +32704,18 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             pass
                     except Exception:
                         _real_prompt = _raw_pe
+                    # The scale is measured on the whole conversation (old reasoning
+                    # included) but applied to the stripped wire view, so the estimate
+                    # ran ~20% low and the proactive fold never fired. The server's own
+                    # count is ground truth: cached + fresh when reported, else at least
+                    # the freshly evaluated part.
+                    _cache_n = last_stats.get("prompt_cache_n")
+                    if isinstance(_cache_n, (int, float)) and _cache_n >= 0:
+                        _server_prompt = int(_cache_n) + int(_raw_pe or 0)
+                    else:
+                        _server_prompt = int(_raw_pe or 0)
+                    if _server_prompt > int(_real_prompt or 0):
+                        _real_prompt = _server_prompt
                     last_stats["prompt_eval_count"] = _real_prompt
                     emit({"type": "stats", **last_stats})
                     # Turn totals keep the raw incremental counts; summing full-prompt counts
@@ -32694,7 +32725,6 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     # The lifetime counter takes the whole prompt this request
                     # carried: llama-server's exact cached + fresh split when
                     # the build reports cache_n, else the payload-derived size.
-                    _cache_n = last_stats.get("prompt_cache_n")
                     if isinstance(_cache_n, (int, float)) and _cache_n >= 0:
                         turn_full_prompt_total += int(_cache_n) + int(_raw_pe or 0)
                     else:
@@ -33446,6 +33476,11 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     _batches.append([_call])
             _round_all_refused = True
             for batch in _batches:
+                if cancel_ev.is_set():
+                    # Stopped mid-round: start nothing new. Unanswered calls are
+                    # dropped by _drop_invalid_call_pairs on the stop path.
+                    break
+                _cancel_seen_at = None
                 _futures: dict[int, object] = {}
                 _call_ids: dict[int, str] = {}
                 for call in batch:
@@ -33476,12 +33511,26 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             future.result(timeout=1.0)
                         except Exception:
                             pass
-                        if not future.done():
-                            try:
-                                emit({"type": "heartbeat", "note": f"waiting for {name}…"})
-                            except Exception:
-                                pass
-                    result = future.result()
+                        if future.done():
+                            break
+                        if cancel_ev.is_set():
+                            # Give a killed command a moment to report back, then
+                            # stop waiting so Stop ends the turn even when the tool
+                            # ignores the kill.
+                            if _cancel_seen_at is None:
+                                _cancel_seen_at = time.monotonic()
+                            elif time.monotonic() - _cancel_seen_at >= 5.0:
+                                break
+                        try:
+                            emit({"type": "heartbeat", "note": f"waiting for {name}…"})
+                        except Exception:
+                            pass
+                    if future.done():
+                        result = future.result()
+                    else:
+                        result = {"error": f"stopped by user before {name} finished; "
+                                           "its result was discarded",
+                                  "cancelled": True}
                     _tool_err = bool(isinstance(result, dict) and
                                      (result.get("error") or result.get("ok") is False or
                                       result.get("exit_code") not in (None, 0)))
@@ -43066,12 +43115,21 @@ class LlamaProcess:
         # degrades long-range attention on many architectures. When the saved ctx
         # exceeds the GGUF-trained max and the build supports it, enable YaRN; a rope
         # flag in llama_extra_args always wins.
+        # llama-server also caps each slot at the trained context (n_ctx_slot()),
+        # so YaRN alone allocates the larger KV cache but never lets a chat use
+        # it. Raising {arch}.context_length lifts that cap; --yarn-orig-ctx then
+        # has to name the real trained size, or YaRN would read the raised value
+        # and scale by 1.
         if caps.get("rope_scaling") and "rope" not in extra_args_raw.lower():
             try:
                 _gg_yarn = read_gguf_metadata(model_path)
                 _trained = int(_gg_yarn.get("context_length") or 0)
                 if _trained > 0 and ctx > _trained:
                     cmd += ["--rope-scaling", "yarn"]
+                    _arch = str(_gg_yarn.get("architecture") or "").strip()
+                    if _arch and "context_length" not in extra_args_raw and "yarn-orig-ctx" not in extra_args_raw:
+                        cmd += ["--yarn-orig-ctx", str(_trained),
+                                "--override-kv", f"{_arch}.context_length=int:{ctx}"]
                     print(f"[llama] ctx {ctx:,} > trained max {_trained:,} — auto-enabling YaRN rope scaling",
                           file=sys.stderr)
             except Exception:

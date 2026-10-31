@@ -399,14 +399,15 @@ button {
   --scan-cool: var(--accent);
   --scan-hot: var(--fg);
   --scan-warm: var(--fg-muted);
+  --scan-ground: color-mix(in srgb, var(--bg) 97%, #000 3%);
   position: absolute;
   inset: 0;
   z-index: 30;
   overflow: hidden;
   color: var(--fg);
   background:
-    radial-gradient(circle at 67% 44%, color-mix(in srgb, var(--scan-cool) 5%, transparent), transparent 38%),
-    color-mix(in srgb, var(--bg) 97%, #000 3%);
+    radial-gradient(ellipse at 68% 50%, color-mix(in srgb, var(--scan-cool) 5%, transparent), transparent 46%),
+    var(--scan-ground);
   opacity: 1;
   transition: opacity 420ms ease, visibility 0s linear 0s;
 }
@@ -426,8 +427,107 @@ button {
   inset: 0;
   z-index: 1;
   background:
-    radial-gradient(ellipse at 68% 46%, transparent 0 28%, color-mix(in srgb, var(--bg) 8%, transparent) 54%, color-mix(in srgb, var(--bg) 45%, transparent) 100%),
-    linear-gradient(90deg, color-mix(in srgb, var(--bg) 92%, transparent), transparent 27% 80%, color-mix(in srgb, var(--bg) 84%, transparent));
+    radial-gradient(ellipse at 66% 50%, transparent 0 52%, color-mix(in srgb, var(--bg) 30%, transparent) 100%),
+    linear-gradient(90deg, color-mix(in srgb, var(--bg) 70%, transparent), transparent 30%);
+}
+/* The map's labels and loupe (built by security-scan-field.js). The field
+   positions them; this is only their look. */
+.security-scan-map { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+.security-map-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 7px 3px 5px;
+  background: var(--scan-ground);
+  color: var(--fg-faint);
+  font: 700 8px/1 var(--font-mono);
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  clip-path: inset(0 100% 0 0);
+  transition: clip-path 520ms steps(14, end), color 240ms ease;
+}
+.security-map-label.is-shown { clip-path: inset(0 0 0 0); }
+.security-map-label::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border: 1px solid var(--border-strong);
+  transition: background-color 240ms ease, border-color 240ms ease, box-shadow 240ms ease;
+}
+.security-map-label b { color: color-mix(in srgb, var(--fg-faint) 75%, transparent); font-weight: 700; }
+.security-map-label em { font-style: normal; }
+.security-map-label.compact em { display: none; }
+.security-map-label[data-state="active"] { color: var(--fg); }
+.security-map-label[data-state="active"] b { color: var(--scan-cool); }
+.security-map-label[data-state="active"]::before {
+  border-color: var(--scan-cool);
+  background: var(--scan-cool);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--scan-cool) 80%, transparent);
+  animation: security-map-blink 1.1s steps(2, jump-none) infinite;
+}
+.security-map-label[data-state="complete"] { color: var(--fg-muted); }
+.security-map-label[data-state="complete"]::before { border-color: var(--fg-muted); background: var(--fg-muted); }
+@keyframes security-map-blink { 50% { opacity: .25; } }
+.security-map-loupe {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: var(--lens, 112px);
+  height: var(--lens, 112px);
+  opacity: 0;
+  will-change: transform, opacity;
+}
+.security-map-loupe > i {
+  position: absolute;
+  inset: 0;
+  border: 1px solid color-mix(in srgb, var(--fg) 15%, transparent);
+  border-radius: 50%;
+  background: radial-gradient(circle, color-mix(in srgb, var(--scan-cool) 9%, transparent), transparent 72%);
+}
+/* lopsided instrument marks: one tick up top, a longer one off the right,
+   and an accent arc that sits off-axis */
+.security-map-loupe > i::before,
+.security-map-loupe > i::after,
+.security-map-loupe::before { content: ""; position: absolute; }
+.security-map-loupe > i::before { top: -8px; left: 50%; width: 1px; height: 5px; background: color-mix(in srgb, var(--fg) 45%, transparent); }
+.security-map-loupe > i::after { top: 50%; right: -13px; width: 10px; height: 1px; background: var(--scan-cool); }
+.security-map-loupe::before {
+  inset: -5px;
+  border: 1px solid transparent;
+  border-top-color: color-mix(in srgb, var(--scan-cool) 85%, transparent);
+  border-radius: 50%;
+  transform: rotate(-38deg);
+}
+.security-map-readout {
+  position: absolute;
+  top: 64%;
+  left: calc(100% + 16px);
+  padding: 3px 7px;
+  border-left: 1px solid var(--scan-cool);
+  background: var(--scan-ground);
+  color: var(--fg-muted);
+  font: 700 8px/1.3 var(--font-mono);
+  letter-spacing: .12em;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.security-map-loupe.flip .security-map-readout {
+  right: calc(100% + 16px);
+  left: auto;
+  border-right: 1px solid var(--scan-cool);
+  border-left: 0;
+}
+.security-map-loupe.flip > i::after { right: auto; left: -13px; }
+.security-scan-intro[data-state="complete"] .security-map-label::before { border-color: var(--success); background: var(--success); box-shadow: none; animation: none; }
+.security-scan-intro[data-state="error"] .security-map-label[data-state="pending"] { color: color-mix(in srgb, var(--danger) 70%, var(--fg-faint)); }
+@media (min-width: 601px) {
+  /* on wide screens the map's own labels track the sources */
+  .security-scan-intro.has-map .security-intro-sources { display: none; }
 }
 #security-scan-canvas {
   position: absolute;
@@ -833,7 +933,9 @@ button {
   .security-intro-sources { right: 18px; bottom: 70px; left: 18px; grid-template-columns: repeat(4, minmax(0, 1fr)); width: auto; }
   .security-intro-sources span:nth-child(5) { border-left: 0; }
   .security-intro-sources span:nth-child(n + 5) { border-top: 1px solid color-mix(in srgb, var(--fg) 6%, transparent); }
-  .security-scan-intro::after { background: linear-gradient(90deg, color-mix(in srgb, var(--bg) 86%, transparent), transparent 22% 78%, color-mix(in srgb, var(--bg) 86%, transparent)); }
+  .security-scan-intro::after { background: none; }
+  .security-map-loupe .security-map-readout,
+  .security-map-loupe.flip .security-map-readout { top: auto; right: auto; bottom: calc(100% + 12px); left: 50%; border-right: 0; border-left: 1px solid var(--scan-cool); transform: translateX(-50%); }
   #security-scan-canvas { opacity: .84; }
   .security-page-head { min-height: 62px; grid-template-columns: 44px 1fr 44px; gap: 8px; padding: max(8px, env(safe-area-inset-top)) 12px 8px; }
   .security-page-head h1 { font-size: 17px; }
@@ -881,7 +983,9 @@ button {
   .security-scan-intro.is-leaving,
   .security-intro-progress i { transition-duration: .01ms; }
   .security-dot-matrix i,
-  .security-scan-track i { animation: none; }
+  .security-scan-track i,
+  .security-map-label::before { animation: none !important; }
+  .security-map-label { transition: none; }
   .security-dot-matrix i:nth-child(3n) { opacity: .72; transform: scale(1); }
   .security-briefing-mark .security-signal-focus { animation: none; }
 }
