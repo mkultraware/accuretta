@@ -42,6 +42,8 @@ start.lnk
 *.log
 *.tmp
 dist/
+# ...except vendored library builds the app loads (html2canvas, jszip)
+!assets/vendor/*/dist/
 build/
 coverage/
 
