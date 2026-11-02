@@ -6708,7 +6708,7 @@
         // Evidence stays hidden until the backend observes a concrete FLAG.
         `<span class="ar-state"><span class="ar-state-dot"></span><span class="ar-state-text">In progress</span></span>` +
       `</div>` +
-      `<div class="ar-summary"><strong class="ar-phase">Recon</strong><span class="ar-elapsed">00:00:00</span></div>` +
+      `<div class="ar-summary"><strong class="ar-phase">Recon</strong><canvas class="ar-strip" aria-hidden="true"></canvas><span class="ar-elapsed">00:00:00</span></div>` +
       `<div class="ar-activity"><span class="ar-pulse live"></span><span class="ar-activity-text">Preparing scoped assessment</span></div>` +
       `<details class="ar-details"><summary>Assessment details</summary><div class="ar-track">${nodesHtml}</div><div class="ar-foot">` +
         `<span class="ar-meta ar-flags" hidden>Evidence <strong class="ar-flag-count"></strong></span>` +
@@ -6722,14 +6722,19 @@
       if (toolStack && toolStack.parentNode) toolStack.parentNode.insertBefore(rail, toolStack);
       else row.appendChild(rail);
     }
-    // Live elapsed clock freezes when the engagement closes or the turn ends.
+    rail._viz = window.AccRtViz?.phases(rail.querySelector(".ar-strip")) || null;
+    // Live elapsed clock freezes when the engagement closes or the turn ends,
+    // and the phase track settles with it.
     const tick = () => {
       if (!document.body.contains(rail)) { clearInterval(rail._timer); return; }
       const frozen = rail.dataset.status === "closed" || !state.streaming;
       if (!frozen) rail.dataset.elapsed = String(Date.now() - (+rail.dataset.start || Date.now()));
       const el = rail.querySelector(".ar-elapsed");
       if (el) el.textContent = fmtElapsed(+(rail.dataset.elapsed || 0));
-      if (frozen) clearInterval(rail._timer);
+      if (frozen) {
+        clearInterval(rail._timer);
+        rail._viz?.update({ live: false });
+      }
     };
     rail._timer = setInterval(tick, 1000);
     tick();
@@ -6774,6 +6779,14 @@
     rail.classList.toggle("is-running", live && !complete);
     rail.classList.toggle("is-guarded", rail.dataset.state === "guarded" && !complete);
     rail.classList.toggle("is-complete", complete);
+    rail._viz?.update({
+      active,
+      visited: history.map(label => ATTACK_NODES.findIndex(n => n.label === label)).filter(i => i >= 0),
+      closed: complete,
+      guarded: rail.dataset.state === "guarded",
+      flags: flagsRaw,
+      live: !complete && !!state.streaming,
+    });
   }
   function attackRailToolStart(row, name, args) {
     // Tool starts update activity. They do not authorize or complete a phase.
@@ -6788,6 +6801,7 @@
     setAttackActivity(rail, name, args);
     rail.querySelector(".ar-pulse")?.classList.add("live");
     renderRail(rail);
+    rail._viz?.probe("out");
   }
   function attackRailToolResult(row, name, result) {
     if (!isAttackRailEnabled(row) || !isRedTeamTool(name) || isFrontendSecretAudit(row)) return;
@@ -6797,6 +6811,8 @@
     rail.dataset.running = String(Math.max(0, +(rail.dataset.running || 0) - 1));
     if (+rail.dataset.running === 0) rail.querySelector(".ar-pulse")?.classList.remove("live");
     const failed = !!(result && (result.error || result.ok === false));
+    // the response travels back down the track; a held call hits the wall
+    rail._viz?.probe(result?.scope_blocked ? "blocked" : failed ? "fail" : "back");
     if (result && result.scope_blocked) {
       rail.dataset.state = "guarded";
       const activity = rail.querySelector(".ar-activity-text");
@@ -6846,6 +6862,7 @@
     rail.dataset.running = "0";
     rail.querySelector(".ar-pulse")?.classList.remove("live");
     renderRail(rail);
+    rail._viz?.update({ live: false });
   }
   function attackRailBreach(row, stage) {
     if (!isAttackRailEnabled(row)) return;
@@ -6862,12 +6879,9 @@
 
   // ---------- frontend exposure rail ----------
   // A frontend audit is one bounded read-only pass, not a four-stage attack.
-  // Its compact signal strip moves while scanning, then settles into a durable
-  // result that stays with the completed answer.
-  const SECRET_SIGNAL_HEIGHTS = [
-    5, 10, 7, 14, 8, 17, 6, 12, 9, 18, 7, 15, 5,
-    11, 8, 16, 6, 13, 9, 17, 7, 14, 5, 12, 8, 15,
-  ];
+  // Its tape (rt-visuals.js) streams the site's JavaScript past a read head
+  // while scanning, then settles into a durable result that stays with the
+  // completed answer.
   function secretRail(row) {
     return (row && row.querySelector(".secret-rail"))
       || document.querySelector("#revealer-deck .secret-rail");
@@ -6886,8 +6900,6 @@
     }
     const deck = document.querySelector("#revealer-deck");
     const toolStack = row.querySelector(".tool-stack");
-    const samples = SECRET_SIGNAL_HEIGHTS.map((height, index) =>
-      `<span style="--sr-i:${index};--sr-h:${height}px"></span>`).join("");
     rail = document.createElement("div");
     rail.className = "secret-rail is-idle";
     rail.dataset.outcome = "pending";
@@ -6906,7 +6918,7 @@
       `<div class="sr-body">` +
         `<div class="sr-title"><span class="sr-kicker">Frontend attack surface</span>` +
           `<strong class="sr-target">${esc(mission.target || "Authorized page")}</strong></div>` +
-        `<div class="sr-spectrum" aria-hidden="true">${samples}<i></i></div>` +
+        `<div class="sr-spectrum" aria-hidden="true"><canvas class="sr-tape"></canvas></div>` +
         `<div class="sr-detail"><span class="sr-live-dot"></span>` +
           `<span class="sr-activity">Ready to inspect bundles, chunks and source maps</span></div>` +
       `</div>` +
@@ -6921,6 +6933,7 @@
     } else {
       row.appendChild(rail);
     }
+    rail._viz = window.AccRtViz?.tape(rail.querySelector(".sr-tape")) || null;
     return rail;
   }
   function secretRailToolStart(row, name) {
@@ -6936,6 +6949,7 @@
     if (stateEl) stateEl.textContent = "Live analysis";
     if (resultEl) resultEl.textContent = "Scanning";
     if (activity) activity.textContent = "Inspecting bundles, lazy chunks and source maps";
+    rail._viz?.set("running");
   }
   function secretRailToolResult(row, name, result) {
     if (name !== "scan_js_secrets" || !isFrontendSecretAudit(row)) return;
@@ -6964,8 +6978,14 @@
       if (resultEl) resultEl.textContent = "Scan failed";
       if (activity) activity.textContent = "The audit stopped before a reliable result was produced";
       if (meta) meta.textContent = "Review the error below";
+      rail._viz?.set("error");
       return;
     }
+    // findings stay marked on the tape: confirmed in danger, candidates in warning
+    rail._viz?.set("complete", {
+      marks: confirmed || candidates,
+      tone: confirmed ? "danger" : candidates ? "warning" : "success",
+    });
     if (stateEl) stateEl.textContent = confirmed || candidates ? "Review ready" : "Complete";
     if (resultEl) resultEl.textContent = confirmed
       ? `${confirmed} confirmed`
@@ -7003,6 +7023,7 @@
     if (stateEl) stateEl.textContent = "Stopped";
     if (resultEl) resultEl.textContent = "No scan result";
     if (activity) activity.textContent = "The one-pass audit ended before the scanner returned";
+    rail._viz?.set("stopped");
   }
   function secretRailFinalize(row) {
     const rail = secretRail(row);
@@ -7016,6 +7037,7 @@
     if (stateEl) stateEl.textContent = "Stopped";
     if (resultEl) resultEl.textContent = "No result";
     if (activity) activity.textContent = "The audit ended before the scanner completed";
+    rail._viz?.set("stopped");
   }
 
   // ---------- confirmed recon -> exploit transition ----------
@@ -7045,7 +7067,7 @@
     { key: "dns", label: "DNS", tools: ["recon_dns"] },
     { key: "certs", label: "Certificates", tools: ["recon_subdomains"] },
     { key: "records", label: "Public record",
-      tools: ["recon_web_archive", "recon_cve_match", "web_search"] },
+      tools: ["recon_web_archive", "recon_shodan", "recon_cve_match", "web_search"] },
   ];
   function osintCatForTool(name) {
     if (!name) return null;
@@ -7090,6 +7112,7 @@
         `<span class="oc-source-dot"></span>` +
         `<span class="oc-cat-body"><span class="oc-cat-label">${c.label}</span>` +
         `<span class="oc-cat-count">Waiting</span></span>` +
+        `<canvas class="oc-matrix" aria-hidden="true"></canvas>` +
       `</div>`
     ).join("");
     card.innerHTML =
@@ -7111,6 +7134,11 @@
       if (toolStack && toolStack.parentNode) toolStack.parentNode.insertBefore(card, toolStack);
       else row.appendChild(card);
     }
+    // one dot matrix per source, filling as its records come in
+    card._viz = {};
+    card.querySelectorAll(".oc-cat").forEach(tile => {
+      card._viz[tile.dataset.cat] = window.AccRtViz?.bucket(tile.querySelector(".oc-matrix"), tile.dataset.cat) || null;
+    });
     return card;
   }
   // Which sub-mode a recon tool is running, so the activity line says what is
@@ -7137,6 +7165,7 @@
     const liveText = card.querySelector(".oc-live-text");
     if (liveText) liveText.textContent = "Collecting";
     card.querySelectorAll(".oc-cat").forEach(t => t.classList.toggle("is-active", t.dataset.cat === cat));
+    Object.entries(card._viz || {}).forEach(([key, viz]) => viz?.setActive(key === cat));
     const act = card.querySelector(".oc-activity");
     if (act) {
       const tgt = String((args && (args.url || args.target || args.domain || args.host || args.query)) || "").replace(/^https?:\/\//, "");
@@ -7158,6 +7187,8 @@
     const countEl = tile.querySelector(".oc-cat-count");
     if (countEl) countEl.textContent = add > 0 ? `${next} found` : "Checked";
     tile.classList.remove("is-empty", "is-active");
+    card._viz?.[cat]?.setActive(false);
+    card._viz?.[cat]?.setCount(next);
     if (next > 0) tile.classList.add("has-data");
     if (add > 0) { tile.classList.remove("just-hit"); void tile.offsetWidth; tile.classList.add("just-hit"); }
     const total = parseInt(card.dataset.total || "0", 10) + add;
@@ -7174,6 +7205,7 @@
     const liveText = card.querySelector(".oc-live-text");
     if (liveText) liveText.textContent = "Complete";
     card.querySelectorAll(".oc-cat.is-active").forEach(t => t.classList.remove("is-active"));
+    Object.values(card._viz || {}).forEach(viz => viz?.setActive(false));
     const act = card.querySelector(".oc-activity");
     if (act) act.textContent = parseInt(card.dataset.total || "0", 10) > 0 ? "Public-source review complete" : "No public records returned";
   }
@@ -14606,6 +14638,7 @@
     $("#sw-rt-jitter")?.classList.toggle("on", s.rt_jitter !== false);
     fill("#set-rt-proxy", s.rt_proxy || "");
     fill("#set-rt-evidence-days", s.rt_evidence_retention_days ?? 30);
+    fill("#set-shodan-key", s.shodan_api_key || "");
     $("#sw-discord-enabled")?.classList.toggle("on", !!s.discord_enabled);
     fill("#set-discord-token", s.discord_bot_token || "");
     fill("#set-discord-owner", s.discord_owner_id || "");
@@ -14782,6 +14815,7 @@
       rt_spoof_xff: $("#sw-rt-spoof-xff")?.classList.contains("on") || false,
       rt_jitter: $("#sw-rt-jitter") ? $("#sw-rt-jitter").classList.contains("on") : true,
       rt_evidence_retention_days: Math.max(0, Math.min(3650, n("#set-rt-evidence-days") || 0)),
+      shodan_api_key: ($("#set-shodan-key")?.value || "").trim(),
       discord_enabled: $("#sw-discord-enabled")?.classList.contains("on") || false,
       discord_bot_token: ($("#set-discord-token")?.value || "").trim(),
       discord_owner_id: ($("#set-discord-owner")?.value || "").trim(),
@@ -17813,6 +17847,10 @@
       saveSettings({ rt_proxy: (e.currentTarget.value || "").trim() });
       toast("rt proxy saved", "ok", 1500);
     });
+    $("#set-shodan-key")?.addEventListener("change", (e) => {
+      saveSettings({ shodan_api_key: (e.currentTarget.value || "").trim() });
+      toast("shodan key saved", "ok", 1500);
+    });
     $("#set-rt-evidence-days")?.addEventListener("change", (e) => {
       const days = Math.max(0, Math.min(3650, Number(e.currentTarget.value || 0)));
       e.currentTarget.value = String(days);
@@ -18557,6 +18595,7 @@
         .forEach(s => { const el = $(s); if (el) el.value = ""; });
       const autoChk = $("#recon-automated-check"); if (autoChk) autoChk.checked = true;
       const destrChk = $("#recon-destructive-check"); if (destrChk) destrChk.checked = false;
+      const keepLogChk = $("#recon-keep-log"); if (keepLogChk) keepLogChk.checked = true;
       const targetInput = $("#recon-target-input");
       if (targetInput) targetInput.placeholder = secretAudit ? "https://example.com/app" : "example.com";
       const chk = $("#recon-auth-check"); if (chk) chk.checked = false;
@@ -18628,6 +18667,7 @@
       const requestCap = numOrZero("#recon-request-cap", 1000000);
       const automatedAllowed = $("#recon-automated-check")?.checked !== false;
       const allowDestructive = !!$("#recon-destructive-check")?.checked;
+      const keepLog = $("#recon-keep-log")?.checked !== false;
       const objective = ($("#recon-objective-text")?.value || "").trim()
         || (passive ? "Build a public-source intelligence profile." : secretAudit ? "Audit frontend resources for exposed credentials." : "");
       const conChips = Array.from(document.querySelectorAll("#recon-constraint-chips .recon-chip.active")).map(c => c.dataset.val);
@@ -18651,6 +18691,7 @@
         request_cap: requestCap,
         automated_allowed: automatedAllowed,
         allow_destructive: allowDestructive,
+        keep_log: keepLog,
         authorized: true,
         engagement: passive ? "passive_osint" : secretAudit ? "frontend_secrets" : reconObjective === "gain_access" ? "pentest" : "recon",
       };
@@ -18678,7 +18719,7 @@
       const passiveTmpl =
         `Run a passive OSINT profile on ${target}. Do not connect to ${target} or any host under it. ` +
         `Use public third-party sources only: recon_rdap, recon_dns without AXFR or loud mode, ` +
-        `recon_subdomains, recon_web_archive, and focused web_search queries. Do not call web_fetch, ` +
+        `recon_subdomains, recon_web_archive, recon_shodan, and focused web_search queries. Do not call web_fetch, ` +
         `TLS, HTTP, port, content-discovery, takeover, validation, shell, sandbox, MCP, or exploit tools. ` +
         `Correlate the results, distinguish observed facts from inference, name the source behind each ` +
         `material claim, and finish with a concise intelligence brief covering ownership and lifecycle, ` +

@@ -28,7 +28,7 @@
   })();
 </script>
 <script src="/appearance.js?v=2"></script>
-<link rel="stylesheet" href="/app.css?v=93">
+<link rel="stylesheet" href="/app.css?v=94">
   <link rel="stylesheet" href="/ui-refresh.css?v=3">
   <link rel="stylesheet" href="/workspace-shell.css?v=10">
 <link rel="stylesheet" href="/research-ui.css?v=2">
@@ -67,7 +67,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v1.0.3</span>
+        <span class="v" id="brand-v">v1.0.4</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -919,6 +919,13 @@
       </div>
       <input type="text" id="recon-constraint-text" class="recon-input" data-recon-active-only data-recon-suite-only placeholder="time budget or other limits" autocomplete="off">
 
+      <label class="recon-check">
+        <input type="checkbox" id="recon-keep-log" checked>
+        <span class="custom-checkbox"></span>
+        <span>Keep log?</span>
+      </label>
+      <p class="recon-field-hint">Logs (evidence receipts, captured responses, screenshots and the request ledger) are better for remembering what happened when you write the report later, and the model may use them to check its own findings and cite proof. Unticked, they still exist while the engagement runs, then are deleted when it ends. Generated reports are kept either way.</p>
+
       <label class="recon-label">Additional notes to agent <span class="recon-opt">optional</span></label>
       <textarea id="recon-notes-text" class="recon-input" rows="3" placeholder="Anything the fields above don't capture: endpoints to prioritize, test credentials you're providing, rules of engagement, out-of-band details…" autocomplete="off" spellcheck="false"></textarea>
       <p class="recon-field-hint">Free text, sent to the model along with the engagement scope.</p>
@@ -1672,6 +1679,13 @@
     <div class="form-row">
       <span class="hint">keeps captured proof across restarts so reports remain verifiable. use <b>0</b> to restore wipe-on-boot behavior.</span>
     </div>
+    <div class="form-row inline">
+      <label>Shodan API key</label>
+      <input type="password" id="set-shodan-key" placeholder="optional, from account.shodan.io" autocomplete="off" spellcheck="false" style="min-width:220px;font-family:ui-monospace,Consolas,monospace;font-size:12px;">
+    </div>
+    <div class="form-row">
+      <span class="hint">used by <b>recon_shodan</b> for full host lookups (banners, services, CVEs). a free account works. leave blank to use Shodan's keyless InternetDB instead. either way the lookup goes to Shodan, never the target, so it is allowed in passive OSINT. stored only in this app's local settings.</span>
+    </div>
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
       <span>Analysis tools</span>
     </div>
@@ -1952,12 +1966,13 @@
 
 <script src="/assets/vendor/highlight.js/highlight.min.js"></script>
   <script src="/security-scan-field.js?v=7"></script>
+  <script src="/rt-visuals.js?v=1"></script>
 <script src="/research-ui.js?v=2"></script>
 <script src="/dropdown-menus.js?v=1"></script>
 <script src="/agent-orb.js?v=4"></script>
 <script src="/theme-flowlines.js?v=2" defer></script>
 <script src="/dot-matrix.js?v=6"></script>
-<script src="/app.js?v=2026103103"></script>
+<script src="/app.js?v=2026103104"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {

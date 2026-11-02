@@ -2007,6 +2007,7 @@ DEFAULT_SETTINGS = {
     "rt_spoof_xff": False,          # random X-Forwarded-For/X-Real-IP on recon requests (log obfuscation)
     "rt_jitter": True,              # small random delays between recon requests (timing anti-fingerprint)
     "rt_evidence_retention_days": 30, # keep proof across restarts for report verification; 0 = wipe on boot
+    "shodan_api_key": "",           # optional; recon_shodan uses keyless InternetDB when blank
     "allow_web_preview": True,
     # memory / performance
     "kv_cache_type": "q8_0",        # K cache: q4_0 | q8_0 | f16 — lower = less VRAM, slightly lower quality.
@@ -5789,15 +5790,92 @@ def _rt_tok_matches(tok: str, host: str, port: int | None) -> bool:
 
 
 _RT_HOST_METADATA_TOOLS = {
-    "recon_dns", "recon_subdomains", "recon_rdap", "recon_web_archive",
+    "recon_dns", "recon_subdomains", "recon_rdap", "recon_web_archive", "recon_shodan",
 }
 
 
-def _rt_allow_matches(name: str, tok: str, host: str, port: int | None) -> bool:
-    """Let host metadata checks omit an authorized port without widening traffic scope."""
+def _rt_scope_token_host(tok: str) -> str:
+    """The hostname inside an in-scope token, or "" for IPs, CIDRs and bare ports."""
+    token_host = tok.strip().lstrip("*.")
+    if ":" in token_host and token_host.rsplit(":", 1)[1].isdigit():
+        token_host = token_host.rsplit(":", 1)[0]
+    if not token_host or token_host.isdigit() or "/" in token_host or "." not in token_host:
+        return ""
+    try:
+        ipaddress.ip_address(token_host)
+        return ""
+    except ValueError:
+        return token_host
+
+
+def _rt_metadata_parent_ok(tok: str, host: str) -> bool:
+    """True when host is a registered parent of an in-scope host, e.g. example.com
+    for portal.example.com. These lookups go to crt.sh, RDAP and DoH, never the
+    target, and RDAP only answers for the registered domain."""
+    token_host = _rt_scope_token_host(tok)
+    if not token_host.endswith("." + host) or "." not in host:
+        return False
+    # Stop at the registered domain: co.uk, com.au and the like are not a parent.
+    labels = host.split(".")
+    return len(labels) > 2 or labels[0] not in {"co", "com", "net", "org", "gov", "ac", "edu"}
+
+
+_RT_SCOPE_IP_CACHE: dict[str, tuple[float, frozenset]] = {}
+_RT_SCOPE_IP_LOCK = threading.Lock()
+_RT_SCOPE_IP_TTL = 300
+
+
+def _rt_resolved_ips(name: str) -> frozenset:
+    """IPv4 addresses for name via dns.google, cached for a few minutes."""
+    now = time.time()
+    with _RT_SCOPE_IP_LOCK:
+        hit = _RT_SCOPE_IP_CACHE.get(name)
+    if hit and now - hit[0] < _RT_SCOPE_IP_TTL:
+        return hit[1]
+    try:
+        ips = frozenset(a for a in _recon_http_doh(name, "A", timeout=4.0)
+                        if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", a))
+    except Exception:
+        return frozenset()
+    with _RT_SCOPE_IP_LOCK:
+        _RT_SCOPE_IP_CACHE[name] = (now, ips)
+    return ips
+
+
+def _rt_metadata_ip_ok(tok: str, host: str) -> bool:
+    """True when host is an IPv4 address that an in-scope hostname, or its
+    registered parent domain, currently resolves to, so Shodan and friends can
+    look up the target's own IPs. Resolved via dns.google like recon_dns, so the
+    check itself never contacts the target."""
+    token_host = _rt_scope_token_host(tok)
+    if not token_host:
+        return False
+    try:
+        if ipaddress.ip_address(host).version != 4:
+            return False
+    except ValueError:
+        return False
+    labels = token_host.split(".")
+    names = [token_host] + [p for p in (".".join(labels[i:]) for i in range(1, len(labels) - 1))
+                            if _rt_metadata_parent_ok(tok, p)]
+    return any(host in _rt_resolved_ips(n) for n in names)
+
+
+def _rt_allow_matches(name: str, tok: str, host: str, port: int | None,
+                      args: dict | None = None) -> bool:
+    """Let host metadata checks omit an authorized port, and look up the parent
+    domain or the resolved IPs of an in-scope host, without widening traffic scope."""
     if _rt_tok_matches(tok, host, port):
         return True
-    if name not in _RT_HOST_METADATA_TOOLS or port is not None or ":" not in tok:
+    if name not in _RT_HOST_METADATA_TOOLS or port is not None:
+        return False
+    args = args or {}
+    # AXFR talks to the nameservers and would dump the whole parent zone.
+    axfr = name == "recon_dns" and (str(args.get("mode") or "").lower() == "axfr"
+                                    or bool(args.get("loud")))
+    if not axfr and (_rt_metadata_parent_ok(tok, host) or _rt_metadata_ip_ok(tok, host)):
+        return True
+    if ":" not in tok:
         return False
     token_host, token_port = tok.rsplit(":", 1)
     return token_port.isdigit() and _rt_tok_matches(token_host, host, None)
@@ -5832,6 +5910,7 @@ def _rt_close_frontend_secret_mission(chat: dict | None, tool_name: str = "") ->
     mission["status"] = "closed"
     mission["closed_at"] = int(time.time())
     chat["mission"] = mission
+    _rt_log_mission_ended(mission)
     return True
 
 
@@ -6802,7 +6881,7 @@ def _rt_scope_block(name: str, args: dict) -> str | None:
             return (f"refused: {where} is OUT OF SCOPE (you marked '{tok}' out of "
                     f"scope). Stay on the in-scope target.")
     allowed = _rt_scope_in_tokens(chat)
-    if not any(_rt_allow_matches(name, tok, host, port) for tok in allowed):
+    if not any(_rt_allow_matches(name, tok, host, port, args) for tok in allowed):
         where = f"{host}:{port}" if port else host
         return (f"refused: {where} is not in the user-authorized scope "
                 f"({', '.join(allowed) or 'no targets'}). Return to the confirmed target.")
@@ -6921,6 +7000,7 @@ def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
     request_cap = _bounded_int(panel.get("request_cap"), 0, 1000000)
     automated_allowed = panel.get("automated_allowed") is not False
     allow_destructive = panel.get("allow_destructive") is True
+    keep_log = panel.get("keep_log") is not False
     facts = ["constraints: " + constraints[:180]] if constraints else []
     if not automated_allowed:
         facts.append("automated testing tools are disabled for this engagement")
@@ -6938,6 +7018,7 @@ def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
         "request_cap": request_cap,
         "automated_allowed": automated_allowed,
         "allow_destructive": allow_destructive,
+        "keep_log": keep_log,
         "facts": facts,
         "phase": "recon",
         "engagement": engagement,
@@ -6948,8 +7029,136 @@ def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
         "authorized_at": int(time.time()),
         "ts": int(time.time()),
     }
+    # A new engagement ends the previous one; drop its logs if it kept none.
+    _rt_log_mission_ended(chat.get("mission"))
     chat["mission"] = mission
     return True
+
+
+# ---- engagement logs the user chose not to keep ----------------------------
+# Unticking "Keep log?" in the questionnaire sets mission.keep_log False. The
+# evidence still gets written during the run (review_finding and the report
+# need it), and every file is remembered here so it can be deleted when the
+# engagement ends: closed, replaced by a new one, or found ended at startup.
+_RT_UNKEPT_LOGS_FILE = DATA / "redteam" / "unkept_logs.json"
+_RT_UNKEPT_LOCK = threading.Lock()
+
+
+def _rt_keeps_log(mission: dict | None) -> bool:
+    return not isinstance(mission, dict) or mission.get("keep_log") is not False
+
+
+def _rt_log_note(mission: dict | None, result: Any, folder: Path | None = None) -> None:
+    """Remember evidence files a no-log engagement wrote, for later deletion."""
+    if _rt_keeps_log(mission) or not mission.get("authorization_id"):
+        return
+    ev_root = (DATA / "recon_evidence").resolve()
+    paths = [str(folder)] if folder else []
+    stack = [result]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            for k, v in item.items():
+                if k in ("evidence_saved", "saved") and isinstance(v, str):
+                    paths.append(v)
+                elif isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(item, list):
+            stack.extend(x for x in item if isinstance(x, (dict, list)))
+    keep = []
+    for p in paths:
+        try:
+            if ev_root in Path(p).resolve().parents:
+                keep.append(str(Path(p).resolve()))
+        except Exception:
+            continue
+    if not keep:
+        return
+    key = str(mission["authorization_id"])
+    with _RT_UNKEPT_LOCK:
+        reg = load_json(_RT_UNKEPT_LOGS_FILE, {})
+        reg = reg if isinstance(reg, dict) else {}
+        files = reg.setdefault(key, [])
+        new = [p for p in dict.fromkeys(keep) if p not in files]
+        if new:
+            files.extend(new)
+            save_json(_RT_UNKEPT_LOGS_FILE, reg)
+
+
+def _rt_filter_jsonl(path: Path, field: str, key: str) -> None:
+    """Rewrite a JSONL log without the lines whose `field` equals `key`."""
+    if not path.exists():
+        return
+    kept, dropped = [], 0
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                if json.loads(line).get(field) == key:
+                    dropped += 1
+                    continue
+            except Exception:
+                pass
+            kept.append(line)
+    if dropped:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text("".join(kept), encoding="utf-8")
+        os.replace(tmp, path)
+
+
+def _rt_log_purge(key: str) -> None:
+    """Delete everything an unkept engagement logged: evidence files, receipts,
+    and its lines in the request ledger and action audit."""
+    if not key:
+        return
+    with _RT_UNKEPT_LOCK:
+        reg = load_json(_RT_UNKEPT_LOGS_FILE, {})
+        reg = reg if isinstance(reg, dict) else {}
+        ev_root = (DATA / "recon_evidence").resolve()
+        for p in reg.pop(key, []):
+            try:
+                target = Path(p).resolve()
+                if ev_root not in target.parents:
+                    continue
+                if target.is_dir():
+                    shutil.rmtree(target, ignore_errors=True)
+                elif target.exists():
+                    target.unlink()
+            except Exception:
+                continue
+        try:
+            with _RT_GOV_LEDGER_LOCK:
+                for name in ("request_ledger.jsonl", "request_ledger.1.jsonl"):
+                    _rt_filter_jsonl(DATA / "redteam" / name, "mission", key)
+            with _ACTION_AUDIT_LOCK:
+                _rt_filter_jsonl(ACTION_AUDIT_FILE, "authorization_id", key)
+        except Exception:
+            pass
+        save_json(_RT_UNKEPT_LOGS_FILE, reg)
+
+
+def _rt_log_mission_ended(mission: dict | None) -> None:
+    """Purge a finished engagement's logs when the user chose not to keep them."""
+    if _rt_keeps_log(mission) or not mission.get("authorization_id"):
+        return
+    threading.Thread(target=_rt_log_purge, args=(str(mission["authorization_id"]),),
+                     daemon=True).start()
+
+
+def _rt_log_sweep() -> int:
+    """At startup, purge unkept engagements that are no longer active (closed,
+    replaced, or their chat deleted while the app was running)."""
+    reg = load_json(_RT_UNKEPT_LOGS_FILE, {})
+    if not isinstance(reg, dict) or not reg:
+        return 0
+    active = set()
+    for chat in (get_chats().get("chats") or {}).values():
+        m = chat.get("mission") if isinstance(chat, dict) else None
+        if _rt_authorized_mission(chat) and isinstance(m, dict):
+            active.add(str(m.get("authorization_id") or ""))
+    ended = [k for k in reg if k not in active]
+    for key in ended:
+        _rt_log_purge(key)
+    return len(ended)
 
 
 def _rt_incl_exploit_for(chat: dict | None, settings: dict | None = None) -> bool:
@@ -19259,11 +19468,31 @@ def _recon_resolve(host: str) -> dict:
         return {"error": f"could not resolve {host}: {e}"}
 
 
+# Passive lookups go to public services (dns.google, crt.sh, Cert Spotter,
+# rdap.org, the Internet Archive, OSV), never to the target. Python 3.13+ turns
+# on VERIFY_X509_STRICT, which rejects any chain holding a CA certificate whose
+# basicConstraints isn't marked critical. archive.org still serves GoDaddy's old
+# cross-signed chain with one, so every archive query failed, while browsers,
+# which don't apply that rule, loaded it fine. This context drops only that
+# flag: the chain must still reach a trusted root, and hostname and dates are
+# still checked. Target-facing tools and the TLS audit keep their own contexts.
+_PUBLIC_SOURCE_TLS: ssl.SSLContext | None = None
+
+
+def _public_source_tls() -> ssl.SSLContext:
+    global _PUBLIC_SOURCE_TLS
+    if _PUBLIC_SOURCE_TLS is None:
+        ctx = ssl.create_default_context()
+        ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+        _PUBLIC_SOURCE_TLS = ctx
+    return _PUBLIC_SOURCE_TLS
+
+
 def _recon_http_doh(name: str, rtype: str, timeout: float = 6.0) -> list:
     """DNS-over-HTTPS query via dns.google. Returns a list of answer strings."""
     url = f"https://dns.google/resolve?name={urllib.parse.quote(name)}&type={rtype}"
     req = urllib.request.Request(url, headers={"Accept": "application/dns-json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=timeout, context=_public_source_tls()) as r:
         data = json.loads(r.read().decode("utf-8", "replace"))
     return [a.get("data", "").strip('"') for a in (data.get("Answer") or [])]
 
@@ -19609,31 +19838,103 @@ def tool_recon_http_fingerprint(args: dict) -> dict:
     }
 
 
+def _ct_names_crtsh(domain: str, timeout: float) -> tuple[list[str] | None, str]:
+    """Certificate names for *.domain from crt.sh. crt.sh runs on donated
+    hardware and answers 502/503 (or an HTML error page) whenever its database
+    is slow, so transient failures are retried with backoff inside a budget."""
+    url = f"https://crt.sh/?q=%25.{urllib.parse.quote(domain)}&output=json"
+    deadline = time.monotonic() + max(timeout * 2, 25.0)
+    last = ""
+    for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining < 3:
+            break
+        try:
+            req = urllib.request.Request(url, headers=_rt_stealth_headers())
+            with urllib.request.urlopen(req, timeout=min(timeout, remaining),
+                                        context=_public_source_tls()) as r:
+                rows = json.loads(r.read().decode("utf-8", "replace"))
+            return [n for row in rows for n in str(row.get("name_value", "")).splitlines()], ""
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code} {e.reason}"
+            if e.code not in (429, 500, 502, 503, 504):
+                break
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ValueError) as e:
+            # ValueError covers the HTML error page crt.sh sends with a 200
+            last = str(getattr(e, "reason", None) or e)
+        except Exception as e:
+            last = str(e)
+            break
+        if attempt < 2:
+            time.sleep(min(1.5 * (attempt + 1) + random.random(), max(0.0, deadline - time.monotonic())))
+    return None, last or "no response"
+
+
+def _ct_names_certspotter(domain: str, timeout: float) -> tuple[list[str] | None, str]:
+    """Fallback certificate-transparency source: Cert Spotter's free API (no
+    key, about 10 requests per window). Follows a few pages at most."""
+    names: list[str] = []
+    after = ""
+    for _page in range(4):
+        query = {"domain": domain, "include_subdomains": "true", "expand": "dns_names"}
+        if after:
+            query["after"] = after
+        url = "https://api.certspotter.com/v1/issuances?" + urllib.parse.urlencode(query)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": _rt_ua(), "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout, context=_public_source_tls()) as r:
+                rows = json.loads(r.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            if names:
+                break
+            return None, f"HTTP {e.code} {e.reason}"
+        except Exception as e:
+            if names:
+                break
+            return None, str(getattr(e, "reason", None) or e)
+        if not isinstance(rows, list) or not rows:
+            break
+        for row in rows:
+            names.extend(str(n) for n in (row.get("dns_names") or []))
+        if len(rows) < 50:
+            break
+        after = str(rows[-1].get("id") or "")
+        if not after:
+            break
+    return names, ""
+
+
 def tool_recon_subdomains(args: dict) -> dict:
-    """Passive subdomain enumeration via certificate transparency logs
-    (crt.sh). No active brute-forcing. Read-only."""
+    """Passive subdomain enumeration via certificate transparency logs:
+    crt.sh first, Cert Spotter when crt.sh is down. No active brute-forcing.
+    Read-only, and neither source contacts the target."""
     domain = _recon_clean_host(args.get("domain") or args.get("target") or "")
     if not domain:
         return {"error": "domain required"}
     timeout = max(4.0, min(float(args.get("timeout") or 15.0), 30.0))
-    url = f"https://crt.sh/?q=%25.{urllib.parse.quote(domain)}&output=json"
-    try:
-        req = urllib.request.Request(url, headers=_rt_stealth_headers())
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            rows = json.loads(r.read().decode("utf-8", "replace"))
-    except Exception as e:
-        return {"error": f"crt.sh query failed: {e}"}
+    names, crtsh_error = _ct_names_crtsh(domain, timeout)
+    source = "certificate transparency (crt.sh) — passive"
+    note = ""
+    if names is None:
+        names, spotter_error = _ct_names_certspotter(domain, timeout)
+        if names is None:
+            return {"error": f"certificate transparency lookup failed: crt.sh ({crtsh_error}), "
+                             f"Cert Spotter ({spotter_error})", "domain": domain}
+        source = "certificate transparency (Cert Spotter) — passive"
+        note = f"crt.sh was unavailable ({crtsh_error}), so Cert Spotter answered instead."
     subs = set()
-    for row in rows:
-        for name in str(row.get("name_value", "")).splitlines():
-            name = name.strip().lstrip("*.").lower()
-            if name.endswith(domain) and name != domain:
-                subs.add(name)
-    return {
+    for name in names:
+        name = name.strip().lstrip("*.").lower()
+        if name.endswith("." + domain):
+            subs.add(name)
+    result = {
         "domain": domain, "count": len(subs),
         "subdomains": sorted(subs)[:300],
-        "source": "certificate transparency (crt.sh) — passive",
+        "source": source,
     }
+    if note:
+        result["note"] = note
+    return result
 
 
 def tool_recon_rdap(args: dict) -> dict:
@@ -19650,10 +19951,17 @@ def tool_recon_rdap(args: dict) -> dict:
             "Accept": "application/rdap+json, application/json",
             "User-Agent": _RECON_UA,
         })
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=15, context=_public_source_tls()) as r:
             data = json.loads(r.read(2_000_000).decode("utf-8", "replace"))
     except Exception as e:
-        return {"error": f"RDAP query failed: {e}", "domain": domain}
+        # .se, .nu, .dk, .de and others publish no RDAP service, so rdap.org
+        # answers 404 for every domain under them. Classic WHOIS still works.
+        rdap_error = str(getattr(e, "reason", None) or e)
+        try:
+            return _recon_whois(domain, rdap_error)
+        except Exception as whois_error:
+            return {"error": f"RDAP query failed ({rdap_error}) and WHOIS failed ({whois_error})",
+                    "domain": domain}
 
     events = {}
     for event in data.get("events") or []:
@@ -19697,6 +20005,108 @@ def tool_recon_rdap(args: dict) -> dict:
     }
 
 
+# ---- WHOIS over port 43, for TLDs without RDAP ----
+# IANA's own WHOIS names each TLD's registry server ("whois:" in its answer to
+# a bare TLD). Servers are cached per TLD for the life of the bridge.
+_WHOIS_SERVERS: dict[str, str] = {}
+_WHOIS_QUERY_FORMAT = {
+    "whois.denic.de": "-T dn,ace {}",  # plain queries only get a status line
+    "whois.jprs.jp": "{}/e",           # English output
+}
+# registry field names vary; these cover .se/.nu, .dk, .de, gTLD thick records
+_WHOIS_FIELDS = {
+    "registrar": ("registrar", "registrar name", "sponsoring registrar"),
+    "registration": ("created", "creation date", "registered", "registration date",
+                     "created on", "domain registration date", "registered on"),
+    "expiration": ("expires", "registry expiry date", "registrar registration expiration date",
+                   "expiry date", "expiration date", "paid-till", "expire date", "expires on"),
+    "last changed": ("modified", "updated date", "last updated", "last modified", "changed",
+                     "last-update", "updated on"),
+}
+_WHOIS_NS_KEYS = ("nserver", "name server", "nameserver", "nameservers", "hostname", "ns")
+_WHOIS_STATUS_KEYS = ("state", "status", "domain status")
+_WHOIS_FREE = re.compile(
+    r"\b(no match|not found|no data found|no entries found|status:\s*free|domain is available"
+    r"|available for registration|no object found)\b", re.I)
+
+
+def _whois_query(server: str, query: str, timeout: float = 12.0) -> str:
+    with socket.create_connection((server, 43), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall((query + "\r\n").encode("ascii", "ignore"))
+        chunks, size = [], 0
+        while size < 200_000:
+            chunk = sock.recv(8192)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    raw = b"".join(chunks)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1", "replace")
+
+
+def _whois_server_for(domain: str) -> str:
+    tld = domain.rsplit(".", 1)[-1].lower()
+    if tld not in _WHOIS_SERVERS:
+        answer = _whois_query("whois.iana.org", tld)
+        m = re.search(r"^\s*whois:\s*(\S+)", answer, re.M | re.I)
+        _WHOIS_SERVERS[tld] = m.group(1).strip().lower() if m else ""
+    return _WHOIS_SERVERS[tld]
+
+
+def _recon_whois(domain: str, rdap_error: str = "") -> dict:
+    """Registration data over classic WHOIS, shaped like the RDAP result so the
+    model and the passive intel card read it the same way. Contacts IANA and
+    the registry's WHOIS server, never the target."""
+    server = _whois_server_for(domain)
+    if not server:
+        raise RuntimeError(f"IANA lists no WHOIS server for .{domain.rsplit('.', 1)[-1]}")
+    text = _whois_query(server, _WHOIS_QUERY_FORMAT.get(server, "{}").format(domain))
+    events, status, nameservers, registrar, dnssec = {}, [], set(), "", ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line[0] in "%#>" or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key, value = key.strip().lower(), value.strip()
+        if not value:
+            continue
+        if key in _WHOIS_NS_KEYS:
+            nameservers.add(value.split()[0].lower().rstrip("."))
+        elif key in _WHOIS_STATUS_KEYS:
+            status.append(value.split()[0])
+        elif key == "dnssec":
+            dnssec = value.lower()
+        else:
+            for field, names in _WHOIS_FIELDS.items():
+                if key in names:
+                    if field == "registrar":
+                        registrar = registrar or value
+                    elif field not in events:
+                        events[field] = value
+                    break
+    body = "\n".join(l for l in text.splitlines() if l.strip() and not l.lstrip().startswith(("%", "#")))
+    result = {
+        "domain": domain,
+        "registered": not (_WHOIS_FREE.search(text) and not events),
+        "registrar": registrar[:160],
+        "status": status[:12],
+        "events": events,
+        "nameservers": sorted(nameservers)[:30],
+        "dnssec_signed": dnssec.startswith(("signed", "yes")) or "signeddelegation" in dnssec,
+        "entities": [],
+        "source": f"WHOIS ({server}), passive",
+        "contacted": f"whois.iana.org and {server}, not the target",
+        "raw": body[:2500],
+    }
+    if rdap_error:
+        result["note"] = f"RDAP had no answer ({rdap_error}); this TLD's registry is read over WHOIS instead."
+    return result
+
+
 def tool_recon_web_archive(args: dict) -> dict:
     """Query the Internet Archive CDX index without visiting the target."""
     domain = _recon_clean_host(args.get("domain") or args.get("target") or "")
@@ -19714,7 +20124,7 @@ def tool_recon_web_archive(args: dict) -> dict:
     url = "https://web.archive.org/cdx/search/cdx?" + query
     try:
         req = urllib.request.Request(url, headers={"User-Agent": _RECON_UA})
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=20, context=_public_source_tls()) as r:
             rows = json.loads(r.read(4_000_000).decode("utf-8", "replace"))
     except Exception as e:
         return {"error": f"Internet Archive query failed: {e}", "domain": domain}
@@ -19746,6 +20156,234 @@ def tool_recon_web_archive(args: dict) -> dict:
         "source": "Internet Archive CDX (passive)",
         "contacted": "web.archive.org, not the target",
     }
+
+
+_SHODAN_MAX_IPS = 8
+
+
+def _shodan_get_json(url: str, timeout: float = 15.0):
+    """GET a Shodan endpoint. Returns (data, None), (None, None) on 404 (no
+    record), or (None, error). Errors never carry the URL, which holds the key."""
+    req = urllib.request.Request(url, headers={"Accept": "application/json",
+                                               "User-Agent": _RECON_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_public_source_tls()) as r:
+            return json.loads(r.read(4_000_000).decode("utf-8", "replace")), None
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, None
+        if e.code == 401:
+            return None, "401 unauthorized: check the Shodan API key in Settings"
+        if e.code == 429:
+            return None, "429 rate limited by Shodan, try again shortly"
+        return None, f"HTTP {e.code}"
+    except Exception as e:
+        return None, str(getattr(e, "reason", None) or type(e).__name__)[:200]
+
+
+def _shodan_host_summary(data: dict) -> dict:
+    """Trim a /shodan/host response to the fields a recon brief needs."""
+    services = []
+    for b in (data.get("data") or [])[:40]:
+        if not isinstance(b, dict):
+            continue
+        svc = {"port": b.get("port"), "transport": b.get("transport") or "tcp"}
+        for k in ("product", "version", "os"):
+            if b.get(k):
+                svc[k] = str(b[k])[:80]
+        if b.get("cpe23") or b.get("cpe"):
+            svc["cpe"] = [str(c)[:120] for c in (b.get("cpe23") or b.get("cpe"))[:5]]
+        module = (b.get("_shodan") or {}).get("module")
+        if module:
+            svc["module"] = module
+        http = b.get("http") or {}
+        if http.get("title"):
+            svc["http_title"] = str(http["title"])[:120]
+        if http.get("server"):
+            svc["http_server"] = str(http["server"])[:80]
+        cert = (b.get("ssl") or {}).get("cert") or {}
+        if cert:
+            svc["tls_subject_cn"] = str((cert.get("subject") or {}).get("CN") or "")[:120]
+            svc["tls_issuer"] = str((cert.get("issuer") or {}).get("O") or
+                                    (cert.get("issuer") or {}).get("CN") or "")[:80]
+            if cert.get("expires"):
+                svc["tls_expires"] = cert["expires"]
+        if b.get("timestamp"):
+            svc["seen"] = str(b["timestamp"])[:19]
+        banner = str(b.get("data") or "").strip()
+        if banner:
+            svc["banner"] = banner[:200]
+        services.append(svc)
+    vulns = data.get("vulns") or []
+    if isinstance(vulns, dict):
+        vulns = list(vulns)
+    out = {
+        "org": data.get("org"), "isp": data.get("isp"), "asn": data.get("asn"),
+        "country": data.get("country_name"), "city": data.get("city"),
+        "os": data.get("os"), "hostnames": (data.get("hostnames") or [])[:20],
+        "domains": (data.get("domains") or [])[:20], "ports": data.get("ports") or [],
+        "tags": data.get("tags") or [], "vulns": sorted(vulns)[:50],
+        "last_update": data.get("last_update"), "services": services,
+    }
+    return {k: v for k, v in out.items() if v not in (None, "", [])}
+
+
+_SHODAN_CDN_WORDS = (
+    "cloudflare", "akamai", "fastly", "cloudfront", "incapsula", "imperva", "sucuri",
+    "stackpath", "edgecast", "bunny", "cdn77", "vercel", "netlify", "azure front door",
+)
+_SHODAN_SHARED_WORDS = (
+    "one.com", "webcluster", "webpod", "shared", "cpanel", "plesk", "godaddy",
+    "secureserver", "hostgator", "bluehost", "siteground", "hostinger", "ionos",
+    "1and1", "namecheap", "dreamhost", "loopia", "binero", "wix", "squarespace",
+    "shopify", "github.io", "wpengine", "kinsta", "pantheon",
+)
+
+
+def _recon_registered_domain(host: str) -> str:
+    """Best-effort registered domain: portal.example.com -> example.com,
+    app.example.co.uk -> example.co.uk."""
+    labels = (host or "").lower().strip(".").split(".")
+    if (len(labels) >= 3 and len(labels[-1]) == 2
+            and labels[-2] in {"co", "com", "net", "org", "gov", "ac", "edu"}):
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _shodan_shared_hosting(row: dict, base: str) -> dict | None:
+    """Spot an IP that serves more than the target: a CDN edge or a shared web
+    host. Shodan's ports and CVEs for such an IP describe the provider or other
+    customers, so the model must not pin them on the target."""
+    idb = row.get("internetdb") if isinstance(row.get("internetdb"), dict) else {}
+    full = row.get("shodan") if isinstance(row.get("shodan"), dict) else {}
+    names = {str(n).lower() for n in (idb.get("hostnames") or []) + (full.get("hostnames") or [])
+             + (full.get("domains") or []) if n}
+    mine = {n for n in names if base and (n == base or n.endswith("." + base))}
+    other = sorted(names - mine)
+    org = " ".join(str(full.get(k) or "") for k in ("org", "isp")).lower()
+    blob = " ".join([org, " ".join(other), " ".join(str(c) for c in idb.get("cpes") or [])]).lower()
+    tags = {str(t).lower() for t in (idb.get("tags") or []) + (full.get("tags") or [])}
+    reasons, kind = [], ""
+    cdn = sorted({w for w in _SHODAN_CDN_WORDS if w in blob})
+    if cdn or "cdn" in tags:
+        kind = "CDN or reverse proxy"
+        reasons.append("CDN signals: " + ", ".join(cdn or ["tagged cdn by Shodan"]))
+    shared = sorted({w for w in _SHODAN_SHARED_WORDS if w in blob})
+    if shared:
+        kind = kind or "shared web hosting"
+        reasons.append("hosting provider signals: " + ", ".join(shared))
+    if len(other) >= 2:
+        kind = kind or "shared web hosting"
+        reasons.append(f"{len(other)} hostname(s) on this IP are not under {base or 'the target'}")
+    if not kind:
+        return None
+    if "cloud" in tags:
+        reasons.append("tagged cloud by Shodan")
+    who = base or "the target"
+    if kind == "CDN or reverse proxy":
+        caution = (f"{row['ip']} is a CDN or reverse-proxy edge. Shodan scanned the edge, not "
+                   f"{who}'s own server, so these ports, software and CVEs belong to the CDN and "
+                   f"are shared by every site behind it. Do not report them as {who}'s findings.")
+    else:
+        caution = (f"{row['ip']} looks like shared web hosting: several unrelated domains can sit "
+                   f"on this one IP. The ports, software and CVEs may belong to the hosting "
+                   f"provider or other customers, not {who}. Only attribute one to {who} if "
+                   f"another source ties it to {who}; otherwise report it as the host's.")
+    out = {"likely": True, "kind": kind, "reasons": reasons, "caution": caution}
+    if other:
+        out["other_names_sample"] = other[:8]
+    return out
+
+
+def tool_recon_shodan(args: dict) -> dict:
+    """Look up what Shodan already knows about a host from its past scans.
+
+    Resolves the domain through DoH, then queries Shodan's keyless InternetDB
+    for each public IP, plus the full host API when a key is set in Settings.
+    Every request goes to dns.google or Shodan, never the target."""
+    target = _recon_clean_host(args.get("target") or args.get("domain") or args.get("host") or "")
+    if not target:
+        return {"error": "target required (a domain or IPv4 address)"}
+    try:
+        ipaddress.ip_address(target)
+        ips = [target]
+        # An IP target says nothing about whose it is; compare against the mission.
+        mission = _rt_mission_get(_rt_context_chat() or {}) or {}
+        base = _recon_registered_domain(_rt_url_host(str(mission.get("target") or "")))
+        try:
+            ipaddress.ip_address(base)
+            base = ""
+        except ValueError:
+            pass
+    except ValueError:
+        base = _recon_registered_domain(target)
+        try:
+            answers = _recon_http_doh(target, "A")
+        except Exception as e:
+            return {"error": f"DNS lookup failed: {e}", "target": target}
+        ips = sorted({a for a in answers if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", a)})
+        if not ips:
+            return {"error": f"{target} has no A records", "target": target}
+    public, skipped = [], []
+    for ip in ips:
+        addr = ipaddress.ip_address(ip)
+        (skipped if (addr.is_private or addr.is_loopback or addr.is_link_local
+                     or addr.is_reserved) else public).append(ip)
+    key = str(get_settings().get("shodan_api_key") or "").strip()
+    hosts, errors = [], []
+    for ip in public[:_SHODAN_MAX_IPS]:
+        row = {"ip": ip}
+        idb, err = _shodan_get_json("https://internetdb.shodan.io/" + ip)
+        if err:
+            errors.append(f"InternetDB {ip}: {err}")
+        elif idb:
+            row["internetdb"] = {k: (idb.get(k) or [])[:50] for k in
+                                 ("ports", "hostnames", "cpes", "vulns", "tags")
+                                 if idb.get(k)}
+            if len(idb.get("vulns") or []) > 50:
+                row["internetdb"]["vulns_total"] = len(idb["vulns"])
+        else:
+            row["internetdb"] = "no record"
+        if key:
+            url = (f"https://api.shodan.io/shodan/host/{ip}?"
+                   + urllib.parse.urlencode({"key": key}))
+            full, err = _shodan_get_json(url)
+            if err:
+                errors.append(f"Shodan host {ip}: {err}")
+            elif full:
+                row["shodan"] = _shodan_host_summary(full)
+            else:
+                row["shodan"] = "no record"
+        shared = _shodan_shared_hosting(row, base)
+        if shared:
+            # Put the warning first so it is read before the ports and CVEs.
+            row = {"ip": ip, "shared_hosting": shared, **{k: v for k, v in row.items() if k != "ip"}}
+        hosts.append(row)
+    shared_ips = [h["ip"] for h in hosts if h.get("shared_hosting")]
+    result = {"target": target}
+    if shared_ips:
+        result["caution"] = (
+            f"{', '.join(shared_ips)} serve(s) other sites besides {base or target} (CDN or "
+            f"shared hosting). Data for these IPs describes the provider and its other "
+            f"customers too. Do not list their ports, software or CVEs as {base or target}'s "
+            f"findings unless another source ties them to it; describe them as the hosting "
+            f"provider's.")
+    result.update({
+        "ips": ips, "hosts": hosts,
+        "source": "Shodan InternetDB" + (" + Shodan host API" if key else "")
+                  + " (past scans, passive)",
+        "contacted": "dns.google and Shodan, not the target",
+    })
+    if not key:
+        result["note"] = ("No Shodan API key in Settings, so only InternetDB ran "
+                          "(ports, CPEs, CVEs, tags). Add a key for banners, org and services.")
+    if len(public) > _SHODAN_MAX_IPS:
+        result["truncated"] = f"looked up the first {_SHODAN_MAX_IPS} of {len(public)} IPs"
+    if skipped:
+        result["skipped_private"] = skipped
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 def _recon_dns_email_auth(domain: str) -> dict:
@@ -20628,7 +21266,7 @@ def tool_recon_cve_match(args: dict) -> dict:
         data = json.dumps(query).encode("utf-8")
         req = urllib.request.Request("https://api.osv.dev/v1/query", data=data,
                                      headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=15, context=_public_source_tls()) as r:
             res = json.loads(r.read().decode("utf-8", "replace"))
     except Exception as e:
         return {"error": f"OSV query failed: {e}"}
@@ -25223,7 +25861,7 @@ TOOLS: dict[str, dict] = {
         "fn": tool_recon_subdomains,
     },
     "recon_rdap": {
-        "description": "PASSIVE OSINT. Read public domain registration, lifecycle, nameserver, registrar, and DNSSEC data through RDAP. Contacts RDAP infrastructure only, never the target.",
+        "description": "PASSIVE OSINT. Read public domain registration, lifecycle, nameserver, registrar, and DNSSEC data through RDAP, falling back to the registry's WHOIS server for TLDs with no RDAP service (.se, .nu, .dk, .de and others). Contacts RDAP/WHOIS infrastructure only, never the target. Prefer this over MCP 'whois' tools, which are RDAP-only.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -25244,6 +25882,17 @@ TOOLS: dict[str, dict] = {
             "required": ["domain"],
         },
         "fn": tool_recon_web_archive,
+    },
+    "recon_shodan": {
+        "description": "PASSIVE OSINT. What Shodan already knows about a host from its own past scans: open ports, software (CPEs), known CVEs, tags, and with a Shodan key in Settings also org, ASN, banners and TLS certs. Resolves the domain via DoH and looks up each public IP. Contacts dns.google and Shodan only, never the target. Results can be days or weeks old. IPs that look like a CDN or shared web hosting come back with a shared_hosting caution: their data describes the provider and other customers too, so never pin those ports or CVEs on the target without corroboration.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "In-scope domain (e.g. portal.example.com) or IPv4 address."},
+            },
+            "required": ["target"],
+        },
+        "fn": tool_recon_shodan,
     },
     "recon_dns": {
         "description": "AUTHORIZED RECON. Enumerate standard DNS records (A/MX/NS/TXT/SOA/CNAME) via DoH, or a mode. Read-only except axfr.",
@@ -27194,7 +27843,7 @@ _RT_EXPLOIT_TOOL_NAMES = {
 # front-end/CORS scanners — the model needs these to FIND something worth the
 # exploit set, so they carry every red-team turn.
 _RT_RECON_TOOL_NAMES = {
-    "recon_dns", "recon_subdomains", "recon_rdap", "recon_web_archive",
+    "recon_dns", "recon_subdomains", "recon_rdap", "recon_web_archive", "recon_shodan",
     "recon_tls_audit", "recon_http_fingerprint",
     "recon_port_scan", "recon_content_discovery", "recon_check_exposure",
     "recon_subdomain_takeover", "recon_cve_match", "recon_injection_probe",
@@ -27217,7 +27866,7 @@ _RT_RECON_TOOL_NAMES = {
 # DNS uses Google's DoH resolver; AXFR is separately refused by the guard.
 _RT_RECON_TOOL_NAMES |= {"observe_response"}
 _RT_PASSIVE_TOOL_NAMES = {
-    "recon_dns", "recon_subdomains", "recon_rdap", "recon_web_archive",
+    "recon_dns", "recon_subdomains", "recon_rdap", "recon_web_archive", "recon_shodan",
     "recon_cve_match", "encode_decode",
 }
 _RT_PASSIVE_ALLOWED_TOOL_NAMES = _RT_PASSIVE_TOOL_NAMES | {
@@ -29450,6 +30099,8 @@ def invoke_tool(name: str, args: dict) -> dict:
             try:
                 store, cid, mission_id = _evidence_context()
                 result["evidence_receipt"] = store.record(cid, mission_id, _current_tool_call_id.get(), canon, args or {}, result.copy())
+                _rt_log_note(_rt_mission_get(_rt_context_chat() or {}), result,
+                             store.folder(cid, mission_id))
             except (ValueError, OSError, KeyError) as exc:
                 result["evidence_warning"] = "Evidence was not recorded: " + str(exc)
         if isinstance(result, dict) and canon in _WRITE_CAPABLE_TOOLS and not result.get("error"):
@@ -31246,7 +31897,8 @@ you may occasionally append exactly one of these to the absolute end of your res
                 parts.append(
                     "passive OSINT policy: zero direct target contact. query only public "
                     "third-party sources with recon_rdap, recon_dns without AXFR, "
-                    "recon_subdomains, recon_web_archive, recon_cve_match, and web_search. "
+                    "recon_subdomains, recon_web_archive, recon_shodan, recon_cve_match, "
+                    "and web_search. "
                     "never fetch a target URL, open a target socket, run shell networking, "
                     "or use TLS, HTTP, port, content, validation, takeover, injection, or "
                     "exploit tools. the bridge enforces this allowlist. report which "
@@ -33266,6 +33918,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 if _rt_on and _rt_passive_mission(_rt_chat):
                     _rt_chat["mission"]["status"] = "closed"
                     _rt_chat["mission"]["closed_at"] = int(time.time())
+                    _rt_log_mission_ended(_rt_chat["mission"])
                     _rt_dirty = True
                     emit({
                         "type": "rt_mission",
@@ -35730,6 +36383,7 @@ def tool_rt_generate_report(args: dict) -> dict:
                             for item in chat.get("findings", [])]
         chat["mission"]["status"] = "closed"
         chat["mission"]["closed_at"] = int(time.time())
+        _rt_log_mission_ended(chat["mission"])
         if isinstance(live_chat, dict):
             live_chat["mission"] = copy.deepcopy(chat["mission"])
         if isinstance(chats_data, dict):
@@ -36155,7 +36809,7 @@ STATIC_WHITELIST = {
     "bridge-client.js", "preview-runtime.js",
     "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css", "glyph-field.js",
     "research-ui.js", "research-ui.css", "dropdown-menus.js",
-    "security-scan-field.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css", "theme-flowlines.js",
+    "security-scan-field.js", "rt-visuals.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css", "theme-flowlines.js",
     "dot-matrix.js", "workbench.css", "opal.css",
     # notch overlay: the island UI (served unchanged) + its bridge wiring
     "accuretta-notch.html", "notch-wire.js", "notch-markdown.js",
@@ -36473,7 +37127,7 @@ class Handler(BaseHTTPRequestHandler):
         live_ui_asset = name in {
             "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css",
             "research-ui.js", "research-ui.css", "dropdown-menus.js",
-            "glyph-field.js", "security-scan-field.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css", "theme-flowlines.js",
+            "glyph-field.js", "security-scan-field.js", "rt-visuals.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css", "theme-flowlines.js",
             "dot-matrix.js", "workbench.css", "opal.css",
             "accuretta-notch.html", "notch-wire.js", "notch-markdown.js",
         }
@@ -44056,6 +44710,12 @@ def _main_owned(httpd):
     if _ev_ret.get("days") is not None:
         print(f"  evidence: kept {_ev_ret['kept']}, removed {_ev_ret['removed']} "
               f"(retention {_ev_ret['days']} day(s))")
+    try:
+        _unkept = _rt_log_sweep()
+        if _unkept:
+            print(f"  evidence: deleted logs of {_unkept} ended engagement(s) set to not keep logs")
+    except Exception as e:
+        print(f"  evidence: could not sweep unkept engagement logs: {e}")
 
     # first-run system context scan (creates data/ACCURETTA.md if missing)
     if not SYSTEM_CONTEXT_FILE.exists():

@@ -2548,6 +2548,8 @@ button {
 .osint-card .oc-cat.has-data { border-top-color: color-mix(in srgb, var(--accent) 45%, var(--border)); background: transparent; }
 .osint-card .oc-cat-label { font-size: 9px; }
 .osint-card .oc-cat-count { margin-top: 3px; color: var(--fg-muted); font-size: 10px; font-weight: 560; }
+/* each source's dot matrix (rt-visuals.js), tucked at the tile's right */
+.osint-card .oc-matrix { flex: 0 0 auto; align-self: center; width: 36px; height: 13px; margin-left: auto; }
 .osint-card .oc-live { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 
 /* ---- mobile polish for the new UI ---- */
@@ -2933,64 +2935,14 @@ button {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* the tape: rt-visuals.js draws the scan into this slot */
 .secret-rail .sr-spectrum {
   position: relative;
   overflow: hidden;
   height: 20px;
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 0;
   margin-top: 6px;
-  padding: 0 2px;
 }
-.secret-rail .sr-spectrum::after {
-  content: "";
-  position: absolute;
-  inset: auto 0 1px;
-  height: 1px;
-  background: color-mix(in srgb, var(--border-strong) 80%, transparent);
-}
-.secret-rail .sr-spectrum span {
-  z-index: 1;
-  width: 2px;
-  height: var(--sr-h);
-  border-radius: 2px 2px 0 0;
-  background: color-mix(in srgb, var(--fg-faint) 52%, transparent);
-  opacity: .46;
-  transform-origin: bottom;
-}
-.secret-rail .sr-spectrum i {
-  position: absolute;
-  z-index: 2;
-  inset: 0 auto 1px -28%;
-  width: 28%;
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--sr-tone) 18%, transparent), color-mix(in srgb, var(--sr-tone) 72%, transparent), transparent);
-  opacity: 0;
-  transform: skewX(-13deg);
-}
-.secret-rail.is-running .sr-spectrum span {
-  animation: secret-sample 1.65s ease-in-out infinite;
-  animation-delay: calc(var(--sr-i) * -87ms);
-}
-.secret-rail.is-running .sr-spectrum i {
-  opacity: 1;
-  animation: secret-sweep 2.3s cubic-bezier(.42, 0, .58, 1) infinite;
-}
-.secret-rail.is-complete .sr-spectrum span,
-.secret-rail.is-error .sr-spectrum span,
-.secret-rail.is-stopped .sr-spectrum span {
-  background: var(--sr-tone);
-  opacity: calc(.32 + (var(--sr-i) * .035));
-}
-@keyframes secret-sample {
-  0%, 100% { opacity: .22; transform: scaleY(.48); }
-  45% { opacity: .92; transform: scaleY(1); background: var(--sr-tone); }
-}
-@keyframes secret-sweep {
-  0% { left: -28%; }
-  58%, 100% { left: 102%; }
-}
+.secret-rail .sr-tape { display: block; width: 100%; height: 100%; }
 .secret-rail .sr-detail {
   min-width: 0;
   display: flex;
@@ -3066,7 +3018,6 @@ button {
   .secret-rail .sr-sigil { width: 32px; height: 32px; border-radius: 10px 3px 10px 10px; }
   .secret-rail .sr-sigil svg { width: 21px; height: 21px; }
   .secret-rail .sr-title { align-items: flex-start; flex-direction: column; gap: 2px; }
-  .secret-rail .sr-spectrum { gap: 4px; }
   .secret-rail .sr-activity { white-space: normal; }
   .secret-rail .sr-readout {
     grid-column: 2;
@@ -18718,6 +18669,8 @@ html[data-custom-ink="light"] .brand .brand-mark-dark { display: block; }
 .task-activity-action { flex: 0 0 auto; }
 .attack-rail .ar-summary { display: flex; align-items: center; gap: 12px; margin-top: 8px; font-size: 11px; }
 .attack-rail .ar-summary .ar-phase { color: var(--fg); }
+/* the phase track (rt-visuals.js) fills the gap between phase and clock */
+.attack-rail .ar-summary .ar-strip { display: block; flex: 1 1 auto; min-width: 60px; height: 10px; }
 .attack-rail .ar-summary .ar-elapsed { margin-left: auto; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
 .attack-rail .ar-details { margin-top: 5px; }
 .attack-rail .ar-details > summary { cursor: pointer; color: var(--fg-muted); font-size: 10px; }
