@@ -25,6 +25,8 @@ import random
 import re
 import shlex
 import shutil
+import stat
+import contextlib
 import subprocess
 import sys
 import threading
@@ -2000,6 +2002,7 @@ DEFAULT_SETTINGS = {
     "notch_enabled": False,
     "keyboard_shortcuts": {},       # user-defined UI key combinations, action -> canonical chord
     "profile_avatar": "",           # small data: URL picture for the Usage stats share card
+    "profile_name": "",             # name at the top of the sidebar (Settings > Profile)
     "auto_approve_read": True,
     "auto_approve_write": False,    # trust writes: skip approval for in-workspace file writes/edits (registry/system/powershell still always prompt)
     "approval_mode": "",            # soft|medium|hard; empty = derive from auto_approve_write (legacy)
@@ -2240,6 +2243,11 @@ def _update_settings_locked(updates: dict) -> dict:
                 len(avatar) > 300_000
                 or not re.fullmatch(r"data:image/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+", avatar))):
             raise ValueError("profile_avatar must be a small PNG, JPEG or WebP data URL")
+    if "profile_name" in allowed:
+        name = allowed["profile_name"]
+        if not isinstance(name, str) or len(name) > 40 or any(ord(ch) < 32 for ch in name):
+            raise ValueError("profile_name must be plain text of at most 40 characters")
+        allowed["profile_name"] = name.strip()
     if "custom_palettes" in allowed:
         palettes = allowed["custom_palettes"]
         if not isinstance(palettes, dict) or len(palettes) > 32:
@@ -6122,6 +6130,36 @@ def _rt_scope_mcp_calls(name: str, args: dict) -> str | None:
     return None
 
 
+# Untrusted pages (red-team targets, pages the model renders) open in the
+# installed Edge or Chrome: those update themselves, while the Chromium that
+# Playwright downloads stays at whatever build came with it and can sit many
+# versions behind. Chromium's sandbox is always on (Playwright leaves it off
+# unless asked); a browser that cannot start sandboxed is not used at all.
+_SAFE_CHROMIUM_ARGS = (
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-sync",
+    "--no-default-browser-check",
+)
+_SAFE_CHROMIUM_CHANNELS = ("msedge", "chrome") if os.name == "nt" else ("chrome", "msedge")
+
+
+def _launch_safe_chromium(engine):
+    """Launch headless, sandboxed Chromium for untrusted pages: the installed
+    Edge or Chrome first, Playwright's bundled build only when neither runs."""
+    tried = []
+    for channel in (*_SAFE_CHROMIUM_CHANNELS, None):
+        options = {"headless": True, "args": list(_SAFE_CHROMIUM_ARGS), "chromium_sandbox": True}
+        if channel:
+            options["channel"] = channel
+        try:
+            return engine.chromium.launch(**options)
+        except Exception as exc:
+            first_line = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
+            tried.append(f"{channel or 'bundled Chromium'}: {first_line[:200]}")
+    raise RuntimeError("No browser could start with its sandbox on. " + " | ".join(tried))
+
+
 class _ScopedBrowserWorker:
     """Own persistent Playwright objects on one dedicated daemon thread."""
 
@@ -6450,12 +6488,7 @@ class _ScopedBrowserWorker:
             try:
                 if engine is None:
                     engine = _sync_playwright().start()
-                    browser = engine.chromium.launch(headless=True, args=[
-                        "--disable-background-networking",
-                        "--disable-component-update",
-                        "--disable-sync",
-                        "--no-default-browser-check",
-                    ])
+                    browser = _launch_safe_chromium(engine)
                 result = self._execute(browser, sessions, payload)
             except Exception as exc:
                 message = str(exc)
@@ -6544,12 +6577,7 @@ class _CasualBrowserWorker:
             try:
                 if engine is None:
                     engine = _sync_playwright().start()
-                    browser = engine.chromium.launch(headless=True, args=[
-                        "--disable-background-networking",
-                        "--disable-component-update",
-                        "--disable-sync",
-                        "--no-default-browser-check",
-                    ])
+                    browser = _launch_safe_chromium(engine)
                 result = self._execute(browser, sessions, payload)
             except Exception as exc:
                 message = str(exc)
@@ -9126,20 +9154,38 @@ def _goal_action_is_gated(kind, command: str, cwd: str | None = None) -> bool:
     return False
 
 
-def _apply_goal_latch(chat_id: str, on: bool) -> bool:
+def _goal_summary(task: str) -> str:
+    """The goal as the composer shows it: one line, at most 500 characters."""
+    return re.sub(r"\s+", " ", task or "").strip()[:500]
+
+
+def _apply_goal_latch(chat_id: str, on: bool, goal: str | None = None) -> bool:
     """Set the hands-free latch for a chat, mirror it onto the persisted chat
     dict (so it survives a UI reload and is rehydrated next turn), and broadcast
-    the goal_mode state to every surface. Returns the new active state."""
+    the goal_mode state to every surface. A task from "/goal <task>" is kept as
+    chat["goal_text"] while the latch is on (the composer shows it); turning
+    the latch off clears it. Returns the new active state."""
     _set_goal_mode(chat_id, on)
+    text = (goal or "") if on else ""
     try:
         chats = get_chats()
         chat = chats.get("chats", {}).get(chat_id)
-        if chat is not None and bool(chat.get("goal_mode")) != bool(on):
+        if chat is not None:
+            changed = bool(chat.get("goal_mode")) != bool(on)
             chat["goal_mode"] = bool(on)
-            save_json(CHATS_FILE, chats)
+            if on and goal and chat.get("goal_text") != goal:
+                chat["goal_text"] = goal
+                changed = True
+            elif not on and "goal_text" in chat:
+                chat.pop("goal_text", None)
+                changed = True
+            if on:
+                text = str(chat.get("goal_text") or "")
+            if changed:
+                save_json(CHATS_FILE, chats)
     except Exception:
         pass
-    broadcast_event({"type": "goal_mode", "chat_id": chat_id, "active": bool(on)})
+    broadcast_event({"type": "goal_mode", "chat_id": chat_id, "active": bool(on), "goal": text})
     return bool(on)
 
 
@@ -20161,9 +20207,29 @@ def tool_recon_web_archive(args: dict) -> dict:
 _SHODAN_MAX_IPS = 8
 
 
+def _shodan_refusal(status: int, reason: str = "") -> str:
+    """What a Shodan refusal means, in words, so nobody chases a bad key or a
+    bad query when the account simply isn't allowed the call. `reason` is
+    Shodan's own message when it sent one."""
+    said = f' (Shodan says: "{reason}")' if reason else ""
+    if status == 401:
+        return (f"Shodan rejected the API key (401){said}: it is wrong or was revoked. "
+                "Get a fresh key at account.shodan.io.")
+    if status == 403:
+        return (f"Shodan refused this request (403){said}. Free Shodan keys can look up a "
+                "single IP, but searches with filters (port:, http.title:, ...), bulk DNS and "
+                "other paid calls need a paid Shodan membership. Not a key or query mistake: "
+                "retrying will not help.")
+    if status == 429:
+        return (f"Shodan rate-limited this key or it is out of query credits (429){said}. "
+                "Wait a moment, or check the credits at account.shodan.io.")
+    return f"Shodan answered HTTP {status}{said}."
+
+
 def _shodan_get_json(url: str, timeout: float = 15.0):
     """GET a Shodan endpoint. Returns (data, None), (None, None) on 404 (no
-    record), or (None, error). Errors never carry the URL, which holds the key."""
+    record), or (None, error). Errors never carry the URL, which holds the key;
+    a refusal says what it means, with Shodan's own reason when it gave one."""
     req = urllib.request.Request(url, headers={"Accept": "application/json",
                                                "User-Agent": _RECON_UA})
     try:
@@ -20172,11 +20238,13 @@ def _shodan_get_json(url: str, timeout: float = 15.0):
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None, None
-        if e.code == 401:
-            return None, "401 unauthorized: check the Shodan API key in Settings"
-        if e.code == 429:
-            return None, "429 rate limited by Shodan, try again shortly"
-        return None, f"HTTP {e.code}"
+        reason = ""
+        try:
+            body = json.loads(e.read(4000).decode("utf-8", "replace"))
+            reason = str(body.get("error") or "").strip()[:200] if isinstance(body, dict) else ""
+        except Exception:
+            pass
+        return None, _shodan_refusal(e.code, reason)
     except Exception as e:
         return None, str(getattr(e, "reason", None) or type(e).__name__)[:200]
 
@@ -25025,6 +25093,21 @@ def _load_mcp_servers():
             _mcp_start_server(server_name, server_config)
 
 
+# Third-party MCP servers (osint-mcp-server and friends) pass a Shodan refusal
+# on as a bare status ("Shodan search failed: 403 Forbidden"). The result
+# gets a line saying what that status means.
+_MCP_SHODAN_STATUS_RE = re.compile(
+    r"\bshodan\b[^\n]{0,80}?\b(?:failed|error|denied|refused|forbidden|unauthorized)\b[^\n]{0,40}?\b(401|403|429)\b",
+    re.IGNORECASE)
+
+
+def _mcp_explain_refusal(text: str) -> str:
+    m = _MCP_SHODAN_STATUS_RE.search(text or "")
+    if not m:
+        return text
+    return f"{text}\n[Accuretta: {_shodan_refusal(int(m.group(1)))}]"
+
+
 def _mcp_make_tool_callable(mcp_client, name, desc, kind):
     def wrapper(args: dict):
         # Mission-scoped URL filter. MCP connectors are third-party and opaque, so
@@ -25064,7 +25147,10 @@ def _mcp_make_tool_callable(mcp_client, name, desc, kind):
 
         response = mcp_client.call_tool(name, args)
         if "error" in response:
-            return {"error": response['error']}
+            err = response["error"]
+            if isinstance(err, dict):
+                err = err.get("message") or json.dumps(err)[:500]
+            return {"error": _mcp_explain_refusal(str(err))}
 
         content = response.get("result", {}).get("content", [])
         texts: list[str] = []
@@ -25085,6 +25171,7 @@ def _mcp_make_tool_callable(mcp_client, name, desc, kind):
         # Strip anonymous layout-container noise from aria snapshots so a big page
         # doesn't flood the context.
         out_text = _compress_aria_text(out_text)
+        out_text = _mcp_explain_refusal(out_text)
         # Untrusted page content entered the context: taint the
         # session so follow-up writes/executions force approval,
         # and frame browser output as [web_content] data.
@@ -25307,6 +25394,17 @@ def _mcp_tool_tokens(registered: list) -> int:
     return (chars + 3) // 4
 
 
+def _mcp_unsandboxed(sc: dict) -> bool:
+    """True when a server is told to run its browser without Chromium's
+    sandbox: --no-sandbox in its arguments, or Playwright MCP's env switch.
+    The MCP window warns about it; Accuretta still runs it as configured."""
+    for arg in sc.get("args") or []:
+        if isinstance(arg, str) and arg.strip().lower().split("=", 1)[0] == "--no-sandbox":
+            return True
+    flag = str((sc.get("env") or {}).get("PLAYWRIGHT_MCP_NO_SANDBOX") or "").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
+
+
 def _mcp_list_servers() -> dict:
     out = {"file": _MCP_CONFIG_FILE.name, "servers": [], "error": ""}
     try:
@@ -25328,6 +25426,7 @@ def _mcp_list_servers() -> dict:
                 "env": [{"key": str(k), "set": bool(str(v))} for k, v in (sc.get("env") or {}).items()],
                 "disabled": disabled,
                 "remote": bool(sc.get("url")),
+                "unsandboxed": _mcp_unsandboxed(sc),
                 "state": state,
                 "error": st.get("error", "") if state == "error" else "",
                 "tools": st.get("tools", []) if state == "running" else [],
@@ -36810,7 +36909,7 @@ STATIC_WHITELIST = {
     "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css", "glyph-field.js",
     "research-ui.js", "research-ui.css", "dropdown-menus.js",
     "security-scan-field.js", "rt-visuals.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css", "theme-flowlines.js",
-    "dot-matrix.js", "workbench.css", "opal.css",
+    "dot-matrix.js", "workbench.css", "opal.css", "sound-cues.js",
     # notch overlay: the island UI (served unchanged) + its bridge wiring
     "accuretta-notch.html", "notch-wire.js", "notch-markdown.js",
     # brand assets — see index.html <link rel="..."> tags
@@ -36818,11 +36917,6 @@ STATIC_WHITELIST = {
     "assets/icons/favicon.png", "assets/icons/favicon-32.png",
     "assets/icons/apple-touch-icon.png",
     "assets/icons/app-icon-192.png", "assets/icons/app-icon-512.png",
-    "assets/audio/notification.mp3",
-    "assets/audio/notification-error.wav",
-    "assets/audio/permission_required.wav",
-    "assets/audio/task_completed.wav",
-    "assets/audio/task_failed.wav",
     "assets/reactions/celebrate.png", "assets/reactions/cool.png",
     "assets/reactions/frustrated.png", "assets/reactions/happy.png",
     "assets/reactions/like.png", "assets/reactions/tired.png",
@@ -37128,7 +37222,7 @@ class Handler(BaseHTTPRequestHandler):
             "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css",
             "research-ui.js", "research-ui.css", "dropdown-menus.js",
             "glyph-field.js", "security-scan-field.js", "rt-visuals.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css", "theme-flowlines.js",
-            "dot-matrix.js", "workbench.css", "opal.css",
+            "dot-matrix.js", "workbench.css", "opal.css", "sound-cues.js",
             "accuretta-notch.html", "notch-wire.js", "notch-markdown.js",
         }
         cache_control = ("no-cache, must-revalidate" if live_ui_asset
@@ -37313,6 +37407,7 @@ class Handler(BaseHTTPRequestHandler):
                 loaded = ""
             for f in files:
                 f["loaded"] = (f["path"] == loaded)
+                f.update(model_display_info_for(f))
             reasoning_capability = _reasoning_capability(loaded, s) if loaded else _reasoning_capability("", s)
             return self._send_json(200, {
                 "models_dir": mdir,
@@ -37324,6 +37419,8 @@ class Handler(BaseHTTPRequestHandler):
                 "reasoning_capability": reasoning_capability,
                 "models": files,
             })
+        if p == "/api/storage":
+            return self._send_json(200, storage_report())
         if p == "/api/models/spec-drafts":
             # Draft GGUFs (DFlash/DSpark) available for the selected model,
             # best metadata-validated match first. `paired` is what auto-tune
@@ -37764,6 +37861,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_api_post(self, p: str, parsed):
         body = self._read_json()
+        if p == "/api/storage/clear":
+            # Deleting app data is for the machine itself, not a paired device.
+            if not self._peer_is_loopback():
+                return self._send_json(403, {"error": "App data can only be cleared on the machine running Accuretta."})
+            try:
+                return self._send_json(200, storage_clear(str(body.get("key") or "")))
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
         if p in {"/api/mcp/servers", "/api/mcp/servers/delete", "/api/mcp/servers/restart", "/api/mcp/import"}:
             # A server entry is a command this machine will run, so only the
             # desktop window (loopback) may change them; a paired Tailscale
@@ -39011,9 +39116,15 @@ class Handler(BaseHTTPRequestHandler):
         # /goal latch: apply an explicit on/off from this message, otherwise rehydrate
         # the persisted latch, so follow-up turns without /goal stay hands-free until
         # the user turns it off.
+        # The turn saves its own copy of the chat later, so it carries the goal too.
         if goal_action == "on":
-            _apply_goal_latch(chat_id, True)
+            chat["goal_mode"] = True
+            if user_text:
+                chat["goal_text"] = _goal_summary(user_text)
+            _apply_goal_latch(chat_id, True, chat.get("goal_text"))
         elif goal_action == "off":
+            chat["goal_mode"] = False
+            chat.pop("goal_text", None)
             _apply_goal_latch(chat_id, False)
         elif chat.get("goal_mode"):
             _set_goal_mode(chat_id, True)
@@ -39189,7 +39300,8 @@ class Handler(BaseHTTPRequestHandler):
         # Reflect the hands-free state on every surface for this turn. The latch
         # persists across turns (see _apply_goal_latch); only "/goal off" or the chip
         # clears it. Announce once when this message turned it on.
-        emit({"type": "goal_mode", "active": goal_active_now})
+        emit({"type": "goal_mode", "active": goal_active_now,
+              "goal": str(chat.get("goal_text") or "") if goal_active_now else ""})
         if goal_action == "on":
             emit({"type": "notice", "note":
                   "Goal mode on — running this chat hands-free. Deletions and destructive actions still ask."})
@@ -39424,13 +39536,15 @@ _TOTAL_RE = re.compile(r"\b(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)b\b|\b(\d+(?:\.\d+)?)b
 _QUANT_RE = re.compile(r"\b(IQ\d_[A-Z]{1,3}|Q\d_[KS01]?_?[MS]?|Q\d_K|F16|BF16|F32)\b", re.IGNORECASE)
 
 
-def read_gguf_metadata(path: str, max_bytes: int = 4 * 1024 * 1024) -> dict:
+def read_gguf_metadata(path: str, max_bytes: int = 4 * 1024 * 1024,
+                       retry_bytes: int = 64 * 1024 * 1024) -> dict:
     """Parse the GGUF v2/v3 header and return architecture-level metadata.
     Reads at most a few MB from the file's start — the metadata block lives
     right after the magic (if the KV list doesn't fit in `max_bytes`, retries
-    once with a 64MB cap; the tensor-info section that follows the KV list is
-    never parsed). Never raises; returns {ok: False} on any parse failure so
-    callers can fall back to filename heuristics.
+    once with a `retry_bytes` cap, 64MB by default, 0 for no retry; the
+    tensor-info section that follows the KV list is never parsed). Never
+    raises; returns {ok: False} on any parse failure so callers can fall back
+    to filename heuristics.
 
     Besides the structured fields below, every scalar KV entry is collected
     verbatim into out["keys"] (full key names, nothing stripped) so tuners can
@@ -39572,7 +39686,7 @@ def read_gguf_metadata(path: str, max_bytes: int = 4 * 1024 * 1024) -> dict:
         # buffer, retry once with a much larger cap before giving up.
         meta: dict = {}
         status = "truncated"
-        for cap in (max_bytes, 64 * 1024 * 1024):
+        for cap in ((max_bytes, retry_bytes) if retry_bytes > max_bytes else (max_bytes,)):
             with open(path, "rb") as f:
                 data = f.read(cap)
             meta, status = _parse_kv_list(data)
@@ -42530,6 +42644,363 @@ def list_spec_drafts(model_path: str = "") -> list[dict]:
         })
     out.sort(key=lambda row: (-row["matched"], -row["score"], row["name"].lower()))
     return out
+
+
+# ---- Settings > Storage: what the app keeps on disk ----
+# Kinds of app data under DATA with their size, file count and last change.
+# Only kinds that are safe to lose can be cleared, and only by these names: a
+# clear deletes the listed files and the contents of the listed folders,
+# never anything outside DATA, and removes links without following them.
+_STORAGE_KINDS = (
+    # key, label, entries under DATA ("*" globs files), clearable
+    ("chats", "Chats", ("chats.json",), False),
+    ("versions", "Preview versions", ("versions",), True),
+    ("snapshots", "Undo snapshots", ("snapshots", "undo"), True),
+    ("evidence", "Red-team evidence", ("recon_evidence", "redteam"), True),
+    ("reports", "Reports and research", ("reports", "research", "renders"), True),
+    ("history", "Command history", ("cmd_history.jsonl",), True),
+    ("logs", "Logs", ("errors.jsonl", "compaction_debug.log", "notch_host.log", "netsnap-debug.log", "fold_events.jsonl"), True),
+    ("backups", "Old settings backups", ("*.bak", "settings.json.pre-*.json"), True),
+    ("audit", "Action audit trail", ("action_audit.jsonl",), False),
+    ("models", "Model profiles and usage", ("model_runtime_profiles.json", "model_usage_dataset.jsonl", "models_config.json"), False),
+    ("security", "Security overview data", ("security_overview.db",), False),
+    ("cache", "Window caches", ("webview", "notch-webview2"), False),
+    ("journals", "Turn journals", ("turn_journal", "pending"), False),
+)
+
+
+def _storage_entries(patterns) -> list:
+    out = []
+    for pattern in patterns:
+        if any(ch in pattern for ch in "*?["):
+            out.extend(p for p in DATA.glob(pattern) if p.is_file() and not p.is_symlink())
+        else:
+            p = DATA / pattern
+            if p.exists() or p.is_symlink():
+                out.append(p)
+    return out
+
+
+def _storage_measure(paths) -> tuple:
+    """(bytes, files, newest mtime) under paths; links are neither followed
+    nor counted."""
+    size = files = 0
+    newest = 0.0
+    stack = list(paths)
+    while stack:
+        p = stack.pop()
+        try:
+            st = p.lstat()
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            try:
+                stack.extend(Path(e.path) for e in os.scandir(p))
+            except OSError:
+                pass
+            continue
+        size += st.st_size
+        files += 1
+        newest = max(newest, st.st_mtime)
+    return size, files, newest
+
+
+def storage_report() -> dict:
+    kinds = []
+    total = 0
+    for key, label, patterns, clearable in _STORAGE_KINDS:
+        size, files, newest = _storage_measure(_storage_entries(patterns))
+        kinds.append({"key": key, "label": label, "size": size, "files": files,
+                      "modified": int(newest), "clearable": clearable})
+        total += size
+    # Uploads live in the workspace, not in DATA: shown, never cleared here.
+    folders = get_workspace().get("folders") or []
+    if folders:
+        incoming = Path(normalize_path(folders[0])) / "Incoming"
+        size, files, newest = _storage_measure([incoming]) if incoming.is_dir() else (0, 0, 0.0)
+        kinds.append({"key": "uploads", "label": "Uploads", "size": size, "files": files,
+                      "modified": int(newest), "clearable": False, "path": str(incoming)})
+    return {"path": str(DATA), "total": total, "kinds": kinds}
+
+
+def storage_clear(key: str) -> dict:
+    kind = next((k for k in _STORAGE_KINDS if k[0] == key), None)
+    if not kind or not kind[3]:
+        raise ValueError("That kind of data can't be cleared here.")
+    root = DATA.resolve()
+    removed = freed = skipped = 0
+    # Command history is appended under its own lock; clear it under it too.
+    with (_cmd_history_lock if key == "history" else contextlib.nullcontext()):
+        for entry in _storage_entries(kind[2]):
+            targets = list(entry.iterdir()) if entry.is_dir() and not entry.is_symlink() else [entry]
+            for target in targets:
+                try:
+                    if target.is_symlink():
+                        target.unlink()  # the link only, never what it points at
+                        removed += 1
+                        continue
+                    target.resolve().relative_to(root)
+                except (OSError, ValueError):
+                    skipped += 1
+                    continue
+                size, files, _ = _storage_measure([target])
+                try:
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                except OSError:
+                    skipped += 1  # in use or read-only: left as it was
+                    continue
+                removed += files or 1
+                freed += size
+    return {"ok": True, "key": key, "removed": removed, "freed": freed, "skipped": skipped}
+
+
+# ---- model menu: clean names, families and quant levels ----
+# The menu shows "Qwen3.8 27B" rather than "Qwen3.8-27B-UD-Q4_K_XL.gguf": the
+# quant and the uploader's build tags come off the name (the version rows show
+# them again), files of one model share a group, and the family behind the
+# rail's logo comes from the GGUF header.
+
+# llama.cpp's general.file_type values (enum llama_ftype) for shipped quants.
+_GGUF_FILE_TYPES = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0", 9: "Q5_1",
+    10: "Q2_K", 11: "Q3_K_S", 12: "Q3_K_M", 13: "Q3_K_L", 14: "Q4_K_S", 15: "Q4_K_M",
+    16: "Q5_K_S", 17: "Q5_K_M", 18: "Q6_K", 19: "IQ2_XXS", 20: "IQ2_XS", 21: "Q2_K_S",
+    22: "IQ3_XS", 23: "IQ3_XXS", 24: "IQ1_S", 25: "IQ4_NL", 26: "IQ3_S", 27: "IQ3_M",
+    28: "IQ2_S", 29: "IQ2_M", 30: "IQ4_XS", 31: "IQ1_M", 32: "BF16", 36: "TQ1_0",
+    37: "TQ2_0", 38: "MXFP4_MOE",
+}
+_NAME_QUANT_RE = re.compile(
+    r"(?<![A-Za-z0-9])(I?Q\d(?:_[A-Z0-9]{1,4})*|BF16|FP16|F16|F32|MXFP4(?:_MOE)?|TQ\d_\d)(?![A-Za-z0-9])",
+    re.IGNORECASE)
+# Name segments that describe the file, not the model: imatrix and uploader
+# build tags, quantization-aware training, multi-token-prediction heads and
+# the container format.
+_NAME_FILE_TAGS = {"ud", "ad", "i1", "imat", "imatrix", "qat", "mtp", "gguf", "ggml"}
+# Lowercase words that read as acronyms ("gpt-oss" -> "GPT OSS").
+_NAME_ACRONYMS = {"gpt": "GPT", "oss": "OSS", "it": "IT", "vl": "VL", "moe": "MoE", "glm": "GLM", "lfm": "LFM"}
+_NAME_SIZE_RE = re.compile(r"^(?:\d+x)?\d+(?:\.\d+)?[bm]$|^a\d+(?:\.\d+)?b$", re.IGNORECASE)
+
+# family key -> (label, logo). Logos are the plain lobe-icons glyphs vendored
+# in assets/vendor/lobe-icons; a family without one (its logo is a wordmark
+# or too detailed to read at 18px) or an unknown family gets a letter.
+MODEL_FAMILIES = {
+    "qwen": ("Qwen", "qwen"), "llama": ("Llama", "meta"), "gemma": ("Gemma", "gemma"),
+    "mistral": ("Mistral", "mistral"), "deepseek": ("DeepSeek", "deepseek"), "phi": ("Phi", "microsoft"),
+    "glm": ("GLM", "chatglm"), "kimi": ("Kimi", "kimi"), "granite": ("Granite", "ibm"),
+    "nemotron": ("Nemotron", "nvidia"), "command": ("Command", "cohere"), "gpt-oss": ("GPT-OSS", "openai"),
+    "hunyuan": ("Hunyuan", "hunyuan"), "ernie": ("ERNIE", "wenxin"), "minimax": ("MiniMax", "minimax"),
+    "olmo": ("OLMo", "ai2"), "exaone": ("EXAONE", "lg"), "internlm": ("InternLM", "internlm"),
+    "falcon": ("Falcon", "tii"), "smollm": ("SmolLM", "huggingface"), "seed": ("Seed", "bytedance"),
+    "step": ("Step", "stepfun"), "yi": ("Yi", "yi"), "baichuan": ("Baichuan", "baichuan"),
+    "grok": ("Grok", "grok"), "jamba": ("Jamba", "ai21"), "arcee": ("Arcee", "arcee"),
+    "solar": ("Solar", "upstage"), "reka": ("Reka", "reka"), "skywork": ("Skywork", "skywork"),
+    "mimo": ("MiMo", ""), "lfm": ("LFM", "liquid"), "arctic": ("Arctic", "snowflake"),
+    "dbrx": ("DBRX", "dbrx"), "stablelm": ("StableLM", "stability"), "openelm": ("OpenELM", "apple"),
+    "rwkv": ("RWKV", "rwkv"), "jina": ("Jina", "jina"), "bge": ("BGE", "baai"),
+    "cogito": ("Cogito", "deepcogito"), "hermes": ("Hermes", "nousresearch"), "dolphin": ("Dolphin", ""),
+    "perplexity": ("Perplexity", "perplexity"), "sensenova": ("SenseNova", "sensenova"),
+    "spark": ("Spark", "spark"), "codegeex": ("CodeGeeX", "codegeex"), "llava": ("LLaVA", "llava"),
+    "longcat": ("LongCat", "longcat"), "kat": ("KAT", "kwaipilot"), "ling": ("Ling", "antgroup"),
+    "essential": ("Essential", "essentialai"), "openchat": ("OpenChat", "openchat"),
+    "sakana": ("Sakana", "sakana"), "pharia": ("Pharia", "alephalpha"), "yandexgpt": ("YandexGPT", "yandex"),
+    "jan": ("Jan", "menlo"), "pangu": ("Pangu", "huawei"), "cerebras": ("Cerebras", "cerebras"),
+    "phind": ("Phind", "phind"),
+}
+# The base model's maker decides first, so a lab's model built on another
+# lab's architecture (Kimi on DeepSeek's) keeps its own family, and a
+# finetune keeps its base model's family.
+_FAMILY_BY_ORG = {
+    "qwen": "qwen", "alibaba": "qwen", "alibabacloud": "qwen",
+    "meta": "llama", "metallama": "llama", "facebook": "llama",
+    "google": "gemma", "mistral": "mistral", "mistralai": "mistral",
+    "deepseek": "deepseek", "deepseekai": "deepseek", "microsoft": "phi",
+    "zai": "glm", "zaiorg": "glm", "thudm": "glm", "zhipuai": "glm",
+    "moonshot": "kimi", "moonshotai": "kimi", "ibm": "granite", "ibmgranite": "granite",
+    "nvidia": "nemotron", "cohere": "command", "cohereforai": "command", "coherelabs": "command",
+    "openai": "gpt-oss", "tencent": "hunyuan", "baidu": "ernie",
+    "minimax": "minimax", "minimaxai": "minimax", "allenai": "olmo",
+    "lgai": "exaone", "lgaiexaone": "exaone", "internlm": "internlm",
+    "tiiuae": "falcon", "huggingfacetb": "smollm",
+    "bytedance": "seed", "bytedanceseed": "seed", "stepfun": "step", "stepfunai": "step",
+    "01ai": "yi", "baichuan": "baichuan", "baichuaninc": "baichuan", "xai": "grok", "xaiorg": "grok",
+    "ai21": "jamba", "ai21labs": "jamba", "arcee": "arcee", "arceeai": "arcee", "upstage": "solar",
+    "reka": "reka", "rekaai": "reka", "skywork": "skywork", "skyworkai": "skywork",
+    "xiaomi": "mimo", "xiaomimimo": "mimo", "liquid": "lfm", "liquidai": "lfm",
+    "snowflake": "arctic", "databricks": "dbrx", "stability": "stablelm", "stabilityai": "stablelm",
+    "apple": "openelm", "rwkv": "rwkv", "blinkdl": "rwkv", "jinaai": "jina", "baai": "bge",
+    "deepcogito": "cogito", "nousresearch": "hermes", "cognitivecomputations": "dolphin", "dphn": "dolphin",
+    "perplexity": "perplexity", "perplexityai": "perplexity", "sensetime": "sensenova", "iflytek": "spark",
+    "llavahf": "llava", "liuhaotian": "llava", "meituan": "longcat", "meituanlongcat": "longcat",
+    "kwaipilot": "kat", "inclusionai": "ling", "antgroup": "ling", "essentialai": "essential",
+    "openchat": "openchat", "sakanaai": "sakana", "alephalpha": "pharia", "yandex": "yandexgpt",
+    "janhq": "jan", "menloresearch": "jan", "huawei": "pangu", "cerebras": "cerebras", "phind": "phind",
+}
+# Then the architecture. "llama" is left out: many labs ship on it, so a bare
+# llama architecture says nothing about who made the model.
+_FAMILY_BY_ARCH = (
+    ("qwen", "qwen"), ("gemma", "gemma"), ("mistral", "mistral"), ("deepseek", "deepseek"),
+    ("phi", "phi"), ("chatglm", "glm"), ("glm", "glm"), ("granite", "granite"),
+    ("nemotron", "nemotron"), ("command-r", "command"), ("cohere", "command"),
+    ("gpt-oss", "gpt-oss"), ("hunyuan", "hunyuan"), ("ernie", "ernie"), ("minimax", "minimax"),
+    ("olmo", "olmo"), ("exaone", "exaone"), ("internlm", "internlm"), ("falcon", "falcon"),
+    ("smollm", "smollm"), ("seed", "seed"), ("step", "step"), ("llama4", "llama"),
+    ("baichuan", "baichuan"), ("grok", "grok"), ("jamba", "jamba"), ("arcee", "arcee"),
+    ("lfm", "lfm"), ("arctic", "arctic"), ("dbrx", "dbrx"), ("stablelm", "stablelm"),
+    ("openelm", "openelm"), ("rwkv", "rwkv"), ("jina", "jina"), ("bailing", "ling"),
+    ("mimo", "mimo"), ("pangu", "pangu"), ("longcat", "longcat"),
+)
+# Last, words in the file name: base families first, "llama" after them (so
+# "DeepSeek-R1-Distill-Llama" stays DeepSeek), then finetune brands.
+_FAMILY_BY_NAME = tuple((re.compile(pattern), family) for pattern, family in (
+    (r"qwen|qwq", "qwen"), (r"gemma", "gemma"),
+    (r"mistral|mixtral|ministral|devstral|magistral|codestral|pixtral|voxtral", "mistral"),
+    (r"deepseek", "deepseek"), (r"\bphi-?\d", "phi"), (r"\bglm|chatglm", "glm"), (r"kimi", "kimi"),
+    (r"granite", "granite"), (r"nemotron", "nemotron"), (r"command-?r|\baya-", "command"),
+    (r"gpt-oss", "gpt-oss"), (r"hunyuan", "hunyuan"), (r"ernie", "ernie"), (r"minimax", "minimax"),
+    (r"olmo", "olmo"), (r"exaone", "exaone"), (r"internlm|intern-?s1", "internlm"), (r"falcon", "falcon"),
+    (r"smollm", "smollm"), (r"seed-?oss", "seed"), (r"\bstep-?\d", "step"), (r"\byi-", "yi"),
+    (r"baichuan", "baichuan"), (r"grok", "grok"), (r"jamba", "jamba"), (r"arcee|\bafm-", "arcee"),
+    (r"\bsolar", "solar"), (r"\breka-", "reka"), (r"skywork", "skywork"), (r"\bmimo", "mimo"),
+    (r"\blfm", "lfm"), (r"snowflake-arctic|\barctic-", "arctic"), (r"dbrx", "dbrx"),
+    (r"stablelm|stable-code", "stablelm"), (r"openelm", "openelm"), (r"rwkv", "rwkv"), (r"jina", "jina"),
+    (r"\bbge-|aquila", "bge"), (r"sensenova", "sensenova"), (r"iflytek", "spark"),
+    (r"codegeex", "codegeex"), (r"llava", "llava"), (r"longcat", "longcat"), (r"\bkat-", "kat"),
+    (r"\bling-|\bring-", "ling"), (r"\brnj-", "essential"), (r"pharia", "pharia"),
+    (r"yandexgpt", "yandexgpt"), (r"pangu", "pangu"), (r"cerebras", "cerebras"),
+    (r"llama", "llama"),
+    (r"hermes", "hermes"), (r"dolphin", "dolphin"), (r"cogito", "cogito"), (r"openchat", "openchat"),
+    (r"r1-1776", "perplexity"), (r"phind", "phind"), (r"\bjan-", "jan"),
+))
+_LOGO_DIR = ROOT / "assets" / "vendor" / "lobe-icons"
+_LOGO_INDEX: dict | None = None
+
+
+def _match_logo(name: str) -> str:
+    """A vendored logo for a maker we have no rule for ("LiquidAI", "Nous
+    Research"): match its name, with a trailing AI / Labs / Research and the
+    like dropped, against the logo files. "" when nothing fits."""
+    global _LOGO_INDEX
+    if _LOGO_INDEX is None:
+        try:
+            _LOGO_INDEX = {re.sub(r"[^a-z0-9]", "", p.stem.lower()): p.stem for p in _LOGO_DIR.glob("*.svg")}
+        except OSError:
+            _LOGO_INDEX = {}
+    slug = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    for candidate in (slug, re.sub(r"(?:ai|labs?|research|inc|org|team|hf|community)$", "", slug)):
+        if candidate and candidate in _LOGO_INDEX:
+            return _LOGO_INDEX[candidate]
+    return ""
+
+
+def _model_family(name: str, meta: dict) -> tuple[str, str, str]:
+    keys = meta.get("keys") or {}
+    org_raw = str(keys.get("general.base_model.0.organization") or "").strip()
+    org = re.sub(r"[^a-z0-9]", "", org_raw.lower())
+    family = _FAMILY_BY_ORG.get(org, "")
+    if not family:
+        arch = str(meta.get("architecture") or keys.get("general.architecture") or "").lower()
+        family = next((fam for prefix, fam in _FAMILY_BY_ARCH if arch.startswith(prefix)), "")
+    if not family:
+        low = name.lower()
+        family = next((fam for pattern, fam in _FAMILY_BY_NAME if pattern.search(low)), "")
+    if family:
+        return (family, *MODEL_FAMILIES[family])
+    # Unknown: name it after the base model's maker, else the file's first word.
+    label = org_raw or (re.match(r"[A-Za-z]+", name) or [""])[0]
+    key = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "other"
+    return key, (label or "Other"), _match_logo(label)
+
+
+def _quant_bits(quant: str) -> int:
+    q = (quant or "").upper()
+    if q in ("BF16", "FP16", "F16"):
+        return 16
+    if q == "F32":
+        return 32
+    if q.startswith("MXFP4"):
+        return 4
+    if q.startswith("TQ"):
+        return 2
+    m = re.match(r"I?Q(\d)", q)
+    return int(m.group(1)) if m else 0
+
+
+def _display_word(seg: str) -> str:
+    if seg.lower() in _NAME_ACRONYMS:
+        return _NAME_ACRONYMS[seg.lower()]
+    if _NAME_SIZE_RE.match(seg):
+        word = seg[:-1] + seg[-1].upper()
+        return "A" + word[1:] if word[:1] in ("a", "A") else word
+    return seg[:1].upper() + seg[1:] if seg.islower() else seg
+
+
+def model_display_info(name: str, meta: dict | None = None) -> dict:
+    """What the model menu shows for one GGUF file: display_name ("Qwen3.8
+    27B"), group (files of one model share it), quant ("Q4_K_XL"), quant_tags
+    (["UD"]), bits (4) and the family key, label and logo. The quant comes from the
+    file name, else from general.file_type. Never raises."""
+    meta = meta or {}
+    keys = meta.get("keys") or {}
+    stem = re.sub(r"\.gguf$", "", str(name or ""), flags=re.IGNORECASE)
+    stem = re.sub(r"[-_.]\d{5}-of-\d{5}$", "", stem, flags=re.IGNORECASE)
+    quant = ""
+    found = list(_NAME_QUANT_RE.finditer(stem))
+    if found:
+        hit = found[-1]
+        quant = hit.group(1).upper()
+        stem = f"{stem[:hit.start()]} {stem[hit.end():]}".strip(" -_.")
+    if not quant:
+        try:
+            quant = _GGUF_FILE_TYPES.get(int(keys.get("general.file_type")), "")
+        except (TypeError, ValueError):
+            quant = ""
+    tags, words = [], []
+    for seg in re.split(r"[-_\s]+|(?<=[A-Za-z])\.(?=[A-Za-z])", stem):
+        if not seg:
+            continue
+        if seg.lower() in _NAME_FILE_TAGS:
+            if seg.lower() not in ("gguf", "ggml"):
+                tags.append(seg)
+            continue
+        words.append(_display_word(seg))
+    display = " ".join(words) or stem or str(name or "")
+    family, family_label, family_logo = _model_family(str(name or ""), meta)
+    return {
+        "display_name": display,
+        "group": display.lower(),
+        "quant": quant,
+        "quant_tags": tags,
+        "bits": _quant_bits(quant),
+        "family": family,
+        "family_label": family_label,
+        "family_logo": family_logo,
+    }
+
+
+_MODEL_INFO_CACHE: dict[tuple, dict] = {}
+
+
+def model_display_info_for(entry: dict) -> dict:
+    """model_display_info for a scan_gguf_dir entry, cached per file version.
+    Only the first megabyte is read: the name, architecture and base-model
+    keys sit at the start of the header. A name without a quant needs
+    general.file_type, which often sits past the tokenizer, so those files
+    get the full header read."""
+    key = (entry.get("path"), entry.get("size"), entry.get("modified_at"))
+    info = _MODEL_INFO_CACHE.get(key)
+    if info is None:
+        path, name = entry.get("path") or "", entry.get("name") or ""
+        meta = read_gguf_metadata(path, max_bytes=1024 * 1024, retry_bytes=0)
+        if not _NAME_QUANT_RE.search(name) and "general.file_type" not in (meta.get("keys") or {}):
+            meta = read_gguf_metadata(path)
+        info = model_display_info(name, meta)
+        _MODEL_INFO_CACHE[key] = info
+    return info
 
 
 def scan_gguf_dir(root: str, include_drafts: bool = False) -> list[dict]:

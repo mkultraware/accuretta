@@ -28,12 +28,12 @@
   })();
 </script>
 <script src="/appearance.js?v=2"></script>
-<link rel="stylesheet" href="/app.css?v=94">
-  <link rel="stylesheet" href="/ui-refresh.css?v=3">
+<link rel="stylesheet" href="/app.css?v=96">
+  <link rel="stylesheet" href="/ui-refresh.css?v=6">
   <link rel="stylesheet" href="/workspace-shell.css?v=10">
 <link rel="stylesheet" href="/research-ui.css?v=2">
 <link rel="stylesheet" href="/ui-pass.css?v=15">
-<link rel="stylesheet" href="/workbench.css?v=14">
+<link rel="stylesheet" href="/workbench.css?v=39">
 <link rel="stylesheet" href="/opal.css?v=3">
 <link rel="stylesheet" href="/assets/vendor/web/icons.css">
 <script src="/assets/vendor/html2canvas/dist/html2canvas.min.js" defer></script>
@@ -67,7 +67,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v1.0.4</span>
+        <span class="v" id="brand-v">v1.0.5</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -312,9 +312,21 @@
       </button>
 
       <div class="composer-wrap">
-        <div class="revealer-deck" id="revealer-deck" role="status" aria-live="polite" aria-relevant="additions text"></div>
-        <section class="message-queue hidden" id="message-queue" aria-label="Your pending updates" aria-live="polite"></section>
+        <div class="composer-projects">
+          <button class="chip project-chip" id="project-chip" type="button" aria-haspopup="menu" aria-controls="project-menu" aria-expanded="false" title="Choose the folder this session works on">
+            <i class="ph ph-folder-simple" aria-hidden="true"></i>
+            <span class="project-chip-label" id="project-chip-label">No project</span>
+            <i class="ph ph-caret-down project-chip-caret" aria-hidden="true"></i>
+          </button>
+          <div class="project-menu" id="project-menu" role="menu" aria-label="Project"></div>
+        </div>
         <div class="composer">
+          <!-- notices, approvals, queued messages and the edit banner: inside the box, above the input -->
+          <div class="composer-inbox">
+            <div class="composer-goal hidden" id="composer-goal" role="status" aria-live="polite"></div>
+            <div class="revealer-deck" id="revealer-deck" role="status" aria-live="polite" aria-relevant="additions text"></div>
+            <section class="message-queue hidden" id="message-queue" aria-label="Your pending updates" aria-live="polite"></section>
+          </div>
           <div class="composer-tools">
             <div class="mode-control" id="composer-mode-control">
               <button class="mode-pill" id="composer-mode-pill" type="button" aria-haspopup="menu" aria-controls="composer-mode-menu" aria-expanded="false" aria-label="Composer mode: Agent" title="Choose how Accuretta handles the next message">
@@ -337,13 +349,13 @@
             <button class="chip" id="btn-attach-image" title="Attach image — the vision model reads it and hands a description to the main model"><i class="ph ph-image"></i>Image</button>
             <button class="chip" id="btn-attach-file" title="Upload files from this browser into the PC workspace"><i class="ph ph-paperclip"></i>File</button>
             <div class="perms-control" id="composer-perms-control">
-              <button class="chip" id="btn-perms" title="Permissions — what the agent may do on its own" aria-haspopup="menu" aria-expanded="false" aria-controls="perms-popover"><i class="ph ph-keyhole"></i><span class="perms-chip-label">Access</span><span class="btn-perms-dot" aria-hidden="true"></span></button>
+              <button class="chip" id="btn-perms" title="Permissions — what the agent may do on its own" aria-haspopup="menu" aria-expanded="false" aria-controls="perms-popover"><i class="ph ph-shield-check" aria-hidden="true"></i><span class="perms-chip-label">Access</span><span class="btn-perms-dot" aria-hidden="true"></span></button>
               <div class="perms-popover" id="perms-popover" role="menu" aria-label="Permissions">
-                <div class="perms-popover-head"><span>Permissions</span><strong id="perms-popover-value">—</strong></div>
+                <div class="perms-popover-head"><span>Permissions</span><button type="button" class="perms-learn" id="perms-learn-more" title="What each level allows">Learn more</button></div>
                 <div class="perms-menu" id="perms-menu">
-                  <button type="button" class="perms-option" role="menuitemradio" aria-checked="false" data-perm-mode="soft"><i class="ph ph-hand-coins" aria-hidden="true"></i><span class="perms-text"><span class="perms-name">Soft</span><span class="perms-desc">Routine project work and non-destructive commands run on their own. Risky actions still ask.</span></span><i class="ph ph-check perms-check" aria-hidden="true"></i></button>
-                  <button type="button" class="perms-option" role="menuitemradio" aria-checked="false" data-perm-mode="medium"><i class="ph ph-note-pencil" aria-hidden="true"></i><span class="perms-text"><span class="perms-name">Medium</span><span class="perms-desc">Workspace file writes save on their own; everything else asks first.</span></span><i class="ph ph-check perms-check" aria-hidden="true"></i></button>
-                  <button type="button" class="perms-option" role="menuitemradio" aria-checked="false" data-perm-mode="hard"><i class="ph ph-hand-palm" aria-hidden="true"></i><span class="perms-text"><span class="perms-name">Hard</span><span class="perms-desc">Every action asks for approval before it runs.</span></span><i class="ph ph-check perms-check" aria-hidden="true"></i></button>
+                  <button type="button" class="perms-option" role="menuitemradio" aria-checked="false" data-perm-mode="soft" title="Routine project work and non-destructive commands run on their own. Risky actions still ask."><i class="ph ph-gauge" aria-hidden="true"></i><span class="perms-text"><span class="perms-name">Soft</span><span class="perms-desc">Asks only before risky actions</span></span><i class="ph ph-check perms-check" aria-hidden="true"></i></button>
+                  <button type="button" class="perms-option" role="menuitemradio" aria-checked="false" data-perm-mode="medium" title="Workspace file writes save on their own; everything else asks first."><i class="ph ph-note-pencil" aria-hidden="true"></i><span class="perms-text"><span class="perms-name">Medium</span><span class="perms-desc">Asks for everything but file writes</span></span><i class="ph ph-check perms-check" aria-hidden="true"></i></button>
+                  <button type="button" class="perms-option" role="menuitemradio" aria-checked="false" data-perm-mode="hard" title="Every action asks for approval before it runs."><i class="ph ph-shield-check" aria-hidden="true"></i><span class="perms-text"><span class="perms-name">Hard</span><span class="perms-desc">Asks before every action</span></span><i class="ph ph-check perms-check" aria-hidden="true"></i></button>
                 </div>
               </div>
             </div>
@@ -413,14 +425,6 @@
               <button class="btn accent" id="btn-send" title="Send (Enter)"><i class="ph-bold ph-arrow-up"></i></button>
             </div>
           </div>
-        </div>
-        <div class="composer-projects">
-          <button class="chip project-chip" id="project-chip" type="button" aria-haspopup="menu" aria-controls="project-menu" aria-expanded="false" title="Choose the folder this session works on">
-            <i class="ph ph-folder-simple" aria-hidden="true"></i>
-            <span class="project-chip-label" id="project-chip-label">No project</span>
-            <i class="ph ph-caret-down project-chip-caret" aria-hidden="true"></i>
-          </button>
-          <div class="project-menu" id="project-menu" role="menu" aria-label="Project"></div>
         </div>
       </div>
     </div>
@@ -1123,7 +1127,7 @@
         <section class="faq-group" id="faq-safety" data-faq-section>
           <header><span>06</span><div><h3>Safety &amp; privacy</h3><p>Local-first still needs a steering wheel and brakes.</p></div></header>
           <div class="faq-list">
-            <details class="faq-item">
+            <details class="faq-item" id="faq-access-levels">
               <summary><span>What do Soft, Medium and Hard mean?</span><i class="ph ph-plus"></i></summary>
               <div><p><strong>Soft</strong> runs routine project work without stopping: workspace edits, commands and tests, cleaning up files inside a project folder, opening a preview image or document, and cloning or staging with Git. It still asks before deleting or writing anything outside your workspace folders, removing a whole project, committing or pushing, launching or killing programs, and any command it can't fully read. <strong>Medium</strong> only trusts normal edits inside the workspace. <strong>Hard</strong> asks for every action. Desktop control, protected or remote changes and anything influenced by recent web content keep stricter checks in every mode, and some destructive actions are refused outright. A keyboard shortcut can approve ordinary requests only; protected actions always need hold-to-approve.</p></div>
             </details>
@@ -1972,7 +1976,8 @@
 <script src="/agent-orb.js?v=4"></script>
 <script src="/theme-flowlines.js?v=2" defer></script>
 <script src="/dot-matrix.js?v=6"></script>
-<script src="/app.js?v=2026103104"></script>
+<script src="/sound-cues.js?v=1"></script>
+<script src="/app.js?v=2026110224"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {

@@ -8528,74 +8528,6 @@ body.is-mobile {
   display: none;
 }
 
-.image-tray .thumb {
-  position: relative;
-  width: 54px;
-  height: 54px;
-  border-radius: 6px;
-  overflow: hidden;
-  background: var(--bg-inset);
-  border: 1px solid var(--border);
-  flex-shrink: 0;
-}
-
-.image-tray .thumb img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
-.image-tray .thumb .rm {
-  position: absolute;
-  top: 2px;
-  right: 2px;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  background: rgba(0, 0, 0, 0.7);
-  color: #fff;
-  border: none;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 11px;
-}
-
-.image-tray .thumb .rm:hover {
-  background: var(--danger);
-}
-
-.image-tray .file-chip {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  min-width: 0;
-  max-width: 260px;
-  min-height: 34px;
-  padding: 6px 8px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg-inset);
-  color: var(--fg-muted);
-  font-size: 11px;
-}
-
-.image-tray .file-chip > span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.image-tray .file-chip .rm {
-  margin-left: auto;
-  border: 0;
-  background: transparent;
-  color: var(--fg-faint);
-  cursor: pointer;
-}
-
 .client-context-control {
   display: inline-flex;
   align-items: center;
@@ -18065,7 +17997,7 @@ pre.code-card.streaming-plain code {
 }
 
 /* Card base & notifications inside docked tab */
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card {
+[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck > .revealer-card {
   width: 100%;
   margin: 0;
   border: none;
@@ -18075,11 +18007,11 @@ pre.code-card.streaming-plain code {
   pointer-events: auto;
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.collapsed {
+[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck > .revealer-card.collapsed {
   max-height: none;
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.notifications {
+[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck > .revealer-card.notifications {
   width: 100%;
   margin: 0;
   min-height: 38px;
@@ -18095,9 +18027,9 @@ pre.code-card.streaming-plain code {
 
 /* Approval is the only thing the user can act on while a tool is blocked.
    Keep status and write cards mounted, but out of its way until it is decided. */
-[data-theme] .composer-wrap > .revealer-deck:has(> .revealer-card.permissions)
+[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck:has(> .revealer-card.permissions)
   > .revealer-card:not(.permissions),
-[data-theme] .composer-wrap > .revealer-deck:has(> .revealer-card.permissions)
+[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck:has(> .revealer-card.permissions)
   > .status-tab {
   display: none;
 }
@@ -18110,7 +18042,7 @@ pre.code-card.streaming-plain code {
 }
 
 /* Flat card integration inside docked tab */
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card {
+[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck > .revealer-card {
   width: 100%;
   margin: 0;
   border-radius: 10px 10px 0 0;
@@ -18121,11 +18053,11 @@ pre.code-card.streaming-plain code {
   pointer-events: auto;
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.collapsed {
+[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck > .revealer-card.collapsed {
   max-height: none;
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.notifications {
+[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck > .revealer-card.notifications {
   width: 100%;
   margin: 0;
   min-height: 38px;
@@ -18135,7 +18067,7 @@ pre.code-card.streaming-plain code {
   box-shadow: none;
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions {
+[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck > .revealer-card.permissions {
   width: 100%;
   margin: 0;
   border-radius: 10px 10px 0 0;
@@ -18145,7 +18077,7 @@ pre.code-card.streaming-plain code {
   box-shadow: none;
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions .revealer-card-icon {
+[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck > .revealer-card.permissions .revealer-card-icon {
   width: 28px;
   height: 28px;
   justify-content: center;
@@ -18155,7 +18087,7 @@ pre.code-card.streaming-plain code {
   background: color-mix(in srgb, var(--warning) 12%, transparent);
 }
 
-[data-theme] .composer-wrap > .revealer-deck > .revealer-card.permissions .revealer-card-body {
+[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck > .revealer-card.permissions .revealer-card-body {
   max-height: min(260px, 38dvh);
 }
 

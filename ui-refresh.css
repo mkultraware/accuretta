@@ -29,27 +29,29 @@
 .usage-calendar-switch button[aria-pressed="true"] { color: var(--fg); background: var(--accent-subtle); }
 .usage-calendar-summary { display: flex; flex-wrap: wrap; gap: 10px 24px; margin: 16px 0 24px; color: var(--fg-muted); font-size: 12px; }
 .usage-calendar-summary strong { color: var(--fg); font-weight: 600; }
-.usage-calendar-scroll { overflow-x: auto; padding: 4px 3px 10px; scrollbar-width: thin; }
-.usage-calendar { display: grid; grid-template-columns: 28px minmax(0, 1fr); grid-template-rows: 20px auto; gap: 8px; min-width: 700px; }
-.usage-months { grid-column: 2; display: grid; grid-template-columns: repeat(var(--weeks), minmax(0, 1fr)); gap: 4px; color: var(--fg-muted); font-size: 10px; }
-.usage-weekdays { display: grid; grid-template-rows: repeat(7, 1fr); gap: 4px; color: var(--fg-muted); font-size: 10px; align-items: center; }
+/* The year fits the panel's width (square cells, 3px gaps). Cells never
+   shrink below ~8px: a narrower panel scrolls, opening on the latest weeks. */
+.usage-calendar-scroll { overflow-x: auto; padding: 2px 2px 6px; scrollbar-width: thin; }
+.usage-calendar { display: grid; grid-template-columns: 26px minmax(0, 1fr); grid-template-rows: 14px auto; gap: 6px 8px; min-width: calc(var(--weeks, 53) * 11px + 34px); }
+.usage-months { grid-column: 2; display: grid; grid-template-columns: repeat(var(--weeks), minmax(0, 1fr)); gap: 3px; color: var(--fg-muted); font-size: 10px; }
+.usage-weekdays { display: grid; grid-template-rows: repeat(7, minmax(0, 1fr)); gap: 3px; color: var(--fg-muted); font-size: 10px; line-height: 1; align-items: center; contain: size; }
 .usage-weekdays span:nth-child(1) { grid-row: 1; }
 .usage-weekdays span:nth-child(2) { grid-row: 3; }
 .usage-weekdays span:nth-child(3) { grid-row: 5; }
-.usage-days { display: grid; grid-template-columns: repeat(var(--weeks), minmax(0, 1fr)); grid-template-rows: repeat(7, 1fr); gap: 4px; }
-.usage-day { display: block; aspect-ratio: 1; min-width: 0; padding: 0; border: 1px solid color-mix(in srgb, var(--fg) 5%, transparent); border-radius: 3px; background: color-mix(in srgb, var(--fg) 7%, transparent); }
+.usage-days { display: grid; grid-template-columns: repeat(var(--weeks), minmax(0, 1fr)); grid-template-rows: repeat(7, auto); gap: 3px; }
+.usage-day { display: block; aspect-ratio: 1; min-width: 0; padding: 0; border: 0; border-radius: 2px; background: color-mix(in srgb, var(--fg) 8%, transparent); }
 button.usage-day { cursor: pointer; }
 .usage-day[data-level="1"] { background: color-mix(in srgb, var(--accent) 25%, var(--bg-raised)); }
 .usage-day[data-level="2"] { background: color-mix(in srgb, var(--accent) 48%, var(--bg-raised)); }
 .usage-day[data-level="3"] { background: color-mix(in srgb, var(--accent) 73%, var(--bg-raised)); }
 .usage-day[data-level="4"] { background: var(--accent); }
-.usage-day.is-selected { border-color: var(--fg); }
-.usage-day.is-outside { background: transparent; border-color: color-mix(in srgb, var(--fg) 8%, transparent); }
-button.usage-day:hover { outline: 1px solid var(--fg); outline-offset: 1px; }
+.usage-day.is-selected { outline: 1px solid var(--fg); outline-offset: 1px; }
+.usage-day.is-outside { background: color-mix(in srgb, var(--fg) 3%, transparent); }
+button.usage-day:hover { outline: 1px solid color-mix(in srgb, var(--fg) 60%, transparent); outline-offset: 1px; }
 .usage-calendar-panel button:focus-visible, .security-quieted-panel summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .usage-calendar-footer { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px; min-height: 36px; margin-top: 8px; color: var(--fg-muted); font-size: 11px; }
 .usage-calendar-legend { display: flex; align-items: center; gap: 4px; }
-.usage-calendar-legend .usage-day { width: 11px; height: 11px; }
+.usage-calendar-legend .usage-day { width: 10px; height: 10px; }
 .usage-calendar-legend span { margin-inline: 4px; }
 .usage-calendar-panel .usage-footnote { margin-bottom: 0; font-size: 11px; }
 .security-alert-actions { flex-wrap: wrap; }

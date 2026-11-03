@@ -264,5 +264,295 @@
     "file": "postcss/source-map-js-LICENSE.txt",
     "source": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.1.tgz",
     "sha256": "6cb0631f71c7749763fd3dd1d5bee52dd1070ec17f2edc1710079ad070bd2fbd"
+  },
+  {
+    "file": "lobe-icons/ai2.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "1f9b7f91cb1f89401b07f5aa0adb20217bf6b1b8e47db6120654fda7ae20b319"
+  },
+  {
+    "file": "lobe-icons/ai21.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "6c80f2c0d8b11d1bee179666049b00e0ab7f58f5ee8c307ca0dd3327bb49f282"
+  },
+  {
+    "file": "lobe-icons/alephalpha.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "466340f37bb1958d24a10e5ced4d980a7a246d4f4efdc3e6bc2a206bb3dc571b"
+  },
+  {
+    "file": "lobe-icons/antgroup.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "0da4c28aae987c169ccd73d572659e3eca89df8e64efd0c3bcdde73f6c79fab9"
+  },
+  {
+    "file": "lobe-icons/apple.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "100637681febc38512bf8d43f7d5f79f2aa8caead15b256cd28b378b053fca69"
+  },
+  {
+    "file": "lobe-icons/arcee.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "3f93dc04611941da19291fb663f935a85f6b1ac44af6449c7b99293df180cc03"
+  },
+  {
+    "file": "lobe-icons/baai.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "9750791f6dd17af093c6682e03761667cab7e0f08566c79b3f54759b5f46d909"
+  },
+  {
+    "file": "lobe-icons/baichuan.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "6f2640b1b3eca4bd3758bb823b1a2df0327d286959706ba14bb564de11ae0ffb"
+  },
+  {
+    "file": "lobe-icons/bytedance.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "f7ae0a574bd2e28b17258e6e65061c564f764d807cba65d6d1013f50cbfdd7f5"
+  },
+  {
+    "file": "lobe-icons/cerebras.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "05af9593eca3fefdb30c5ad042040f008beea2b27e0a6b7315c319492f7a44ff"
+  },
+  {
+    "file": "lobe-icons/chatglm.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "9dbb651f279cbd5e4197c5ed27c30336411f5a3496261f35f6bf04b324b6676f"
+  },
+  {
+    "file": "lobe-icons/codegeex.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "c262ac0196177083772441b0fd7aa4e7aa658bded9d8ad86672f8eb8a32302d8"
+  },
+  {
+    "file": "lobe-icons/cohere.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "72851dd36d6ab017f535202744765eead8f99cfb5ced77e1840bfdb70db7a85c"
+  },
+  {
+    "file": "lobe-icons/dbrx.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "bf3827d806b5b3b6808842556bff4389d82213bd50f8ffa33363c0e0a25ba489"
+  },
+  {
+    "file": "lobe-icons/deepcogito.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "3034229f495a45db3a0556c1e88c133dbae114419019ca1329e16b277d4bbde2"
+  },
+  {
+    "file": "lobe-icons/deepseek.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "8f9443e351b6dacce71871790201b799d92e8bf96a45ef79aeb5e9bf4db423e2"
+  },
+  {
+    "file": "lobe-icons/essentialai.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "e0778f1357d696e8dea976d9b8d15b845201065c67933e6d949047e4b5af440c"
+  },
+  {
+    "file": "lobe-icons/gemma.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "8f9b74f6bbbf17203da8d81c3a4bb8750dbf13afe3ab4c1d482e84be62cd03a6"
+  },
+  {
+    "file": "lobe-icons/grok.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "9175fc90c22655160231976c849f25a03b888d7cc0e04c5f1b987b659bb07c95"
+  },
+  {
+    "file": "lobe-icons/huawei.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "edc88427effc3f4459f15f2f134a95d90609d630fef68b67639288bfc3dbc34d"
+  },
+  {
+    "file": "lobe-icons/huggingface.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "de7f2c60f974b75b385116ef0dc6a9fa62f2fd7bf58156b5623301a5436b91c4"
+  },
+  {
+    "file": "lobe-icons/hunyuan.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "7306a65eb71c4de61e21a637e5c4fef94afde823678e225c46f891cc783f6531"
+  },
+  {
+    "file": "lobe-icons/ibm.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "62c37af8c3f191572921197a29c90687079e62d3033f503faae59cdc96af0fb2"
+  },
+  {
+    "file": "lobe-icons/internlm.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "2507dd5e17f3ba47e0ed2c89181a677389a24620157aa4e56e9970dd5ecec2f9"
+  },
+  {
+    "file": "lobe-icons/jina.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "dbb78d6217774ddde8c57a6f5c94a3294c59e99c4a1e6ec786e409648b9bdb84"
+  },
+  {
+    "file": "lobe-icons/kimi.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "ed08131b46acf70e6e2144eceb775e74098b58ea65fa21eaee04be7b05cfe63b"
+  },
+  {
+    "file": "lobe-icons/kwaipilot.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "272e9c1e79573e210da571f51b1b2e7f6f6310bd942721f375b9e8aca264d38a"
+  },
+  {
+    "file": "lobe-icons/lg.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "170748b661b83c24cec2ccaf0bffacd37f16f1ee840c832518e5fc369308e379"
+  },
+  {
+    "file": "lobe-icons/LICENSE",
+    "source": "https://raw.githubusercontent.com/lobehub/lobe-icons/master/LICENSE",
+    "sha256": "add9d7531d1b21646317a8958e38fc727506fa39d24bdecb44154d943c82753a"
+  },
+  {
+    "file": "lobe-icons/liquid.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "4727b1cbd33bd256aca5be79a7d91a4f2753b2feb0dcfbb7b9fb3f23928c2467"
+  },
+  {
+    "file": "lobe-icons/llava.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "63d4df7fd6c6094e8d55d21dccefc1f579c93dc21698c289125397a5a4849016"
+  },
+  {
+    "file": "lobe-icons/longcat.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "4f1ff7194ad6752ea48773b73c48b5de4de9d8d6ee265b7d31df8053e519182d"
+  },
+  {
+    "file": "lobe-icons/menlo.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "453b4738e4826ef4b65ec00ff9a4db38a3fe304e14336cf4a437888b5c7c95eb"
+  },
+  {
+    "file": "lobe-icons/meta.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "805ef9a35305393eb5a89be46b0708c9b119b3308ca44aaedd1457ff04857060"
+  },
+  {
+    "file": "lobe-icons/microsoft.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "0617d6111e99845e7ab06dd4ff1e16c2c1ad381575b3204ef02dd71b716ffa4b"
+  },
+  {
+    "file": "lobe-icons/minimax.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "bb96e2005081494716de6af5fd030701ae551ee68393ad61b325c07325607848"
+  },
+  {
+    "file": "lobe-icons/mistral.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "a06cfa54e7deff7f7544175b006b7f8a03fbc5624c44f7d553a44d07ea96e629"
+  },
+  {
+    "file": "lobe-icons/nousresearch.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "4dc3c7cdf13d2f0bdf16b872d76293f048010a00f580df68a85e1f9c4e500e5d"
+  },
+  {
+    "file": "lobe-icons/nvidia.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "5a419b99e0ffdbfbe8caa7ec25581054eae03024da59cb860c54ea55ac8e7e73"
+  },
+  {
+    "file": "lobe-icons/openai.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "a595df6b423920c67a7f8f73c063e4bfb72d415948097b6cac063a2366bb5186"
+  },
+  {
+    "file": "lobe-icons/openchat.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "d069ee8265deee34af7457e8825b4bfb440f48b07fff99904eeb06c52d25410b"
+  },
+  {
+    "file": "lobe-icons/perplexity.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "c66c64e9e3c273ef6c235f743808d67ffa7d482e8cbe4a79496a42b60333e1fe"
+  },
+  {
+    "file": "lobe-icons/phind.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "1c79c51bc75b77d2a951c803fa2e037a95d4e0139142409a61325962efccd9a6"
+  },
+  {
+    "file": "lobe-icons/qwen.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "dcb3ba2f2b55ccbacbade0ca0bf98921fbaf8a07848972974b4a9bf8077376cf"
+  },
+  {
+    "file": "lobe-icons/reka.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "533ae212f32db47ffc179c272fb6c7fb0cc71e516a68ad3b58c435b0e8f20063"
+  },
+  {
+    "file": "lobe-icons/rwkv.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "4b075139e78fdaf9d4a81c34fff1ab4ac1b7136b055051df6c206c34b8152587"
+  },
+  {
+    "file": "lobe-icons/sakana.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "329e703ef2014dce216172ff4aef9c226cb6c79dbd71fc5d76cc923b63b9e732"
+  },
+  {
+    "file": "lobe-icons/sensenova.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "6dbe2705669ffb174bdb9dd3f489dfadec0018b6c6580794337378c9842cb621"
+  },
+  {
+    "file": "lobe-icons/skywork.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "b37324cf85df1d65002dc7775ea302b637ee6ff1679ccb9b4367856af27ea6f3"
+  },
+  {
+    "file": "lobe-icons/snowflake.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "4e814ab515ea483f674946d39279da9b6400abf650c68dccbfe06c837e0e3ab6"
+  },
+  {
+    "file": "lobe-icons/spark.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "e19b6b5d7c398d115934e4c8762a8fde525db792e2c4e8bc6934a71e70e7ce7c"
+  },
+  {
+    "file": "lobe-icons/stability.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "6cf25e3b187754f804f8a2f54a5955a166f877d907c83517adfe95b432585562"
+  },
+  {
+    "file": "lobe-icons/stepfun.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "90138fab370e3c0ce3105d38a496d6796ce73d44f9829d8e1045013dc064bcd2"
+  },
+  {
+    "file": "lobe-icons/tii.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "93030a4904ca3aa3535c08d115d579e9ada7f1bc02e3d57b6660558b87f975a3"
+  },
+  {
+    "file": "lobe-icons/upstage.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "2b740c9457fdbe4b0e7e3ff2e10f99882314a813e1e81f8d291b7b61d56a2416"
+  },
+  {
+    "file": "lobe-icons/wenxin.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "3624b6084ce8ebefcbbb90ae6ab6485c4df9083187ae6e4012e1aba9a4bcea04"
+  },
+  {
+    "file": "lobe-icons/yandex.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "390d3758093817548b39bc60f9400369708c290093059796b25d4604813d3450"
+  },
+  {
+    "file": "lobe-icons/yi.svg",
+    "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
+    "sha256": "c1975458cc94ee44306336215fdf64b1a25f60d7b3f4c01aee5a720eddea0e0a"
   }
 ]

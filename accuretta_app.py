@@ -217,7 +217,7 @@ def _read_app_version() -> str:
             return m.group(1)
     except Exception:
         pass
-    return "1.0.4"
+    return "1.0.5"
 
 
 def _glyph_field_js() -> str:
@@ -501,9 +501,14 @@ _FAILED_HTML = ("<body style='font-family:system-ui,sans-serif;background:#12151
 class DesktopWindowApi:
     def __init__(self):
         self._window = None
+        # A close goes straight through once the app means it (the shutdown
+        # dialog's buttons, the bridge stopping) or before the app's UI is up.
+        self._allow_close = False
+        self._app_loaded = False
 
     def close_window(self):
         if self._window is not None:
+            self._allow_close = True
             # Destroying synchronously inside the WebView2 bridge callback can
             # leave the callback waiting on the window it is trying to close.
             # Let the callback return, then close on the GUI thread.
@@ -511,13 +516,60 @@ class DesktopWindowApi:
         return True
 
 
-def _watch_bridge(win) -> None:
+def _session_ending() -> bool:
+    """True while Windows is shutting down or signing out. Closing must not
+    wait on the in-app dialog then, or the app would hold up the shutdown."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.GetSystemMetrics(0x2000))  # SM_SHUTTINGDOWN
+    except Exception:
+        return False
+
+
+def _ask_before_closing(win, api: DesktopWindowApi) -> bool:
+    """The window's X (or Alt+F4) opens the in-app shutdown dialog: save the
+    session or close without saving. Returning False cancels this close, and
+    the dialog's buttons close the window themselves. The page is asked from
+    another thread (this handler runs on the GUI thread, which evaluate_js
+    needs); if it can't show the dialog within two seconds (still on the
+    splash, frozen, failed to start) the window closes as it always did."""
+    if api._allow_close or not api._app_loaded or _session_ending():
+        return True
+
+    def ask() -> None:
+        answer: list = []
+
+        def probe() -> None:
+            try:
+                answer.append(win.evaluate_js(
+                    "window.accurettaRequestQuit ? window.accurettaRequestQuit() : false"))
+            except Exception:
+                pass  # no answer: close below
+
+        waiter = threading.Thread(target=probe, daemon=True)
+        waiter.start()
+        waiter.join(2.0)
+        if not answer or answer[0] is not True:
+            api._allow_close = True
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    threading.Thread(target=ask, daemon=True).start()
+    return False
+
+
+def _watch_bridge(win, api: DesktopWindowApi) -> None:
     """Close the window (exit the app) once the bridge stops responding, e.g.
-    right after the in-app Shutdown button stops it."""
+    right after the in-app shutdown dialog stops it."""
     time.sleep(3)
     misses = 0
     while True:
         if bridge._shutdown_ready.is_set():
+            api._allow_close = True
             try:
                 win.destroy()
             except Exception:
@@ -529,6 +581,7 @@ def _watch_bridge(win) -> None:
         except OSError:
             misses += 1
             if misses >= 2:
+                api._allow_close = True
                 try:
                     win.destroy()
                 except Exception:
@@ -584,6 +637,7 @@ def main() -> int:
                                 width=1440, height=920, min_size=(960, 640),
                                 text_select=True)
     desktop_api._window = win
+    win.events.closing += lambda: _ask_before_closing(win, desktop_api)
 
     def _boot() -> None:
         def _stage(label: str, pct: int) -> None:
@@ -616,7 +670,8 @@ def main() -> int:
                 elapsed = time.monotonic() - splash_created_at
             time.sleep(max(0.38, 1.45 - elapsed))
             win.load_url(f"http://127.0.0.1:{PORT}")
-            threading.Thread(target=_watch_bridge, args=(win,), daemon=True).start()
+            desktop_api._app_loaded = True
+            threading.Thread(target=_watch_bridge, args=(win, desktop_api), daemon=True).start()
         else:
             win.load_html(_FAILED_HTML)
 

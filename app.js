@@ -38,6 +38,7 @@
     mobileTab: "chat",
     pendingImages: [],  // [{ dataUrl, name }]
     pendingFiles: [],   // browser File objects uploaded on send
+    uploadingFiles: false, // true while send uploads the tray
     messageQueues: new Map(), // chat id -> queued composer snapshots
     queueDispatching: false,
     queueEditId: null,
@@ -813,8 +814,9 @@
   }
 
   // ---------- notifications & audio ----------
+  // One set of sounds across Accuretta: the notch's cues (sound-cues.js) for a
+  // request arriving and a long turn finishing or failing.
   let _lastSound = 0;
-  const _activeNotificationAudio = new Set();
   function soundOn() { return state.settings ? state.settings.sound_notifications !== false : true; }
   function reserveSoundSlot() {
     const now = performance.now();
@@ -822,85 +824,19 @@
     _lastSound = now;
     return true;
   }
-  function playChime(notes, vol, reserved) {
-    if (!soundOn()) return;
-    if (!reserved && !reserveSoundSlot()) return;
-    try {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      const ctx = new AC();
-      const master = ctx.createGain();
-      master.gain.value = vol || 0.16;
-      const lp = ctx.createBiquadFilter();
-      lp.type = "lowpass"; lp.frequency.value = 2600; lp.Q.value = 0.7;
-      master.connect(lp); lp.connect(ctx.destination);
-      const t0 = ctx.currentTime;
-      let end = t0;
-      notes.forEach(n => {
-        const st = t0 + (n.t || 0), dur = n.dur || 0.5;
-        const osc = ctx.createOscillator();
-        osc.type = "sine"; osc.frequency.value = n.f;
-        const osc2 = ctx.createOscillator();   // faint detuned layer for warmth
-        osc2.type = "triangle"; osc2.frequency.value = n.f; osc2.detune.value = 6;
-        const g = ctx.createGain();
-        g.gain.setValueAtTime(0.0001, st);
-        g.gain.exponentialRampToValueAtTime(1, st + 0.015);
-        g.gain.exponentialRampToValueAtTime(0.0001, st + dur);
-        osc.connect(g); osc2.connect(g); g.connect(master);
-        osc.start(st); osc2.start(st);
-        osc.stop(st + dur + 0.05); osc2.stop(st + dur + 0.05);
-        end = Math.max(end, st + dur);
-      });
-      setTimeout(() => { try { ctx.close(); } catch (e) {} }, (end - t0) * 1000 + 300);
-    } catch (e) {}
-  }
-  function playNotificationAsset({ src = "/assets/audio/notification.mp3?v=2026082401", rate = 1, volume = 0.72, fallbackNotes, fallbackVolume = 0.14 } = {}) {
+  function playCue(name) {
     if (!soundOn() || !reserveSoundSlot()) return;
-    let didFallback = false;
-    const fallback = () => {
-      if (didFallback) return;
-      didFallback = true;
-      playChime(fallbackNotes, fallbackVolume, true);
-    };
-    try {
-      const audio = new Audio(src);
-      audio.preload = "auto";
-      audio.volume = volume;
-      audio.playbackRate = rate;
-      if (rate !== 1) {
-        audio.preservesPitch = false;
-        audio.webkitPreservesPitch = false;
-      }
-      const cleanup = () => _activeNotificationAudio.delete(audio);
-      _activeNotificationAudio.add(audio);
-      audio.addEventListener("ended", cleanup, { once: true });
-      audio.addEventListener("error", () => { cleanup(); fallback(); }, { once: true });
-      const started = audio.play();
-      if (started && typeof started.catch === "function") started.catch(() => { cleanup(); fallback(); });
-    } catch (e) {
-      fallback();
-    }
+    window.AccurettaSound?.play(name);
   }
-  function playApprovalSound() {
-    playNotificationAsset({
-      src: "/assets/audio/permission_required.wav?v=2026090701",
-      fallbackNotes: [{ f: 523.25, t: 0, dur: 0.28 }, { f: 783.99, t: 0.13, dur: 0.5 }],
-      fallbackVolume: 0.15,
-    });
+  // The notch already sounds every request on this PC, so the main window
+  // stays quiet then: one sound, not two. A phone or another PC still sounds.
+  function notchSoundsApprovals() {
+    return !!state.settings?.notch_enabled && !state.clientContext?.remote;
   }
-  function playCompletionSound() {
-    playNotificationAsset({
-      src: "/assets/audio/task_completed.wav?v=2026090701",
-      fallbackNotes: [{ f: 523.25, t: 0, dur: 0.22 }, { f: 659.25, t: 0.1, dur: 0.22 }, { f: 783.99, t: 0.2, dur: 0.6 }],
-    });
-  }
-  function playFailureSound() {
-    playNotificationAsset({
-      src: "/assets/audio/task_failed.wav?v=2026090701",
-      volume: 0.68,
-      fallbackNotes: [{ f: 392, t: 0, dur: 0.28 }, { f: 293.66, t: 0.14, dur: 0.55 }],
-      fallbackVolume: 0.13,
-    });
-  }
+  function playApprovalSound() { if (!notchSoundsApprovals()) playCue("gate"); }
+  function playCompletionSound() { playCue("done"); }
+  function playFailureSound() { playCue("error"); }
+  document.addEventListener("pointerdown", () => window.AccurettaSound?.unlock(), { once: true, capture: true });
 
   function notifyApproval() {
     playApprovalSound();   // always audible (when enabled) — approvals are the point
@@ -1392,6 +1328,62 @@
     if (slot) slot.innerHTML = TCARD_STATE_SVG[st];
   }
 
+  // Web search alone: when every call in a card is a web search, the card
+  // reads as a small tree: "Ran 3 searches", a row per query with its result
+  // count and a Sources row of favicons (which opens the result chips), X and
+  // Reddit searches named as such, and "Working Ns" while the model writes.
+  const TCARD_SEARCH_SITES = [
+    { re: /\bsite:(?:www\.)?(?:x|twitter)\.com\b/i, name: "X", key: "x", icon: "ph-x-logo", unit: "post" },
+    { re: /\bsite:(?:www\.|old\.)?reddit\.com\b|^\s*r\/\w+/i, name: "Reddit", key: "reddit", icon: "ph-reddit-logo", unit: "thread" },
+  ];
+  function tcardDecorateSearch(row) {
+    const query = String(row._args?.query || "").trim();
+    const site = TCARD_SEARCH_SITES.find(s => s.re.test(query)) || null;
+    const shown = (site ? query.replace(/\s*\bsite:\S+/gi, "").trim() : query) || query;
+    const results = Array.isArray(row._result?.results) ? row._result.results : null;
+    const running = row.classList.contains("running");
+    const failed = row.classList.contains("err");
+    const sig = `${running ? "r" : failed ? "e" : "d"}|${results ? results.length : "-"}|${query}`;
+    if (row.dataset.searchSig === sig) return;
+    row.dataset.searchSig = sig;
+    const line = row.querySelector(":scope > .tcard-line");
+    const icon = line?.querySelector(":scope > .tcard-ico");
+    if (icon) icon.outerHTML = `<span class="tcard-ico tcard-search-ico" data-site="${site ? site.key : "web"}">`
+      + `<i class="ph ${site ? site.icon : "ph-lightbulb"}" aria-hidden="true"></i></span>`;
+    row.querySelector(":scope > .tcard-sources")?.remove();
+    if (failed || !query) return;
+    const label = line?.querySelector(":scope > .tcard-label");
+    if (label) label.innerHTML = site
+      ? `${running ? "Searching" : "Searched"} ${site.name} for <code>${esc(shown)}</code>`
+      : `${running ? "Searching for" : "Searched for"} ${esc(shown)}`;
+    const meta = line?.querySelector(":scope > .tcard-meta");
+    if (meta && results) {
+      const unit = site ? site.unit : "result";
+      meta.textContent = `${results.length} ${unit}${results.length === 1 ? "" : "s"}`;
+    }
+    if (!results?.length) return;
+    const hosts = [...new Set(results.map(r => {
+      try { return new URL(r.url).hostname.replace(/^www\./, ""); } catch { return ""; }
+    }).filter(Boolean))].slice(0, 5);
+    const favs = hosts.map(host => `<span class="tcard-fav" title="${esc(host)}">${TOOL_SVG.globe}`
+      + (state.settings.offline_active ? "" : `<img src="https://icons.duckduckgo.com/ip3/${esc(host)}.ico" alt="" loading="lazy" onerror="this.remove()">`)
+      + `</span>`).join("");
+    line.insertAdjacentHTML("afterend", `<button type="button" class="tcard-sources" aria-label="Show the sources">`
+      + `<span>Sources</span><span class="tcard-favs">${favs}</span><i class="ph ph-caret-down" aria-hidden="true"></i></button>`);
+  }
+  function tcardSearchWorking(group, show) {
+    let working = group.querySelector(".tcard-working");
+    if (!show) { working?.remove(); return; }
+    if (!working) {
+      working = document.createElement("div");
+      working.className = "tcard-working";
+      working.innerHTML = `<i class="ph ph-sparkle" aria-hidden="true"></i><span class="shimmer">Working</span><span class="tcard-working-time"></span>`;
+      group.querySelector(".tcard-list")?.appendChild(working);
+    }
+    const secs = group._t0 ? (Date.now() - group._t0) / 1000 : 0;
+    working.querySelector(".tcard-working-time").textContent = `${secs.toFixed(1)}s`;
+  }
+
   function tcardSync(group) {
     if (!group) return;
     const head = group.querySelector(".tcard-head");
@@ -1404,6 +1396,17 @@
     const failed = rows.filter(r => r.classList.contains("err")).length;
     const calls = rows.reduce((sum, r) => sum + (Number(r.dataset.count) || 1), 0);
     const latest = running[running.length - 1] || rows[rows.length - 1];
+    const searchOnly = rows.length > 0 && rows.every(r => r.dataset.name === "web_search");
+    group.classList.toggle("search-only", searchOnly);
+    if (searchOnly) {
+      rows.forEach(tcardDecorateSearch);
+      // The tree is the point, so a live search card opens once by itself.
+      if (live && !group.dataset.searchOpened) {
+        group.dataset.searchOpened = "1";
+        if (!open) { tcardSetOpen(group, true); return; }
+      }
+    }
+    tcardSearchWorking(group, searchOnly && live && !running.length);
     // Collapsed while live, the head IS the latest row: its icon, label,
     // fact and status. Otherwise it summarises with the tools' icons.
     const single = live && !open;
@@ -1438,11 +1441,12 @@
         : latest?.querySelector(".tcard-meta")?.innerHTML || "";
       state = latest ? tcardRowState(latest) : "running";
     } else if (live) {
-      tcardTick(group, waiting ? "Waiting for approval" : `Using ${plural(calls, "tool")}`, false);
+      tcardTick(group, waiting ? "Waiting for approval" : searchOnly ? "Searching the web" : `Using ${plural(calls, "tool")}`, false);
       meta.textContent = running.length > 1 ? `${running.length} in parallel` : "";
       state = waiting ? "waiting" : running.length ? "running" : "";
     } else {
-      tcardTick(group, `Used ${plural(calls, "tool")}${failed ? ` · ${failed} failed` : ""}`, false);
+      const used = searchOnly ? `Ran ${calls} search${calls === 1 ? "" : "es"}` : `Used ${plural(calls, "tool")}`;
+      tcardTick(group, `${used}${failed ? ` · ${failed} failed` : ""}`, false);
       meta.textContent = group._t0 && group._t1 ? tcardDuration(group._t1 - group._t0) : "";
       state = failed ? "err" : "";
     }
@@ -1487,7 +1491,8 @@
   function tcardStartTimer(group) {
     if (!group || group._timer) return;
     group._timer = setInterval(() => {
-      if (!group.isConnected || !tcardTickRunning(group)) {
+      const searching = group.classList.contains("search-only") && group.classList.contains("live-activity");
+      if (!group.isConnected || (!tcardTickRunning(group) && !searching)) {
         clearInterval(group._timer);
         group._timer = 0;
       }
@@ -1509,6 +1514,8 @@
     if (!group || group.dataset.wired === "true") return;
     group.dataset.wired = "true";
     const activate = (e) => {
+      const sources = e.target.closest(".tcard-sources");
+      if (sources) { tcardToggleRow(sources.closest(".tcard-row")); return; }
       if (e.target.closest("a, button, summary, .tcard-more")) return;
       const line = e.target.closest(".tcard-line");
       if (line) { tcardToggleRow(line.closest(".tcard-row")); return; }
@@ -1581,6 +1588,7 @@
 
     group.classList.remove("live-activity");
     group.classList.add("done");
+    tcardSearchWorking(group, false);
     group._t1 = Date.now();
     clearInterval(group._timer);
     group._timer = 0;
@@ -4178,7 +4186,7 @@
     }
     renderSkillPill();
     // Reflect this chat's /goal latch on the Access chip (persisted per chat).
-    setGoalModeUI(!!(chat && chat.goal_mode));
+    setGoalModeUI(!!(chat && chat.goal_mode), { goal: (chat && chat.goal_text) || "" });
     
     // Scan past messages to populate the image-to-source map
     state.imageUrlToSourceMap.clear();
@@ -4673,7 +4681,8 @@
     // "All projects": sessions sit in collapsible project groups (missions
     // and plain conversations get their own). A scoped project keeps the
     // flat, date-bucketed list.
-    if (!state.projectScope && ordered.length) {
+    let sections = null;
+    if (!state.projectScope && (ordered.length || state.workspace?.folders?.length)) {
       const groups = new Map();
       for (const id of ordered) {
         const c = state.chats.chats[id];
@@ -4681,10 +4690,24 @@
         if (!groups.has(g.key)) groups.set(g.key, { ...g, ids: [] });
         groups.get(g.key).ids.push(id);
       }
+      // Every project folder shows, sessions or not, and carries its path
+      // for the Files row.
+      for (const folder of state.workspace?.folders || []) {
+        const key = `proj:${wbNorm(folder)}`;
+        if (!groups.has(key)) groups.set(key, { key, label: folderLeafName(folder), icon: "ph-folder-simple", ids: [] });
+        if (!groups.get(key).path) groups.get(key).path = folder;
+      }
       const collapsed = wbCollapsedGroups();
       // Projects (and missions) by recency; sessions without a project last.
       const ordered_groups = [...groups.values()].sort((x, y) => (x.key === "chats") - (y.key === "chats"));
+      // The new sidebar folds the list into two sections: Projects (folders,
+      // repos, missions) and Chats (sessions without a project, no group head).
+      if ($("#sidebar")?.classList.contains("sb-v2")) sections = sbListSections(wrap);
       for (const g of ordered_groups) {
+        if (sections && g.key === "chats") {
+          for (const id of g.ids) { sections.chats.appendChild(wbChatRow(id, state.chats.chats[id], true)); rendered++; }
+          continue;
+        }
         const isCollapsed = collapsed.has(g.key);
         const box = document.createElement("div");
         box.className = "wb-group" + (isCollapsed ? " collapsed" : "");
@@ -4694,7 +4717,9 @@
         head.className = "wb-group-head";
         head.title = g.key === "chats" ? "Sessions without a project folder" : g.label;
         head.setAttribute("aria-expanded", String(!isCollapsed));
-        head.innerHTML = `<i class="ph ph-caret-${isCollapsed ? "right" : "down"} wb-group-caret" aria-hidden="true"></i>`
+        const folderIcons = g.path ? `<i class="ph ph-folder-simple wb-group-icon is-closed" aria-hidden="true"></i><i class="ph ph-folder-open wb-group-icon is-open" aria-hidden="true"></i>`
+          : `<i class="ph ${g.icon || "ph-chats-circle"} wb-group-icon" aria-hidden="true"></i>`;
+        head.innerHTML = `<i class="ph ph-caret-${isCollapsed ? "right" : "down"} wb-group-caret" aria-hidden="true"></i>${folderIcons}`
           + `<span class="wb-group-name">${esc(g.label)}</span>`
           + `<span class="wb-group-count">${g.ids.length}</span>`;
         head.addEventListener("click", () => {
@@ -4709,9 +4734,11 @@
         const body = document.createElement("div");
         body.className = "wb-group-body";
         for (const id of g.ids) { body.appendChild(wbChatRow(id, state.chats.chats[id], true)); rendered++; }
+        if (g.path) body.appendChild(sbFilesRow(g.path));
         box.append(head, body);
-        wrap.appendChild(box);
+        (sections ? sections.projects : wrap).appendChild(box);
       }
+      if (sections) sbFillEmptySections(sections);
     } else {
       let lastHeadKey = "";
       for (const id of ordered) {
@@ -4734,7 +4761,7 @@
         rendered++;
       }
     }
-    if (!rendered) {
+    if (!rendered && !sections) {
       const empty = document.createElement("div");
       empty.className = "chatlist-empty";
       empty.textContent = state.projectScope
@@ -5296,8 +5323,10 @@
       banner = document.createElement("div");
       banner.className = "bubble-editing-banner";
       banner.setAttribute("role", "status");
+      // Inside the box with the notices, right after them.
       const deck = document.getElementById("revealer-deck");
-      wrap.insertBefore(banner, deck?.nextSibling || wrap.firstChild);
+      if (deck) deck.after(banner);
+      else wrap.prepend(banner);
     }
     banner.innerHTML = `<strong>Editing your last message</strong><span>— sending replaces the turn and everything after it.</span><button type="button" class="bubble-editing-cancel" title="Cancel edit"><i class="ph ph-x"></i></button>`;
     banner.querySelector(".bubble-editing-cancel").addEventListener("click", cancelEditTurn);
@@ -5512,33 +5541,68 @@
     meta.after(actions);
   }
 
-  // ---------- image attachments ----------
+  // ---------- attachments ----------
+  // Images and files wait above the input as tiles: a thumbnail, or a colored
+  // file-type icon over the name. Files upload when the message is sent; while
+  // they do, each tile draws its progress round its edge and counts up in the
+  // corner, one file after another, and can't be removed.
+  const ATTACH_TYPES = [
+    [/^pdf$/, "ph-file-pdf", "red"],
+    [/^(docx?|odt|rtf|pages)$/, "ph-file-doc", "blue"],
+    [/^(txt|log)$/, "ph-file-txt", "gray"],
+    [/^(md|markdown)$/, "ph-file-md", "gray"],
+    [/^(xlsx?|ods|numbers)$/, "ph-file-xls", "green"],
+    [/^(csv|tsv)$/, "ph-file-csv", "green"],
+    [/^(pptx?|odp|key)$/, "ph-file-ppt", "orange"],
+    [/^(html?|css|[cm]?jsx?|tsx?|py|sql|c|cc|cpp|h|hpp|rs|go|java|kt|swift|rb|php|sh|ps1|bat|json|ya?ml|toml|xml|ini)$/, "ph-file-code", "teal"],
+    [/^(zip|7z|rar|tar|gz|tgz|bz2|xz)$/, "ph-file-zip", "amber"],
+    [/^(mp3|wav|flac|ogg|m4a|aac)$/, "ph-file-audio", "pink"],
+    [/^(mp4|mov|mkv|webm|avi|m4v)$/, "ph-file-video", "blue"],
+    [/^(png|jpe?g|gif|webp|bmp|tiff?|heic|ico|svg)$/, "ph-file-image", "violet"],
+  ];
+  function attachType(name) {
+    const ext = (String(name).match(/\.([a-z0-9]+)$/i) || [])[1]?.toLowerCase() || "";
+    const hit = ATTACH_TYPES.find(([re]) => re.test(ext));
+    return hit ? { icon: hit[1], tint: hit[2] } : { icon: "ph-file", tint: "gray" };
+  }
+  function attachTile(kind, index, name, body, title) {
+    const tile = document.createElement("div");
+    tile.className = "wb-att";
+    tile.dataset.kind = kind;
+    tile.dataset.index = String(index);
+    tile.title = title;
+    tile.innerHTML = body
+      + `<span class="wb-att-pct" aria-hidden="true"></span>`
+      + `<svg class="wb-att-ring" aria-hidden="true" focusable="false"><rect class="wb-att-ring-track"></rect><rect class="wb-att-ring-arc" pathLength="100"></rect></svg>`
+      + `<button type="button" class="wb-att-x" aria-label="Remove ${esc(name)}" title="Remove"><i class="ph ph-x" aria-hidden="true"></i></button>`;
+    return tile;
+  }
   function renderImageTray() {
     const tray = $("#image-tray");
     if (!tray) return;
     tray.innerHTML = "";
     if (!state.pendingImages.length && !state.pendingFiles.length) { tray.classList.add("hidden"); return; }
     tray.classList.remove("hidden");
+    tray.classList.toggle("uploading", !!state.uploadingFiles);
     state.pendingImages.forEach((img, i) => {
-      const div = document.createElement("div");
-      div.className = "thumb";
-      div.innerHTML = `<img src="${img.dataUrl}" alt="${esc(img.name || "image")}"><button class="rm" title="Remove"><i class="ph ph-x"></i></button>`;
-      div.querySelector(".rm").addEventListener("click", () => {
-        state.pendingImages.splice(i, 1);
-        renderImageTray();
-      });
-      tray.appendChild(div);
+      const name = img.name || "image";
+      tray.appendChild(attachTile("image", i, name, `<img class="wb-att-thumb" src="${img.dataUrl}" alt="${esc(name)}">`, name));
     });
     state.pendingFiles.forEach((file, i) => {
-      const div = document.createElement("div");
-      div.className = "file-chip";
-      div.innerHTML = `<i class="ph ph-file"></i><span title="${esc(file.name)}">${esc(file.name)}</span><small>${humanBytes(file.size)}</small><button class="rm" title="Remove"><i class="ph ph-x"></i></button>`;
-      div.querySelector(".rm").addEventListener("click", () => {
-        state.pendingFiles.splice(i, 1);
-        renderImageTray();
-      });
-      tray.appendChild(div);
+      const { icon, tint } = attachType(file.name);
+      tray.appendChild(attachTile("file", i, file.name,
+        `<i class="ph-fill ${icon} wb-att-icon" data-tint="${tint}" aria-hidden="true"></i><span class="wb-att-name">${esc(file.name)}</span>`,
+        `${file.name} · ${humanBytes(file.size)}`));
     });
+  }
+  // Progress for the i-th pending file: 0..1 while it uploads, 1 once landed.
+  function setAttachProgress(i, fraction) {
+    const tile = $(`#image-tray .wb-att[data-kind="file"][data-index="${i}"]`);
+    if (!tile) return;
+    const pct = Math.max(0, Math.min(100, Math.round(fraction * 100)));
+    tile.dataset.state = pct >= 100 ? "done" : "uploading";
+    tile.querySelector(".wb-att-pct").textContent = pct >= 100 ? "" : `${pct}%`;
+    tile.querySelector(".wb-att-ring-arc").style.strokeDasharray = `${pct} 100`;
   }
   function fileToDataURL(file) {
     return new Promise((resolve, reject) => {
@@ -5809,20 +5873,33 @@
     }
   }
 
-  async function uploadClientFiles(files) {
+  // XMLHttpRequest rather than fetch: it reports upload progress. It also
+  // skips bridge-client.js's fetch wrapper, so it sends the token itself.
+  function uploadClientFile(file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/client-files/upload");
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
+      xhr.setRequestHeader("X-Accuretta-Token", document.querySelector('meta[name="accuretta-request-token"]')?.content || "");
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable && e.total) onProgress?.(e.loaded / e.total); };
+      xhr.onload = () => {
+        let data = {};
+        try { data = JSON.parse(xhr.responseText || "{}"); } catch {}
+        if (xhr.status < 200 || xhr.status >= 300 || data.error) reject(new Error(data.error || `upload failed (${xhr.status})`));
+        else resolve(data);
+      };
+      xhr.onerror = () => reject(new Error("upload failed (connection lost)"));
+      xhr.send(file);
+    });
+  }
+  // One file after another; onProgress(i, fraction) follows each.
+  async function uploadClientFiles(files, onProgress) {
     const uploaded = [];
-    for (const file of files) {
-      const resp = await fetch("/api/client-files/upload", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/octet-stream",
-          "X-File-Name": encodeURIComponent(file.name),
-        },
-        body: file,
-      });
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok || data.error) throw new Error(data.error || `upload failed (${resp.status})`);
-      uploaded.push(data);
+    for (let i = 0; i < files.length; i++) {
+      onProgress?.(i, 0);
+      uploaded.push(await uploadClientFile(files[i], (fraction) => onProgress?.(i, Math.min(fraction, 0.99))));
+      onProgress?.(i, 1);
     }
     return uploaded;
   }
@@ -5869,13 +5946,26 @@
            prompt: 'Continue the saved research and prepare the presentation from the collected evidence.' });
   });
 
+  // The Access chip wears the icon of its level, taken from that level's row
+  // in the Access menu; goal mode shows a flag.
+  function setPermsChipIcon(level) {
+    const icon = document.querySelector("#btn-perms > i.ph");
+    if (!icon) return;
+    const row = level === "goal" ? null
+      : document.querySelector(`#perms-menu .perms-option[data-perm-mode="${level}"] > i.ph`);
+    const glyph = row ? [...row.classList].find(c => c.startsWith("ph-")) : "ph-flag-checkered";
+    if (glyph) icon.className = `ph ${glyph}`;
+  }
+
   // /goal hands-free latch: reflect it on the Access chip ("Goal", pulsing) and
   // play a one-shot flourish on the composer. Turning off restores the
   // permission-mode label. The flourish only fires on the off->on transition,
   // unless `flourish` is forced.
-  function setGoalModeUI(active, { flourish = false } = {}) {
+  function setGoalModeUI(active, { flourish = false, goal } = {}) {
     const on = !!active;
     const was = !!state.goalMode;
+    if (!on) state.goalText = "";
+    else if (goal !== undefined) state.goalText = goal || "";
     document.body.classList.toggle("goal-mode-active", on);
     const permsBtn = document.querySelector("#btn-perms");
     if (permsBtn) {
@@ -5886,6 +5976,7 @@
         if (lbl) lbl.textContent = "Goal";
         permsBtn.classList.add("on");
         permsBtn.title = "Goal mode — this chat runs hands-free. Click to turn off. Deletions and destructive actions still ask.";
+        setPermsChipIcon("goal");
       } else if (permsBtn.dataset.goal) {
         delete permsBtn.dataset.goal;
         if (lbl && permsBtn._goalPrevLabel != null) lbl.textContent = permsBtn._goalPrevLabel;
@@ -5893,6 +5984,7 @@
           ((state.settings && state.settings.auto_approve_write) ? "medium" : "hard");
         permsBtn.classList.toggle("on", mode !== "hard");
         permsBtn.title = "Permissions · " + (mode.charAt(0).toUpperCase() + mode.slice(1));
+        setPermsChipIcon(mode);
       }
     }
     if (on && (!was || flourish)) {
@@ -5905,9 +5997,38 @@
       }
     }
     state.goalMode = on;
+    renderGoalRow();
+  }
+
+  // While /goal runs, its task sits as a row inside the composer box, above
+  // the input, with a button that ends it.
+  function renderGoalRow() {
+    const row = $("#composer-goal");
+    if (!row) return;
+    const on = !!state.goalMode;
+    row.classList.toggle("hidden", !on);
+    if (!on) { row.innerHTML = ""; return; }
+    const text = state.goalText || "Hands-free until you turn it off";
+    row.innerHTML = `<i class="ph ph-target" aria-hidden="true"></i><span class="composer-goal-label">Goal</span>`
+      + `<span class="composer-goal-text" title="${esc(text)}">${esc(text)}</span>`
+      + `<button type="button" class="composer-goal-off" title="End the goal" aria-label="End the goal"><i class="ph ph-x" aria-hidden="true"></i></button>`;
+    row.querySelector(".composer-goal-off").addEventListener("click", turnGoalOff);
+  }
+  function turnGoalOff() {
+    if (state.chatId) {
+      fetch("/api/chat/goal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: state.chatId, active: false }),
+      }).catch(() => {});
+    }
+    setGoalModeUI(false);
+    toast("Goal mode off — back to your standing permissions.", "info", 3200, "goal-toggle");
   }
 
   async function send(opts = {}) {
+    // The tray is already on its way up; a second Enter would upload it twice.
+    if (state.uploadingFiles && opts.prompt === undefined && !opts.fromQueue) return false;
     // Edit & resend: only composer-originated sends become edits; queued messages
     // and suggestion-card prompts must not replace an edited turn.
     if (state.editingTurn && !opts.fromEdit && opts.prompt === undefined && !opts.fromQueue) {
@@ -5988,14 +6109,24 @@
     }
     let uploadedFiles = [];
     if (files.length) {
+      // From the tray the tiles show the progress; other sends keep the toast.
+      const onTray = fromComposer && files.length === state.pendingFiles.length
+        && files.every((file, i) => file === state.pendingFiles[i]);
+      // The tiles stay in place (re-rendering would replay their fade-in);
+      // a failed upload redraws them without the half-drawn rings.
+      state.uploadingFiles = true;
+      if (onTray) $("#image-tray")?.classList.add("uploading");
+      else toast(`uploading ${files.length} file${files.length === 1 ? "" : "s"}…`, "info", 60000, "client-upload");
       try {
-        toast(`uploading ${files.length} file${files.length === 1 ? "" : "s"}…`, "info", 60000, "client-upload");
-        uploadedFiles = await uploadClientFiles(files);
-        hideToast("client-upload");
+        uploadedFiles = await uploadClientFiles(files, onTray ? setAttachProgress : null);
       } catch (e) {
-        hideToast("client-upload");
         toast(`File upload failed: ${e.message || e}`, "err", 4500);
+        if (onTray) renderImageTray();
         return false;
+      } finally {
+        state.uploadingFiles = false;
+        hideToast("client-upload");
+        $("#image-tray")?.classList.remove("uploading");
       }
       const fileBlock = [
         "[Files uploaded from the active browser client into the inference PC workspace]",
@@ -8054,7 +8185,7 @@
       // Bridge echo of the /goal latch on this turn's own stream; apply it
       // unconditionally (chat_id can still be null on a brand-new chat, exactly
       // when the first flourish must show).
-      setGoalModeUI(!!evt.active);
+      setGoalModeUI(!!evt.active, { goal: evt.goal });
     } else if (evt.type === "breach") {
       if (!isAttackRailEnabled(row)) return;
       // Cyber-range / CTF: a FLAG{...} was captured in a tool response = a
@@ -8927,12 +9058,7 @@
   }
 
   function ghActivityOpen() {
-    const scrim = $("#github-activity-scrim"), modal = $("#github-activity-modal");
-    if (!scrim || !modal) return;
-    scrim.classList.add("open");
-    modal.classList.add("open");
-    modal.setAttribute("aria-hidden", "false");
-    loadGitHubActivity();
+    openSettingsAt("github");
   }
 
   function ghActivityClose() {
@@ -9581,6 +9707,10 @@
       panel.querySelector("#usage-day-detail").textContent = cell.dataset.detail;
       cells.forEach(item => { item.tabIndex = item === cell ? 0 : -1; item.classList.toggle("is-selected", item === cell); });
     }
+    const days = panel.querySelector(".usage-days");
+    days?.addEventListener("pointerleave", () => {
+      panel.querySelector("#usage-day-detail").textContent = (days.querySelector(".is-selected") || cells.at(-1))?.dataset.detail || "";
+    });
     for (const cell of cells) {
       cell.addEventListener("pointerenter", () => { panel.querySelector("#usage-day-detail").textContent = cell.dataset.detail; });
       cell.addEventListener("focus", () => describe(cell));
@@ -9594,7 +9724,9 @@
         cells[next]?.focus();
       });
     }
-    if (cells.length) describe(cells.at(-1));
+    if (cells.length) panel.querySelector("#usage-day-detail").textContent = cells.at(-1).dataset.detail;
+    const scroller = panel.querySelector(".usage-calendar-scroll");
+    if (scroller) scroller.scrollLeft = scroller.scrollWidth;
   }
 
   function renderUsageStats(data) {
@@ -9767,14 +9899,7 @@
   }
 
   function openUsageStats() {
-    const page = $("#usage-page");
-    if (!page) return;
-    closeFaq();
-    closeSecurityOverview();
-    page.classList.add("open");
-    page.setAttribute("aria-hidden", "false");
-    drawUsageMark(true);
-    loadUsageStats();
+    openSettingsAt("usage", "stats");
   }
 
   function closeUsageStats() {
@@ -10432,11 +10557,12 @@
     }
   }
 
+  // Too much to show in the settings window, so the overview keeps its own
+  // full page; its schedule stays in Settings > Security scans.
   async function openSecurityOverview() {
     const page = $("#security-page");
     if (!page) return;
     closeFaq();
-    closeUsageStats();
     closeSettings();
     page.classList.add("open");
     page.setAttribute("aria-hidden", "false");
@@ -10500,6 +10626,18 @@
     page.classList.add("open");
     page.setAttribute("aria-hidden", "false");
     requestAnimationFrame(syncFaqNav);
+  }
+
+  // Open the FAQ on one answer: clear any search that would hide it, expand
+  // it and bring it into view.
+  function openFaqAt(itemId) {
+    const search = $("#faq-search");
+    if (search?.value) { search.value = ""; filterFaq(""); }
+    openFaq();
+    const item = document.getElementById(itemId);
+    if (!item) return;
+    item.open = true;
+    requestAnimationFrame(() => item.scrollIntoView({ block: "center" }));
   }
 
   function closeFaq() {
@@ -11685,6 +11823,8 @@
 
       wrap.appendChild(wrapper);
     }
+    // The sidebar lists every project folder, so a folder change redraws it.
+    if ($("#sidebar")?.classList.contains("sb-v2")) renderChatList();
   }
 
   async function addWorkspaceFolder() {
@@ -12582,8 +12722,11 @@
         // /goal latch changed (toggle endpoint or a turn). Keep the stored chat
         // flag in sync, and repaint the chip when it's the chat in view.
         const c = state.chats && state.chats.chats && state.chats.chats[evt.chat_id];
-        if (c) c.goal_mode = !!evt.active;
-        if (!evt.chat_id || evt.chat_id === state.chatId) setGoalModeUI(!!evt.active);
+        if (c) {
+          c.goal_mode = !!evt.active;
+          if (evt.goal !== undefined) c.goal_text = evt.goal || "";
+        }
+        if (!evt.chat_id || evt.chat_id === state.chatId) setGoalModeUI(!!evt.active, { goal: evt.goal });
       } else if (evt.type === "chat:rename") {
         const c = state.chats && state.chats.chats && state.chats.chats[evt.chat_id];
         if (c) {
@@ -12825,7 +12968,6 @@
   }
 
   // ---------- settings drawer ----------
-  const SETTINGS_SECTION_STATE_KEY = "accuretta:settings-panels:v2";
 
   function settingsGroupTitle(el) {
     const label = el.querySelector(":scope > span:not(.grow):not(.hint)");
@@ -12836,23 +12978,6 @@
       .join(" ")
       .replace(/\s+/g, " ")
       .trim();
-  }
-
-  function readSettingsSectionState() {
-    try {
-      const value = JSON.parse(localStorage.getItem(SETTINGS_SECTION_STATE_KEY) || "{}");
-      return value && typeof value === "object" ? value : {};
-    } catch (_) {
-      return {};
-    }
-  }
-
-  function rememberSettingsSections() {
-    const next = {};
-    $$("#settings-body details.settings-section").forEach(section => {
-      next[section.dataset.settingsSection] = !!section.open;
-    });
-    try { localStorage.setItem(SETTINGS_SECTION_STATE_KEY, JSON.stringify(next)); } catch (_) {}
   }
 
   function settingsSectionId(title) {
@@ -12925,14 +13050,13 @@
       }
     });
 
-    const saved = readSettingsSectionState();
     const fragment = document.createDocumentFragment();
     chunks.forEach(chunk => {
       const sectionId = settingsSectionId(chunk.title);
       const section = document.createElement("details");
       section.className = "settings-section";
       section.dataset.settingsSection = sectionId;
-      section.open = !!saved[sectionId];
+      section.open = true;
 
       const summary = document.createElement("summary");
       summary.className = "settings-section-summary";
@@ -12941,11 +13065,9 @@
         <span class="settings-section-icon" aria-hidden="true"><i class="ph ${icon}"></i></span>
         <strong class="settings-section-title">${esc(chunk.title)}</strong>
         <i class="ph ph-caret-down settings-section-chevron" aria-hidden="true"></i>`;
-      summary.addEventListener("keydown", (event) => {
-        if (event.key !== "Enter" && event.key !== " ") return;
-        event.preventDefault();
-        section.open = !section.open;
-      });
+      // Sections stay open in the settings window; the summary is a heading.
+      summary.addEventListener("click", (event) => event.preventDefault());
+      summary.tabIndex = -1;
       section.appendChild(summary);
 
       const content = document.createElement("div");
@@ -12953,26 +13075,19 @@
       moveSettingsHeadingMeta(chunk.nodes[0], content);
       chunk.nodes.slice(1).forEach(node => content.appendChild(node));
       section.appendChild(content);
-      section.addEventListener("toggle", () => {
-        // Accordion exclusivity: opening one section closes the others, except while
-        // a search is driving sections open. The <details> toggle event fires async
-        // (after settingsSearchDriving has reset), so check the drawer's persistent
-        // is-searching class instead.
-        if (section.open && !$("#settings-drawer")?.classList.contains("is-searching")) {
-          body.querySelectorAll("details.settings-section[open]").forEach(other => {
-            if (other !== section) other.open = false;
-          });
-        }
-        // Search-driven opens (and cards opened while searching) aren't the user's
-        // accordion layout, so don't save them.
-        if (!settingsSearchDriving && !$("#settings-drawer")?.classList.contains("is-searching")) {
-          rememberSettingsSections();
-        }
-      });
       fragment.appendChild(section);
     });
 
     body.replaceChildren(fragment);
+    // A setting's description belongs under its name: a hint standing in its
+    // own row right above a toggle row moves into that row.
+    body.querySelectorAll(".settings-section-content > .form-row").forEach(row => {
+      const label = row.nextElementSibling?.matches(".form-row.inline") && row.nextElementSibling.querySelector(":scope > label");
+      if (label && row.children.length && [...row.children].every(child => child.matches("span.hint"))) {
+        label.after(...row.children);
+        row.remove();
+      }
+    });
     if (saveRow) {
       saveRow.classList.add("settings-savebar");
       body.after(saveRow);
@@ -12980,14 +13095,338 @@
     initSettingsNav();
   }
 
-  // ===== Settings section rail + search =====
-  // ~20 sections: a sticky rail jumps straight to one, and a search field
-  // filters rows live.
+  // ===== Pages that live in settings =====
+  // Usage stats, the security overview, MCP servers, command history and
+  // GitHub activity were pages and windows of their own. Their content moves
+  // into settings pages (ids, handlers and renderers stay as they were), their
+  // open functions open settings on that page, and each page loads its data
+  // when it is shown.
+  let settingsOpenPage = "";
+  let settingsUsageTab = "stats";
+  const SETTINGS_PAGE_SHOWN = {
+    usage: () => selectSettingsTab(settingsUsageTab),
+    tools: () => wbMcpLoad(),
+    github: () => loadGitHubActivity(),
+    profile: () => renderSettingsProfile(),
+    skills: () => loadSkills(true).then(renderSettingsSkills),
+    storage: () => loadSettingsStorage(),
+  };
+  // Sections a panel replaces: MCP servers' "Manage" row opened the window
+  // that now sits on the same page.
+  const SETTINGS_ABSORBED = ["mcp-servers"];
+
+  function openSettingsAt(pageId, tab = "") {
+    if (tab) settingsUsageTab = tab;
+    const drawer = $("#settings-drawer");
+    if (drawer?.classList.contains("open") && drawer.querySelector(".settings-pages")) {
+      showSettingsPage(pageId);
+      return;
+    }
+    settingsOpenPage = pageId;
+    openSettings();
+  }
+
+  function selectSettingsTab(tab) {
+    const panel = $('#settings-body > .settings-panel[data-settings-page="usage"]');
+    if (!panel) return;
+    settingsUsageTab = tab === "commands" ? "commands" : "stats";
+    panel.querySelectorAll("[data-settings-tab]").forEach(btn => {
+      btn.setAttribute("aria-selected", String(btn.dataset.settingsTab === settingsUsageTab));
+    });
+    panel.querySelectorAll("[data-settings-tab-panel]").forEach(el => {
+      el.hidden = el.dataset.settingsTabPanel !== settingsUsageTab;
+    });
+    if (settingsUsageTab === "commands") loadCmdHistory();
+    else { drawUsageMark(true); loadUsageStats(); }
+  }
+
+  // Profile: the picture (the usage card's, cropped and saved the same way)
+  // and a name, both shown at the top of the sidebar. Saved as they change.
+  function renderSettingsProfile() {
+    const url = state.settings?.profile_avatar || "";
+    const name = String(state.settings?.profile_name || "");
+    const pic = $("#settings-avatar");
+    if (pic) {
+      pic.innerHTML = url ? `<img src="${esc(url)}" alt="">` : esc((name.trim()[0] || "A").toUpperCase());
+      pic.classList.toggle("has-photo", !!url);
+    }
+    const remove = $("#settings-avatar-remove");
+    if (remove) remove.hidden = !url;
+    const input = $("#settings-profile-name");
+    if (input && document.activeElement !== input && input.value !== name) input.value = name;
+    if (typeof renderSidebarProfile === "function") renderSidebarProfile();
+  }
+
+  // Skills: what the skills folder holds; the loaded one is marked.
+  function renderSettingsSkills() {
+    const list = $("#settings-skill-list");
+    if (!list) return;
+    const skills = state.skills || [];
+    const active = state.activeSkill?.name || "";
+    $("#settings-skill-count").textContent = `${skills.length} skill${skills.length === 1 ? "" : "s"}`;
+    list.innerHTML = skills.length ? skills.map(s => `<div class="settings-card-row settings-skill">`
+      + `<i class="ph ph-book-open-text" aria-hidden="true"></i>`
+      + `<div class="settings-card-text"><b>${esc(s.name)}${s.name === active ? ` <span class="settings-badge">Loaded</span>` : ""}</b>`
+      + `<small title="${esc(s.description || "")}">${esc(s.description || "")}</small></div>`
+      + `<span class="settings-card-meta">~${esc(kTokens(s.budget || 0))} tok</span></div>`).join("")
+      : `<div class="settings-empty">No skills yet. Add a folder with a SKILL.md to the skills folder, then refresh.</div>`;
+  }
+
+  // Storage: the app's data on disk by kind. Clearable kinds get a delete
+  // button that asks first; the rest are shown for their size only.
+  const STORAGE_ICONS = {
+    chats: "ph-chats", versions: "ph-clock-counter-clockwise", snapshots: "ph-arrow-counter-clockwise",
+    evidence: "ph-crosshair", reports: "ph-file-text", history: "ph-terminal-window", logs: "ph-scroll",
+    backups: "ph-archive", audit: "ph-list-checks", models: "ph-cpu", security: "ph-shield-check",
+    cache: "ph-browser", journals: "ph-notebook", uploads: "ph-upload-simple",
+  };
+  let settingsStorage = null;
+  async function loadSettingsStorage() {
+    const table = $("#settings-storage-table");
+    if (!table) return;
+    try {
+      settingsStorage = await api("/api/storage");
+    } catch (e) {
+      table.innerHTML = `<div class="settings-empty">Could not read storage: ${esc(e.message || e)}</div>`;
+      return;
+    }
+    const day = (secs) => secs ? new Date(secs * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "—";
+    $("#settings-storage-total").textContent = `${humanBytes(settingsStorage.total || 0)} in ${settingsStorage.path || "the data folder"}`;
+    table.innerHTML = `<div class="settings-storage-head"><span>Kind</span><span>Files</span><span>Size</span><span>Last changed</span><span></span></div>`
+      + (settingsStorage.kinds || []).map(k => `<div class="settings-storage-row" title="${esc(k.path || "")}">`
+        + `<span class="settings-storage-kind"><i class="ph ${STORAGE_ICONS[k.key] || "ph-file"}" aria-hidden="true"></i>${esc(k.label)}</span>`
+        + `<span>${Number(k.files || 0).toLocaleString()}</span><span>${esc(humanBytes(k.size || 0))}</span><span>${esc(day(k.modified))}</span>`
+        + (k.clearable && k.files
+          ? `<button type="button" class="settings-storage-clear" data-storage-clear="${esc(k.key)}" title="Delete ${esc(k.label.toLowerCase())}" aria-label="Delete ${esc(k.label.toLowerCase())}"><i class="ph ph-trash" aria-hidden="true"></i></button>`
+          : `<span></span>`)
+        + `</div>`).join("");
+  }
+  async function clearSettingsStorage(key) {
+    const kind = (settingsStorage?.kinds || []).find(k => k.key === key);
+    if (!kind) return;
+    const ok = await confirmModal({
+      title: `Delete ${kind.label.toLowerCase()}?`,
+      message: `This permanently deletes ${Number(kind.files).toLocaleString()} file${kind.files === 1 ? "" : "s"} (${humanBytes(kind.size)}) from ${settingsStorage.path}. It can't be undone.`,
+      confirmText: "Delete",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const res = await api("/api/storage/clear", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key }),
+      });
+      if (res?.error) throw new Error(res.error);
+      toast(`Freed ${humanBytes(res.freed || 0)}${res.skipped ? ` · ${res.skipped} in use, left as they were` : ""}`, "ok", 3200);
+    } catch (e) {
+      toast(`Could not delete: ${e.message || e}`, "err", 4000);
+    }
+    loadSettingsStorage();
+  }
+
+  function initSettingsOwnPages(body) {
+    const panel = (pageId, html) => {
+      const el = document.createElement("div");
+      el.className = "settings-panel";
+      el.dataset.settingsPage = pageId;
+      el.innerHTML = html;
+      body.appendChild(el);
+      return el;
+    };
+    const profile = panel("profile", `<div class="settings-card">`
+      + `<div class="settings-card-row"><div class="settings-card-text"><b>Picture</b><small>Shown at the top of the sidebar and on your usage card.</small></div>`
+      + `<div class="settings-profile-pic"><span class="settings-avatar" id="settings-avatar" aria-hidden="true"></span>`
+      + `<button type="button" class="btn sm" id="settings-avatar-pick">Upload</button>`
+      + `<button type="button" class="btn sm" id="settings-avatar-remove" hidden>Remove</button></div></div>`
+      + `<div class="settings-card-row"><div class="settings-card-text"><b>Name</b><small>Shown at the top of the sidebar.</small></div>`
+      + `<input type="text" id="settings-profile-name" maxlength="40" placeholder="Your name" autocomplete="off" spellcheck="false"></div></div>`);
+    profile.querySelector("#settings-avatar-pick").addEventListener("click", () => $("#usage-avatar-file")?.click());
+    profile.querySelector("#settings-avatar-remove").addEventListener("click", () => $("#usage-avatar-remove")?.click());
+    const nameInput = profile.querySelector("#settings-profile-name");
+    nameInput.addEventListener("change", async () => {
+      await persistUiPreference({ profile_name: nameInput.value.trim().slice(0, 40) });
+      renderSettingsProfile();
+    });
+
+    const skills = panel("skills", `<div class="settings-panel-bar"><span id="settings-skill-count"></span>`
+      + `<button type="button" id="settings-skills-refresh"><i class="ph ph-arrow-clockwise" aria-hidden="true"></i>Refresh</button></div>`
+      + `<div class="settings-card" id="settings-skill-list"></div>`
+      + `<p class="settings-panel-note">Load a skill from the composer's + menu, or type # in the message box.</p>`);
+    skills.querySelector("#settings-skills-refresh").addEventListener("click", () => loadSkills(true).then(renderSettingsSkills));
+
+    const storage = panel("storage", `<div class="settings-panel-bar"><span id="settings-storage-total"></span>`
+      + `<button type="button" id="settings-storage-refresh"><i class="ph ph-arrow-clockwise" aria-hidden="true"></i>Refresh</button></div>`
+      + `<div class="settings-card settings-storage" id="settings-storage-table"></div>`
+      + `<p class="settings-panel-note">Only data that is safe to lose can be deleted here. Chats are cleared from the sidebar; uploads live in your workspace.</p>`);
+    storage.querySelector("#settings-storage-refresh").addEventListener("click", loadSettingsStorage);
+    storage.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-storage-clear]");
+      if (btn) clearSettingsStorage(btn.dataset.storageClear);
+    });
+  }
+
+  // The page list and the page fade at an edge with more behind it, instead
+  // of cutting off there.
+  function initSettingsFades() {
+    for (const el of [$("#settings-body"), $("#settings-drawer .settings-tools")]) {
+      if (!el) continue;
+      el.classList.add("settings-fade");
+      const sync = () => {
+        el.classList.toggle("fade-top", el.scrollTop > 2);
+        el.classList.toggle("fade-bottom", el.scrollTop + el.clientHeight < el.scrollHeight - 2);
+      };
+      el.addEventListener("scroll", sync, { passive: true });
+      new ResizeObserver(sync).observe(el);
+      new MutationObserver(sync).observe(el, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "hidden"] });
+      sync();
+    }
+  }
+
+  function initSettingsPanels(body) {
+    const section = id => body.querySelector(`details.settings-section[data-settings-section="${id}"]`);
+    const panel = (pageId, before) => {
+      const el = document.createElement("div");
+      el.className = "settings-panel";
+      el.dataset.settingsPage = pageId;
+      if (before) before.before(el);
+      else body.appendChild(el);
+      return el;
+    };
+    const bar = (...nodes) => {
+      const el = document.createElement("div");
+      el.className = "settings-panel-bar";
+      el.append(...nodes.filter(Boolean));
+      return el;
+    };
+    const tabPanel = (name, ...nodes) => {
+      const el = document.createElement("div");
+      el.dataset.settingsTabPanel = name;
+      el.append(...nodes.filter(Boolean));
+      return el;
+    };
+
+    // Usage: the stats, with the command history as a second tab.
+    const usage = panel("usage");
+    usage.innerHTML = `<div class="settings-tabs" role="tablist" aria-label="Usage">`
+      + `<button type="button" role="tab" data-settings-tab="stats" aria-selected="true">Stats</button>`
+      + `<button type="button" role="tab" data-settings-tab="commands" aria-selected="false">Commands</button></div>`;
+    usage.append(
+      tabPanel("stats", bar($("#btn-refresh-usage")), $("#usage-page .usage-shell")),
+      tabPanel("commands", bar($("#cmd-history-count"), $("#btn-cmd-history-refresh"), $("#btn-cmd-history-clear")), $("#cmd-history-body")));
+    usage.querySelector(".settings-tabs").addEventListener("click", (e) => {
+      const tab = e.target.closest("[data-settings-tab]");
+      if (tab) selectSettingsTab(tab.dataset.settingsTab);
+    });
+
+    // Security scans: the schedule, and a way to the overview's full page.
+    const security = panel("security", section("scheduled-security-overview"));
+    security.innerHTML = `<div class="settings-panel-bar"><span>The scan results have their own page.</span>`
+      + `<button type="button" id="settings-open-security"><i class="ph ph-lightning" aria-hidden="true"></i>Open Security overview</button></div>`;
+    security.querySelector("#settings-open-security").addEventListener("click", openSecurityOverview);
+
+    // Tools: MCP servers lead the page.
+    const tools = panel("tools", section("mcp-servers"));
+    tools.append($("#mcp-window .mcp-head"), $("#mcp-window .mcp-body"));
+
+    // GitHub: activity under the integration settings.
+    const github = panel("github");
+    section("github-integration")?.after(github);
+    github.append(bar($("#gh-activity-login")), $("#gh-activity-body"));
+
+    initSettingsOwnPages(body);
+  }
+
+  function wbMcpShown() {
+    const drawer = $("#settings-drawer");
+    return !!drawer?.classList.contains("open") && drawer.dataset.settingsPage === "tools";
+  }
+
+  // ===== Settings window: page list + search =====
+  // A centered window: grouped pages on the left with search on top, one page
+  // at a time on the right. A page shows its sections fully open, each titled
+  // like a group; search looks across every page. Sections no page claims land
+  // on "More", so a new settings group never goes missing.
+  const SETTINGS_PAGES = [
+    { group: "Settings", pages: [
+      { id: "general", label: "General", icon: "ph-gear-six", sections: ["network", "notifications", "keyboard-shortcuts", "preview"] },
+      { id: "profile", label: "Profile", icon: "ph-user-circle", sections: [] },
+      { id: "appearance", label: "Appearance", icon: "ph-palette", sections: ["appearance"] },
+      { id: "usage", label: "Usage", icon: "ph-chart-bar", sections: [] },
+      { id: "memory", label: "Memory & rules", icon: "ph-notebook", sections: ["machine-context", "preferences-and-memory"] },
+      { id: "tools", label: "Tools", icon: "ph-wrench", sections: ["mcp-servers", "analysis-tools", "desktop-automation", "sandbox"] },
+      { id: "storage", label: "Storage", icon: "ph-database", sections: [] },
+    ] },
+    { group: "Models", pages: [
+      { id: "model", label: "Model", icon: "ph-cpu", sections: ["model"] },
+      { id: "performance", label: "Performance", icon: "ph-gauge", sections: ["auto-tune", "model-health"] },
+      { id: "generation", label: "Generation", icon: "ph-sliders-horizontal", sections: ["sampling", "reasoning", "sub-agents"] },
+      { id: "developer", label: "Developer", icon: "ph-terminal-window", sections: ["advanced-llama-server"] },
+    ] },
+    { group: "Security", pages: [
+      { id: "approvals", label: "Approvals", icon: "ph-shield-check", sections: ["approvals"] },
+      { id: "security", label: "Security scans", icon: "ph-shield-star", sections: ["scheduled-security-overview"] },
+      { id: "red-team", label: "Red team", icon: "ph-crosshair", sections: ["red-team-tools", "red-team-stealth"] },
+    ] },
+    { group: "Connections", pages: [
+      { id: "skills", label: "Skills", icon: "ph-book-open-text", sections: [] },
+      { id: "github", label: "GitHub", icon: "ph-github-logo", sections: ["github-integration"] },
+      { id: "remote", label: "Remote", icon: "ph-device-mobile", sections: ["tailscale-remote-access", "discord-remote-bridge"] },
+    ] },
+  ];
+  const SETTINGS_PAGE_KEY = "accuretta:settings-page";
+  const settingsPageList = () => SETTINGS_PAGES.flatMap(group => group.pages);
+
+  function showSettingsPage(pageId) {
+    const body = $("#settings-body");
+    const drawer = $("#settings-drawer");
+    if (!body || !drawer) return;
+    const pages = settingsPageList();
+    const page = pages.find(p => p.id === pageId) || pages[0];
+    body.querySelectorAll(":scope > [data-settings-page]").forEach(el => {
+      el.classList.toggle("off-page", el.dataset.settingsPage !== page.id);
+    });
+    drawer.querySelectorAll(".settings-pages [data-settings-page]").forEach(btn => {
+      const on = btn.dataset.settingsPage === page.id;
+      btn.classList.toggle("is-current", on);
+      if (on) btn.setAttribute("aria-current", "page");
+      else btn.removeAttribute("aria-current");
+    });
+    const title = drawer.querySelector(".drawer-head h3");
+    if (title) title.textContent = page.label;
+    drawer.dataset.settingsPage = page.id;
+    body.scrollTop = 0;
+    try { localStorage.setItem(SETTINGS_PAGE_KEY, page.id); } catch (_) {}
+    if (drawer.classList.contains("open")) SETTINGS_PAGE_SHOWN[page.id]?.();
+  }
+
   function initSettingsNav() {
     const body = $("#settings-body");
     const drawer = $("#settings-drawer");
     if (!body || !drawer || body.dataset.navReady === "1") return;
     body.dataset.navReady = "1";
+    drawer.classList.add("settings-window");
+
+    const sections = () => [...body.querySelectorAll("details.settings-section")];
+    // Claim each section for its page; strays go to "More".
+    const claimed = new Set([...settingsPageList().flatMap(p => p.sections), ...SETTINGS_ABSORBED]);
+    const strays = sections().map(s => s.dataset.settingsSection).filter(id => !claimed.has(id));
+    if (strays.length) SETTINGS_PAGES[0].pages.push({ id: "more", label: "More", icon: "ph-dots-three-circle", sections: strays });
+    const pages = settingsPageList();
+    sections().forEach(section => {
+      if (SETTINGS_ABSORBED.includes(section.dataset.settingsSection)) {
+        section.classList.add("absorbed");
+        return;
+      }
+      const page = pages.find(p => p.sections.includes(section.dataset.settingsSection));
+      section.dataset.settingsPage = page.id;
+      // A page with one section already says its name in the header.
+      section.toggleAttribute("data-solo", page.sections.length === 1);
+    });
+    // Sections follow their page's order, so a page reads top to bottom.
+    pages.forEach(page => page.sections.forEach(id => {
+      const section = body.querySelector(`details.settings-section[data-settings-section="${id}"]`);
+      if (section) body.appendChild(section);
+    }));
+    initSettingsPanels(body);
 
     const head = drawer.querySelector(".drawer-head");
     const tools = document.createElement("div");
@@ -12995,49 +13434,27 @@
     tools.innerHTML = `
       <label class="settings-search">
         <i class="ph ph-magnifying-glass" aria-hidden="true"></i>
-        <input type="search" id="settings-search-input" placeholder="Search settings…" autocomplete="off" spellcheck="false" aria-label="Search settings">
+        <input type="search" id="settings-search-input" placeholder="Search settings" autocomplete="off" spellcheck="false" aria-label="Search settings">
         <button type="button" class="settings-search-clear" title="Clear search" aria-label="Clear search"><i class="ph ph-x"></i></button>
       </label>
-      <nav class="settings-nav" aria-label="Settings sections"></nav>
+      <nav class="settings-pages" aria-label="Settings pages">${SETTINGS_PAGES.map(group =>
+        `<div class="settings-pages-group">${esc(group.group)}</div>`
+        + group.pages.map(page => `<button type="button" data-settings-page="${esc(page.id)}">`
+          + `<i class="ph ${page.icon}" aria-hidden="true"></i><span>${esc(page.label)}</span></button>`).join("")).join("")}</nav>
       <p class="settings-search-note" id="settings-search-note" aria-live="polite"></p>`;
-
-    const nav = tools.querySelector(".settings-nav");
     const input = tools.querySelector("#settings-search-input");
     const clearBtn = tools.querySelector(".settings-search-clear");
     const note = tools.querySelector("#settings-search-note");
 
-    const sections = () => [...body.querySelectorAll("details.settings-section")];
-
-    // Rail chips: one per section. Clicking jumps and opens (the accordion
-    // exclusivity in the section toggle handler closes the others).
-    sections().forEach(section => {
-      const title = section.querySelector(".settings-section-title")?.textContent || section.dataset.settingsSection;
-      const icon = SETTINGS_SECTION_ICONS[section.dataset.settingsSection] || "ph-gear";
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.dataset.settingsSection = section.dataset.settingsSection;
-      btn.innerHTML = `<i class="ph ${icon}" aria-hidden="true"></i><span>${esc(title)}</span>`;
-      btn.addEventListener("click", () => {
-        section.open = true;
-        section.scrollIntoView({ behavior: "smooth", block: "start" });
-        nav.querySelectorAll("button").forEach(b => b.classList.toggle("is-current", b === btn));
-      });
-      nav.appendChild(btn);
+    tools.querySelector(".settings-pages").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-settings-page]");
+      if (!btn) return;
+      if (input.value) { input.value = ""; applySearch(); }
+      showSettingsPage(btn.dataset.settingsPage);
     });
 
-    // Track which section is in view so the rail follows scroll.
-    const railObserver = new IntersectionObserver(entries => {
-      if (input.value.trim()) return;
-      const visible = entries.filter(e => e.isIntersecting)
-        .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
-      if (!visible) return;
-      nav.querySelectorAll("button").forEach(b =>
-        b.classList.toggle("is-current", b.dataset.settingsSection === visible.target.dataset.settingsSection));
-    }, { root: body, threshold: [0.05, 0.3] });
-    sections().forEach(section => railObserver.observe(section));
-
-    // Search: hide non-matching rows, auto-open matching sections, and
-    // collapse to a count note. Esc clears; empty restores the accordion.
+    // Search: rows that match show, across every page, under their section's
+    // title; the rest hide. Empty restores the current page.
     let searchTimer = null;
     // textContent misses placeholders, titles, aria-labels, select options and
     // typed values, so row matching uses all of them.
@@ -13056,22 +13473,6 @@
       ];
       return parts.join(" ").toLowerCase();
     };
-    // Match-count pill on a section summary (before the chevron); count 0 removes
-    // it. Sections stay collapsed during search and the badge says how many
-    // settings matched.
-    const setSectionCount = (section, count) => {
-      const summary = section.querySelector(".settings-section-summary");
-      if (!summary) return;
-      let badge = summary.querySelector(".settings-section-count");
-      if (!count) { badge?.remove(); return; }
-      if (!badge) {
-        badge = document.createElement("span");
-        badge.className = "settings-section-count";
-        badge.setAttribute("aria-hidden", "true");
-        summary.insertBefore(badge, summary.querySelector(".settings-section-chevron"));
-      }
-      badge.textContent = String(count);
-    };
     const applySearch = () => {
       const q = input.value.trim().toLowerCase();
       tools.querySelector(".settings-search").classList.toggle("has-value", !!q);
@@ -13079,51 +13480,31 @@
       drawer.classList.toggle("is-searching", searching);
       let hitRows = 0;
       let hitSections = 0;
-      settingsSearchDriving = true;
-      try {
       sections().forEach(section => {
         const titleHit = searching && (section.querySelector(".settings-section-title")?.textContent || "").toLowerCase().includes(q);
         const content = section.querySelector(".settings-section-content");
-        const rows = content ? [...content.children] : [];
         let sectionHits = 0;
-        rows.forEach(row => {
-          // A section-title match reveals the whole section, so searching a section
-          // name ("key" -> Keyboard shortcuts) shows its controls, not just the
-          // description.
+        [...(content?.children || [])].forEach(row => {
+          // A section-title match shows the whole section, so searching a
+          // section's name ("key" -> Keyboard shortcuts) shows its controls.
           const match = !searching || titleHit || rowHaystack(row).includes(q);
           row.hidden = searching && !match;
           if (searching && match) sectionHits++;
         });
         const isMatch = sectionHits > 0 || !!titleHit;
-        if (searching) {
-          // Matching sections show closed with a count badge; the user opens the one
-          // they want (accordion exclusivity is off while searching).
-          section.open = false;
-          if (isMatch) hitSections++;
-          hitRows += sectionHits;
-          section.toggleAttribute("data-no-matches", !isMatch);
-          setSectionCount(section, isMatch ? sectionHits : 0);
-        } else {
-          // Back to the user's own accordion state so a cleared search
-          // leaves the drawer exactly as they'd find it manually.
-          const saved = readSettingsSectionState();
-          if (section.dataset.settingsSection in saved) {
-            section.open = !!saved[section.dataset.settingsSection];
-          }
-          section.removeAttribute("data-no-matches");
-          setSectionCount(section, 0);
-        }
+        if (searching && isMatch) hitSections++;
+        hitRows += sectionHits;
         section.hidden = searching && !isMatch;
       });
-      } finally {
-        settingsSearchDriving = false;
-      }
+      const title = drawer.querySelector(".drawer-head h3");
       if (searching) {
+        if (title) title.textContent = "Search";
         note.textContent = hitRows
           ? `${hitRows} setting${hitRows === 1 ? "" : "s"} in ${hitSections} section${hitSections === 1 ? "" : "s"}`
           : "No settings match. Check the spelling or try a shorter word.";
         note.classList.add("has-hits");
       } else {
+        showSettingsPage(drawer.dataset.settingsPage);
         note.textContent = "";
         note.classList.remove("has-hits");
       }
@@ -13133,19 +13514,23 @@
       searchTimer = setTimeout(applySearch, 120);
     });
     input.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { input.value = ""; applySearch(); input.blur(); }
+      if (e.key === "Escape" && input.value) { e.stopPropagation(); input.value = ""; applySearch(); }
     });
     clearBtn.addEventListener("click", () => { input.value = ""; applySearch(); input.focus(); });
 
-    // The tools block mounts between the head and the scrollable body.
-    head.after(tools);
+    // The page list sits beside the header and the scrollable body.
+    head.before(tools);
+    let saved = "";
+    try { saved = localStorage.getItem(SETTINGS_PAGE_KEY) || ""; } catch (_) {}
+    showSettingsPage(saved);
+    initSettingsFades();
   }
 
   function revealSettingsControl(selector) {
     const el = typeof selector === "string" ? $(selector) : selector;
     if (!el) return;
-    const section = el.closest("details.settings-section");
-    if (section) section.open = true;
+    const holder = el.closest("#settings-body > [data-settings-page]");
+    if (holder) showSettingsPage(holder.dataset.settingsPage);
     requestAnimationFrame(() => el.scrollIntoView({ behavior: "smooth", block: "center" }));
   }
 
@@ -13514,16 +13899,20 @@
   let settingsReturnFocus = null;
   // While a settings search drives sections open/closed, the toggle handler
   // must not persist those forced moves as the user's accordion preference.
-  let settingsSearchDriving = false;
   async function openSettings() {
     closeSecurityOverview();
     closeFaq();
     closeUsageStats();
     initSettingsSections();
+    if (settingsOpenPage) {
+      showSettingsPage(settingsOpenPage);
+      settingsOpenPage = "";
+    }
     $("#drawer-scrim").classList.add("open");
     settingsReturnFocus = document.activeElement;
     $("#settings-drawer").classList.add("open");
     $("#settings-drawer").setAttribute("aria-hidden", "false");
+    SETTINGS_PAGE_SHOWN[$("#settings-drawer").dataset.settingsPage]?.();
     $("#btn-close-settings").focus();
     touchedLoadControls.clear();
     populateSettingsForm();
@@ -14196,7 +14585,15 @@
       if (btn) btn.disabled = false;
     }
   }
-  function closeSettings() {
+  function closeSettings(force = false) {
+    // Unsaved MCP server edits ask first, as their own window did.
+    if (!force && mcpUi.dirty && wbMcpShown()) {
+      confirmModal({ title: "Discard changes?", message: "This server has unsaved changes.", confirmText: "Discard", danger: true })
+        .then(ok => { if (ok) { mcpUi.dirty = false; closeSettings(true); } });
+      return;
+    }
+    clearTimeout(mcpUi.poll);
+    closeUsageStats();
     $("#drawer-scrim").classList.remove("open");
     $("#settings-drawer").classList.remove("open");
     settingsReturnFocus?.focus();
@@ -14214,10 +14611,8 @@
   // stdout/stderr, duration). Fetches /api/cmd-history on open and renders each
   // entry as a collapsed row with click-to-expand detail, using the Settings
   // scrim mechanism.
-  async function openCmdHistory() {
-    $("#cmd-history-scrim").classList.add("open");
-    $("#cmd-history-drawer").classList.add("open");
-    await loadCmdHistory();
+  function openCmdHistory() {
+    openSettingsAt("usage", "commands");
   }
   function closeCmdHistory() {
     $("#cmd-history-scrim").classList.remove("open");
@@ -14944,10 +15339,18 @@
   function normalizeTheme(theme) {
     return THEME_MIGRATIONS[theme] || theme;
   }
-  function nextTheme(cur) {
+  function nextTheme(cur, step = 1) {
     cur = normalizeTheme(cur);
+    const n = THEME_CYCLE.length;
     const idx = THEME_CYCLE.indexOf(cur);
-    return THEME_CYCLE[(idx + 1) % THEME_CYCLE.length];
+    return THEME_CYCLE[((idx + step) % n + n) % n];
+  }
+  // Every theme control steps through THEME_CYCLE. The theme shows at once and
+  // saves behind it, so quick clicks keep stepping instead of repeating one.
+  async function stepTheme(step = 1) {
+    const next = nextTheme(document.documentElement.dataset.theme || state.settings.theme || "light", step);
+    applyTheme(next);
+    await saveSettings({ theme: next });
   }
   // applyTheme takes a theme string from THEME_CYCLE; a boolean from older
   // callers is coerced (true -> "dark", false -> "light").
@@ -15820,6 +16223,7 @@
     }
     const remove = $("#usage-avatar-remove");
     if (remove) remove.hidden = !url;
+    renderSettingsProfile();
   }
 
   // Center-crop to a 192px square JPEG so the picture stays small in settings.
@@ -16378,7 +16782,8 @@
       pill.title = `${String(state.missingModel).split(/[\\/]/).pop()} is no longer on disk — click to pick another model`;
     } else if (loadedPath) {
       const fullName = String(loadedPath).split(/[\\/]/).pop();
-      const shortName = shortenModelName(fullName);
+      const entry = (state.modelsList || []).find(m => m.path === loadedPath);
+      const shortName = entry?.display_name || shortenModelName(fullName);
       nameEl.textContent = state._reloading ? `${shortName} …` : shortName;
       pill.title = state._reloading
         ? `${fullName} — reloading with new settings…`
@@ -16443,6 +16848,7 @@
     if (popoverValue) popoverValue.textContent = meta.label;
     if (icon) icon.className = `ph ${meta.icon} mode-pill-icon`;
     if (pill) pill.setAttribute("aria-label", `Composer mode: ${meta.label}`);
+    wbSyncModeChip();
     if (persist) {
       persistUiPreference({ composer_mode: mode });
       const chat = state.chats?.chats?.[state.chatId];
@@ -16796,63 +17202,136 @@
 
   // Rows for the model-pill dropdown from state.modelsList, rebuilt on every
   // open so the "loaded" indicator matches what the bridge is running.
+  // ---- model menu ----
+  // A rail of model families beside the list. Files of one model fold into a
+  // row whose "N versions" chip lists them by bit level and size, and the
+  // loaded row carries the reasoning-effort chip. Names, groups, families,
+  // logos and bit levels come from /api/models (model_display_info in
+  // bridge.py); a family without a logo shows its first letter.
+  const mp = { family: "", query: "", open: new Set(), view: "models" };
+
+  function wbModelGroups() {
+    const groups = new Map();
+    for (const m of state.modelsList || []) {
+      const key = m.group || String(m.name || "").toLowerCase();
+      if (!groups.has(key)) {
+        groups.set(key, { key, name: m.display_name || shortenModelName(m.name), family: m.family || "other",
+          familyLabel: m.family_label || "Other", familyLogo: m.family_logo || "", files: [] });
+      }
+      groups.get(key).files.push(m);
+    }
+    for (const g of groups.values()) g.files.sort((a, b) => (a.size || 0) - (b.size || 0));
+    return [...groups.values()];
+  }
+  const wbLoadedPath = () => state.loadedModel || state.settings.model_path || "";
+  const wbFileLoaded = (m) => m.path === wbLoadedPath() || !!m.loaded;
+  const wbGigs = (bytes) => (bytes ? `${(bytes / 1073741824).toFixed(1)} GB` : "");
+  const wbBitsLabel = (m) => [m.bits ? `${m.bits}-bit` : "", wbGigs(m.size)].filter(Boolean).join(" · ");
+  // Five bars of precision: 2-bit lights one, 8-bit and up lights all five.
+  function wbBars(bits) {
+    const level = bits >= 8 ? 5 : bits >= 5 ? 4 : bits >= 4 ? 3 : bits >= 3 ? 2 : bits ? 1 : 0;
+    return `<span class="wb-mp-bars" data-level="${level}" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>`;
+  }
+  function wbFamilyGlyph(logo, label) {
+    return /^[\w-]+$/.test(logo || "")
+      ? `<span class="wb-mp-logo" style="--wb-logo:url('/assets/vendor/lobe-icons/${logo}.svg')" aria-hidden="true"></span>`
+      : `<span class="wb-mp-letter" aria-hidden="true">${esc((label || "?").charAt(0).toUpperCase())}</span>`;
+  }
+  function wbDraftBadge(m) {
+    const pair = state.draftPairs && state.draftPairs[m.path];
+    return pair ? `<i class="ph-fill ph-lightning wb-mp-draft" title="DFlash draft paired: ${esc(pair.draft)}" aria-hidden="true"></i>` : "";
+  }
+  function wbModelGroupHtml(g, isLoaded) {
+    const multi = g.files.length > 1;
+    const single = g.files[0];
+    const open = multi && mp.open.has(g.key);
+    const effortCtl = $("#reasoning-effort-control");
+    const effortOn = isLoaded && effortCtl && !effortCtl.classList.contains("hidden");
+    const effortLabel = $("#reasoning-effort-value")?.textContent.trim() || "Default";
+    let html = `<div class="wb-mp-row${isLoaded ? " loaded" : ""}" data-mp-group="${esc(g.key)}">`
+      + `<button type="button" class="wb-mp-pick" role="option" aria-selected="${isLoaded}"`
+      + (multi ? ` data-mp-versions aria-expanded="${open}" title="${esc(g.name)}: ${g.files.length} files"`
+        : ` data-mp-path="${esc(single.path)}" title="${esc(single.name)}"`)
+      + `><span class="wb-mp-name">${esc(g.name)}</span>${multi ? "" : wbDraftBadge(single)}</button>`
+      + (effortOn ? `<button type="button" class="wb-mp-chip" data-mp-effort title="Reasoning effort for the next message">${esc(effortLabel)}<i class="ph ph-caret-right" aria-hidden="true"></i></button>` : "")
+      + (multi
+        ? `<button type="button" class="wb-mp-chip" data-mp-versions aria-expanded="${open}">${g.files.length} versions<i class="ph ph-caret-${open ? "down" : "right"}" aria-hidden="true"></i></button>`
+        : `<span class="wb-mp-meta">${esc(wbBitsLabel(single))}</span>`)
+      + `<span class="wb-mp-radio" aria-hidden="true"></span></div>`;
+    if (open) {
+      html += `<div class="wb-mp-versions" role="group" aria-label="${esc(g.name)} versions">`
+        + g.files.map(m => {
+          const on = wbFileLoaded(m);
+          const tag = [...(m.quant_tags || []), m.quant || ""].filter(Boolean).join(" ");
+          return `<button type="button" class="wb-mp-ver${on ? " loaded" : ""}" data-mp-path="${esc(m.path)}" role="option" aria-selected="${on}" title="${esc(m.name)}">`
+            + `${wbBars(m.bits)}<span class="wb-mp-ver-name">${esc(wbBitsLabel(m))}</span>${wbDraftBadge(m)}`
+            + `<span class="wb-mp-tag">${esc(tag)}</span><i class="ph ph-check wb-mp-check" aria-hidden="true"></i></button>`;
+        }).join("") + `</div>`;
+    }
+    return html;
+  }
+  function wbEffortRowsHtml() {
+    return `<button type="button" class="wb-mp-item wb-mp-back" data-mp-back><i class="ph ph-caret-left" aria-hidden="true"></i><span class="wb-mp-name">Effort</span></button>`
+      + [...document.querySelectorAll("#reasoning-effort-menu .effort-option")].map(opt => {
+        const on = opt.classList.contains("active");
+        const icon = [...(opt.querySelector("i.ph")?.classList || [])].find(c => c.startsWith("ph-")) || "ph-brain";
+        return `<button type="button" class="wb-mp-item${on ? " loaded" : ""}" data-mp-level="${esc(opt.dataset.level)}" role="menuitemradio" aria-checked="${on}">`
+          + `<i class="ph ${icon}" aria-hidden="true"></i><span class="wb-mp-name">${esc(opt.querySelector("span")?.textContent.trim() || opt.dataset.level)}</span>`
+          + `<i class="ph ph-check wb-mp-check" aria-hidden="true"></i></button>`;
+      }).join("");
+  }
+  function wbRenderModelList() {
+    const menu = $("#model-pill-menu");
+    const shell = menu?.querySelector(".wb-mp");
+    if (!shell) return;
+    const groups = wbModelGroups();
+    const families = new Map();
+    for (const g of groups) {
+      const f = families.get(g.family) || { key: g.family, label: g.familyLabel, logo: g.familyLogo, count: 0 };
+      f.count += 1;
+      families.set(g.family, f);
+    }
+    const fams = [...families.values()].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+    const loaded = groups.find(g => g.files.some(wbFileLoaded));
+    if (!families.has(mp.family)) mp.family = loaded?.family || fams[0]?.key || "";
+    const q = mp.query.trim().toLowerCase();
+    shell.dataset.view = mp.view;
+    shell.querySelector(".wb-mp-rail").innerHTML = fams.map(f => {
+      const on = !q && f.key === mp.family;
+      return `<button type="button" class="wb-mp-fam${on ? " on" : ""}" data-mp-family="${esc(f.key)}" aria-pressed="${on}"`
+        + ` aria-label="${esc(f.label)}" title="${esc(f.label)} · ${f.count}">${wbFamilyGlyph(f.logo, f.label)}</button>`;
+    }).join("");
+    const list = shell.querySelector(".wb-mp-list");
+    if (mp.view === "effort") {
+      list.innerHTML = wbEffortRowsHtml();
+      return;
+    }
+    const shown = q
+      ? groups.filter(g => g.name.toLowerCase().includes(q) || g.files.some(m => String(m.name).toLowerCase().includes(q)))
+      : groups.filter(g => g.family === mp.family);
+    list.innerHTML = shown.map(g => wbModelGroupHtml(g, g === loaded)).join("")
+      || `<div class="wb-mp-empty">${q ? "No models match that search" : "No models in this family"}</div>`;
+  }
   function renderModelMenu() {
     const menu = $("#model-pill-menu");
     if (!menu) return;
-    menu.innerHTML = "";
-    const list = state.modelsList || [];
-    if (!list.length) {
-      const empty = document.createElement("div");
-      empty.className = "model-pill-menu-empty";
-      empty.textContent = state.modelsError || "pick a models folder in Settings";
-      menu.appendChild(empty);
-      wbAugmentModelMenu(menu);
+    if (!(state.modelsList || []).length) {
+      menu.innerHTML = `<div class="model-pill-menu-empty">${esc(state.modelsError || "pick a models folder in Settings")}</div>`;
       return;
     }
-    const loadedPath = state.loadedModel || state.settings.model_path || "";
-    for (const m of list) {
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = "mm-row" + ((m.path === loadedPath || m.loaded) ? " loaded" : "");
-      row.dataset.path = m.path;
-      row.setAttribute("role", "option");
-      row.title = m.path;
-      const dot = document.createElement("span");
-      dot.className = "mm-row-dot";
-      const name = document.createElement("span");
-      name.className = "mm-row-name";
-      name.textContent = m.name;
-      row.appendChild(dot);
-      row.appendChild(name);
-      const pair = state.draftPairs && state.draftPairs[m.path];
-      if (pair) {
-        const badge = document.createElement("span");
-        badge.className = "mm-row-draft";
-        badge.title = `DFlash draft paired: ${pair.draft}`;
-        badge.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13 2 4.5 13.5h6L9 22l10.5-12.5h-6.5z"/></svg>';
-        row.appendChild(badge);
-      }
-      if (m.size_gb) {
-        const size = document.createElement("span");
-        size.className = "mm-row-size";
-        size.textContent = `${m.size_gb} GB`;
-        row.appendChild(size);
-      }
-      row.addEventListener("click", async () => {
-        const btn = $("#model-pill");
-        menu.classList.remove("open");
-        btn?.classList.remove("open");
-        const allRows = menu.querySelectorAll(".mm-row");
-        allRows.forEach(r => r.setAttribute("disabled", "true"));
-        try {
-          await loadModelByPath(m.path);
-        } finally {
-          allRows.forEach(r => r.removeAttribute("disabled"));
-        }
+    if (!menu.querySelector(".wb-mp")) {
+      menu.innerHTML = `<div class="wb-mp"><nav class="wb-mp-rail" aria-label="Model families"></nav><div class="wb-mp-main">`
+        + `<div class="wb-mp-head"><span class="wb-mp-title">Models</span><label class="wb-mp-search">`
+        + `<input type="search" placeholder="Quick search" aria-label="Search models" autocomplete="off" spellcheck="false">`
+        + `<i class="ph ph-magnifying-glass" aria-hidden="true"></i></label></div>`
+        + `<div class="wb-mp-list" role="listbox" aria-label="Models"></div></div></div>`;
+      menu.querySelector(".wb-mp-search input").addEventListener("input", (e) => {
+        mp.query = e.target.value;
+        mp.view = "models";
+        wbRenderModelList();
       });
-      menu.appendChild(row);
     }
-    wbAugmentModelMenu(menu);
+    wbRenderModelList();
   }
 
   // Model-pill dropdown toggle. Same positioning as wireOverflow (reparent to
@@ -16865,43 +17344,122 @@
     if (menu.parentNode !== document.body) document.body.appendChild(menu);
     function positionMenu() {
       const r = btn.getBoundingClientRect();
-      const mw = menu.offsetWidth || 240;
-      const mh = menu.offsetHeight || 200;
       const margin = 8;
       const vw = window.innerWidth, vh = window.innerHeight;
-      let top = r.top - mh - 6;
-      if (top < margin) top = r.bottom + 6;
-      if (top + mh > vh - margin) top = Math.max(margin, vh - mh - margin);
+      // Open on the roomier side and let the list scroll, so expanding a
+      // model's versions never flips the menu over the composer.
+      menu.style.maxHeight = "";
+      const above = r.top - 6 - margin;
+      const below = vh - r.bottom - 6 - margin;
+      const up = menu.offsetHeight <= above || above >= below;
+      menu.style.maxHeight = `min(460px, ${Math.max(160, Math.round(up ? above : below))}px)`;
+      const mw = menu.offsetWidth || 240;
+      const mh = menu.offsetHeight || 200;
+      const top = up ? r.top - mh - 6 : r.bottom + 6;
       let left = r.right - mw;
       if (left + mw > vw - margin) left = vw - mw - margin;
       if (left < margin) left = margin;
-      menu.style.top = `${Math.round(top)}px`;
+      menu.style.top = `${Math.round(Math.max(margin, top))}px`;
       menu.style.left = `${Math.round(left)}px`;
     }
+    const close = () => {
+      menu.classList.remove("open");
+      btn.classList.remove("open");
+    };
+    // Re-render the list in place and put focus back on the same control.
+    const rerender = (focusSel) => {
+      wbRenderModelList();
+      positionMenu();
+      if (focusSel) menu.querySelector(focusSel)?.focus({ preventScroll: true });
+    };
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
       const willOpen = !menu.classList.contains("open");
       if (willOpen) {
+        // Open on the loaded model's family, its versions showing.
+        mp.view = "models";
+        mp.query = "";
+        mp.family = "";
+        const loaded = wbModelGroups().find(g => g.files.some(wbFileLoaded));
+        if (loaded && loaded.files.length > 1) mp.open.add(loaded.key);
         renderModelMenu();
+        const input = menu.querySelector(".wb-mp-search input");
+        if (input) input.value = "";
         menu.classList.add("open");
         btn.classList.add("open");
         positionMenu();
         requestAnimationFrame(positionMenu);
+        if (input && !isMobile()) input.focus({ preventScroll: true });
       } else {
-        menu.classList.remove("open");
-        btn.classList.remove("open");
+        close();
+      }
+    });
+    menu.addEventListener("click", async (e) => {
+      // The list re-renders under the click, so the target may already be
+      // detached by the time the document handler would see it.
+      e.stopPropagation();
+      const t = e.target;
+      const fam = t.closest("[data-mp-family]");
+      if (fam) {
+        mp.family = fam.dataset.mpFamily;
+        mp.query = "";
+        mp.view = "models";
+        const input = menu.querySelector(".wb-mp-search input");
+        if (input) input.value = "";
+        return rerender(`[data-mp-family="${CSS.escape(mp.family)}"]`);
+      }
+      if (t.closest("[data-mp-back]")) {
+        mp.view = "models";
+        return rerender("[data-mp-effort]");
+      }
+      if (t.closest("[data-mp-effort]")) {
+        mp.view = "effort";
+        return rerender(".wb-mp-item.loaded");
+      }
+      const level = t.closest("[data-mp-level]");
+      if (level) {
+        // Picking an effort is a choice made, like picking a model: close.
+        close();
+        btn.focus({ preventScroll: true });
+        document.querySelector(`#reasoning-effort-menu .effort-option[data-level="${CSS.escape(level.dataset.mpLevel)}"]`)?.click();
+        return;
+      }
+      const row = t.closest("[data-mp-group]");
+      const versions = t.closest("[data-mp-versions]") || (row && !t.closest("[data-mp-path]") && row.querySelector("[data-mp-versions]"));
+      if (versions && row) {
+        const key = row.dataset.mpGroup;
+        if (mp.open.has(key)) mp.open.delete(key);
+        else mp.open.add(key);
+        return rerender(`[data-mp-group="${CSS.escape(key)}"] .wb-mp-pick`);
+      }
+      const pick = t.closest("[data-mp-path]") || row?.querySelector("[data-mp-path]");
+      if (!pick) return;
+      close();
+      if (pick.dataset.mpPath === wbLoadedPath()) return;
+      await loadModelByPath(pick.dataset.mpPath);
+    });
+    menu.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        const items = [...menu.querySelectorAll(".wb-mp-list button")];
+        if (!items.length) return;
+        e.preventDefault();
+        const at = items.indexOf(document.activeElement);
+        const step = e.key === "ArrowDown" ? 1 : -1;
+        const next = at < 0 ? (step > 0 ? 0 : items.length - 1) : (at + step + items.length) % items.length;
+        items[next].focus({ preventScroll: false });
+      } else if (e.key === "ArrowLeft" && mp.view === "effort") {
+        e.preventDefault();
+        mp.view = "models";
+        rerender("[data-mp-effort]");
       }
     });
     document.addEventListener("click", (e) => {
-      if (!menu.contains(e.target) && e.target !== btn && !btn.contains(e.target)) {
-        menu.classList.remove("open");
-        btn.classList.remove("open");
-      }
+      if (!menu.contains(e.target) && e.target !== btn && !btn.contains(e.target)) close();
     });
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && menu.classList.contains("open")) {
-        menu.classList.remove("open");
-        btn.classList.remove("open");
+        close();
+        btn.focus({ preventScroll: true });
       }
     });
     window.addEventListener("resize", () => { if (menu.classList.contains("open")) positionMenu(); });
@@ -17328,9 +17886,9 @@
       if (menu.classList.contains("open")) positionMenu();
     }, true);
   }
-  // Keep mode selection visible as one compact button. Less-used attachment
-  // and access controls move into the overflow menu on narrow screens.
-  const _MOBILE_TOOLBAR_IDS = ["btn-attach-image", "btn-attach-file", "composer-perms-control"];
+  // Less-used attachment controls move into the overflow menu on narrow
+  // screens; Access stays in the bar.
+  const _MOBILE_TOOLBAR_IDS = ["btn-attach-image", "btn-attach-file"];
   function applyMobileToolbarLayout() {
     const tools = document.querySelector(".composer-tools");
     const menu = document.getElementById("toolbar-overflow-menu");
@@ -17637,6 +18195,13 @@
     
     const openShutdown = () => { $("#shutdown-scrim")?.classList.add("open"); $("#shutdown-modal")?.classList.add("open"); };
     const closeShutdown = () => { $("#shutdown-scrim")?.classList.remove("open"); $("#shutdown-modal")?.classList.remove("open"); };
+    // In the desktop app the window's X asks here first (accuretta_app.py):
+    // true means the dialog is up and the window stays open for its answer.
+    window.accurettaRequestQuit = () => { openShutdown(); return true; };
+    // ...so the sidebar's power button is only needed in a browser.
+    const markDesktopApp = () => document.body.classList.add("in-desktop-app");
+    if (window.pywebview) markDesktopApp();
+    window.addEventListener("pywebviewready", markDesktopApp);
     $("#btn-shutdown-side")?.addEventListener("click", openShutdown);
     $$('[data-mm="shutdown"]').forEach(el => el.addEventListener("click", () => { closeMobileMenu(); openShutdown(); }));
     $("#btn-close-shutdown")?.addEventListener("click", closeShutdown);
@@ -17794,7 +18359,7 @@
       const on = e.currentTarget.classList.toggle("on");
       if (state.settings) state.settings.sound_notifications = on;   // so the preview chime respects it now
       saveSettings({ sound_notifications: on });
-      if (on) { _lastSound = 0; playApprovalSound(); }   // preview the chime when turning on
+      if (on) { _lastSound = 0; playCue("gate"); }   // preview the sound when turning on
       toast(on ? "sound notifications on" : "sound notifications off", "ok", 1500);
     });
     $("#sw-notch-enabled")?.addEventListener("click", (e) => {
@@ -18192,12 +18757,7 @@
     });
     $("#btn-sysctx-rescan").addEventListener("click", rescanSystemContext);
     $("#btn-sysctx-save").addEventListener("click", saveSystemContext);
-    $("#btn-theme").addEventListener("click", async () => {
-      // Step to the next theme in THEME_CYCLE.
-      const next = nextTheme(state.settings.theme || "light");
-      await saveSettings({ theme: next });
-      applyTheme(next);
-    });
+    $("#btn-theme").addEventListener("click", () => stepTheme(1));
     // Sidebar-foot mirror, reachable when the topbar is covered or only the
     // sidebar shows on a narrow window; delegates to the topbar handler.
     document.getElementById("btn-theme-side")?.addEventListener("click", () => {
@@ -18252,21 +18812,25 @@
         // While the /goal latch is on, the Access chip IS the off switch — a
         // click turns hands-free mode off rather than opening the mode popover.
         if (permsBtn.dataset.goal) {
-          if (state.chatId) {
-            fetch("/api/chat/goal", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ chat_id: state.chatId, active: false }),
-            }).catch(() => {});
-          }
-          setGoalModeUI(false);
-          toast("Goal mode off — back to your standing permissions.", "info", 3200, "goal-toggle");
+          turnGoalOff();
           return;
         }
         const open = !permsPopover?.classList.contains("open");
         permsPopover?.classList.toggle("open", open);
         permsBtn.setAttribute("aria-expanded", String(open));
+        if (open && permsPopover) {
+          // Keep the card on screen when the chip sits far right (phones, or
+          // with a mode chip before it).
+          permsPopover.style.left = "";
+          const over = permsPopover.getBoundingClientRect().right - (window.innerWidth - 8);
+          if (over > 0) permsPopover.style.left = `${-Math.ceil(over)}px`;
+        }
         if (open) permsMenu?.querySelector(".perms-option.active")?.focus({ preventScroll: true });
+      });
+      $("#perms-learn-more")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        closePerms();
+        openFaqAt("faq-access-levels");
       });
       permsMenu?.addEventListener("click", async (e) => {
         const opt = e.target.closest(".perms-option");
@@ -18318,9 +18882,8 @@
         tb.setAttribute("aria-label", `Permissions: ${mode}`);
         const label = tb.querySelector(".perms-chip-label");
         if (label) label.textContent = mode.charAt(0).toUpperCase() + mode.slice(1);
+        setPermsChipIcon(tb.dataset.goal ? "goal" : mode);
       }
-      const popValue = $("#perms-popover-value");
-      if (popValue) popValue.textContent = mode;
       document.querySelectorAll("#perms-menu .perms-option").forEach(opt => {
         const active = opt.dataset.permMode === mode;
         opt.classList.toggle("active", active);
@@ -18346,6 +18909,13 @@
     $("#file-client")?.addEventListener("change", (e) => {
       addClientFiles(Array.from(e.target.files || []));
       e.target.value = "";
+    });
+    $("#image-tray")?.addEventListener("click", (e) => {
+      const x = e.target.closest(".wb-att-x");
+      if (!x || state.uploadingFiles) return;
+      const tile = x.closest(".wb-att");
+      (tile.dataset.kind === "image" ? state.pendingImages : state.pendingFiles).splice(Number(tile.dataset.index), 1);
+      renderImageTray();
     });
     $("#composer-input").addEventListener("paste", (e) => {
       const items = Array.from(e.clipboardData?.items || []);
@@ -19440,6 +20010,7 @@
   const wbFileIndex = { files: null, loadedAt: 0, loading: null };
   const WB_TABS_KEY = "accuretta:wb:tabs";
   const WB_GROUPS_KEY = "accuretta:wb:collapsed-groups";
+  const SB_SECTIONS_KEY = "accuretta:sb:collapsed-sections";
   const wbNorm = (p) => String(p || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
   const wbStore = {
     get(key, fallback) { try { const v = localStorage.getItem(key); return v == null ? fallback : JSON.parse(v); } catch { return fallback; } },
@@ -19692,11 +20263,11 @@
     if (cat) return { key: `mission:${cat.key}`, label: cat.label, icon: cat.icon };
     if (c.github_worktree) {
       const name = String(c.github_worktree.repo || c.github_worktree.name || "GitHub").trim();
-      return { key: `gh:${wbNorm(c.github_worktree.path || name)}`, label: name, icon: "ph-git-branch" };
+      return { key: `gh:${wbNorm(c.github_worktree.path || name)}`, label: name, icon: "ph-git-branch", path: c.github_worktree.path || "" };
     }
     if (c.project_workspace) {
       const name = String(c.project_workspace.name || folderLeafName(c.project_workspace.path || "") || "Project").trim();
-      return { key: `proj:${wbNorm(c.project_workspace.path || name)}`, label: name, icon: "ph-folder-simple" };
+      return { key: `proj:${wbNorm(c.project_workspace.path || name)}`, label: name, icon: "ph-folder-simple", path: c.project_workspace.path || "" };
     }
     return { key: "chats", label: "Chats", icon: "ph-chats-circle" };
   }
@@ -19707,6 +20278,7 @@
     const c = state.chats?.chats?.[id];
     if (!c || state.projectScope) return;
     const key = wbChatGroup(c).key;
+    sbRevealSection(key === "chats" ? "chats" : "projects");
     const set = wbCollapsedGroups();
     if (!set.delete(key)) return;
     wbSaveCollapsedGroups(set);
@@ -20133,6 +20705,7 @@
     }).join("");
     // cached string: reading innerHTML back on every streaming tick costs a serialize
     if (box._wbHtml !== html) { box._wbHtml = html; box.innerHTML = html; }
+    renderSidebarUsage();
   }
   async function wbPollStatus() {
     if (document.visibilityState !== "visible") return;
@@ -20165,11 +20738,11 @@
   }
 
   // ---- composer: four controls ----
-  // "+" (attachments, build toggles, quick prompts), "Mode · Access", the model
-  // group (context ring, model, effort) and one send / stop / steer button. The
+  // "+" (attachments, modes, build toggles, playbooks, skills), Access, the
+  // model group (model, effort) and one send / stop / steer button. The
   // original controls stay in the DOM with their own handlers and the new ones
-  // drive them, so behavior (goal mode, approvals, queueing, recon gates) is
-  // unchanged.
+  // drive them, so behavior (goal mode, approvals, queueing, recon gates,
+  // Deep Research briefs) is unchanged.
   function wbInsertAtCaret(text) {
     const input = $("#composer-input");
     if (!input) return;
@@ -20187,52 +20760,129 @@
     $("#wb-add-menu")?.classList.remove("open");
     $("#wb-add")?.setAttribute("aria-expanded", "false");
   }
-  function wbRenderAddMenu() {
+  const WB_MODE_NOTES = { agent: "Works with your tools", ide: "Build with a live preview", research: "Investigate and present" };
+  // Short notes for the playbook rows; the full description stays the tooltip.
+  const WB_PLAYBOOK_NOTES = {
+    "quick-netscan-mothership": "This machine's connections",
+    "quick-passive-osint": "Public sources only",
+    "quick-recon-target": "Scoped DNS, TLS, HTTP, ports",
+    "quick-frontend-secrets": "Exposed keys in JavaScript",
+    "quick-gain-access": "Recon, validate, report",
+    "quick-health-check": "Read-only host triage",
+    "quick-persistence-hunt": "Read-only startup sweep",
+  };
+  const WB_PLAYBOOK_TILES = { network: "blue", "red team": "red", "blue team": "teal" };
+  // Playbooks (the quick-* launchers) come straight from the original overflow
+  // menu, sections and all, so a new prompt added there shows up here too.
+  function wbPlaybooks() {
+    const out = [];
+    let section = "";
+    for (const el of $("#toolbar-overflow-menu")?.children || []) {
+      if (el.classList.contains("overflow-section-label")) { section = el.textContent.trim(); continue; }
+      if (!el.id || !el.id.startsWith("quick-")) continue;
+      const icon = [...(el.querySelector("i.ph")?.classList || [])].find(c => c.startsWith("ph-")) || "ph-lightning";
+      out.push({ id: el.id, section, icon, label: el.textContent.trim().replace(/\s*\(read-only\)$/i, ""), title: el.title || "" });
+    }
+    return out;
+  }
+  function wbMenuRow({ act = "", sub = "", back = "", icon, tile = "", label, note = "", role = "menuitem", checked = null, disabled = false, title = "" }) {
+    const attrs = [`type="button"`, `class="wb-menu-item${checked ? " on" : ""}${back ? " wb-menu-back" : ""}"`, `role="${role}"`];
+    if (checked !== null) attrs.push(`aria-checked="${checked}"`);
+    if (disabled) attrs.push(`aria-disabled="true"`);
+    if (act) attrs.push(`data-wb-add="${esc(act)}"`);
+    if (sub) attrs.push(`data-wb-sub="${esc(sub)}"`, `aria-haspopup="menu"`);
+    if (back) attrs.push(`data-wb-back="${esc(back)}"`);
+    if (title) attrs.push(`title="${esc(title)}"`);
+    const glyph = tile
+      ? `<span class="wb-tile" data-tile="${esc(tile)}"><i class="ph ${icon}" aria-hidden="true"></i></span>`
+      : `<i class="ph ${icon}" aria-hidden="true"></i>`;
+    const trail = sub ? `<i class="ph ph-caret-right wb-menu-caret" aria-hidden="true"></i>`
+      : checked !== null ? `<i class="ph ph-check wb-menu-check" aria-hidden="true"></i>` : "";
+    return `<button ${attrs.join(" ")}>${glyph}<span class="wb-menu-text"><b>${esc(label)}</b>`
+      + `${note ? `<small>${esc(note)}</small>` : ""}</span>${trail}</button>`;
+  }
+  // The menu drills in instead of opening a second floating layer: Playbooks
+  // and Skills replace the main list, with a back row on top.
+  function wbRenderAddMenu(view = "main") {
     const menu = $("#wb-add-menu");
     if (!menu) return;
-    const row = (act, icon, label, extra = "", on = null) =>
-      `<button type="button" class="wb-menu-item${on ? " on" : ""}" role="menuitem" data-wb-add="${act}">`
-      + `<i class="ph ${icon}" aria-hidden="true"></i><span>${esc(label)}</span>`
-      + (on !== null ? `<i class="ph ph-check wb-menu-check" aria-hidden="true"></i>` : (extra ? `<small>${esc(extra)}</small>` : ""))
-      + `</button>`;
+    menu.dataset.view = view;
+    if (view === "playbooks") {
+      let html = wbMenuRow({ back: "playbooks", icon: "ph-caret-left", label: "Playbooks" });
+      let section = null;
+      for (const p of wbPlaybooks()) {
+        if (p.section !== section) {
+          section = p.section;
+          if (section) html += `<div class="wb-menu-label">${esc(section)}</div>`;
+        }
+        html += wbMenuRow({ act: `quick:${p.id}`, icon: p.icon, tile: WB_PLAYBOOK_TILES[section.toLowerCase()] || "gray",
+          label: p.label, note: WB_PLAYBOOK_NOTES[p.id] || "", title: p.title });
+      }
+      menu.innerHTML = html;
+      return;
+    }
+    if (view === "skills") {
+      const active = state.activeSkill?.name || "";
+      let html = wbMenuRow({ back: "skills", icon: "ph-caret-left", label: "Skills" });
+      if (active) html += wbMenuRow({ act: "skill-clear", icon: "ph-x-circle", label: `Unload ${active}` });
+      if (!state.skills) html += `<div class="wb-menu-empty">Loading skills…</div>`;
+      else if (!state.skills.length) html += `<div class="wb-menu-empty">No skills yet. Add them in the skills folder.</div>`;
+      else html += state.skills.map(s => wbMenuRow({ act: `skill:${s.name}`, icon: "ph-book-open-text", tile: "violet",
+        label: s.name, note: String(s.description || "").split(/(?<=\.)\s/)[0], title: s.description || "",
+        role: "menuitemradio", checked: s.name === active })).join("");
+      menu.innerHTML = html;
+      return;
+    }
     const tw = $("#toggle-tailwind");
     const mf = $("#toggle-multifile");
-    // Playbooks (the quick-* launchers) come straight from the original overflow menu, sections
-    // and all, so a new prompt added there shows up here too.
-    const source = $("#toolbar-overflow-menu");
-    let quick = "";
-    if (source) {
-      let section = "";
-      for (const el of source.children) {
-        if (el.classList.contains("overflow-section-label")) { section = el.textContent.trim(); continue; }
-        if (!el.id || !el.id.startsWith("quick-")) continue;
-        if (section) { quick += `<div class="wb-menu-label">${esc(section)}</div>`; section = ""; }
-        const icon = el.querySelector("i.ph")?.className.replace(/^ph\s+/, "").split(" ").find(c => c.startsWith("ph-")) || "ph-lightning";
-        quick += `<button type="button" class="wb-menu-item" role="menuitem" data-wb-quick="${esc(el.id)}" title="${esc(el.title || "")}">`
-          + `<i class="ph ${icon}" aria-hidden="true"></i><span>${esc(el.textContent.trim())}</span></button>`;
-      }
+    const mode = state.mode || "agent";
+    const narrow = isCompactViewport();
+    let html = `<div class="wb-menu-label">Add</div>`
+      + wbMenuRow({ act: "file", icon: "ph-paperclip", label: "Files", note: "Upload to the workspace" })
+      + wbMenuRow({ act: "image", icon: "ph-image", label: "Image", note: state.visionCapable ? "The model sees it" : "Described by the vision model" })
+      + wbMenuRow({ act: "mention", icon: "ph-at", label: "Workspace file", note: "Reference with @" })
+      + `<div class="wb-menu-label">Mode</div>`
+      + Object.entries(COMPOSER_MODES).map(([key, meta]) => wbMenuRow({ act: `mode:${key}`, icon: meta.icon, label: meta.label,
+        note: WB_MODE_NOTES[key] || "", role: "menuitemradio", checked: mode === key, disabled: key === "ide" && narrow,
+        title: key === "ide" && narrow ? "IDE mode needs a wider window for the preview pane" : "" })).join("");
+    if (mode === "ide" && (tw || mf)) {
+      html += `<div class="wb-menu-label">Build</div>`
+        + (tw ? wbMenuRow({ act: "tailwind", icon: "ph-wind", label: "Tailwind CDN", role: "menuitemcheckbox", checked: tw.classList.contains("on") }) : "")
+        + (mf ? wbMenuRow({ act: "multifile", icon: "ph-folder-simple", label: "Multi-file output", role: "menuitemcheckbox", checked: mf.classList.contains("on") }) : "");
     }
-    const quickOpen = menu.classList.contains("quick-open");
-    menu.innerHTML =
-      `<div class="wb-menu-label">Add</div>`
-      + row("image", "ph-image", "Image", state.visionCapable ? "vision" : "")
-      + row("file", "ph-paperclip", "Upload file")
-      + row("mention", "ph-at", "Workspace file", "@")
-      + row("skill", "ph-sparkle", "Skill", "#")
-      + `<div class="wb-menu-sep"></div><div class="wb-menu-label">Build</div>`
-      + (tw ? row("tailwind", "ph-wind", "Tailwind CDN", "", tw.classList.contains("on")) : "")
-      + (mf ? row("multifile", "ph-folder-simple", "Multi-file output", "", mf.classList.contains("on")) : "")
-      + (quick ? `<div class="wb-menu-sep"></div><button type="button" class="wb-menu-item wb-menu-more" data-wb-add="quick" aria-expanded="${quickOpen}"><i class="ph ph-strategy" aria-hidden="true"></i><span>Playbooks</span><i class="ph ph-caret-${quickOpen ? "down" : "right"} wb-menu-caret" aria-hidden="true"></i></button><div class="wb-menu-quick"${quickOpen ? "" : " hidden"}>${quick}</div>` : "");
+    html += `<div class="wb-menu-sep"></div>`
+      + (wbPlaybooks().length ? wbMenuRow({ sub: "playbooks", icon: "ph-strategy", tile: "coral", label: "Playbooks", note: "Guided security jobs" }) : "")
+      + wbMenuRow({ sub: "skills", icon: "ph-book-open-text", tile: "violet", label: "Skills",
+        note: state.activeSkill ? `${state.activeSkill.name} is loaded` : "Load a procedure" });
+    menu.innerHTML = html;
+  }
+  function wbAddMenuView(view, focusSub = "") {
+    const menu = $("#wb-add-menu");
+    if (!menu) return;
+    wbRenderAddMenu(view);
+    wbPositionAddMenu();
+    const target = focusSub ? menu.querySelector(`[data-wb-sub="${focusSub}"]`)
+      : menu.querySelector(".wb-menu-item:not(.wb-menu-back)") || menu.querySelector(".wb-menu-item");
+    target?.focus({ preventScroll: true });
+    if (view === "skills" && (!state.skills || Date.now() - (state.skillsAt || 0) > 20000)) {
+      loadSkills().then(() => { if (menu.dataset.view === "skills" && menu.classList.contains("open")) wbAddMenuView("skills"); });
+    }
   }
   function wbPositionAddMenu() {
     const btn = $("#wb-add");
     const menu = $("#wb-add-menu");
     if (!btn || !menu) return;
     const r = btn.getBoundingClientRect();
+    // Open on the roomier side and scroll inside it, so a long list (Skills)
+    // never flips over the composer.
+    menu.style.maxHeight = "";
+    const above = r.top - 16;
+    const below = window.innerHeight - r.bottom - 16;
+    const up = menu.offsetHeight <= above || above >= below;
+    menu.style.maxHeight = `min(520px, ${Math.max(160, Math.round(up ? above : below))}px)`;
     const mh = menu.offsetHeight || 300;
     const mw = menu.offsetWidth || 260;
-    let top = r.top - mh - 8;
-    if (top < 8) top = Math.min(window.innerHeight - mh - 8, r.bottom + 8);
+    const top = up ? r.top - mh - 8 : r.bottom + 8;
     let left = Math.min(r.left, window.innerWidth - mw - 8);
     menu.style.top = `${Math.max(8, Math.round(top))}px`;
     menu.style.left = `${Math.max(8, Math.round(left))}px`;
@@ -20244,7 +20894,7 @@
     btn.type = "button";
     btn.id = "wb-add";
     btn.className = "wb-add";
-    btn.title = "Add images, files, skills, build options and playbooks";
+    btn.title = "Add files, switch mode, run a playbook or load a skill";
     btn.setAttribute("aria-label", "Add");
     btn.setAttribute("aria-haspopup", "menu");
     btn.setAttribute("aria-expanded", "false");
@@ -20259,50 +20909,53 @@
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
       if (menu.classList.contains("open")) return wbCloseAddMenu();
-      wbRenderAddMenu();
       menu.classList.add("open");
       btn.setAttribute("aria-expanded", "true");
-      wbPositionAddMenu();
+      wbAddMenuView("main");
       requestAnimationFrame(wbPositionAddMenu);
-      menu.querySelector(".wb-menu-item")?.focus({ preventScroll: true });
     });
     menu.addEventListener("click", (e) => {
       e.stopPropagation();
-      const quickBtn = e.target.closest("[data-wb-quick]");
-      if (quickBtn) {
-        wbCloseAddMenu();
-        document.getElementById(quickBtn.dataset.wbQuick)?.click();
-        return;
-      }
-      const item = e.target.closest("[data-wb-add]");
+      const item = e.target.closest(".wb-menu-item");
       if (!item) return;
-      const act = item.dataset.wbAdd;
-      if (act === "quick") {
-        menu.classList.toggle("quick-open");
-        wbRenderAddMenu();
-        wbPositionAddMenu();
-        menu.querySelector('[data-wb-add="quick"]')?.focus({ preventScroll: true });
-        return;
-      }
+      if (item.dataset.wbSub) return wbAddMenuView(item.dataset.wbSub);
+      if (item.dataset.wbBack) return wbAddMenuView("main", item.dataset.wbBack);
+      const act = item.dataset.wbAdd || "";
       if (act === "tailwind" || act === "multifile") {
         // Toggles stay open so both can be flipped in one visit.
         document.getElementById(act === "tailwind" ? "toggle-tailwind" : "toggle-multifile")?.click();
-        setTimeout(() => { wbRenderAddMenu(); }, 250);
+        setTimeout(() => { if (menu.classList.contains("open")) wbRenderAddMenu("main"); }, 250);
         return;
       }
       wbCloseAddMenu();
-      if (act === "image") $("#btn-attach-image")?.click();
+      if (act.startsWith("mode:")) {
+        // The original option runs the mode switch: the IDE width check, saving
+        // the choice, and the Deep Research brief.
+        document.querySelector(`#composer-mode-menu [data-composer-mode="${act.slice(5)}"]`)?.click();
+        if (act !== "mode:research") $("#composer-input")?.focus();
+      } else if (act.startsWith("quick:")) {
+        document.getElementById(act.slice(6))?.click();
+      } else if (act.startsWith("skill:")) {
+        const skill = (state.skills || []).find(s => s.name === act.slice(6));
+        if (skill && skill.name !== state.activeSkill?.name) activateSkill(skill);
+      } else if (act === "skill-clear") clearActiveSkill();
+      else if (act === "image") $("#btn-attach-image")?.click();
       else if (act === "file") $("#btn-attach-file")?.click();
       else if (act === "mention") wbInsertAtCaret("@");
-      else if (act === "skill") wbInsertAtCaret("#");
     });
     menu.addEventListener("keydown", (e) => {
-      const items = [...menu.querySelectorAll(".wb-menu-item")].filter(el => el.offsetParent);
+      const items = [...menu.querySelectorAll(".wb-menu-item")];
       const at = items.indexOf(document.activeElement);
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
         const next = e.key === "ArrowDown" ? (at + 1) % items.length : (at - 1 + items.length) % items.length;
         items[next]?.focus({ preventScroll: true });
+      } else if (e.key === "ArrowRight" && document.activeElement?.dataset.wbSub) {
+        e.preventDefault();
+        wbAddMenuView(document.activeElement.dataset.wbSub);
+      } else if (e.key === "ArrowLeft" && menu.dataset.view !== "main") {
+        e.preventDefault();
+        wbAddMenuView("main", menu.dataset.view);
       } else if (e.key === "Escape") {
         e.preventDefault();
         wbCloseAddMenu();
@@ -20315,83 +20968,42 @@
     window.addEventListener("resize", () => { if (menu.classList.contains("open")) wbPositionAddMenu(); });
   }
 
-  // Mode · Access: the mode pill also names the access level, and its menu
-  // lists both. Access rows press the original permission options, so the
-  // same save, toast and goal-mode handling run.
-  function wbAccessState() {
-    const perms = $("#btn-perms");
-    const goal = !!perms?.dataset.goal;
-    const mode = perms?.dataset.mode || state.settings?.approval_mode || "hard";
-    return { goal, mode, label: goal ? "Goal" : mode.charAt(0).toUpperCase() + mode.slice(1) };
+  // Mode chip: Agent is the default and shows nothing; IDE and Deep Research
+  // show as a chip after the "+" whose × goes back to Agent.
+  function wbSyncModeChip() {
+    const chip = $("#wb-mode-chip");
+    if (!chip) return;
+    const mode = state.mode || "agent";
+    const meta = COMPOSER_MODES[mode];
+    chip.hidden = mode === "agent" || !meta;
+    if (chip.hidden) return;
+    chip.querySelector(".wb-mode-chip-icon").className = `ph ${meta.icon} wb-mode-chip-icon`;
+    chip.querySelector(".wb-mode-chip-label").textContent = meta.label;
+    const x = chip.querySelector(".wb-mode-chip-x");
+    x.setAttribute("aria-label", `Leave ${meta.label} and go back to Agent`);
+    x.title = "Back to Agent";
   }
-  function wbSyncAccess() {
-    const pill = $("#composer-mode-pill");
-    if (!pill) return;
-    const { goal, mode, label } = wbAccessState();
-    let tag = pill.querySelector(".wb-access");
-    if (!tag) {
-      tag = document.createElement("span");
-      tag.className = "wb-access";
-      pill.querySelector(".mode-pill-label")?.after(tag);
-    }
-    // Write only on change: the pill is watched by a MutationObserver that
-    // calls back here, and an identical write still counts as a mutation.
-    const text = `· ${label}`;
-    if (tag.textContent !== text) tag.textContent = text;
-    const tagMode = goal ? "goal" : mode;
-    if (tag.dataset.mode !== tagMode) tag.dataset.mode = tagMode;
-    const modeLabel = pill.querySelector(".mode-pill-label")?.textContent || "";
-    const title = `${modeLabel} · Access: ${label}`;
-    if (pill.title !== title) pill.title = title;
-    const list = $("#wb-access-menu");
-    if (!list) return;
-    list.querySelectorAll("[data-wb-perm]").forEach(opt => {
-      const active = !goal && opt.dataset.wbPerm === mode;
-      opt.classList.toggle("active", active);
-      opt.setAttribute("aria-checked", String(active));
-    });
-    const goalRow = list.querySelector("[data-wb-goal]");
-    if (goalRow) goalRow.hidden = !goal;
-    const value = $("#wb-access-value");
-    if (value) value.textContent = label;
-  }
-  function wbInitModeAccess() {
-    const popover = $("#composer-mode-popover");
-    const perms = $("#perms-menu");
-    if (!popover || !perms || $("#wb-access-menu")) return;
-    const section = document.createElement("div");
-    section.className = "wb-access-section";
-    const notes = { soft: "Routine work runs on its own", medium: "File writes save on their own", hard: "Every action asks first" };
-    const options = [...perms.querySelectorAll(".perms-option")].map(opt => {
-      const key = opt.dataset.permMode;
-      const icon = opt.querySelector("i.ph")?.className.split(" ").find(c => c.startsWith("ph-")) || "ph-keyhole";
-      const name = opt.querySelector(".perms-name")?.textContent.trim() || key;
-      const desc = opt.querySelector(".perms-desc")?.textContent.trim() || "";
-      return `<button type="button" class="mode-option wb-access-option" role="menuitemradio" aria-checked="false" data-wb-perm="${esc(key)}" title="${esc(desc)}">`
-        + `<i class="ph ${icon}" aria-hidden="true"></i><span>${esc(name)}<small class="mode-option-note">${esc(notes[key] || "")}</small></span><i class="ph ph-check mode-check" aria-hidden="true"></i></button>`;
-    }).join("");
-    section.innerHTML = `<div class="mode-popover-head wb-access-head"><span>Access</span><strong id="wb-access-value"></strong></div>`
-      + `<div class="mode-menu" id="wb-access-menu" role="menu" aria-label="Access">`
-      + `<button type="button" class="mode-option wb-goal-option" data-wb-goal="1" hidden><i class="ph ph-flag-checkered" aria-hidden="true"></i><span>Goal mode is on<small class="mode-option-note">Click to return to your standing access</small></span></button>`
-      + options + `</div>`;
-    popover.appendChild(section);
-    section.addEventListener("click", (e) => {
-      const opt = e.target.closest("[data-wb-perm], [data-wb-goal]");
-      if (!opt) return;
+  function wbInitModeChip() {
+    const add = $("#wb-add");
+    if (!add || $("#wb-mode-chip")) return;
+    const chip = document.createElement("span");
+    chip.id = "wb-mode-chip";
+    chip.className = "wb-mode-chip";
+    chip.hidden = true;
+    chip.innerHTML = '<i class="ph wb-mode-chip-icon" aria-hidden="true"></i><span class="wb-mode-chip-label"></span>'
+      + '<button type="button" class="wb-mode-chip-x"><i class="ph ph-x" aria-hidden="true"></i></button>';
+    add.after(chip);
+    chip.querySelector(".wb-mode-chip-x").addEventListener("click", (e) => {
       e.stopPropagation();
-      if (opt.dataset.wbGoal) $("#btn-perms")?.click();
-      else perms.querySelector(`.perms-option[data-perm-mode="${opt.dataset.wbPerm}"]`)?.click();
-      popover.classList.remove("open");
-      $("#composer-mode-pill")?.setAttribute("aria-expanded", "false");
+      document.querySelector('#composer-mode-menu [data-composer-mode="agent"]')?.click();
+      $("#composer-input")?.focus();
     });
-    const sync = () => wbSyncAccess();
-    new MutationObserver(sync).observe($("#btn-perms"), { attributes: true, childList: true, subtree: true, characterData: true });
-    new MutationObserver(sync).observe($("#composer-mode-pill"), { childList: true, subtree: true, characterData: true });
-    wbSyncAccess();
+    wbSyncModeChip();
   }
 
-  // Model group: context ring, model and effort read as one pill; the model
-  // menu also carries the effort levels and the context summary.
+  // Model group: model and effort read as one control; the model menu also
+  // carries the effort levels and the context summary. The context ring
+  // lives at the right end of the strip above the box, with its percentage.
   function wbInitModelGroup() {
     const pill = $("#model-pill");
     if (!pill || pill.closest(".wb-model-group")) return;
@@ -20399,53 +21011,13 @@
     group.className = "wb-model-group";
     pill.before(group);
     const ring = $("#ctx-gauge");
+    const strip = $(".composer-projects");
     const effort = $("#reasoning-effort-control");
-    if (ring) group.appendChild(ring);
+    if (ring && strip) strip.appendChild(ring);
+    else if (ring) group.appendChild(ring);
     group.appendChild(pill);
     if (effort) group.appendChild(effort);
   }
-  function wbAugmentModelMenu(menu) {
-    if (!menu) return;
-    menu.querySelectorAll(".wb-mm-extra").forEach(el => el.remove());
-    const extra = document.createElement("div");
-    extra.className = "wb-mm-extra";
-    const effortControl = $("#reasoning-effort-control");
-    const levels = [...document.querySelectorAll("#reasoning-effort-menu .effort-option")];
-    let html = "";
-    if (effortControl && !effortControl.classList.contains("hidden") && levels.length) {
-      html += `<div class="wb-mm-head"><span>Effort</span></div><div class="wb-mm-seg" role="radiogroup" aria-label="Reasoning effort">`
-        + levels.map(opt => `<button type="button" role="radio" data-wb-level="${esc(opt.dataset.level)}" aria-checked="${opt.classList.contains("active")}" class="${opt.classList.contains("active") ? "on" : ""}">${esc(opt.querySelector("span")?.textContent.trim() || opt.dataset.level)}</button>`).join("")
-        + `</div>`;
-    }
-    const ctx = computeCtxUsage();
-    const pct = Math.round(ctx.pct * 100);
-    const cap = ctx.capacity >= 1024 ? `${Math.round(ctx.capacity / 1024)}k` : String(ctx.capacity);
-    html += `<div class="wb-mm-head"><span>Context</span><b>${pct}% of ${cap}</b></div>`
-      + `<div class="wb-mm-bar"><i style="width:${Math.min(100, pct)}%" data-level="${ctx.pct >= 0.9 ? "crit" : ctx.pct >= 0.7 ? "warn" : ""}"></i></div>`
-      + `<button type="button" class="mm-row wb-mm-compact" data-wb-compact="1"><i class="ph ph-arrows-in-line-vertical" aria-hidden="true"></i><span class="mm-row-name">Compact now</span></button>`;
-    extra.innerHTML = html;
-    menu.appendChild(extra);
-    extra.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const level = e.target.closest("[data-wb-level]");
-      if (level) {
-        document.querySelector(`#reasoning-effort-menu .effort-option[data-level="${level.dataset.wbLevel}"]`)?.click();
-        extra.querySelectorAll("[data-wb-level]").forEach(b => {
-          const on = b === level;
-          b.classList.toggle("on", on);
-          b.setAttribute("aria-checked", String(on));
-        });
-        return;
-      }
-      if (e.target.closest("[data-wb-compact]")) {
-        menu.classList.remove("open");
-        $("#model-pill")?.classList.remove("open");
-        showCtxPopover();
-        setTimeout(() => $("#btn-compact")?.click(), 30);
-      }
-    });
-  }
-
   // One action button: dim send when there is nothing to send, send, stop
   // while a turn runs, and a split Steer | stop when you type mid-turn.
   function wbComposerHasContent() {
@@ -20508,9 +21080,211 @@
   function wbInitComposer() {
     document.body.classList.add("wb-composer");
     wbInitAddMenu();
-    wbInitModeAccess();
+    wbInitModeChip();
     wbInitModelGroup();
     wbInitAction();
+  }
+
+  // ---- sidebar ----
+  // Profile on top, Quick search, New session, Security overview, Customize,
+  // projects holding their sessions and a Files row each, then the theme
+  // toggle, Support, Settings and today's usage. The old controls keep their
+  // handlers (the new rows press them); what the new layout drops is hidden.
+  function renderSidebarProfile() {
+    const avatar = $("#sb-avatar");
+    const nameEl = $("#sb-name");
+    if (!avatar || !nameEl) return;
+    const url = state.settings?.profile_avatar || "";
+    const name = String(state.settings?.profile_name || "").trim();
+    // Before a name or picture is set, the app's own mark stands in.
+    avatar.innerHTML = url ? `<img src="${esc(url)}" alt="">`
+      : name ? esc(name[0].toUpperCase())
+      : `<img src="/assets/brand/logo-mark-${sbIsDark() ? "dark" : "light"}.png" alt="">`;
+    avatar.classList.toggle("is-mark", !url && !name);
+    nameEl.textContent = name || "Accuretta";
+    const version = $("#brand-v")?.textContent || "";
+    $("#sb-profile").title = `${name || "Accuretta"}${version ? ` · Accuretta ${version}` : ""} · Profile settings`;
+  }
+
+  function sbIsDark() {
+    const bg = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
+    const hex = /^#([0-9a-f]{6})$/i.exec(bg)?.[1];
+    if (!hex) return /dark|opal|dim/.test(document.documentElement.dataset.theme || "");
+    const [r, g, b] = [0, 2, 4].map(i => parseInt(hex.slice(i, i + 2), 16));
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) < 128;
+  }
+  function syncSidebarTheme() {
+    const theme = document.documentElement.dataset.theme || "";
+    const label = [...($("#set-theme")?.options || [])].find(o => o.value === theme)?.textContent || theme;
+    const name = $("#sb-theme-label");
+    if (name) {
+      name.textContent = label;
+      const at = THEME_CYCLE.indexOf(theme) + 1;
+      name.closest("button").title = `Theme: ${label}${at ? ` (${at} of ${THEME_CYCLE.length})` : ""}. Click for the next one.`;
+    }
+    renderSidebarProfile();
+  }
+
+  function renderSidebarUsage() {
+    const line = $("#sb-usage-line");
+    if (!line) return;
+    const n = Number(wb.status?.tokens_today) || 0;
+    const tokens = n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}K` : String(n);
+    const saved = $("#cost-session")?.textContent?.trim() || "$0.00";
+    const text = `${tokens} tokens · ${saved} saved`;
+    if (line.textContent !== text) line.textContent = text;
+  }
+
+  // A project's Files row opens its file tree under its sessions. Open trees
+  // survive the list re-rendering; closing one drops it, so reopening reads
+  // the folder again.
+  const sbOpenFiles = new Set();
+  const sbFileTrees = new Map();
+  function sbFilesRow(path) {
+    const wrap = document.createElement("div");
+    wrap.className = "sb-files";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "sb-files-row";
+    btn.title = path;
+    btn.innerHTML = `<i class="ph ph-files" aria-hidden="true"></i><span>Files</span><i class="ph ph-caret-right sb-files-caret" aria-hidden="true"></i>`;
+    wrap.appendChild(btn);
+    const show = async () => {
+      let tree = sbFileTrees.get(path);
+      if (!tree) {
+        tree = document.createElement("div");
+        tree.className = "ws-tree sb-files-tree";
+        tree.innerHTML = `<div class="tree-loading" style="--depth:1">loading…</div>`;
+        sbFileTrees.set(path, tree);
+        const entries = await fetchFolderListing(path);
+        tree.innerHTML = "";
+        if (entries._error) tree.innerHTML = `<div class="tree-empty" style="--depth:1">${esc(entries._error)}</div>`;
+        else if (!entries.length) tree.innerHTML = `<div class="tree-empty" style="--depth:1">empty</div>`;
+        else for (const child of entries) tree.appendChild(renderTreeNode(child, 1, path));
+      }
+      if (sbOpenFiles.has(path)) wrap.appendChild(tree);
+    };
+    const sync = () => {
+      const open = sbOpenFiles.has(path);
+      wrap.classList.toggle("open", open);
+      btn.setAttribute("aria-expanded", String(open));
+    };
+    btn.addEventListener("click", () => {
+      if (sbOpenFiles.has(path)) {
+        sbOpenFiles.delete(path);
+        sbFileTrees.get(path)?.remove();
+        sbFileTrees.delete(path);
+      } else {
+        sbOpenFiles.add(path);
+        show();
+      }
+      sync();
+    });
+    sync();
+    if (sbOpenFiles.has(path)) show();
+    return wrap;
+  }
+
+  function sbListSections(wrap) {
+    const folded = new Set(wbStore.get(SB_SECTIONS_KEY, []));
+    const make = (key, label, tool) => {
+      const box = document.createElement("section");
+      box.className = "sb-section" + (folded.has(key) ? " collapsed" : "");
+      box.dataset.section = key;
+      box.innerHTML = `<div class="sb-section-head"><button type="button" class="sb-section-toggle" aria-expanded="${!folded.has(key)}">`
+        + `<span>${label}</span><i class="ph ph-caret-down" aria-hidden="true"></i></button>${tool}</div><div class="sb-section-body"></div>`;
+      const toggle = box.querySelector(".sb-section-toggle");
+      toggle.addEventListener("click", () => {
+        const set = new Set(wbStore.get(SB_SECTIONS_KEY, []));
+        const fold = box.classList.toggle("collapsed");
+        if (fold) set.add(key); else set.delete(key);
+        wbStore.set(SB_SECTIONS_KEY, [...set]);
+        toggle.setAttribute("aria-expanded", String(!fold));
+      });
+      wrap.appendChild(box);
+      return box;
+    };
+    const projects = make("projects", "Projects", `<button type="button" class="iconbtn sb-section-tool" title="Add a project folder" aria-label="Add a project folder"><i class="ph ph-plus" aria-hidden="true"></i></button>`);
+    const chats = make("chats", "Chats", `<button type="button" class="iconbtn sb-section-tool" title="Clear conversations" aria-label="Clear conversations"><i class="ph ph-trash" aria-hidden="true"></i></button>`);
+    projects.querySelector(".sb-section-tool").addEventListener("click", addProjectFolder);
+    chats.querySelector(".sb-section-tool").addEventListener("click", clearConversations);
+    return { projects: projects.querySelector(".sb-section-body"), chats: chats.querySelector(".sb-section-body") };
+  }
+  function sbFillEmptySections(sections) {
+    if (!sections.projects.children.length) {
+      sections.projects.innerHTML = `<button type="button" class="sb-section-empty"><i class="ph ph-plus" aria-hidden="true"></i><span>Add a project folder</span></button>`;
+      sections.projects.firstChild.addEventListener("click", addProjectFolder);
+    }
+    if (!sections.chats.children.length) sections.chats.innerHTML = `<div class="sb-section-empty">No chats yet</div>`;
+  }
+  function sbRevealSection(key) {
+    const set = new Set(wbStore.get(SB_SECTIONS_KEY, []));
+    if (!set.delete(key)) return;
+    wbStore.set(SB_SECTIONS_KEY, [...set]);
+    const box = document.querySelector(`#chatlist .sb-section[data-section="${key}"]`);
+    box?.classList.remove("collapsed");
+    box?.querySelector(".sb-section-toggle")?.setAttribute("aria-expanded", "true");
+  }
+
+  function wbInitSidebar() {
+    const sidebar = $("#sidebar");
+    if (!sidebar || sidebar.classList.contains("sb-v2")) return;
+    sidebar.classList.add("sb-v2");
+
+    const profile = document.createElement("button");
+    profile.type = "button";
+    profile.id = "sb-profile";
+    profile.className = "sb-profile";
+    profile.innerHTML = `<span class="sb-avatar" id="sb-avatar" aria-hidden="true"></span><span class="sb-name" id="sb-name"></span>`
+      + `<i class="ph ph-caret-up-down" aria-hidden="true"></i>`;
+    profile.addEventListener("click", () => openSettingsAt("profile"));
+    sidebar.querySelector(".brand-row")?.prepend(profile);
+
+    const nav = sidebar.querySelector(".workspace-nav");
+    const search = $("#btn-search-sessions");
+    if (nav && search) {
+      const label = search.querySelector("span");
+      if (label) label.textContent = "Quick search";
+      nav.prepend(search);
+      nav.insertAdjacentHTML("beforeend",
+        `<button type="button" class="workspace-nav-action" id="sb-security" title="Security overview"><i class="ph ph-lightning" aria-hidden="true"></i><span>Security overview</span></button>`
+        + `<button type="button" class="workspace-nav-action" id="sb-customize" title="Customize"><i class="ph ph-sliders-horizontal" aria-hidden="true"></i><span>Customize</span></button>`);
+      $("#sb-customize").addEventListener("click", () => openSettingsAt("skills"));
+      $("#sb-security").addEventListener("click", openSecurityOverview);
+    }
+
+    const bottom = document.createElement("div");
+    bottom.className = "sb-bottom";
+    bottom.innerHTML = `<div class="sb-theme" role="group" aria-label="Theme">`
+      + `<button type="button" class="sb-theme-step" data-step="-1" title="Previous theme" aria-label="Previous theme"><i class="ph ph-caret-left" aria-hidden="true"></i></button>`
+      + `<button type="button" class="sb-theme-name" data-step="1"><span class="sb-theme-swatch" aria-hidden="true"></span><span id="sb-theme-label">Theme</span></button>`
+      + `<button type="button" class="sb-theme-step" data-step="1" title="Next theme" aria-label="Next theme"><i class="ph ph-caret-right" aria-hidden="true"></i></button></div>`
+      + `<button type="button" class="sb-link" id="sb-support" title="Support"><i class="ph ph-headset" aria-hidden="true"></i><span>Support</span></button>`
+      + `<div class="sb-link-row"><button type="button" class="sb-link" id="sb-settings" title="Settings"><i class="ph ph-gear-six" aria-hidden="true"></i><span>Settings</span></button></div>`
+      + `<button type="button" class="sb-usage" id="sb-usage" title="Usage stats">`
+      + `<span class="sb-usage-icon" aria-hidden="true"><i class="ph ph-chart-bar"></i></span>`
+      + `<span class="sb-usage-text"><b>Today</b><small id="sb-usage-line">0 tokens</small></span>`
+      + `<span class="sb-usage-btn">Usage</span></button>`;
+    // Below the scrolling list, so it stays at the bottom of the sidebar.
+    sidebar.querySelector(".sidebar-scroll")?.after(bottom);
+    // Steps through every theme, both ways; the dot and name show the current one.
+    bottom.querySelectorAll(".sb-theme [data-step]").forEach(btn =>
+      btn.addEventListener("click", () => stepTheme(Number(btn.dataset.step))));
+    $("#sb-support").addEventListener("click", openFaq);
+    $("#sb-settings").addEventListener("click", () => openSettings());
+    $("#sb-usage").addEventListener("click", () => openSettingsAt("usage", "stats"));
+    // In a browser the power button sits beside Settings (the desktop app's
+    // window X opens the same dialog).
+    const power = $("#btn-shutdown-side");
+    if (power) bottom.querySelector(".sb-link-row").appendChild(power);
+
+    new MutationObserver(syncSidebarTheme).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme", "style"] });
+    const cost = $("#cost-session");
+    if (cost) new MutationObserver(renderSidebarUsage).observe(cost, { childList: true, characterData: true, subtree: true });
+    syncSidebarTheme();
+    renderSidebarUsage();
+    // The list may have drawn before this layout existed; redraw it in sections.
+    if (state.chats) renderChatList();
   }
 
   // ---- MCP servers window ----
@@ -20521,15 +21295,9 @@
   const mcpUi = { data: null, selected: "", dirty: false, poll: 0, paste: false };
 
   function wbMcpOpen(select) {
-    const win = $("#mcp-window");
-    if (!win) return;
-    if ($("#settings-drawer")?.classList.contains("open")) closeSettings();
     mcpUi.selected = select || mcpUi.selected || "";
     mcpUi.dirty = false;
-    win.classList.add("open");
-    win.setAttribute("aria-hidden", "false");
-    $("#mcp-scrim")?.classList.add("open");
-    wbMcpLoad();
+    openSettingsAt("tools");
   }
   function wbMcpClose() {
     if (!$("#mcp-window")?.classList.contains("open")) return;
@@ -20566,7 +21334,7 @@
     // Don't rebuild a form the user is typing into; just refresh its status.
     if (mcpUi.dirty) wbMcpRenderStatus(); else wbMcpRenderDetail();
     if (mcpPop.open) wbMcpPopRender();
-    if ((data.servers || []).some(s => s.state === "starting") && ($("#mcp-window")?.classList.contains("open") || mcpPop.open)) {
+    if ((data.servers || []).some(s => s.state === "starting") && (wbMcpShown() || mcpPop.open)) {
       mcpUi.poll = setTimeout(wbMcpLoad, 1200);
     }
   }
@@ -20585,7 +21353,9 @@
       const st = wbMcpState(s);
       return `<button type="button" class="mcp-row${s.name === mcpUi.selected ? " active" : ""}" data-name="${esc(s.name)}">`
         + `<span class="mcp-dot" data-state="${esc(s.state)}" aria-hidden="true"></span>`
-        + `<span class="mcp-row-name">${esc(s.name)}</span><span class="mcp-row-meta">${esc(st.label)}</span></button>`;
+        + `<span class="mcp-row-name">${esc(s.name)}</span>`
+        + (s.unsandboxed ? `<i class="ph ph-warning mcp-row-warn" title="Runs its browser without the sandbox" aria-label="Not sandboxed"></i>` : "")
+        + `<span class="mcp-row-meta">${esc(st.label)}</span></button>`;
     }).join("") + (mcpUi.selected === "__new"
       ? `<button type="button" class="mcp-row active" data-name="__new"><span class="mcp-dot" aria-hidden="true"></span><span class="mcp-row-name">New server</span></button>` : "");
     $("#mcp-add").hidden = mcpUi.data?.can_edit === false || !!mcpUi.data?.unavailable;
@@ -20605,8 +21375,16 @@
       + `<span>${s.state === "running" ? `${esc(st.label)} available to the agent` : s.state === "disabled" ? "Its tools are hidden from the agent" : s.state === "starting" ? "Launching and asking for its tools" : "Its tools are unavailable"}</span></div>`
       + (canEdit && s.state !== "disabled" ? `<button type="button" class="btn ghost sm" data-mcp="restart"${s.state === "starting" ? " disabled" : ""}><i class="ph ph-arrow-clockwise"></i>Restart</button>` : "")
       + (canEdit ? `<button type="button" class="sw${s.disabled ? "" : " on"}" data-mcp="toggle" role="switch" aria-checked="${!s.disabled}" title="${s.disabled ? "Turn on" : "Turn off"}" aria-label="${s.disabled ? "Turn on" : "Turn off"} ${esc(s.name)}"></button>` : "")
-      + `</div>${detail}${log}`;
+      + `</div>${detail}${s.unsandboxed ? MCP_UNSANDBOXED_WARNING : ""}${log}`;
   }
+  // Shown for a server whose browser runs with --no-sandbox (or Playwright
+  // MCP's PLAYWRIGHT_MCP_NO_SANDBOX). Accuretta still runs it as configured.
+  const MCP_UNSANDBOXED_WARNING = `<div class="mcp-warn" role="note"><i class="ph ph-warning" aria-hidden="true"></i><div>`
+    + `<strong>This server's browser isn't sandboxed</strong>`
+    + `<p>It runs with <code>--no-sandbox</code>, so every page it opens has the same access to this PC as you do. `
+    + `A malicious or hacked site that exploits a browser bug could then read or change your files, take saved logins and API keys, and run programs, `
+    + `instead of being stuck inside the browser. Pages the agent visits on its own are the riskiest.</p>`
+    + `<p>Remove <code>--no-sandbox</code> from its arguments unless it runs inside a container or VM that needs it.</p></div></div>`;
   function wbMcpRenderStatus() {
     const box = $("#mcp-detail .mcp-status-slot");
     if (box) box.innerHTML = wbMcpStatusHtml(wbMcpCurrent());
@@ -21017,6 +21795,7 @@
     wbInitComposer();
     wbInitJumps();
     wbInitMcpWindow();
+    wbInitSidebar();
 
     // tabs live in the topbar path, after the project context
     const path = $(".topbar .path");
