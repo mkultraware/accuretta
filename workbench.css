@@ -2870,3 +2870,11 @@ body.wb-composer #app .chat-scroll {
 .mcp-warn p { margin: 0 0 6px; color: var(--fg-muted); }
 .mcp-warn p:last-child { margin-bottom: 0; }
 .mcp-warn code { padding: 0 4px; border-radius: 4px; background: color-mix(in srgb, var(--fg) 8%, transparent); font: 12px/1.4 var(--font-mono); }
+
+/* The folder chip just picked up the folder the agent is working in. */
+@keyframes project-chip-followed {
+  0% { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+  100% { background: transparent; }
+}
+#project-chip.just-followed { animation: project-chip-followed 1.6s ease-out; }
+@media (prefers-reduced-motion: reduce) { #project-chip.just-followed { animation: none; } }

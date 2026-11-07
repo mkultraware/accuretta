@@ -11,6 +11,7 @@ Runs on 0.0.0.0:8787 so Tailscale / LAN peers can reach it from phones.
 from __future__ import annotations
 
 import ast
+import atexit
 from memory_store import MemoryStore, memory_kind
 import ctypes
 import difflib
@@ -65,6 +66,7 @@ from cvss_v31 import base_score as cvss_base_score, normalize_cwe
 
 _steering = SteeringInbox()
 from network_policy import install_offline_guard
+import ghidra_worker
 
 # ---- console encoding hardening -------------------------------------------
 # Redirected stdout on Windows is cp1252, so a print() holding an emoji raised
@@ -195,18 +197,15 @@ except Exception:
     _HAVE_PYELFTOOLS = False
 
 # ---- Native binary analysis via Ghidra (optional) ------------------------
-# pyghidra runs Ghidra in-process via JPype (~600MB resident, ~10s JVM boot).
-# Importing is cheap; pyghidra.start() is deferred to the first
-# tool_ghidra_analyze call and later calls reuse the running JVM. Requires
-# JDK 21+ and a Ghidra install (settings.ghidra_path or $GHIDRA_INSTALL_DIR).
+# Ghidra runs in its own process (ghidra_worker.py, started on first use) with
+# a capped JVM heap; it exits when idle, so the bridge never holds a JVM.
+# Requires pyghidra, JDK 21+ and a Ghidra install (settings.ghidra_path or
+# $GHIDRA_INSTALL_DIR). Only presence is checked here: nothing is imported.
 try:
-    import pyghidra as _pyghidra  # type: ignore
-    _HAVE_PYGHIDRA = True
+    import importlib.util as _ilu
+    _HAVE_PYGHIDRA = _ilu.find_spec("pyghidra") is not None
 except Exception:
-    _pyghidra = None  # type: ignore
     _HAVE_PYGHIDRA = False
-_PYGHIDRA_STARTED = False
-_PYGHIDRA_START_LOCK = threading.Lock()
 
 # ---- Cybersecurity / Forensics (optional) --------------------------------
 try:
@@ -677,7 +676,19 @@ def _save_chats_snapshot(snapshot: _ChatSnapshot) -> None:
                             live[key] = copy.deepcopy(val)
                     chosen = copy.deepcopy(live)
                 elif len(lmsgs) <= len(pmsgs) and lmsgs == pmsgs[:len(lmsgs)]:
-                    pass
+                    # This snapshot extends the live history (a turn adding its
+                    # messages). A field changed live while it was out (a project
+                    # picked up mid-turn, a rename) wins wherever this snapshot
+                    # left that field as it found it.
+                    base = before if isinstance(before, dict) else {}
+                    for key in (set(live) | set(base)) - {"messages", "_rev"}:
+                        untouched = _chat_payload_digest(chosen.get(key)) == _chat_payload_digest(base.get(key))
+                        moved = _chat_payload_digest(live.get(key)) != _chat_payload_digest(base.get(key))
+                        if untouched and moved:
+                            if key in live:
+                                chosen[key] = copy.deepcopy(live[key])
+                            else:
+                                chosen.pop(key, None)
                 else:
                     conflicts.append({"chat_id": cid, "kind": "divergent_update"})
             chosen["_rev"] = max(
@@ -2085,9 +2096,10 @@ DEFAULT_SETTINGS = {
     "vram_reserve_gb": 0.25,        # Minimal GPU-side safety (Windows compositor/desktop spikes on the same card).
                                     # Shaved off the auto-tune VRAM budget only; 0 = give the LLM everything
                                     # (the ~8% headroom still guards CUDA workspace + alignment).
-    "ctx_checkpoints_enabled": False, # Advanced compatibility override. Current llama.cpp builds lose normal
-                                      # slot-prefix reuse when context checkpoints are enabled on hybrid/SWA
-                                      # models. Keep them off unless a future build/model is measured to benefit.
+    "ctx_checkpoints_enabled": False, # Advanced override: pass explicit --ctx-checkpoints flags. Off does NOT
+                                      # turn checkpoints off. It only leaves llama.cpp's own defaults (build
+                                      # 12121: 32 per slot, 8192 tokens apart), which hybrid/SWA models fall
+                                      # back to whenever the prompt stops matching the cache.
     "ctx_checkpoints": 1,           # Number of checkpoints when the explicit override above is enabled.
     "checkpoint_min_step": 4096,    # --checkpoint-min-step (newer builds) / --checkpoint-every-n-tokens
                                     # (older): minimum spacing between snapshots. 4096 beats the 8192 default
@@ -2129,6 +2141,10 @@ DEFAULT_SETTINGS = {
     # Native-binary analysis via Ghidra (in-process through pyghidra).
     "ghidra_path": "",              # Ghidra install root, e.g. C:\Program Files\ghidra_12.0.4_PUBLIC.
                                     # Blank = use $GHIDRA_INSTALL_DIR. Requires JDK 21+ + `pip install pyghidra`.
+    "ghidra_max_heap_gb": 0,        # Ghidra's memory limit (JVM max heap) in GB. 0 = auto: an eighth of RAM,
+                                    # 2-8 GB. Ghidra runs in its own process (ghidra_worker.py).
+    "ghidra_idle_minutes": 5,       # Close the Ghidra process this many minutes after its last analysis,
+                                    # handing its memory back. The next analysis restarts it (~10-20s).
 }
 
 
@@ -2202,7 +2218,7 @@ def get_settings() -> dict:
     draft_mode = str(out.get("spec_draft_mode") or "auto").strip().lower()
     out["spec_draft_mode"] = draft_mode if draft_mode in {"auto", "off"} else "auto"
     reasoning_effort = str(out.get("reasoning_effort") or "auto").strip().lower()
-    out["reasoning_effort"] = reasoning_effort if reasoning_effort in {"auto", "low", "medium", "high"} else "auto"
+    out["reasoning_effort"] = _normalize_effort_choice(reasoning_effort)
     for _base_key in ("repos_baseline_unique", "repos_baseline_sessions"):
         try:
             out[_base_key] = max(0, int(out.get(_base_key) or 0))
@@ -2351,7 +2367,7 @@ def _update_settings_locked(updates: dict) -> dict:
 
     if "reasoning_effort" in allowed:
         effort = str(cur.get("reasoning_effort") or "auto").strip().lower()
-        cur["reasoning_effort"] = effort if effort in {"auto", "low", "medium", "high"} else "auto"
+        cur["reasoning_effort"] = _normalize_effort_choice(effort)
 
     if "autotune_kv_cache" in allowed:
         kv_pref = str(cur.get("autotune_kv_cache") or "auto").strip().lower()
@@ -3015,6 +3031,69 @@ def _selected_remote_machine(args: dict) -> dict | None:
     if not row or row.get("status") != "ready":
         return None
     return row
+
+
+_SUBFOLDER_LIST_CAP = 1000
+
+
+def _list_subfolders(raw: str) -> dict:
+    """Folders inside `raw`, or the starting points (home folder, then each
+    drive on Windows or / elsewhere) when `raw` is empty. Names only, never
+    file contents."""
+    raw = str(raw or "").strip()
+    if not raw:
+        roots: list[dict] = []
+        home = Path.home()
+        if home.is_dir():
+            roots.append({"name": home.name or str(home), "path": str(home), "kind": "home"})
+        if os.name == "nt":
+            import string
+            for letter in string.ascii_uppercase:
+                drive = Path(f"{letter}:\\")
+                try:
+                    if drive.exists():
+                        roots.append({"name": f"{letter}:", "path": str(drive), "kind": "drive"})
+                except OSError:
+                    continue
+        else:
+            roots.append({"name": "/", "path": "/", "kind": "drive"})
+        return {"path": "", "entries": roots}
+    try:
+        target = Path(normalize_path(raw)).resolve()
+    except Exception:
+        return {"path": raw, "error": "bad path", "entries": []}
+    if not target.is_dir():
+        return {"path": str(target), "error": "not a folder", "entries": []}
+    entries: list[dict] = []
+    try:
+        for child in sorted(target.iterdir(), key=lambda c: c.name.lower()):
+            try:
+                if child.is_dir():
+                    entries.append({"name": child.name, "path": str(child)})
+            except OSError:
+                continue
+            if len(entries) >= _SUBFOLDER_LIST_CAP:
+                break
+    except PermissionError:
+        return {"path": str(target), "error": "permission denied", "entries": []}
+    except OSError as e:
+        return {"path": str(target), "error": str(e), "entries": []}
+    return {"path": str(target), "entries": entries}
+
+
+def _path_in_workspace(target: Path, folders: list) -> bool:
+    """True when `target` (already resolved) is a workspace folder or inside one.
+
+    Compares whole path components: a plain string-prefix check let C:\\foo
+    also admit C:\\foobar."""
+    for f in folders or []:
+        try:
+            root = Path(f).resolve()
+        except Exception:
+            continue
+        if target == root or root in target.parents:
+            return True
+    return False
 
 
 def get_workspace() -> dict:
@@ -3690,6 +3769,10 @@ def _count_msg_tokens(msg: dict) -> int:
         text_tokens = text_total + image_count * 600
     else:
         text_tokens = _approx_tokens(content)
+    # Reasoning sent in its own field (templates that read reasoning_content)
+    # is still prompt the model sees.
+    if isinstance(msg.get("reasoning_content"), str):
+        text_tokens += _approx_tokens(msg["reasoning_content"])
     # tool_call JSON is also text the model sees
     tcs = msg.get("tool_calls") or []
     extra = json.dumps(tcs, ensure_ascii=False) if tcs else ""
@@ -14157,6 +14240,7 @@ def _project_workspace_metadata(raw: object) -> dict | None:
         "brief": str(raw.get("brief") or "").strip()[:4000],
         "published": bool(raw.get("published")),
         "owner": owner,
+        "auto": bool(raw.get("auto")),
     }
 
 
@@ -14193,6 +14277,159 @@ def _project_workspace_root(requested: str = "") -> str | None:
         return roots[0]
     wanted = normalize_path(requested)
     return next((root for root in roots if os.path.normcase(root) == os.path.normcase(wanted)), None)
+
+
+# The composer's folder chip follows the agent: when a chat with no chosen
+# project starts changing files in a folder (writing, editing or deleting
+# files, git commands that change a repo, a clone), that folder becomes the
+# chat's project, marked auto. Reading never moves it. A folder the user
+# picked is never replaced; an auto one moves when the agent moves on.
+_PROJECT_FOLLOW_FILE_TOOLS = {"write_file", "edit_file", "delete_file"}
+_PROJECT_FOLLOW_GIT_TOOLS = {"git_add", "git_branch", "git_checkout", "git_commit", "git_init",
+                             "git_pull", "git_push", "git_reset", "git_restore", "git_fetch"}
+_PROJECT_FOLLOW_SHELL_TOOLS = {"run_powershell", "run_python", "run_tests"}
+_GIT_WRITE_VERBS = {"add", "commit", "push", "pull", "checkout", "switch", "merge", "rebase",
+                    "reset", "restore", "init", "clone", "tag", "fetch", "stash", "am", "cherry-pick"}
+# git clone options that take a value, so the value isn't read as the URL or folder
+_GIT_CLONE_VALUE_OPTS = {"-b", "--branch", "--depth", "-o", "--origin", "-c", "--config",
+                         "--reference", "--separate-git-dir", "-j", "--jobs", "--filter",
+                         "--shallow-since", "--shallow-exclude", "-u", "--upload-pack", "--template"}
+
+
+def _project_follow_folder(path: str) -> str | None:
+    """The project folder a path belongs to: its git repo's top folder, or else
+    the folder right under the workspace root. None outside every workspace
+    root, or for a file sitting directly in a root."""
+    if not path:
+        return None
+    full = normalize_path(path)
+    root = _workspace_root_for(full)
+    if not root:
+        return None
+    here = Path(full)
+    if not here.is_dir():
+        here = here.parent
+    root_path = Path(root)
+    probe = here
+    while True:
+        if (probe / ".git").exists():
+            return normalize_path(str(probe))
+        if os.path.normcase(str(probe)) == os.path.normcase(str(root_path)) or probe.parent == probe:
+            break
+        probe = probe.parent
+    try:
+        rel = here.relative_to(root_path)
+    except ValueError:
+        rel = Path(os.path.relpath(str(here), str(root_path)))
+    if not rel.parts or rel.parts[0] in (".", ".."):
+        return None
+    folder = root_path / rel.parts[0]
+    return normalize_path(str(folder)) if folder.is_dir() else None
+
+
+def _git_command_folders(command: str, cwd: str) -> list[str]:
+    """Folders a shell command changes through git: a clone's target, the
+    folder named by git -C, or the command's cwd for other changing verbs."""
+    found: list[str] = []
+    for segment in re.split(r"[;&|\n]+", command or ""):
+        try:
+            tokens = shlex.split(segment, posix=False)
+        except ValueError:
+            tokens = segment.split()
+        tokens = [t.strip("\"'") for t in tokens]
+        lowered = [t.lower() for t in tokens]
+        if "git" not in lowered and "git.exe" not in lowered:
+            continue
+        i = lowered.index("git") if "git" in lowered else lowered.index("git.exe")
+        rest = tokens[i + 1:]
+        where = cwd
+        while len(rest) >= 2 and rest[0] == "-C":
+            where = rest[1] if os.path.isabs(rest[1]) else os.path.join(where, rest[1])
+            rest = rest[2:]
+        if not rest or rest[0].lower() not in _GIT_WRITE_VERBS:
+            continue
+        if rest[0].lower() == "clone":
+            positional, skip = [], False
+            for tok in rest[1:]:
+                if skip:
+                    skip = False
+                    continue
+                if tok.startswith("-"):
+                    skip = tok in _GIT_CLONE_VALUE_OPTS
+                    continue
+                positional.append(tok)
+            if not positional:
+                continue
+            dest = positional[1] if len(positional) > 1 else re.sub(r"\.git$", "", positional[0].rstrip("/\\").replace("\\", "/").split("/")[-1].split(":")[-1])
+            found.append(dest if os.path.isabs(dest) else os.path.join(where, dest))
+        else:
+            found.append(where)
+    return found
+
+
+def _project_follow_target(canon: str, args: dict) -> str | None:
+    """Where a successful tool call changed things, as a project folder."""
+    args = args if isinstance(args, dict) else {}
+    cwd = _default_command_cwd()
+
+    def full(p):
+        p = str(p or "").strip()
+        return p if not p or os.path.isabs(p) else os.path.join(cwd, p)
+
+    candidates: list[str] = []
+    if canon in _PROJECT_FOLLOW_FILE_TOOLS:
+        candidates.append(full(args.get("path")))
+    elif canon in _PROJECT_FOLLOW_GIT_TOOLS:
+        candidates.append(full(args.get("path")) or cwd)
+    elif canon == "git_clone":
+        dest = args.get("dest")
+        if not dest:
+            url = str(args.get("url") or "").rstrip("/")
+            dest = re.sub(r"\.git$", "", url.split("/")[-1].split(":")[-1]) if url else ""
+        candidates.append(full(dest))
+    elif canon in _PROJECT_FOLLOW_SHELL_TOOLS:
+        command = str(args.get("command") or args.get("code") or "")
+        candidates.extend(_git_command_folders(command, full(args.get("cwd")) or cwd))
+    for path in reversed(candidates):
+        folder = _project_follow_folder(path)
+        if folder:
+            return folder
+    return None
+
+
+def _project_follow(canon: str, args: dict, result: Any) -> None:
+    """Point the chat's project at the folder the agent just changed things in,
+    unless the user chose one, and tell the open composer."""
+    if not isinstance(result, dict) or result.get("error") or result.get("not_executed"):
+        return
+    if canon not in (_PROJECT_FOLLOW_FILE_TOOLS | _PROJECT_FOLLOW_GIT_TOOLS
+                     | _PROJECT_FOLLOW_SHELL_TOOLS | {"git_clone"}):
+        return
+    chat_id = _current_chat_id.get() or _get_current_chat()
+    if not chat_id:
+        return
+    try:
+        folder = _project_follow_target(canon, args)
+        if not folder:
+            return
+        chats = get_chats()
+        chat = chats.get("chats", {}).get(chat_id)
+        if not isinstance(chat, dict) or chat.get("github_worktree"):
+            return
+        current = chat.get("project_workspace")
+        if isinstance(current, dict) and current.get("path"):
+            if not current.get("auto"):
+                return
+            if os.path.normcase(normalize_path(current["path"])) == os.path.normcase(folder):
+                return
+        project = _project_workspace_metadata({"path": folder, "name": Path(folder).name, "auto": True})
+        if not project:
+            return
+        chat["project_workspace"] = project
+        save_json(CHATS_FILE, chats)
+        _emit_chat_event({"type": "project_follow", "chat_id": chat_id, "project_workspace": project})
+    except Exception:
+        pass
 
 
 def _github_create_project(name: str, brief: str = "", workspace_root: str = "",
@@ -17783,19 +18020,8 @@ def tool_decompile_apk(args: dict) -> dict:
 
 
 # ---- Ghidra (native binary) analysis -------------------------------------
-# Common dangerous symbols to flag in import lists. Not exhaustive — just the
-# usual suspects for memory corruption / privilege issues / dynamic loading.
-# String-match against the basename of the imported symbol (handles `@@GLIBC`
-# version suffixes by splitting on '@').
-_GHIDRA_DANGER_IMPORTS = {
-    "strcpy", "strcat", "sprintf", "vsprintf", "gets", "scanf",
-    "memcpy", "memmove", "strncpy", "strncat",
-    "system", "popen", "exec", "execl", "execlp", "execle", "execv", "execvp", "execve",
-    "fork", "vfork", "setuid", "setgid", "seteuid", "setegid",
-    "dlopen", "dlsym", "LoadLibraryA", "LoadLibraryW", "GetProcAddress",
-    "mprotect", "VirtualAlloc", "VirtualProtect", "WriteProcessMemory",
-    "ptrace", "syscall",
-}
+# Dangerous imports to flag (shared with the worker; see ghidra_worker.py).
+_GHIDRA_DANGER_IMPORTS = ghidra_worker.DANGER_IMPORTS
 
 
 def _resolve_ghidra_install_dir() -> str | None:
@@ -17807,71 +18033,213 @@ def _resolve_ghidra_install_dir() -> str | None:
     env = os.environ.get("GHIDRA_INSTALL_DIR", "").strip()
     if env and os.path.isdir(env):
         return env
-    # Common Windows install patterns. Match anything starting with `ghidra_`.
-    pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-    try:
-        for child in pf.iterdir():
-            if child.is_dir() and child.name.lower().startswith("ghidra_"):
-                # sanity-check: the install root contains a `support` dir
-                if (child / "support").is_dir():
-                    return str(child)
-    except OSError:
-        pass
+    # Common install spots: Program Files, or unzipped into the home folder.
+    # Match anything starting with `ghidra_`, newest name first.
+    for base in (Path(os.environ.get("ProgramFiles", r"C:\Program Files")), Path.home()):
+        try:
+            found = sorted((c for c in base.iterdir()
+                            if c.is_dir() and c.name.lower().startswith("ghidra_")
+                            and (c / "support").is_dir()),
+                           key=lambda c: c.name.lower(), reverse=True)
+        except OSError:
+            continue
+        if found:
+            return str(found[0])
     return None
 
 
-def _ensure_pyghidra_started() -> dict | None:
-    """Boot the JVM for pyghidra if not yet running. Returns None on success,
-    or an error dict on failure. Idempotent and thread-safe — only the first
-    caller pays the ~10s JVM cold start. Subsequent callers return immediately."""
-    global _PYGHIDRA_STARTED
-    if not _HAVE_PYGHIDRA:
-        return {"error": "pyghidra not installed. Run: pip install pyghidra"}
-    if _PYGHIDRA_STARTED:
-        return None
-    with _PYGHIDRA_START_LOCK:
-        if _PYGHIDRA_STARTED:
-            return None
-        install_dir = _resolve_ghidra_install_dir()
+def _ghidra_heap_mb(settings: dict | None = None) -> int:
+    """Max JVM heap for Ghidra. Settings > Ghidra memory limit (GB) wins; 0 =
+    auto: an eighth of system RAM, at least 2 GB (Ghidra's own headless
+    default) and at most 8 GB. Java left to itself takes up to a quarter of
+    RAM, and it grows into whatever ceiling it gets."""
+    s = settings if settings is not None else get_settings()
+    try:
+        gb = float(s.get("ghidra_max_heap_gb") or 0)
+    except (TypeError, ValueError):
+        gb = 0.0
+    if gb > 0:
+        return int(max(0.5, gb) * 1024)
+    info = _system_ram_info()
+    total_gb = info[0] if info else 16.0
+    return int(min(8.0, max(2.0, total_gb / 8.0)) * 1024)
+
+
+def _ghidra_idle_s(settings: dict | None = None) -> int:
+    """Seconds the Ghidra worker stays up after its last analysis."""
+    s = settings if settings is not None else get_settings()
+    try:
+        minutes = float(s.get("ghidra_idle_minutes") or 5)
+    except (TypeError, ValueError):
+        minutes = 5.0
+    return int(max(0.5, minutes) * 60)
+
+
+class _GhidraWorker:
+    """Runs ghidra_worker.py on demand and talks to it over pipes.
+
+    One analysis at a time. Started on the first request, it exits by itself
+    after an idle spell (or when the bridge goes away and its stdin closes), so
+    Ghidra's memory comes back once it is done. A timed-out analysis is killed,
+    not left running. A heap-limit change takes effect on the next request."""
+
+    BOOT_TIMEOUT_S = 180
+    LOG_CAP = 5_000_000
+
+    def __init__(self, cmd: list[str] | None = None):
+        self._cmd = cmd                      # tests swap in a fake worker
+        self._proc: subprocess.Popen | None = None
+        self._answers: Queue = Queue()
+        self._lock = threading.Lock()
+        self._next_id = 0
+        self._heap_mb = 0
+
+    def _command(self) -> list[str]:
+        if self._cmd:
+            return self._cmd
+        python = sys.executable
+        if getattr(sys, "frozen", False):
+            # In the packaged app sys.executable is Accuretta.exe itself;
+            # starting it again would open a second app, not the worker.
+            python = shutil.which("python") or shutil.which("py") or ""
+            if not python:
+                raise RuntimeError("Ghidra analysis needs Python with pyghidra installed and on PATH.")
+        return [python, "-u", str(ROOT / "ghidra_worker.py")]
+
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def stop(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _pump(proc: subprocess.Popen, answers: Queue) -> None:
+        mark = ghidra_worker.MARK
         try:
-            if install_dir:
-                _pyghidra.start(install_dir=install_dir)
-            else:
-                # Let pyghidra try its own auto-detect (env vars, etc).
-                _pyghidra.start()
-            _PYGHIDRA_STARTED = True
-            return None
+            for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                if line.startswith(mark):
+                    try:
+                        answers.put(json.loads(line[len(mark):]))
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+        answers.put({"exited": True})
+
+    def _start(self, env_extra: dict, heap_mb: int) -> str | None:
+        answers: Queue = Queue()
+        self._answers = answers
+        log_path = DATA / "ghidra_worker.log"
+        try:
+            if log_path.exists() and log_path.stat().st_size > self.LOG_CAP:
+                log_path.replace(log_path.with_name(log_path.name + ".1"))
+            log = open(log_path, "ab")
+        except OSError:
+            log = subprocess.DEVNULL
+        try:
+            self._proc = subprocess.Popen(
+                self._command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+                env={**os.environ, **env_extra}, cwd=str(ROOT),
+                creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0))
         except Exception as e:
-            return {
-                "error": (
-                    f"pyghidra.start() failed: {type(e).__name__}: {e}. "
-                    f"Set settings.ghidra_path to your Ghidra install root "
-                    f"(e.g. C:\\Program Files\\ghidra_12.0.4_PUBLIC) and ensure "
-                    f"JDK 21+ is on PATH."
-                )
-            }
+            return f"could not start the Ghidra worker: {type(e).__name__}: {e}"
+        finally:
+            if log is not subprocess.DEVNULL:
+                log.close()
+        threading.Thread(target=self._pump, args=(self._proc, answers),
+                         name="ghidra-worker-out", daemon=True).start()
+        try:
+            msg = answers.get(timeout=self.BOOT_TIMEOUT_S)
+        except Empty:
+            self.stop()
+            return f"Ghidra took over {self.BOOT_TIMEOUT_S}s to start"
+        if msg.get("ready"):
+            self._heap_mb = heap_mb
+            return None
+        self.stop()
+        return msg.get("fatal") or "the Ghidra worker exited while starting (see data/ghidra_worker.log)"
+
+    def analyze(self, request: dict, timeout: float, env_extra: dict, heap_mb: int) -> dict:
+        with self._lock:
+            for attempt in (1, 2):
+                if self.alive() and self._heap_mb != heap_mb:
+                    self.stop()                     # the memory limit changed
+                if not self.alive():
+                    err = self._start(env_extra, heap_mb)
+                    if err:
+                        return {"error": err}
+                self._next_id += 1
+                rid = self._next_id
+                try:
+                    self._proc.stdin.write((json.dumps({**request, "id": rid}) + "\n").encode("utf-8"))
+                    self._proc.stdin.flush()
+                except (OSError, ValueError):
+                    self.stop()                     # it exited (idle) as we wrote
+                    continue
+                deadline = time.time() + timeout
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        self.stop()
+                        return {"error": (
+                            f"ghidra analysis timed out after {int(timeout)}s and was stopped, so it is "
+                            f"no longer using memory or CPU. Try a larger timeout, or skip "
+                            f"decompile=true and run a smaller follow-up.")}
+                    try:
+                        msg = self._answers.get(timeout=min(remaining, 5.0))
+                    except Empty:
+                        continue
+                    if msg.get("exited"):
+                        proc, self._proc = self._proc, None
+                        code = proc.poll() if proc is not None else None
+                        if code == 0 and attempt == 1:
+                            break                   # idle exit raced our request: retry once
+                        return {"error": (
+                            "the Ghidra worker stopped mid-analysis (often out of memory). Raise "
+                            "Settings > Ghidra memory limit, or analyse a smaller binary. "
+                            "Details: data/ghidra_worker.log")}
+                    if msg.get("id") == rid:
+                        if "result" in msg and isinstance(msg["result"], dict):
+                            return msg["result"]
+                        return {"error": f"ghidra analysis failed: {msg.get('error')}"}
+            return {"error": "the Ghidra worker could not take the request"}
+
+
+_GHIDRA_WORKER = _GhidraWorker()
+atexit.register(_GHIDRA_WORKER.stop)
 
 
 def tool_ghidra_analyze(args: dict) -> dict:
-    """Static analysis of a native binary using Ghidra (in-process via pyghidra).
-    Loads the file, runs auto-analysis, and returns format/imports/exports/
-    strings/functions plus an optional decompilation of a named function.
-    Long-running on first call (~30s for analysis) and on first invocation
-    overall (~10s JVM boot). Subsequent calls reuse the running Ghidra."""
+    """Static analysis of a native binary using Ghidra, in its own process
+    (ghidra_worker.py) with a capped heap. Loads the file, runs auto-analysis,
+    and returns format/imports/exports/strings/functions plus an optional
+    decompilation of a named function. The first call starts Ghidra (~10-20s);
+    later calls reuse it until it has been idle for a few minutes, and an
+    unchanged binary reuses its saved analysis."""
     path, err = _fw_check_path(args.get("path") or "")
     if err:
         return err
     if not os.path.isfile(path):
         return {"error": f"not a file: {path}"}
+    if not _HAVE_PYGHIDRA:
+        return {"error": "pyghidra not installed. Run: pip install pyghidra"}
 
     function_name = (args.get("function") or "").strip()
     decompile = bool(args.get("decompile"))
     max_strings = max(10, min(int(args.get("max_strings") or 200), 2000))
     max_functions = max(10, min(int(args.get("max_functions") or 200), 5000))
     timeout = max(30, min(int(args.get("timeout") or 240), 1800))
+    settings = get_settings()
+    heap_mb = _ghidra_heap_mb(settings)
 
-    # Approval gate — Ghidra runs auto-analysis which can be heavy on RAM/CPU
-    # for huge binaries, plus the JVM persists in memory after first call.
+    # Approval gate: auto-analysis can be heavy on RAM/CPU for huge binaries.
     approval = request_approval(
         title="Analyze with Ghidra",
         command=f'ghidra_analyze "{Path(path).name}"' + (
@@ -17883,205 +18251,28 @@ def tool_ghidra_analyze(args: dict) -> dict:
             "function": function_name,
             "decompile": decompile,
             "timeout_s": timeout,
+            "memory_limit_gb": round(heap_mb / 1024, 1),
         },
     )
     if approval.get("decision") != "approve":
         return {"error": f"user denied ghidra analysis ({approval.get('status')})"}
 
-    boot_err = _ensure_pyghidra_started()
-    if boot_err:
-        return boot_err
-
     t0 = time.time()
-    try:
-        # Run in a worker so a hard timeout can be enforced: auto-analysis and
-        # decompilation can hang on pathological binaries.
-        result_box: dict[str, object] = {}
-        exc_box: dict[str, object] = {}
-
-        def _worker():
-            try:
-                with _pyghidra.open_program(path, analyze=True) as flat_api:  # type: ignore[attr-defined]
-                    program = flat_api.getCurrentProgram()
-                    result_box["data"] = _ghidra_collect(
-                        program, function_name, decompile,
-                        max_strings, max_functions,
-                    )
-            except Exception as e:  # pragma: no cover (Java exceptions cross JPype)
-                exc_box["err"] = f"{type(e).__name__}: {e}"
-
-        worker = threading.Thread(target=_worker, name="ghidra-worker", daemon=True)
-        worker.start()
-        worker.join(timeout)
-        if worker.is_alive():
-            return {
-                "error": (
-                    f"ghidra analysis timed out after {timeout}s. Try a larger "
-                    f"timeout, or skip decompile=true and run a smaller follow-up."
-                ),
-            }
-        if "err" in exc_box:
-            return {"error": f"ghidra analysis failed: {exc_box['err']}"}
-        out = result_box.get("data") or {}
-        if not isinstance(out, dict):
-            return {"error": "ghidra analysis returned unexpected payload"}
-        out["elapsed_s"] = round(time.time() - t0, 2)
-        out["source"] = path
+    out = _GHIDRA_WORKER.analyze(
+        {"path": path, "function": function_name, "decompile": decompile,
+         "max_strings": max_strings, "max_functions": max_functions},
+        timeout,
+        {"ACCURETTA_GHIDRA_INSTALL": _resolve_ghidra_install_dir() or "",
+         "ACCURETTA_GHIDRA_HEAP_MB": str(heap_mb),
+         "ACCURETTA_GHIDRA_IDLE_S": str(_ghidra_idle_s(settings)),
+         "ACCURETTA_GHIDRA_PROJECTS": str(DATA / "ghidra_projects")},
+        heap_mb,
+    )
+    if out.get("error") and not out.get("ok"):
         return out
-    except Exception as e:
-        return {"error": f"ghidra analysis crashed: {type(e).__name__}: {e}"}
-
-
-def _ghidra_collect(
-    program,
-    function_name: str,
-    decompile: bool,
-    max_strings: int,
-    max_functions: int,
-) -> dict:
-    """Walk a loaded Ghidra Program and extract a JSON-friendly summary.
-    Kept separate from tool_ghidra_analyze so the worker thread is small and
-    the timeout/error handling stays clean."""
-    # Format / language metadata
-    addr_space = program.getAddressFactory().getDefaultAddressSpace()
-    fmt_info = {
-        "format": str(program.getExecutableFormat()),
-        "language": str(program.getLanguageID()),
-        "compiler": str(program.getCompilerSpec().getCompilerSpecID()),
-        "address_size_bits": int(addr_space.getSize()),
-        "image_base": str(program.getImageBase()),
-        "memory_size": int(program.getMemory().getSize()),
-        "executable_md5": str(program.getExecutableMD5() or ""),
-        "executable_sha256": str(program.getExecutableSHA256() or ""),
-    }
-
-    # Imports (external symbols) and exports (entry points)
-    sym_tab = program.getSymbolTable()
-    imports: list[str] = []
-    seen_imports: set[str] = set()
-    try:
-        for sym in sym_tab.getExternalSymbols():
-            n = str(sym.getName())
-            if n and n not in seen_imports:
-                seen_imports.add(n)
-                imports.append(n)
-            if len(imports) >= 1000:
-                break
-    except Exception:
-        pass
-    imports.sort()
-
-    exports: list[dict] = []
-    try:
-        for sym in sym_tab.getSymbolIterator():
-            try:
-                if sym.isExternalEntryPoint():
-                    exports.append({
-                        "name": str(sym.getName()),
-                        "addr": str(sym.getAddress()),
-                    })
-                    if len(exports) >= 500:
-                        break
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # Functions — enumerate with a hard cap
-    fm = program.getFunctionManager()
-    functions: list[dict] = []
-    target_func = None
-    try:
-        for f in fm.getFunctions(True):
-            entry = {
-                "name": str(f.getName()),
-                "addr": str(f.getEntryPoint()),
-                "size": int(f.getBody().getNumAddresses()),
-                "external": bool(f.isExternal()),
-            }
-            functions.append(entry)
-            if function_name and target_func is None and entry["name"] == function_name:
-                target_func = f
-            if len(functions) >= max_functions and (target_func or not function_name):
-                break
-    except Exception:
-        pass
-    function_total = int(fm.getFunctionCount())
-
-    # Defined strings
-    strings: list[dict] = []
-    try:
-        listing = program.getListing()
-        for d in listing.getDefinedData(True):
-            try:
-                if d.hasStringValue():
-                    s_val = d.getValue()
-                    if s_val is None:
-                        continue
-                    s_str = str(s_val)
-                    if len(s_str) >= 4:
-                        strings.append({"addr": str(d.getAddress()), "s": s_str[:240]})
-                        if len(strings) >= max_strings:
-                            break
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # Optional decompilation
-    decompiled = None
-    if function_name and decompile:
-        if target_func is None:
-            # Fall back to a slower scan in case the early loop bailed before
-            # we found the named function.
-            try:
-                for f in fm.getFunctions(True):
-                    if str(f.getName()) == function_name:
-                        target_func = f
-                        break
-            except Exception:
-                pass
-        if target_func is None:
-            decompiled = f"(function not found: {function_name})"
-        else:
-            try:
-                from ghidra.app.decompiler import DecompInterface  # type: ignore
-                from ghidra.util.task import ConsoleTaskMonitor    # type: ignore
-                dec = DecompInterface()
-                try:
-                    dec.openProgram(program)
-                    res = dec.decompileFunction(target_func, 60, ConsoleTaskMonitor())
-                    if res.decompileCompleted():
-                        decompiled = str(res.getDecompiledFunction().getC())
-                    else:
-                        decompiled = f"(decompile failed: {res.getErrorMessage()})"
-                finally:
-                    dec.dispose()
-            except Exception as e:
-                decompiled = f"(decompile crashed: {type(e).__name__}: {e})"
-
-    # Risk surface — flag dangerous imports
-    risk: list[dict] = []
-    for imp in imports:
-        # GLIBC versioning: "memcpy@@GLIBC_2.14" → "memcpy"
-        base = imp.split("@", 1)[0]
-        if base in _GHIDRA_DANGER_IMPORTS:
-            risk.append({"kind": "dangerous_import", "name": imp, "base": base})
-
-    return {
-        "ok": True,
-        **fmt_info,
-        "function_count": function_total,
-        "function_sample": functions[:max_functions],
-        "import_count": len(imports),
-        "imports": imports[:300],
-        "export_count": len(exports),
-        "exports": exports[:200],
-        "string_count": len(strings),
-        "strings": strings,
-        "decompiled": decompiled,
-        "risk_summary": risk,
-    }
+    out["elapsed_s"] = round(time.time() - t0, 2)
+    out["source"] = path
+    return out
 
 
 # ---- Binary triage (PE/ELF/Mach-O) + YARA scanning -----------------------
@@ -28257,7 +28448,7 @@ def _subagent_complete(chat_id: str, messages: list[dict], tools: list[dict]) ->
     }
     payload["max_tokens"] = min(int(payload.get("max_tokens") or _SUBAGENT_MAX_TOKENS), _SUBAGENT_MAX_TOKENS)
     tpl_kwargs = {"enable_thinking": True, "thinking_budget": _SUBAGENT_THINK_BUDGET}
-    if _verification_wanted(s, str(s.get("reasoning_effort") or ""), str(s.get("model_path") or "")):
+    if _verification_wanted(s, _effort_tier(s.get("reasoning_effort")), str(s.get("model_path") or "")):
         tpl_kwargs["verification"] = True
     payload["chat_template_kwargs"] = tpl_kwargs
     if tools:
@@ -30162,6 +30353,7 @@ def _invoke_tool_with_context(name: str, args: dict, call_id: str) -> dict:
             return {"error": "Action skipped because the user updated the current task.",
                     "not_executed": True, "superseded": True}
         result = feedback(canon, invoke_tool(canon, args))
+        _project_follow(canon, args, result)
         chat_id, research_id = _research_context()
         if research_id:
             observed = _research_store.observe(research_id, chat_id, canon, args, result)
@@ -32307,6 +32499,77 @@ def _attach_session_state(messages: list[dict], body: str, role: str) -> list[di
     return messages + [{"role": role, "content": body}]
 
 
+# Sections of the task-state note that change on almost every round. A change
+# there alone does not trigger a new note; it rides along with the periodic
+# refresh. Every _STATE_NOTE_REFRESH_EVERY rounds the note is added again even
+# if unchanged, so it stays near the end where attention lands. Adding costs a
+# little context but never breaks the cache; only rewriting earlier text does.
+_STATE_NOTE_SLOW_PREFIXES = ("=== RECENT TOOL LEDGER", "=== STRUCTURED CONTINUITY")
+_STATE_NOTE_REFRESH_EVERY = 4
+# Old notes stay where they were sent. Past this many tokens of them, they are
+# all dropped once and the note starts fresh (one cache re-read, bounded size).
+_STATE_NOTE_KEEP_TOKENS = 6000
+
+
+class _StateNotes:
+    """Turn-local record of where each task-state note was attached.
+
+    The note used to be rebuilt every round and attached to the newest tool
+    result only, so the previous result lost its copy every round. That rewrote
+    earlier prompt text each round, and hybrid models (Qwen3.5/3.6/3.8, whose
+    recurrent state cannot rewind) then re-read from their last context
+    checkpoint, often 8K+ tokens back. Now a note stays on the message it was
+    attached to, and a new one is added only when its text changes, so within a
+    task the prompt only grows. Placement follows _attach_session_state: inside
+    a tool result, or as its own message when the last one is not a tool result.
+    Records hold the anchor message itself, so an identity match cannot hit a
+    different message that reused a freed object's id."""
+
+    def __init__(self) -> None:
+        self.placed: list[dict] = []
+        self.fast: str | None = None
+        self.sent_round = 0
+
+    def kept_tokens(self) -> int:
+        """Prompt the kept notes add on top of the trimmed messages."""
+        return sum(_approx_tokens(p["body"]) + 8 for p in self.placed)
+
+    def apply(self, wire: list[dict], header: str, sections: list[str], role: str,
+              round_no: int, allow_new: bool = True) -> list[dict]:
+        ids = {id(m) for m in wire}
+        # Notes whose message was trimmed or folded away are gone with it.
+        self.placed = [p for p in self.placed if id(p["anchor"]) in ids
+                       and any(m is p["anchor"] for m in wire)]
+        fast = "\n\n".join(s for s in sections if not s.startswith(_STATE_NOTE_SLOW_PREFIXES))
+        if self.kept_tokens() > _STATE_NOTE_KEEP_TOKENS:
+            self.placed = []
+        if allow_new and sections and wire:
+            stale = (not self.placed or fast != self.fast
+                     or round_no - self.sent_round >= _STATE_NOTE_REFRESH_EVERY)
+            if stale:
+                anchor = wire[-1]
+                kind = ("inside" if anchor.get("role") == "tool"
+                        and isinstance(anchor.get("content"), str) else "after")
+                body = header + "\n" + "\n\n".join(sections)
+                # Same anchor as the newest note (no new message since): replace it.
+                self.placed = [p for p in self.placed if p["anchor"] is not anchor]
+                self.placed.append({"anchor": anchor, "body": body, "kind": kind, "role": role})
+                self.fast, self.sent_round = fast, round_no
+        if not self.placed:
+            return wire
+        out: list[dict] = []
+        for m in wire:
+            rec = next((p for p in self.placed if p["anchor"] is m), None)
+            if rec is None:
+                out.append(m)
+            elif rec["kind"] == "inside":
+                out.append(dict(m, content=f"{m['content']}\n\n{rec['body']}"))
+            else:
+                out.append(m)
+                out.append({"role": rec["role"], "content": rec["body"]})
+        return out
+
+
 def _looks_unfinished(text: str, finish_reason: str = None) -> bool:
     """True when a reply is truncated by token limit or trails off on a colon."""
     if finish_reason == "length":
@@ -32430,7 +32693,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
     if not model:
         emit({"type": "error", "error": "no model selected. Pick one in Settings."})
         return None
-    requested_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    requested_reasoning_effort = _normalize_effort_choice(reasoning_effort)
     reasoning_capability = _reasoning_capability(
         _llama.loaded_model() or settings.get("model_path") or model, settings)
 
@@ -32579,6 +32842,9 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         _turn_checks: list[dict] = []
         _verification_dirty = False
         _roll_active = False
+        _state_notes = _StateNotes()
+        # Cut point of the latest reasoning cleanup (see _reasoning_cleanup_anchor).
+        _reasoning_keep_from: dict | None = None
         try:
             _c0 = get_chats().get("chats", {}).get(chat_id) or {}
             if settings.get("rt_mission_state", True) and isinstance(_c0.get("mission"), dict):
@@ -32755,7 +33021,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             _stub_savings = (sum(_count_msg_tokens(m) for m in conversation[:_stub_cutoff]
                                  if m.get("role") == "tool")
                              if stub_old_tools else 0)
-            effective_reserve = max(1024, min(reserve + tools_overhead + 768 - _stub_savings,
+            # Task-state notes kept where they were sent ride on top of the trimmed
+            # messages, so their size comes out of the trim budget too.
+            effective_reserve = max(1024, min(reserve + tools_overhead + 768 - _stub_savings
+                                              + _state_notes.kept_tokens(),
                                               ctx_limit - 2048))
             # Budget the trim in the server's real token units: one /tokenize call yields
             # a correction factor for the char heuristic, so the trimmer and the slot
@@ -32767,7 +33036,30 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # trigger, fold before the trimmer drops the middle. The fold is deep (~10% of
             # ctx kept raw), so the round gets real runway again.
             try:
+                _cleaned = False
                 if (summarize_enabled
+                        and _last_prompt_tokens_by_chat.get(chat_id, 0)
+                        >= _summary_trigger_limit(ctx_limit)):
+                    # Reasoning cleanup first: drop older rounds' reasoning, keep
+                    # everything else word for word. Compact only when that frees
+                    # less than _REASONING_CLEANUP_MIN_FRAC of the window.
+                    _cut = _reasoning_cleanup_anchor(conversation, settings)
+                    if _cut is not None and _cut is not _reasoning_keep_from:
+                        _units_now = sum(_count_msg_tokens(m) for m in _thinking_wire_view(
+                            conversation, settings, keep_reasoning_from=_reasoning_keep_from))
+                        _units_cut = sum(_count_msg_tokens(m) for m in _thinking_wire_view(
+                            conversation, settings, keep_reasoning_from=_cut))
+                        _freed = int((_units_now - _units_cut) * token_scale)
+                        if _freed >= ctx_limit * _REASONING_CLEANUP_MIN_FRAC:
+                            _reasoning_keep_from = _cut
+                            _cleaned = True
+                            _log_compact(chat_id, f"reasoning_cleanup: map={_last_prompt_tokens_by_chat.get(chat_id, 0)} "
+                                                  f"freed~{_freed} kept_rounds={_REASONING_CLEANUP_KEEP_ROUNDS} "
+                                                  f"ctx={ctx_limit}")
+                            emit({"type": "notice", "quiet": True,
+                                  "note": f"context nearly full: dropped older reasoning (~{_freed // 1000}k tokens) "
+                                          f"and kept every tool result, instead of compacting"})
+                if (not _cleaned and summarize_enabled
                         and _last_prompt_tokens_by_chat.get(chat_id, 0)
                         >= _summary_trigger_limit(ctx_limit)):
                     _log_compact(chat_id, f"proactive: map={_last_prompt_tokens_by_chat.get(chat_id, 0)} "
@@ -32793,7 +33085,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # Budget against what is actually sent (old reasoning stripped), so
             # stripping buys real runway before the trim/fold below fires.
             # `conversation` itself stays whole for the fold summarizer.
-            _wire_conv = _thinking_wire_view(conversation, settings)
+            _wire_conv = _thinking_wire_view(conversation, settings,
+                                             keep_reasoning_from=_reasoning_keep_from)
             trimmed = truncate_messages(_wire_conv, ctx_limit, reserve=effective_reserve,
                                         token_scale=token_scale)
             dropped = max(0, len(conversation) - len(trimmed))
@@ -32835,7 +33128,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             if isinstance(_fold.get("compaction_memory"), dict):
                                 _compaction_memory = dict(_fold["compaction_memory"])
                             token_scale = _conversation_token_scale(conversation)
-                            _wire_conv = _thinking_wire_view(conversation, settings)
+                            _wire_conv = _thinking_wire_view(
+                                conversation, settings, keep_reasoning_from=_reasoning_keep_from)
                             trimmed = truncate_messages(_wire_conv, ctx_limit,
                                                         reserve=effective_reserve,
                                                         token_scale=token_scale)
@@ -32941,13 +33235,19 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # llama.cpp can prefill and continue that exact message. Adding the
             # volatile session tail after it converts this into a new turn and
             # makes models restart the call from its first byte.
-            if _tail_secs and not _carry_call:
-                # Neutral wording: "re-sent every turn" made models open their reasoning
-                # with "Session state has been resent" (30 of 368 logged rounds).
-                _body = ("[task state from the harness: follow it, stay on the task, do not undo it, "
-                         "and do not restate or comment on it]\n" + "\n\n".join(_tail_secs))
-                _role = "system" if _rt_trailing_system_ok() else "user"
-                trimmed = _attach_session_state(trimmed, _body, _role)
+            # Earlier notes stay on the messages they were sent with, and a new
+            # one is added only when its text changed (see _StateNotes), so the
+            # prompt only grows within a task and the cache is reused whole.
+            # Neutral wording: "re-sent every turn" made models open their reasoning
+            # with "Session state has been resent" (30 of 368 logged rounds).
+            trimmed = _state_notes.apply(
+                trimmed,
+                "[task state from the harness: follow it, stay on the task, do not undo it, "
+                "and do not restate or comment on it]",
+                _tail_secs,
+                "system" if _rt_trailing_system_ok() else "user",
+                rounds,
+                allow_new=not _carry_call)
 
             payload = {
                 "model": model or "local",
@@ -33129,7 +33429,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     if _ctx_attempt < 3 and _is_ctx_overflow(e):
                         pad = max(2048, int(ctx_limit * 0.12)) * (_ctx_attempt + 1)
                         tighter = min(effective_reserve + pad, ctx_limit - 1024)
-                        trimmed = truncate_messages(_thinking_wire_view(conversation, settings),
+                        trimmed = truncate_messages(_thinking_wire_view(
+                            conversation, settings, keep_reasoning_from=_reasoning_keep_from),
                                                     ctx_limit, reserve=tighter,
                                                     token_scale=token_scale)
                         payload["messages"] = _sanitize_messages_for_openai(
@@ -33852,7 +34153,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     notebook = _research_store.get(research_id, chat_id)
                     if notebook["notes"] and notebook["status"] != "complete":
                         research_retries += 1
-                        conversation.append({"role": "user", "content":
+                        conversation.append({"role": "user", "_synthetic": True, "content":
                             "The research notebook has evidence but no published presentation. Call research_notebook, "
                             "resolve uncovered questions or declare the gaps, then call research_publish. "
                             "Do not claim the presentation exists before the tool succeeds."})
@@ -34557,9 +34858,9 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
 
 
 # Rewrite prior assistant <think>...</think> blocks as plain-text short-term
-# memory notes so they survive chat-template stripping (Qwen3, DeepSeek, etc.
-# discard prior reasoning by default). The wire marker stays
-# `[scratchpad-from-earlier-turn]` so older chat histories keep rendering.
+# memory notes so they survive templates that drop earlier reasoning (older
+# Qwen3 and DeepSeek templates do; Qwen3.5+ templates keep it). The wire marker
+# stays `[scratchpad-from-earlier-turn]` so older chat histories keep rendering.
 _PRIOR_THINK_RE = re.compile(r"<think>([\s\S]*?)</think>", re.IGNORECASE)
 
 def _preserve_prior_thinking(text: str) -> str:
@@ -34577,11 +34878,33 @@ def _preserve_prior_thinking(text: str) -> str:
 
 # With preserve_prior_thinking off, strip old <think> blocks ourselves:
 # Qwen3.5-family templates (and llama.cpp's reasoning-preserve default) replay
-# every prior <think> verbatim, 31% of a real 91K-token agent prompt. The
-# newest round keeps its reasoning so the model knows why it ran the call
-# whose result it is reading. Keeping more costs prompt cache: each round the
-# oldest kept message flips to stripped and llama.cpp re-prefills from there.
-_PRIOR_THINK_KEEP_RECENT = 1
+# every prior <think> verbatim, 31% of a real 91K-token agent prompt.
+#
+# Reasoning is stripped only from tasks the user has moved on from: every
+# assistant message since the user's latest real message keeps it. Stripping
+# within a task (v1.0.0 kept just the newest round) rewrote the previous
+# round's message on every round. On a plain transformer llama.cpp re-prefills
+# from that point, a few hundred tokens. Hybrid models (Qwen3.5/3.6/3.8, whose
+# recurrent state cannot rewind) fall back to the last context checkpoint
+# instead, 8K+ tokens apart by default: measured 6-10x more prompt processing
+# per long agent turn. Now the prompt only grows within a task, and the
+# reprocess happens once, when the user sends a new message.
+#
+# Mid-task messages the harness injects (automatic notes, recovery and loop
+# guard prompts, thinking notes, steering updates) are not a new task.
+_SYNTHETIC_USER_PREFIXES = ("[automatic", "[loop guard]")
+
+
+def _is_task_boundary(m: dict) -> bool:
+    """True for a real user message, the start of a new task."""
+    if not isinstance(m, dict) or m.get("role") != "user":
+        return False
+    if m.get("_thinking_note") or m.get("_steering_id") or m.get("_synthetic"):
+        return False
+    content = m.get("content")
+    if isinstance(content, list):
+        content = " ".join(str(p.get("text") or "") for p in content if isinstance(p, dict))
+    return not str(content or "").lstrip().startswith(_SYNTHETIC_USER_PREFIXES)
 
 
 def _strip_prior_thinking(text: str) -> str:
@@ -34767,12 +35090,21 @@ def _prior_thinking_mode(settings: dict | None = None) -> str:
         return "scratchpad"
 
 
-def _thinking_wire_view(msgs: list[dict], settings: dict | None = None) -> list[dict]:
+def _thinking_wire_view(msgs: list[dict], settings: dict | None = None,
+                        keep_reasoning_from: dict | None = None) -> list[dict]:
     """What the model is actually sent for prior reasoning, as message copies.
 
     The context budget (trim/fold decisions) and the payload both go through
     this, so the fill they measure matches the prompt. The stored conversation
-    — the compaction summarizer's input — is never changed."""
+    — the compaction summarizer's input — is never changed.
+
+    `keep_reasoning_from` is a reasoning cleanup's cut point (see
+    _reasoning_cleanup_anchor): an assistant message from `msgs` before which
+    reasoning is stripped even inside the current task."""
+    # Cut point by identity in the caller's list; normalizing below copies
+    # some messages, and the positions stay one-to-one.
+    cut = (next((i for i, m in enumerate(msgs) if m is keep_reasoning_from), -1)
+           if keep_reasoning_from is not None else -1)
     # Every assistant message goes out with real <think>…</think> tags (never
     # the bare marker), whether prior reasoning is then stripped or preserved.
     normalized = []
@@ -34786,10 +35118,13 @@ def _thinking_wire_view(msgs: list[dict], settings: dict | None = None) -> list[
         msgs = normalized
     if _prior_thinking_mode(settings) != "strip":
         return msgs
-    assistant_idxs = [i for i, m in enumerate(msgs) if m.get("role") == "assistant"]
-    if len(assistant_idxs) <= _PRIOR_THINK_KEEP_RECENT:
+    # Keep reasoning from the user's latest real message on (see
+    # _SYNTHETIC_USER_PREFIXES); strip it from earlier tasks, and from before a
+    # reasoning cleanup's cut point.
+    keep_from = max((i for i, m in enumerate(msgs) if _is_task_boundary(m)), default=-1)
+    keep_from = max(keep_from, cut)
+    if keep_from <= 0:
         return msgs
-    keep_from = assistant_idxs[-_PRIOR_THINK_KEEP_RECENT] if _PRIOR_THINK_KEEP_RECENT else len(msgs)
     out = []
     for i, m in enumerate(msgs):
         if i < keep_from and m.get("role") == "assistant" and isinstance(m.get("content"), str):
@@ -34798,6 +35133,85 @@ def _thinking_wire_view(msgs: list[dict], settings: dict | None = None) -> list[
                 m = dict(m, content=stripped)
         out.append(m)
     return out
+
+
+# Reasoning cleanup: when a long task's prompt reaches the compaction trigger,
+# first drop the reasoning of all but the last few rounds and keep everything
+# else (tool results, answers, tool calls) word for word. Reasoning is the least
+# valuable context, and on a reasoning-heavy task it was ~70% of what the model
+# wrote, so this frees real room without summarizing anything away. It costs
+# one re-read of the prompt (the earlier text changes once), about what a
+# compaction's rebuild costs, minus the summarizer call and its detail loss.
+# Compaction still runs when a cleanup would not free enough. 25% so it only
+# fires when it can actually head off a compaction (reasoning-heavy, light
+# tool output). At 10%, a replay of a real 66-round task spent ~80 s
+# re-reading to delay its one compaction by just 7 minutes.
+_REASONING_CLEANUP_KEEP_ROUNDS = 3
+_REASONING_CLEANUP_MIN_FRAC = 0.25   # of the context window
+
+
+def _reasoning_cleanup_anchor(msgs: list[dict], settings: dict | None = None) -> dict | None:
+    """The assistant message a reasoning cleanup would keep reasoning from (the
+    _REASONING_CLEANUP_KEEP_ROUNDS-th newest), or None when there is nothing
+    older to drop or reasoning is not stripped for this model."""
+    if _prior_thinking_mode(settings) != "strip":
+        return None
+    asst = [m for m in msgs if isinstance(m, dict) and m.get("role") == "assistant"]
+    if len(asst) <= _REASONING_CLEANUP_KEEP_ROUNDS:
+        return None
+    return asst[-_REASONING_CLEANUP_KEEP_ROUNDS]
+
+
+_REASONING_FIELD_CACHE: dict[tuple, bool] = {}
+
+
+def _template_reads_reasoning_content(model_path: str) -> bool:
+    """True when the model's chat template renders `message.reasoning_content`
+    (Qwen3.5+, DeepSeek and most current reasoning templates). Those templates
+    never look for <think> inside `content`: they print their own think block
+    from the field, so reasoning sent inline came out doubled, an empty
+    <think></think> followed by the real one."""
+    if not model_path:
+        return False
+    try:
+        st = Path(model_path).stat()
+        key = (model_path, int(st.st_mtime_ns), int(st.st_size))
+    except Exception:
+        key = (model_path, 0, 0)
+    if key in _REASONING_FIELD_CACHE:
+        return _REASONING_FIELD_CACHE[key]
+    texts: list[str] = []
+    try:
+        keys = (read_gguf_metadata(model_path).get("keys") or {})
+        texts += [str(v) for k, v in keys.items()
+                  if "chat_template" in str(k).lower() and isinstance(v, str)]
+    except Exception:
+        pass
+    if not texts:
+        # Only ask the server about the model it is actually running.
+        try:
+            if _llama.loaded_model() == model_path:
+                tpl = _llama_props_data().get("chat_template")
+                if isinstance(tpl, str):
+                    texts.append(tpl)
+        except Exception:
+            pass
+    found = "reasoning_content" in "\n".join(texts)
+    _REASONING_FIELD_CACHE[key] = found
+    return found
+
+
+def _split_reasoning_field(content: str) -> tuple[str, str] | None:
+    """Split a leading <think>R</think>A into (R, A), or None."""
+    if not isinstance(content, str):
+        return None
+    head = content.lstrip()
+    if not head.lower().startswith("<think>"):
+        return None
+    close = head.lower().find("</think>")
+    if close < 0:
+        return None
+    return head[len("<think>"):close].strip(), head[close + len("</think>"):].strip()
 
 
 def _sanitize_messages_for_openai(msgs: list[dict],
@@ -34810,6 +35224,16 @@ def _sanitize_messages_for_openai(msgs: list[dict],
     untouched); rolling-summary mode passes false so evidence stays live until a
     fold. The stub path is the fallback when compaction is off."""
     thinking_mode = _prior_thinking_mode()
+    # Reasoning goes out in its own field when the template reads one, so the
+    # model sees each earlier turn exactly as it generated it, and the prompt
+    # extends the cached sequence token for token. Native mode (Nanbeige) keeps
+    # its verbatim inline form, which its template expects.
+    try:
+        reasoning_field = (thinking_mode != "native"
+                           and _template_reads_reasoning_content(
+                               str(get_settings().get("model_path") or "")))
+    except Exception:
+        reasoning_field = False
     out = []
     # the LAST assistant message is "current" reasoning being authored — we
     # only rewrite think blocks for messages strictly older than the latest.
@@ -34850,6 +35274,10 @@ def _sanitize_messages_for_openai(msgs: list[dict],
             if (thinking_mode == "scratchpad" and role == "assistant"
                     and i < last_assistant_idx and isinstance(text_content, str)):
                 text_content = _preserve_prior_thinking(text_content)
+            split = (_split_reasoning_field(text_content)
+                     if reasoning_field and role == "assistant" else None)
+            if split is not None:
+                clean["reasoning_content"], text_content = split
             clean["content"] = text_content
         if role == "tool":
             clean["tool_call_id"] = m.get("tool_call_id") or m.get("name") or "tool"
@@ -35392,6 +35820,45 @@ def _wsl_exe() -> str:
     return _trusted_windows_binary("wsl.exe")
 
 
+_sandbox_exit_stop_lock = threading.Lock()
+_sandbox_exit_stop_registered = False
+
+
+def _stop_sandbox_on_exit() -> None:
+    """Stop the sandbox guest as this process exits. Only our own distro is
+    terminated; `wsl --shutdown` would also stop Docker and the user's other
+    distros. WSL then lets its idle VM go on its own."""
+    try:
+        _wsl_run(["--terminate", SANDBOX_DISTRO], timeout=15)
+    except Exception:
+        pass
+
+
+def _note_sandbox_use() -> None:
+    """Remember that this process started the sandbox guest, so it is stopped
+    when the process exits. Registered on first use rather than in main(), so
+    a script that imports the bridge and runs sandbox commands (a benchmark,
+    a dev check) also stops the guest instead of leaving it running."""
+    global _sandbox_exit_stop_registered
+    with _sandbox_exit_stop_lock:
+        if _sandbox_exit_stop_registered:
+            return
+        _sandbox_exit_stop_registered = True
+    import atexit
+    atexit.register(_stop_sandbox_on_exit)
+
+
+def _wsl_args_enter_sandbox(args) -> bool:
+    """True when wsl.exe args run something inside the sandbox guest."""
+    args = list(args or [])
+    for flag in ("-d", "--distribution"):
+        if flag in args:
+            i = args.index(flag)
+            if i + 1 < len(args) and args[i + 1] == SANDBOX_DISTRO:
+                return True
+    return False
+
+
 def _wsl_run(args, timeout=60):
     """Run a wsl.exe command, return (returncode, combined_output).
     WSL_UTF8=1 makes wsl.exe emit UTF-8 (its native output is UTF-16LE, which
@@ -35401,6 +35868,8 @@ def _wsl_run(args, timeout=60):
     executable = _wsl_exe()
     if not executable:
         return 127, "trusted wsl.exe was not found in the Windows system directory"
+    if _wsl_args_enter_sandbox(args):
+        _note_sandbox_use()
     try:
         r = subprocess.run([executable, *args], capture_output=True, text=True,
                            timeout=timeout, env=env, creationflags=_NO_WINDOW,
@@ -35450,6 +35919,8 @@ def _wsl_bash(distro, script, timeout=120, *, announce=False,
             _emit_execution_event("not_executed", "sandbox", command or script,
                                   cwd=cwd, reason="spawn_error", message=message)
         return 127, message, False, False
+    if distro == SANDBOX_DISTRO:
+        _note_sandbox_use()
     try:
         p = subprocess.Popen([
             executable, "-d", distro, "-u", "root", "--",
@@ -35756,6 +36227,7 @@ def _sbx_stream_provision(script, timeout=1800) -> int:
     if not executable:
         _sbx_log("trusted wsl.exe was not found in the Windows system directory")
         return 127
+    _note_sandbox_use()
     cmd = [
         executable, "-d", SANDBOX_DISTRO, "-u", "root", "--",
         "/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV",
@@ -37732,6 +38204,13 @@ class Handler(BaseHTTPRequestHandler):
             # GET — best-effort GPU VRAM probe via nvidia-smi. Used by the
             # Settings drawer to pre-fill the VRAM tier dropdown.
             return self._send_json(200, detect_vram_gb())
+        if p == "/api/list-subfolders":
+            # The project picker's folder browser: folder names only, anywhere on
+            # this computer (the same reach as the native "Open folder…" dialog).
+            # A picked folder outside the workspace is added to it, which is what
+            # scopes the agent's file tools. No path = the starting points.
+            qs = urllib.parse.parse_qs(parsed.query)
+            return self._send_json(200, _list_subfolders((qs.get("path") or [""])[0]))
         if p == "/api/list-folder":
             qs = urllib.parse.parse_qs(parsed.query)
             raw = (qs.get("path") or [""])[0]
@@ -37745,16 +38224,7 @@ class Handler(BaseHTTPRequestHandler):
                 target_resolved = target.resolve()
             except Exception:
                 return self._send_json(400, {"error": "bad path"})
-            allowed = False
-            for f in ws:
-                try:
-                    root = Path(f).resolve()
-                    if str(target_resolved).lower().startswith(str(root).lower()):
-                        allowed = True
-                        break
-                except Exception:
-                    continue
-            if not allowed:
+            if not _path_in_workspace(target_resolved, ws):
                 return self._send_json(403, {"error": "path outside workspace"})
             if not target_resolved.exists() or not target_resolved.is_dir():
                 return self._send_json(404, {"error": "not a directory"})
@@ -38970,7 +39440,7 @@ class Handler(BaseHTTPRequestHandler):
         _effort = body.get("reasoning_effort")
         if _effort is None or not str(_effort).strip():
             _effort = get_settings().get("reasoning_effort")
-        reasoning_effort = _normalize_reasoning_effort(_effort)
+        reasoning_effort = _normalize_effort_choice(_effort)
         client_ctx = _handler_client_context(self, body.get("client_context"))
         _client_context_by_chat[chat_id] = client_ctx
         if client_ctx.get("execution_target") != "host":
@@ -39862,12 +40332,34 @@ def inspect_model(model_path: str) -> dict:
 
 _REASONING_LEVELS = ("auto", "low", "medium", "high")
 
+# Effort names templates use, weakest first. The composer shows a model's own
+# names (Qwen3.8: low/medium/xhigh; gpt-oss: low/medium/high); internally each
+# maps to one of the low/medium/high tiers for response room and verification.
+_EFFORT_RANK = {"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
+_EFFORT_CHOICES = frozenset(_EFFORT_RANK) | {"auto"}
+
+
+def _normalize_effort_choice(value) -> str:
+    """A composer choice: "auto" or any known native effort name."""
+    value = str(value or "auto").strip().lower()
+    aliases = {"med": "medium", "default": "auto", "normal": "medium", "x-high": "xhigh",
+               "extra-high": "xhigh", "extra_high": "xhigh", "deep": "high"}
+    value = aliases.get(value, value)
+    return value if value in _EFFORT_CHOICES else "auto"
+
+
+def _effort_tier(value) -> str:
+    """auto / low / medium / high for any choice (xhigh and max count as high)."""
+    choice = _normalize_effort_choice(value)
+    if choice == "auto":
+        return "auto"
+    rank = _EFFORT_RANK[choice]
+    return "low" if rank <= _EFFORT_RANK["low"] else "medium" if rank == _EFFORT_RANK["medium"] else "high"
+
 
 def _normalize_reasoning_effort(value) -> str:
-    value = str(value or "auto").strip().lower()
-    aliases = {"med": "medium", "default": "auto", "normal": "medium"}
-    value = aliases.get(value, value)
-    return value if value in _REASONING_LEVELS else "auto"
+    """The tier of a composer choice (kept for callers that think in tiers)."""
+    return _effort_tier(value)
 
 
 def _model_reasoning_was_observed(model: str) -> bool:
@@ -39906,6 +40398,68 @@ def _mark_model_reasoning_observed(model: str) -> None:
             _REASONING_CAP_CACHE.clear()
         except Exception:
             pass
+
+
+_EFFORT_VAR = r"[\w.]*(?:effort|thinking_level|reasoning_level|reasoning_strength)[\w.]*"
+
+
+def _effort_names(raw: str) -> list[str]:
+    """Known effort names in a quoted list, ordered low to high. "none" is
+    thinking-off, which the thinking toggle already covers."""
+    found = {m.lower() for m in re.findall(r"['\"]([A-Za-z]+)['\"]", raw or "")}
+    return sorted((n for n in found if n in _EFFORT_RANK and n != "none"),
+                  key=lambda n: _EFFORT_RANK[n])
+
+
+def _parse_native_effort_levels(template: str) -> tuple[list[str], str]:
+    """Read a chat template's own effort level names and its default.
+
+    Tried in order, most to least explicit:
+      1. a whitelist the template enforces, e.g. Qwen3.8's
+         `resolved_reasoning_effort not in ('xhigh', 'medium', 'low')`;
+      2. the values it assigns to its effort variable, for templates that
+         fold aliases (high/max/extreme -> xhigh) into a few canonical levels;
+      3. the values it compares its effort variable against.
+    Returns ([], "") when the template names no levels."""
+    text = str(template or "").replace('\\"', '"').replace("\\n", "\n")
+    levels: list[str] = []
+    for m in re.finditer(_EFFORT_VAR + r"\s+not\s+in\s*[\(\[]([^\)\]]*)[\)\]]", text, re.I):
+        levels = _effort_names(m.group(1))
+        if levels:
+            break
+    if not levels:
+        assigned = re.findall(r"set\s+" + _EFFORT_VAR + r"\s*=\s*(['\"][A-Za-z]+['\"])", text, re.I)
+        levels = _effort_names(" ".join(assigned))
+        if len(levels) < 2:
+            levels = []
+    if not levels:
+        compared = re.findall(_EFFORT_VAR + r"\s*==\s*(['\"][A-Za-z]+['\"])", text, re.I)
+        levels = _effort_names(" ".join(compared))
+        if len(levels) < 2:
+            levels = []
+    default = ""
+    for pat in (_EFFORT_VAR + r"\s*\|\s*default\(\s*['\"]([A-Za-z]+)['\"]",
+                r"set\s+[\w.]*default[\w.]*(?:effort|level)[\w.]*\s*=\s*['\"]([A-Za-z]+)['\"]",
+                r"set\s+(?:reasoning_effort|thinking_level|reasoning_level|reasoning_strength)"
+                r"\s*=\s*['\"]([A-Za-z]+)['\"]"):
+        m = re.search(pat, text, re.I)
+        if m and m.group(1).lower() in _EFFORT_RANK:
+            default = m.group(1).lower()
+            break
+    if levels and default and default not in levels:
+        default = _nearest_native_level(default, levels) or ""
+    return levels, default
+
+
+def _nearest_native_level(choice: str, levels) -> str | None:
+    """The model's level closest to a choice; a tie goes to the deeper one
+    (asking for "high" on a low/medium/xhigh model gets xhigh)."""
+    choice = _normalize_effort_choice(choice)
+    levels = [l for l in (levels or []) if l in _EFFORT_RANK]
+    if choice == "auto" or not levels:
+        return None
+    rank = _EFFORT_RANK[choice]
+    return min(levels, key=lambda l: (abs(_EFFORT_RANK[l] - rank), -_EFFORT_RANK[l]))
 
 
 def _reasoning_capability(model_path: str = "", settings: dict | None = None,
@@ -39957,6 +40511,8 @@ def _reasoning_capability(model_path: str = "", settings: dict | None = None,
         }
         if override == "native_effort":
             cap["native_parameter"] = "reasoning_effort"
+            cap["native_levels"] = ["low", "medium", "high"]
+            cap["native_default"] = ""
         _REASONING_CAP_CACHE[cache_key] = cap
         return dict(cap)
 
@@ -40052,6 +40608,22 @@ def _reasoning_capability(model_path: str = "", settings: dict | None = None,
             cap["native_effort_map"] = native_map
         if advertised_native_levels:
             cap["native_effort_values"] = sorted(advertised_native_levels)
+        # The picker shows the template's own names (Qwen3.8: low, medium,
+        # xhigh), read from the GGUF template first, then the live server's.
+        native_levels, native_default = _parse_native_effort_levels(gguf_template)
+        if not native_levels:
+            native_levels, native_default = _parse_native_effort_levels(props_text)
+        if not native_levels and any(x in name for x in ("gpt-oss", "gpt_oss")):
+            native_levels, native_default = ["low", "medium", "high"], "medium"
+        if not native_levels:
+            native_levels = [l for l in ("low", "medium", "high", "xhigh", "max")
+                             if l in advertised_native_levels]
+            if len(native_levels) < 2:
+                native_levels = ["low", "medium", "high"]
+        cap["native_levels"] = native_levels
+        cap["native_default"] = native_default
+        cap["levels"] = ["auto"] + native_levels
+        cap["description"] = "Uses the model's own effort levels: " + ", ".join(native_levels) + "."
     _REASONING_CAP_CACHE[cache_key] = cap
     return dict(cap)
 
@@ -40112,9 +40684,10 @@ def _reasoning_budget_for_effort(level: str, ctx_limit: int) -> int:
 def _resolve_reasoning_request(effort, capability: dict, settings: dict,
                                ctx_limit: int) -> dict:
     """Resolve one composer choice into template kwargs + harness limits."""
-    level = _normalize_reasoning_effort(effort)
+    choice = _normalize_effort_choice(effort)
+    level = _effort_tier(choice)
     if level != "auto" and not capability.get("supported"):
-        level = "auto"
+        choice = level = "auto"
     enabled = settings.get("enable_thinking") is not False
     try:
         legacy_budget = int(settings.get("thinking_budget") if settings.get("thinking_budget") is not None else 2048)
@@ -40125,7 +40698,14 @@ def _resolve_reasoning_request(effort, capability: dict, settings: dict,
         enabled = True
         effort_headroom = _reasoning_budget_for_effort(level, ctx_limit)
         if capability.get("mode") == "native_effort":
-            native_effort = (capability.get("native_effort_map") or {}).get(level, level)
+            native_levels = capability.get("native_levels") or []
+            if choice in native_levels:
+                # The model's own level name (e.g. Qwen's "xhigh") goes
+                # through untouched.
+                native_effort = choice
+            else:
+                native_effort = _nearest_native_level(choice, native_levels) \
+                    or (capability.get("native_effort_map") or {}).get(level, level)
             # Native-effort models decide how long Low/Medium/Deep should reason.
             # Keep enough response room for that thinking, but do not also send
             # a numeric target or trip the numeric runaway ceiling against it.
@@ -40141,7 +40721,7 @@ def _resolve_reasoning_request(effort, capability: dict, settings: dict,
         budget = 0
         response_headroom = 0
     return {
-        "effort": level, "enabled": bool(enabled), "budget": int(budget),
+        "effort": level, "choice": choice, "enabled": bool(enabled), "budget": int(budget),
         "native_effort": native_effort,
         "response_headroom": int(response_headroom),
     }
@@ -41809,7 +42389,11 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
             )
 
     out["num_ctx"] = chosen_ctx
-    out["n_cpu_moe"] = chosen_n_cpu_moe
+    # Expert offload is MoE-only. A proven combo copied from a saved config can
+    # carry a value a previous MoE model left in the shared setting; on a dense
+    # model llama.cpp ignores it, but it mislabels the plan and skips the
+    # spare-VRAM ubatch step.
+    out["n_cpu_moe"] = chosen_n_cpu_moe if is_moe else 0
     notes.extend(tier_notes)
     if trained_max:
         notes.append(f"GGUF reports trained max {trained_max:,} tokens (informational, not enforced).")
@@ -42202,19 +42786,47 @@ def llama_caps(bin_path: str = "") -> dict:
             caps["checkpoint_every_n"] = "--checkpoint-every-n-tokens" in help_txt
             caps["moe_cache"] = "--moe-cache-mib" in help_txt
             caps["fit_target"] = "--fit-target" in help_txt
+            # How to load the weights without keeping a memory-mapped copy:
+            # newer builds take --load-mode, older ones --no-mmap.
+            caps["load_mode"] = "--load-mode" in help_txt
+            caps["no_mmap"] = "--no-mmap" in help_txt
     except Exception:
         pass
     _LLAMA_CAPS_CACHE[key] = caps
     return caps
 
 
+def _no_mmap_flags(caps: dict, ngl: int, n_cpu_moe: int, extra_args: str = "") -> list[str]:
+    """Load the weights without keeping a memory-mapped copy in RAM.
+
+    By default llama.cpp maps the .gguf into memory, copies the weights to the
+    GPU, and the mapped pages stay in its working set: measured 12.6 GB of a
+    16.35 GB Qwen3.8 quant held in RAM while every layer ran on the GPU, with
+    the system at 0.7 GB free. When the whole model is on the GPU nothing reads
+    those pages again, so load without mapping and the RAM is free after
+    loading (the load itself is a little slower). With weights or experts
+    offloaded to the CPU the mapping is what they run from, so keep it there.
+    A loading flag the user put in extra args always wins."""
+    if ngl != -1 or n_cpu_moe > 0:
+        return []
+    low = f" {extra_args or ''} ".lower()
+    if any(f in low for f in (" --load-mode", " -lm ", " --no-mmap", " --mmap", " --mlock")):
+        return []
+    if caps.get("load_mode"):
+        return ["--load-mode", "none"]
+    if caps.get("no_mmap"):
+        return ["--no-mmap"]
+    return []
+
+
 def _checkpoint_spawn_flags(caps: dict, profile: dict) -> list[str]:
     """Explicit compatibility override for hybrid/SWA context checkpoints.
 
-    On current llama.cpp builds (measured on Qwen 3.8 and Qwen35 hybrids) these
-    flags disable ordinary slot-prefix reuse, turning warm 32K/62K follow-ups
-    into full prefills. Kept available for future builds, but never enabled
-    just because a model is hybrid."""
+    On the llama.cpp build this was written against (v0.7.9 era, Qwen 3.8 and
+    Qwen35 hybrids) these flags disabled ordinary slot-prefix reuse, turning
+    warm 32K/62K follow-ups into full prefills. Returning no flags does not
+    disable checkpoints: newer builds create their own by default (build 12121:
+    32 per slot, 8192 apart). Never enabled just because a model is hybrid."""
     try:
         s = get_settings()
         if not bool(s.get("ctx_checkpoints_enabled", False)):
@@ -43399,6 +44011,21 @@ def _apply_model_config(model_path: str) -> bool:
     for k in _MODEL_TUNE_RESET_KEYS:
         if k not in cfg:
             s[k] = DEFAULT_SETTINGS[k]
+    # n_cpu_moe is one shared setting. A partial saved config (a drawer save
+    # right after switching models writes only the touched keys) must not let
+    # the previous model's offload ride along, and a dense model never offloads
+    # experts at all. Heal a stale saved value while we're here.
+    if "n_cpu_moe" not in cfg or (int(cfg.get("n_cpu_moe") or 0) > 0 and _model_is_dense(model_path)):
+        s["n_cpu_moe"] = 0
+        if int(cfg.get("n_cpu_moe") or 0) > 0:
+            try:
+                allc = _models_config()
+                ent = allc.get(model_path)
+                if isinstance(ent, dict):
+                    ent["n_cpu_moe"] = 0
+                    save_json(MODELS_CONFIG_FILE, allc)
+            except Exception:
+                pass
     s["mmproj_mode"] = _normalized_mmproj_mode(s)
     s["mmproj_auto"] = s["mmproj_mode"] == "auto"
     if "spec_strategy" in cfg:
@@ -43453,6 +44080,18 @@ def _stamp_proven_boot(model_path: str, ctx: int) -> None:
         pass
 
 
+def _model_is_dense(model_path: str) -> bool:
+    """True only when the GGUF header was read and lists no experts. An
+    unreadable header says nothing, so callers keep their MoE offload then."""
+    if not model_path:
+        return False
+    try:
+        gg = read_gguf_metadata(model_path)
+    except Exception:
+        return False
+    return bool(gg.get("ok")) and int(gg.get("expert_count") or 0) <= 1
+
+
 def _proven_cfg(model_path: str) -> dict:
     """The proven-boot metadata for a model, or {} — tiny passthrough so
     callers pass it straight into auto_tune()."""
@@ -43480,8 +44119,11 @@ def _auto_tune_for_load(model_path: str) -> bool:
             return False
         profile = inspect_model(model_path)
         # A fresh tune (no remembered config): still grow-only vs the saved
-        # num_ctx so a user's raised context survives a re-tune here too.
-        _min_ctx_saved = int(get_settings().get("num_ctx") or 0)
+        # num_ctx so a user's raised context survives a re-tune here too — but
+        # only when that ctx is this model's. On a switch, settings.num_ctx
+        # still holds the previous model's window, which is no floor for this one.
+        _min_ctx_saved = (int(get_settings().get("num_ctx") or 0)
+                          if _llama.loaded_model() == model_path else 0)
         suggested = auto_tune(model_path, vram, profile=profile, min_ctx=_min_ctx_saved)
         if not suggested.get("num_ctx"):
             return False
@@ -43960,6 +44602,10 @@ class LlamaProcess:
         n_threads = int(s.get("num_thread") or 0)  # 0 = let llama-server pick
         n_parallel = max(int(s.get("n_parallel") or 1), 1)
         n_cpu_moe = max(int(s.get("n_cpu_moe") or 0), 0)
+        if n_cpu_moe > 0 and _model_is_dense(model_path):
+            print(f"[llama] ignoring n_cpu_moe {n_cpu_moe}: {os.path.basename(model_path)} is a dense model",
+                  file=sys.stderr)
+            n_cpu_moe = 0
         kv_type = (s.get("kv_cache_type") or "q8_0").strip().lower()
         if kv_type not in ("f16", "bf16", "f32", "q8_0", "q4_0", "q5_0", "q5_1", "q4_1"):
             kv_type = "q8_0"
@@ -44080,6 +44726,7 @@ class LlamaProcess:
         # only as a safety net for a real shortage at boot.
         if ngl == -1 and caps.get("fit_target"):
             cmd += ["--fit-target", "384"]
+        cmd += _no_mmap_flags(caps, ngl, n_cpu_moe, extra_args_raw)
         if caps.get("flash_attn", True):
             cmd += ["--flash-attn", "on" if flash_on else "off"]
         elif flash_on:

@@ -2788,11 +2788,17 @@
     return `<div class="diff-card">${head}${rawHolder}<div class="diff-split">${renderDiffSplit(rows)}</div>${unified}</div>`;
   }
 
+  // Paragraph break the app inserts between agent steps (see tool_start), led by
+  // an invisible separator (U+2063) so it can be told apart from model text.
+  const STEP_BREAK = "⁣\n\n";
+  const STEP_BREAK_RE = /⁣\n\n/g;
+
   // Working notes are model narration, not a deliverable. Render them as
   // escaped prose so stray backticks cannot turn whole thoughts into code UI.
   function renderWorkingNotes(text) {
     if (!text) return "";
     const plain = String(text)
+      .replace(/⁣/g, "")
       .replace(/(^|\n)[ \t]*```[^\n]*\n?/g, "$1")
       .replace(/```/g, "")
       .replace(/`+/g, "")
@@ -3827,7 +3833,10 @@
     if (!chip || !label) return;
     const pointer = projectPointerForChat(chat);
     label.textContent = pointer ? pointer.name : "No project";
-    chip.title = pointer ? pointer.path : "Choose the folder this session works on";
+    // A folder picked up from the agent's own work says so on hover.
+    const auto = !!chat?.project_workspace?.auto && !chat?.github_worktree;
+    chip.title = pointer ? (auto ? `${pointer.path}\nThe agent is working here. Click to choose another folder.` : pointer.path)
+      : "Choose the folder this session works on";
     chip.classList.toggle("on", !!pointer);
   }
 
@@ -3854,20 +3863,58 @@
     return { recent, folders };
   }
 
+  // Folder browser inside the project menu: a stack of folders the user opened
+  // with a row's chevron. Empty = the top list (recent + workspace folders);
+  // "" on the stack = this computer's starting points (home, drives).
+  const projectBrowse = { stack: [] };
+  const PROJECT_BROWSE_ROOTS = "";
+
+  // A project must sit in a workspace folder (that's what scopes the agent's
+  // file tools); one picked outside gets added, as Open folder… does.
+  function projectInWorkspace(path) {
+    const key = projectPathKey(path);
+    return !!key && (state.workspace?.folders || []).some(root => {
+      const rootKey = projectPathKey(root);
+      return rootKey && (key === rootKey || key.startsWith(rootKey + "/"));
+    });
+  }
+
+  // Tool and cache folders that are never a project.
+  const PROJECT_BROWSE_SKIP = new Set([".git", "node_modules", "__pycache__", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", ".tox", ".idea"]);
+
+  function projectRow(pointer, currentKey, { showPath = true } = {}) {
+    const selected = projectPathKey(pointer.path) === currentKey;
+    const name = pointer.name || projectBaseName(pointer.path);
+    // Home and drives are places to start from, never a project themselves
+    // (a whole drive would hand the agent's file tools the whole drive).
+    if (pointer.kind === "drive" || pointer.kind === "home") {
+      return `<button type="button" class="mm-row" role="menuitem" data-drill-path="${esc(pointer.path)}" title="${esc(pointer.path)}">
+        <i class="ph ${pointer.kind === "drive" ? "ph-hard-drives" : "ph-house"}" aria-hidden="true"></i>
+        <span class="mm-row-name">${esc(name)}</span>
+        ${showPath ? `<span class="mm-row-sub">${esc(pointer.path)}</span>` : ""}
+        <i class="ph ph-caret-right project-row-caret" aria-hidden="true"></i>
+      </button>`;
+    }
+    const drill = `<button type="button" class="project-drill" role="menuitem" data-drill-path="${esc(pointer.path)}" title="Show the folders inside ${esc(name)}" aria-label="Show the folders inside ${esc(name)}"><i class="ph ph-caret-right" aria-hidden="true"></i></button>`;
+    const icon = selected ? "ph-folder-open" : "ph-folder-simple";
+    return `<div class="project-row">
+      <button type="button" class="mm-row${selected ? " loaded" : ""}" role="menuitemradio" aria-checked="${selected}" data-project-path="${esc(pointer.path)}" data-project-name="${esc(name)}" title="${esc(pointer.path)}">
+        <i class="ph ${icon}" aria-hidden="true"></i>
+        <span class="mm-row-name">${esc(name)}</span>
+        ${showPath ? `<span class="mm-row-sub">${esc(pointer.path)}</span>` : ""}
+      </button>${drill}
+    </div>`;
+  }
+
   function renderProjectMenu() {
     const menu = $("#project-menu");
     if (!menu) return;
+    if (projectBrowse.stack.length) return renderProjectBrowse(menu);
     const current = projectPointerForChat(state.chats?.chats?.[state.chatId]);
     const currentKey = current ? projectPathKey(current.path) : "";
     const { recent, folders } = projectCandidates();
-    const row = (pointer) => {
-      const selected = projectPathKey(pointer.path) === currentKey;
-      return `<button type="button" class="mm-row${selected ? " loaded" : ""}" role="menuitemradio" aria-checked="${selected}" data-project-path="${esc(pointer.path)}" data-project-name="${esc(pointer.name)}" title="${esc(pointer.path)}">
-        <i class="ph ${selected ? "ph-folder-open" : "ph-folder-simple"}" aria-hidden="true"></i>
-        <span class="mm-row-name">${esc(pointer.name || projectBaseName(pointer.path))}</span>
-        <span class="mm-row-sub">${esc(pointer.path)}</span>
-      </button>`;
-    };
+    const row = (pointer) => projectRow(pointer, currentKey);
     const parts = [];
     if (recent.length) {
       parts.push('<div class="overflow-section-label">Recent</div>');
@@ -3877,15 +3924,56 @@
       parts.push('<div class="overflow-section-label">Workspace folders</div>');
       parts.push(...folders.map(row));
     }
-    if (!recent.length && !folders.length) {
-      parts.push('<div class="project-menu-empty">No folders in the workspace yet. Use Open folder… to add one.</div>');
-    }
+    parts.push(`<button type="button" class="mm-row" data-drill-path="${PROJECT_BROWSE_ROOTS}" role="menuitem" title="Pick any folder on this computer"><i class="ph ph-hard-drives" aria-hidden="true"></i><span class="mm-row-name">Browse this computer</span><i class="ph ph-caret-right project-row-caret" aria-hidden="true"></i></button>`);
     parts.push('<div class="overflow-section-label">Session</div>');
     if (current) {
       parts.push('<button type="button" class="mm-row" id="project-clear" role="menuitem"><i class="ph ph-x" aria-hidden="true"></i><span class="mm-row-name">No project</span></button>');
     }
     parts.push('<button type="button" class="mm-row" id="project-open-folder" role="menuitem" title="Add a folder from this computer to the workspace"><i class="ph ph-folder-open" aria-hidden="true"></i><span class="mm-row-name">Open folder…</span></button>');
     menu.innerHTML = parts.join("");
+    menu._reposition?.();
+  }
+
+  // One folder's subfolders: back, "use this folder", then each subfolder
+  // (click to use it, chevron to go further in). The roots entry lists the
+  // home folder and drives instead.
+  async function renderProjectBrowse(menu) {
+    const path = projectBrowse.stack[projectBrowse.stack.length - 1];
+    const atRoots = path === PROJECT_BROWSE_ROOTS;
+    const name = atRoots ? "This computer" : projectBaseName(path);
+    const current = projectPointerForChat(state.chats?.chats?.[state.chatId]);
+    const currentKey = current ? projectPathKey(current.path) : "";
+    const useThis = atRoots ? "" : `<button type="button" class="mm-row${projectPathKey(path) === currentKey ? " loaded" : ""}" role="menuitemradio" aria-checked="${projectPathKey(path) === currentKey}" data-project-path="${esc(path)}" data-project-name="${esc(name)}" title="${esc(path)}">
+        <i class="ph ph-check" aria-hidden="true"></i>
+        <span class="mm-row-name">Use this folder</span>
+      </button>`;
+    const head = `<button type="button" class="mm-row project-back" id="project-back" role="menuitem" title="Back">
+        <i class="ph ph-caret-left" aria-hidden="true"></i>
+        <span class="mm-row-name">${esc(name)}</span>
+        ${atRoots ? "" : `<span class="mm-row-sub">${esc(path)}</span>`}
+      </button>${useThis}
+      <div class="overflow-section-label">${atRoots ? "Start from" : "Folders inside"}</div>`;
+    menu.innerHTML = head + '<div class="project-menu-empty">Loading…</div>';
+    menu._reposition?.();
+    let listing;
+    try {
+      listing = await api(`/api/list-subfolders?path=${encodeURIComponent(path)}`);
+    } catch (e) {
+      listing = { error: e.message || String(e), entries: [] };
+    }
+    // The user may have moved on (back, deeper, closed) while this loaded.
+    if (projectBrowse.stack[projectBrowse.stack.length - 1] !== path || !menu.classList.contains("open")) return;
+    const dirs = (listing.entries || []).filter(e => !PROJECT_BROWSE_SKIP.has(e.name));
+    let body;
+    if (listing.error) {
+      body = `<div class="project-menu-empty">Couldn't open this folder: ${esc(listing.error)}</div>`;
+    } else {
+      body = dirs.length
+        ? dirs.map(e => projectRow(e, currentKey, { showPath: atRoots && e.kind === "home" })).join("")
+        : '<div class="project-menu-empty">No folders inside this one.</div>';
+    }
+    menu.innerHTML = head + body;
+    menu._reposition?.();
   }
 
   async function setChatProject(pointer) {
@@ -4105,19 +4193,34 @@
     chip.addEventListener("click", () => {
       const willOpen = !menu.classList.contains("open");
       chip.setAttribute("aria-expanded", String(willOpen));
-      if (willOpen) renderProjectMenu();
+      if (willOpen) {
+        projectBrowse.stack = [];         // every open starts at the top list
+        renderProjectMenu();
+      }
     });
     menu.addEventListener("click", async (event) => {
+      // Going into a folder or back out re-renders the menu, which detaches
+      // the clicked button; stop here so the outside-click handler doesn't
+      // read that as a click outside the menu and close it.
+      const nav = event.target.closest("[data-drill-path], #project-back");
+      if (nav) {
+        event.stopPropagation();
+        if (nav.id === "project-back") projectBrowse.stack.pop();
+        else projectBrowse.stack.push(nav.dataset.drillPath);
+        renderProjectMenu();
+        return;
+      }
       const target = event.target.closest("[data-project-path], #project-clear, #project-open-folder");
       if (!target) return;
+      projectBrowse.stack = [];
       menu.classList.remove("open");
       chip.setAttribute("aria-expanded", "false");
       if (target.id === "project-open-folder") return pickProjectFolder();
       if (target.id === "project-clear") return setChatProject(null);
-      await setChatProject({
-        path: target.dataset.projectPath || "",
-        name: target.dataset.projectName || projectBaseName(target.dataset.projectPath || ""),
-      });
+      const path = target.dataset.projectPath || "";
+      // Outside the workspace: add it first, exactly like Open folder… does.
+      if (!projectInWorkspace(path) && !(await addFolderToWorkspace(path))) return;
+      await setChatProject({ path, name: target.dataset.projectName || projectBaseName(path) });
     });
     wireOverflow("#project-chip", "#project-menu");
   }
@@ -6660,6 +6763,18 @@
     return `${verb} ${file || name.replaceAll("_", " ")} · ${lines} line${lines === 1 ? "" : "s"}`;
   }
 
+  // Which orb shape a tool call shows. Order matters: web_search is a search,
+  // remote_read_file is a connection, git_diff is reading.
+  function orbPhaseForTool(name) {
+    name = String(name || "");
+    if (name === "update_plan") return "planning";
+    if (/search|find|grep|project_map/.test(name)) return "searching";
+    if (/web|http|fetch|remote|mcp_|connect|recon_|tcp_send|cors_probe/.test(name)) return "connecting";
+    if (/^(read_|list_directory|file_inspect|strings_dump|binary_inspect|disasm_at|ghidra_analyze|decompile_apk|load_skill|parse_|analyze_|git_(status|log|diff|show))/.test(name)) return "reading";
+    if (/^(run_|sandbox_|session_|git_)|shell|check_syntax/.test(name)) return "running";
+    return "working";
+  }
+
   function updateThinkLine(row, running, label) {
     const writing = /^Writing\b/.test(label || "");
     window.AccurettaOrb?.setState(row, running ? (writing ? "composing" : "thinking") : "idle");
@@ -7414,6 +7529,73 @@
     return out;
   }
 
+  // ---------- streaming fade ----------
+  // New answer text fades in tinted with the theme accent, then settles into
+  // the normal text colour, so the last few words always trail a soft accent.
+  // The bubble is re-rendered from markdown on every paint, so the fade can't
+  // live on the DOM: each paint records when the visible text grew, and the
+  // stretches younger than STREAM_FADE_MS are re-wrapped after the paint with a
+  // negative animation-delay, which resumes each fade where it left off.
+  const STREAM_FADE_MS = 900;
+  const STREAM_FADE_SKIP = "pre, svg, .katex, math, button, .stream-code-hint";
+  function applyStreamFade(bubble, opts = {}) {
+    if (!bubble || !bubble.isConnected) return;
+    const now = performance.now();
+    const total = bubble.textContent.length;
+    const f = bubble._fade || (bubble._fade = { len: 0, marks: [] });
+    if (total < f.len) {
+      // Text shrank (markdown re-interpreted, or the bubble was reset).
+      f.marks = f.marks.filter(m => m.from < total).map(m => ({ ...m, to: Math.min(m.to, total) }));
+    } else if (total > f.len && !opts.settle) {
+      // settle (the final render) only finishes fades already running; text
+      // it adds (code-card chrome, etc.) isn't new output.
+      f.marks.push({ from: f.len, to: total, t: now });
+    }
+    f.len = total;
+    f.marks = f.marks.filter(m => now - m.t < STREAM_FADE_MS && m.to > m.from);
+    if (!f.marks.length) return;
+    const minFrom = f.marks[0].from;
+    // Walk text nodes backwards from the end until the oldest fading offset.
+    const walker = document.createTreeWalker(bubble, NodeFilter.SHOW_TEXT);
+    walker.currentNode = bubble;
+    let node = walker.lastChild();
+    let end = total;
+    const todo = [];
+    while (node && end > minFrom) {
+      const start = end - node.nodeValue.length;
+      todo.push([node, start, end]);
+      end = start;
+      node = walker.previousNode();
+    }
+    for (const [tn, start, stop] of todo) {
+      const parent = tn.parentElement;
+      if (!parent || !tn.nodeValue.trim() || parent.closest(STREAM_FADE_SKIP)) continue;
+      const pieces = [];
+      let pos = start;
+      for (const m of f.marks) {
+        const a = Math.max(m.from, start), b = Math.min(m.to, stop);
+        if (b <= a) continue;
+        if (a > pos) pieces.push([pos, a, -1]);
+        pieces.push([a, b, now - m.t]);
+        pos = b;
+      }
+      if (!pieces.length) continue;
+      if (pos < stop) pieces.push([pos, stop, -1]);
+      const text = tn.nodeValue;
+      const frag = document.createDocumentFragment();
+      for (const [a, b, age] of pieces) {
+        const s = text.slice(a - start, b - start);
+        if (age < 0) { frag.appendChild(document.createTextNode(s)); continue; }
+        const span = document.createElement("span");
+        span.className = "stream-fresh";
+        span.style.animationDelay = `-${Math.round(age)}ms`;
+        span.textContent = s;
+        frag.appendChild(span);
+      }
+      tn.replaceWith(frag);
+    }
+  }
+
   function paintStreamDelta(ctx) {
     const { bubble } = ctx;
     const row = ctx.row;
@@ -7548,6 +7730,7 @@
         enhanceCodeBlocks(bubble);
         didRender = true;
       }
+      if (didRender) applyStreamFade(bubble);
       // The completion event normally carries the same text as the final
       // streamed paint. Retain this exact snapshot so it can settle metadata
       // without replacing an already-stable prose node and nudging the chat.
@@ -7751,16 +7934,23 @@
       }
       // Mark the content boundary: everything streamed before this tool call is
       // interim narration (rendered dimmed), everything after is the live answer.
-      if (row) row._answerBufBase = ctx.getBuf().length;
+      // Each step's narration ends here, so give it its own paragraph: steps
+      // streamed back to back with nothing between them ("…the log.No Java…").
+      // STEP_BREAK carries an invisible marker so the final render can tell
+      // these breaks from the model's own text.
+      if (row) {
+        const buf = ctx.getBuf();
+        // Only after a step that wrote visible text: a break after pure
+        // reasoning would make an empty reply look non-empty.
+        const visible = buf ? splitThinking(buf).content.replace(/⁣/g, "").trim() : "";
+        if (visible && !/\n\s*\n\s*$/.test(buf)) ctx.setBuf(buf + STEP_BREAK);
+        row._answerBufBase = ctx.getBuf().length;
+      }
       if (evt.name === "session_start") {
         surfaceShell(evt.arguments?.session_id || evt.arguments?.id || "");
       }
       startToolActivity(toolStack, toolCards, evt);
-      const orbPhase = evt.name === "update_plan" ? "planning"
-        : /search|find|grep|project_map/.test(evt.name) ? "searching"
-        : /web|http|fetch|remote|mcp_|connect/.test(evt.name) ? "connecting"
-        : "working";
-      window.AccurettaOrb?.setState(row, orbPhase);
+      const orbPhase = orbPhaseForTool(evt.name);
       if (!["run_powershell", "run_tests", "sandbox_run", "sandbox_nmap", "sandbox_sqlmap"].includes(evt.name)) {
         const lbl = toolLabel(evt.name, evt.arguments);
         appendAgentLog(`Tool started: ${lbl}`);
@@ -7805,6 +7995,8 @@
       // Keep the turn visibly alive. The concrete action sits in the trail;
       // this header remains the honest overall state until the answer starts.
       if (row) updateThinkLine(row, true, "Working…");
+      // After the header update, which would otherwise put the orb back on "thinking".
+      window.AccurettaOrb?.setState(row, orbPhase);
       // Estimate tokens for the tool call itself — the model generated
       // the tool name + JSON arguments, which aren't in content deltas.
       const argsLen = evt.arguments ? JSON.stringify(evt.arguments).length : 0;
@@ -7843,6 +8035,8 @@
       }
     } else if (evt.type === "tool_result") {
       const completedActivity = finishToolActivity(toolStack, toolCards, evt);
+      // A failed tool scatters the orb until the model's next step moves it on.
+      if (toolResultFailed(evt.result)) window.AccurettaOrb?.setState(row, "error");
       secretRailToolResult(row, evt.name, evt.result);
       attackRailToolResult(row, evt.name, evt.result);
       osintCardToolResult(row, evt.name, evt.result);
@@ -8113,11 +8307,18 @@
           // captured during streaming; if it's no longer a clean prefix, nothing is
           // demoted.
           const interimText = lastRow._interimText || "";
+          // The step breaks exist only in the live buffer, not in the bridge's
+          // text, so match the prefix without them too.
+          const interimBare = interimText.replace(STEP_BREAK_RE, "");
           let interimHtml = "";
           let answerText = finalContent;
-          if (interimText.trim() && finalContent.startsWith(interimText)) {
-            interimHtml = renderWorkingNotesBlock(interimText);
-            answerText = finalContent.slice(interimText.length);
+          if (interimText.trim()) {
+            const cut = finalContent.startsWith(interimText) ? interimText.length
+              : (interimBare !== interimText && finalContent.startsWith(interimBare)) ? interimBare.length : -1;
+            if (cut >= 0) {
+              interimHtml = renderWorkingNotesBlock(interimText);
+              answerText = finalContent.slice(cut);
+            }
           }
           // Decide synchronously (reads live DOM), apply in the finish batch so the
           // bubble rewrite and think-line flip land in one frame. mode: "keep" = live
@@ -8156,6 +8357,8 @@
                 finalBubble.classList.remove("hidden");
                 finalBubble.innerHTML = interimHtml + rendered;
                 enhanceCodeBlocks(finalBubble);
+                // Let the last words finish their fade instead of snapping.
+                applyStreamFade(finalBubble, { settle: true });
               } else if (mode === "hide") {
                 // All content was tool-call-stripped. Keep the bubble hidden.
                 finalBubble.innerHTML = "";
@@ -8181,6 +8384,21 @@
       window.AccurettaResearch?.update(row, evt.research);
     } else if (evt.type === "notice") {
       if (!evt.quiet) toast(evt.note || "", "info", 3000, "ctx-notice");
+    } else if (evt.type === "project_follow") {
+      // The agent started changing files in a folder: the chip follows it.
+      const chat = state.chats?.chats?.[evt.chat_id || state.chatId];
+      if (chat && evt.project_workspace) {
+        chat.project_workspace = evt.project_workspace;
+        if (!evt.chat_id || evt.chat_id === state.chatId) {
+          renderProjectChip(chat);
+          renderTopbarContext(chat);
+          const chip = $("#project-chip");
+          chip?.classList.remove("just-followed");
+          void chip?.offsetWidth;
+          chip?.classList.add("just-followed");
+        }
+        renderChatList();
+      }
     } else if (evt.type === "goal_mode") {
       // Bridge echo of the /goal latch on this turn's own stream; apply it
       // unconditionally (chat_id can still be null on a brand-new chat, exactly
@@ -8983,6 +9201,24 @@
     });
   }
 
+  // "n/N" where n rolls: the old digit slides up and out as the new one rises in.
+  function _setPlanCount(panel, done, total) {
+    const num = panel.querySelector(".plan-count-num");
+    const tot = panel.querySelector(".plan-count-tot");
+    if (!num || !tot) return;
+    tot.textContent = `/${total}`;
+    const cur = num.querySelector(".pcn:not(.pcn-out)");
+    if (cur && cur.textContent === String(done)) return;
+    const next = document.createElement("span");
+    next.className = cur ? "pcn pcn-in" : "pcn";
+    next.textContent = String(done);
+    if (cur) {
+      cur.classList.add("pcn-out");
+      setTimeout(() => cur.remove(), 420);
+    }
+    num.appendChild(next);
+  }
+
   function renderPlanPanel(steps) {
     let panel = document.getElementById("plan-panel");
     if (!steps || !steps.length) { if (panel) panel.remove(); setPlanBtn(false); return; }
@@ -8991,8 +9227,9 @@
       panel.id = "plan-panel";
       panel.innerHTML = `
         <div class="plan-head">
+          <span class="plan-status" aria-hidden="true"><span class="plan-spin"></span><i class="ph-fill ph-check-circle"></i></span>
           <span class="plan-title">Plan</span>
-          <span class="plan-count"></span>
+          <span class="plan-count" aria-live="polite"><span class="plan-count-num"></span><span class="plan-count-tot"></span></span>
           <button class="plan-min" type="button" title="Collapse"><i class="ph ph-caret-up"></i></button>
           <button class="plan-close" type="button" title="Hide"><i class="ph ph-x"></i></button>
         </div>
@@ -9011,14 +9248,27 @@
       setPlanBtn(true);   // auto-pop on first plan of the turn
     }
     const done = steps.filter(s => s.status === "done").length;
-    panel.querySelector(".plan-count").textContent = `${done}/${steps.length}`;
+    _setPlanCount(panel, done, steps.length);
     panel.classList.toggle("plan-complete", done === steps.length);
-    panel.querySelector(".plan-body").innerHTML = steps.map(s => {
+    // Rows are updated in place while the step list is the same, so a step
+    // changing state animates (icon swap, strike drawn across) instead of the
+    // whole list being replaced.
+    const body = panel.querySelector(".plan-body");
+    const titles = steps.map(s => String(s.title || ""));
+    const sameList = body._titles && body._titles.length === titles.length
+      && body._titles.every((t, i) => t === titles[i]);
+    if (!sameList) {
+      body.innerHTML = titles.map(t =>
+        `<div class="plan-step"><span class="plan-ico" aria-hidden="true">` +
+        `<i class="ph ph-circle"></i><i class="ph ph-arrow-circle-right"></i><i class="ph-fill ph-check-circle"></i>` +
+        `</span><span class="plan-text"><span class="plan-label">${esc(t)}</span></span></div>`).join("");
+      body._titles = titles;
+    }
+    const rows = body.children;
+    steps.forEach((s, i) => {
       const st = s.status === "done" ? "done" : (s.status === "active" ? "active" : "pending");
-      const icon = st === "done" ? `<i class="ph ph-check-circle"></i>`
-        : (st === "active" ? `<i class="ph ph-arrow-right"></i>` : `<i class="ph ph-circle"></i>`);
-      return `<div class="plan-step is-${st}">${icon}<span>${esc(s.title)}</span></div>`;
-    }).join("");
+      if (rows[i] && !rows[i].classList.contains(`is-${st}`)) rows[i].className = `plan-step is-${st}`;
+    });
     // Ensure it's in the right container after an update (e.g. if preview was
     // toggled between plan events).
     _reparentPlan();
@@ -15025,6 +15275,8 @@
     $("#sw-notch-enabled")?.classList.toggle("on", !!s.notch_enabled);
     $("#sw-red-team-enabled")?.classList.toggle("on", !!s.red_team_enabled);
     $("#sw-analysis-tools-enabled")?.classList.toggle("on", !!s.analysis_tools_enabled);
+    fill("#set-ghidra-heap", s.ghidra_max_heap_gb ?? 0);
+    fill("#set-ghidra-idle", s.ghidra_idle_minutes ?? 5);
     $("#sw-passive-model-telemetry")?.classList.toggle("on", s.passive_model_telemetry !== false);
     $("#sw-passive-model-telemetry")?.setAttribute(
       "aria-checked", String(s.passive_model_telemetry !== false));
@@ -15202,6 +15454,8 @@
       notch_enabled: $("#sw-notch-enabled")?.classList.contains("on") || false,
       red_team_enabled: $("#sw-red-team-enabled")?.classList.contains("on") || false,
       analysis_tools_enabled: $("#sw-analysis-tools-enabled")?.classList.contains("on") || false,
+      ghidra_max_heap_gb: Math.min(64, Math.max(0, Number($("#set-ghidra-heap")?.value || 0))),
+      ghidra_idle_minutes: Math.min(120, Math.max(1, Number($("#set-ghidra-idle")?.value || 5))),
       passive_model_telemetry: $("#sw-passive-model-telemetry")
         ? $("#sw-passive-model-telemetry").classList.contains("on")
         : true,
@@ -16957,8 +17211,55 @@
   }
 
   const REASONING_EFFORT_KEY = "accuretta:reasoning-effort:v1";
-  const REASONING_EFFORT_LEVELS = ["auto", "low", "medium", "high"];
-  const REASONING_EFFORT_LABELS = ["Default", "Low", "Medium", "Deep"];
+  // Effort names ranked low to high. A model with its own levels (Qwen3.8:
+  // low, medium, xhigh) shows exactly those; others get low, medium, high.
+  const EFFORT_RANK = { minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 };
+  const EFFORT_NAMES = { auto: "Default", minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "xHigh", max: "Max" };
+  const EFFORT_ICONS = { auto: "ph-magic-wand", minimal: "ph-leaf", low: "ph-leaf", medium: "ph-lightning", high: "ph-fire", xhigh: "ph-fire", max: "ph-fire" };
+
+  function effortLevels() {
+    const cap = state.reasoningCapability || {};
+    const native = cap.mode === "native_effort" && Array.isArray(cap.native_levels)
+      ? cap.native_levels.filter(l => EFFORT_RANK[l]) : [];
+    return ["auto", ...(native.length >= 2 ? native : ["low", "medium", "high"])];
+  }
+
+  function effortLabel(level) {
+    return EFFORT_NAMES[level] || String(level || "");
+  }
+
+  // A saved choice the current model lacks maps to its closest level (a tie
+  // goes deeper): "high" becomes xHigh on Qwen3.8, "xhigh" becomes High elsewhere.
+  function fitEffortLevel(level, levels) {
+    level = String(level || "auto").toLowerCase();
+    if (level === "deep") level = "high";
+    if (levels.includes(level)) return level;
+    const rank = EFFORT_RANK[level];
+    if (!rank) return "auto";
+    let best = "auto";
+    let bestKey = null;
+    for (const l of levels) {
+      if (!EFFORT_RANK[l]) continue;
+      const key = [Math.abs(EFFORT_RANK[l] - rank), -EFFORT_RANK[l]];
+      if (!bestKey || key[0] < bestKey[0] || (key[0] === bestKey[0] && key[1] < bestKey[1])) {
+        best = l;
+        bestKey = key;
+      }
+    }
+    return best;
+  }
+
+  function renderEffortMenu(levels) {
+    const menu = $("#reasoning-effort-menu");
+    if (!menu) return;
+    const sig = levels.join(",");
+    if (menu.dataset.levels === sig) return;
+    menu.dataset.levels = sig;
+    menu.innerHTML = levels.map(l =>
+      `<button type="button" class="effort-option" role="menuitemradio" aria-checked="false" data-level="${esc(l)}">`
+      + `<i class="ph ${EFFORT_ICONS[l] || "ph-brain"}" aria-hidden="true"></i><span>${esc(effortLabel(l))}</span>`
+      + `<i class="ph ph-check effort-check" aria-hidden="true"></i></button>`).join("");
+  }
 
   function reasoningModelKey() {
     return String(state.loadedModel || state.settings.model_path || state.settings.model || "")
@@ -16982,18 +17283,18 @@
     input.disabled = nativeOverride;
     row.classList.toggle("is-overridden", nativeOverride);
     if (nativeOverride) {
-      const level = REASONING_EFFORT_LABELS[REASONING_EFFORT_LEVELS.indexOf(state.reasoningEffort)] || "Native effort";
+      const level = effortLabel(state.reasoningEffort) || "Native effort";
       hint.textContent = `${level} uses this model's native effort control. Your saved numeric budget remains available for Default effort and budget-controlled models.`;
     } else if (cap.mode === "native_effort") {
-      hint.textContent = "Default effort uses this saved target. Choosing Low, Medium, or Deep gives control to the model's native effort setting.";
+      const names = effortLevels().slice(1).map(effortLabel).join(", ");
+      hint.textContent = `Default effort uses this saved target. Choosing ${names} gives control to the model's native effort setting.`;
     } else {
       hint.textContent = "Used for Default effort and models that expose a numeric reasoning budget.";
     }
   }
 
   function setReasoningEffort(level, persist = true) {
-    level = String(level || "auto").toLowerCase();
-    if (!REASONING_EFFORT_LEVELS.includes(level)) level = "auto";
+    level = fitEffortLevel(level, effortLevels());
     state.reasoningEffort = level;
     if (persist) {
       const key = reasoningModelKey();
@@ -17004,8 +17305,7 @@
       }
       persistUiPreference({ reasoning_effort: level });
     }
-    const idx = REASONING_EFFORT_LEVELS.indexOf(level);
-    const label = REASONING_EFFORT_LABELS[idx];
+    const label = effortLabel(level);
     document.querySelectorAll("#reasoning-effort-menu .effort-option").forEach(opt => {
       const active = opt.dataset.level === level;
       opt.classList.toggle("active", active);
@@ -17043,9 +17343,10 @@
     const wasHidden = control.classList.contains("hidden");
     control.classList.remove("hidden");
     control.dataset.mode = cap.mode || "budget";
+    renderEffortMenu(effortLevels());
     const saved = readReasoningEffortMap();
     const durable = String(state.settings.reasoning_effort || "").toLowerCase();
-    const restored = REASONING_EFFORT_LEVELS.includes(durable)
+    const restored = EFFORT_NAMES[durable]
       ? durable : (saved[reasoningModelKey()] || "auto");
     setReasoningEffort(restored, false);
     const pill = $("#reasoning-effort-pill");
@@ -17113,39 +17414,17 @@
   }
 
   // Shared model-load flow for the settings <select> and the model-pill
-  // dropdown. Mirrors auto-tuned values into the settings form (its elements
-  // exist whether or not the drawer is open). Returns true on success.
+  // dropdown. The tune happens server-side in /api/models/load: a known model
+  // gets its remembered config back, a new one is tuned fresh. Tuning here
+  // first used to run with the previous model's ctx as the grow-only floor and
+  // save the result while model_path still pointed at the previous model, so
+  // every switch rewrote both models' configs (and the model advisor, which
+  // learns per exact config, started over). loadSettings() below mirrors the
+  // restored values into the settings form. Returns true on success.
   async function loadModelByPath(modelPath, opts = {}) {
     if (!modelPath) return false;
     const hint = opts.hint || null;
     const prev = hint?.textContent;
-    const tier = Number($("#set-vram-tier")?.value || 0);
-    let tuned = null;
-    if (tier > 0) {
-      if (hint) hint.textContent = "auto-tuning for this model…";
-      try {
-        const curCtx = Number($("#set-ctx")?.value || state.settings.num_ctx || 0) || 0;
-        const r = await api("/api/llama/auto-tune", {
-          method: "POST", headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({ model_path: modelPath, vram_gb: tier, min_ctx: curCtx }),
-        });
-        tuned = r?.suggested || null;
-        if (tuned) {
-          // The tuner enforces grow-only (min_ctx above); apply the returned combo via
-          // the shared helper.
-          await applyAutoTune(tuned);
-          const tnotes = $("#autotune-notes");
-          if (tnotes && tuned.notes) {
-            const lines = [];
-            if (tuned.quant_downshift) { lines.push(`>> ${tuned.quant_downshift}`); lines.push(""); }
-            lines.push(tuned.notes);
-            tnotes.textContent = lines.join("\n");
-          }
-        }
-      } catch (e) {
-        console.warn("auto-tune on model change failed:", e);
-      }
-    }
     if (hint) hint.textContent = "loading model into llama-server...";
     // Surface the backend output so the model-load progress is visible live.
     try { toggleConsolePane(true); activateTerminalTab("backend"); } catch {}
@@ -17158,8 +17437,7 @@
     const loadingName = modelPath.split(/[\\/]/).pop().replace(/\.gguf$/i, "");
     toast(`Loading ${loadingName} into llama-server…`, "info", 600000, "model-load");
     try {
-      // Tuner keys were already saved by applyAutoTune above — this persists
-      // just the model selection itself.
+      // Persist just the model selection; the load restores or tunes its flags.
       const persistPayload = {
         model_path: modelPath,
         model: modelPath.split(/[\\/]/).pop().replace(/\.gguf$/i, ""),
@@ -17168,14 +17446,8 @@
       await requestModelLoad(modelPath);
       await loadSettings();
       await refreshModels();
-      if (tuned) {
-        const msg = tuned.quant_downshift
-          ? "model loaded — auto-tuned (see quant suggestion in notes)"
-          : `model loaded — auto-tuned (ctx ${Number(tuned.num_ctx).toLocaleString()}, n_cpu_moe ${tuned.n_cpu_moe ?? 0})`;
-        toast(msg, tuned.quant_downshift ? "warn" : "ok", 4000, "model-load");
-      } else {
-        toast("model loaded", "ok", 2500, "model-load");
-      }
+      const ctx = Number(state.settings?.num_ctx || 0);
+      toast(ctx ? `model loaded (ctx ${ctx.toLocaleString()})` : "model loaded", "ok", 2500, "model-load");
       return true;
     } catch (e) {
       if (hint) hint.textContent = prev || "";
@@ -17858,6 +18130,9 @@
       menu.style.top = `${Math.round(top)}px`;
       menu.style.left = `${Math.round(left)}px`;
     }
+    // Menus whose content changes while open (the project picker's folder
+    // browser) re-anchor through this.
+    menu._reposition = positionMenu;
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
       const willOpen = !menu.classList.contains("open");

@@ -2382,27 +2382,105 @@ button {
   top: 50px; /* clear topbar */
   right: 14px;
 }
-#plan-panel .plan-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border-subtle); }
-#plan-panel .plan-title { font-weight: 700; color: var(--fg); letter-spacing: .01em; }
-#plan-panel .plan-count { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); }
-#plan-panel.plan-complete .plan-count { color: var(--success); }
+/* Header: status mark (spinning ring while working, accent check when every
+   step is done) · title · rolling n/N count · collapse · hide. */
+#plan-panel .plan-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px 4px; }
+#plan-panel.collapsed .plan-head { padding-bottom: 10px; }
+#plan-panel .plan-status { position: relative; width: 14px; height: 14px; flex-shrink: 0; display: inline-grid; place-items: center; }
+#plan-panel .plan-spin {
+  width: 12px; height: 12px; border-radius: 50%; box-sizing: border-box;
+  border: 1.5px solid var(--fg-muted); border-right-color: transparent;
+  animation: plan-spin .9s linear infinite;
+  transition: opacity .2s ease, transform .2s ease;
+}
+#plan-panel .plan-status .ph-check-circle {
+  position: absolute; inset: 0; display: grid; place-items: center;
+  font-size: 15px; color: var(--accent);
+  opacity: 0; transform: scale(.4);
+  transition: opacity .2s ease, transform .35s cubic-bezier(.3, 1.5, .5, 1);
+}
+#plan-panel.plan-complete .plan-spin { opacity: 0; transform: scale(.5); animation-play-state: paused; }
+#plan-panel.plan-complete .plan-status .ph-check-circle { opacity: 1; transform: scale(1); }
+#plan-panel .plan-title { font-weight: 600; color: var(--fg); letter-spacing: .01em; }
+#plan-panel .plan-count {
+  margin-left: auto; display: inline-flex; align-items: baseline;
+  font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+#plan-panel .plan-count-num { display: inline-grid; overflow: hidden; height: 1.3em; line-height: 1.3em; }
+#plan-panel .pcn { grid-area: 1 / 1; text-align: right; }
+#plan-panel .pcn-in { animation: plan-count-in .38s cubic-bezier(.2, .8, .3, 1) both; }
+#plan-panel .pcn-out { animation: plan-count-out .38s cubic-bezier(.2, .8, .3, 1) both; }
+@keyframes plan-count-in { from { transform: translateY(100%); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes plan-count-out { from { transform: none; opacity: 1; } to { transform: translateY(-100%); opacity: 0; } }
 #plan-panel .plan-min, #plan-panel .plan-close {
   background: transparent; border: 0; color: var(--fg-faint); cursor: pointer;
-  padding: 2px; border-radius: 5px; display: inline-flex; font-size: 13px;
+  padding: 2px; border-radius: 5px; display: inline-flex; font-size: 12px;
 }
-#plan-panel .plan-min { margin-left: auto; }
+#plan-panel .plan-min .ph { transition: transform .2s ease; }
+#plan-panel.collapsed .plan-min .ph { transform: rotate(180deg); }
 #plan-panel .plan-min:hover, #plan-panel .plan-close:hover { color: var(--fg); background: var(--border-subtle); }
-#plan-panel .plan-body { padding: 6px 8px; display: flex; flex-direction: column; gap: 1px; max-height: 46vh; overflow-y: auto; }
+#plan-panel .plan-body { padding: 4px 12px 10px; display: flex; flex-direction: column; gap: 2px; max-height: 46vh; overflow-y: auto; }
 #plan-panel.collapsed .plan-body { display: none; }
-#plan-panel .plan-step { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 7px; color: var(--fg-muted); line-height: 1.35; }
-#plan-panel .plan-step > .ph { flex-shrink: 0; font-size: 14px; }
-#plan-panel .plan-step.is-pending > .ph { color: var(--fg-faint); }
-#plan-panel .plan-step.is-active { color: var(--fg); background: var(--accent-subtle); }
-#plan-panel .plan-step.is-active > .ph { color: var(--accent); animation: plan-pulse 1.6s ease-in-out infinite; }
-#plan-panel .plan-step.is-done { color: var(--fg-faint); }
-#plan-panel .plan-step.is-done > .ph { color: var(--success); }
-#plan-panel .plan-step.is-done span { text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--fg-faint) 70%, transparent); }
-@keyframes plan-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
+
+/* Rows: hollow circle (pending) → ringed arrow + light sweep across the text
+   (active) → filled check, dimmed, strike drawn left to right (done). */
+#plan-panel .plan-step { display: flex; align-items: flex-start; gap: 8px; padding: 3px 0; color: var(--fg-muted); line-height: 1.4; }
+#plan-panel .plan-ico { position: relative; width: 14px; height: 1.4em; flex-shrink: 0; }
+#plan-panel .plan-ico > i {
+  position: absolute; inset: 0; display: grid; place-items: center; font-size: 14px;
+  opacity: 0; transform: scale(.6);
+  transition: opacity .2s ease, transform .3s cubic-bezier(.3, 1.4, .5, 1), color .2s ease;
+}
+#plan-panel .plan-step:not(.is-active):not(.is-done) .ph-circle,
+#plan-panel .plan-step.is-active .ph-arrow-circle-right,
+#plan-panel .plan-step.is-done .ph-check-circle { opacity: 1; transform: none; }
+#plan-panel .plan-step .ph-circle { color: var(--fg-faint); }
+#plan-panel .plan-step .ph-arrow-circle-right { color: var(--fg); }
+#plan-panel .plan-step .ph-check-circle { color: var(--fg-faint); }
+#plan-panel .plan-text {
+  min-width: 0;
+  transition: color .3s ease;
+}
+/* The strike is a 1px background line so it can be drawn, not toggled. It
+   sits on the inline label, not the flex item: a flex item is one block, so a
+   wrapped title got a single line through the middle of the whole block.
+   Inline + clone gives every wrapped line its own strike. */
+#plan-panel .plan-label {
+  background: linear-gradient(currentColor, currentColor) 0 58% / 0 1px no-repeat;
+  -webkit-box-decoration-break: clone; box-decoration-break: clone;
+  transition: background-size .45s cubic-bezier(.4, 0, .2, 1);
+}
+#plan-panel .plan-step.is-done .plan-text { color: var(--fg-faint); }
+#plan-panel .plan-step.is-done .plan-label { background-size: 100% 1px; }
+/* The sweep is a mask, not background-clip text, so the background stays free
+   for the strike: active → done then draws the line from zero. */
+#plan-panel .plan-step.is-active .plan-text {
+  color: var(--fg);
+  -webkit-mask: linear-gradient(90deg, rgb(0 0 0 / .55) 0 38%, #000 50%, rgb(0 0 0 / .55) 62% 100%) 100% 0 / 250% 100% no-repeat;
+  mask: linear-gradient(90deg, rgb(0 0 0 / .55) 0 38%, #000 50%, rgb(0 0 0 / .55) 62% 100%) 100% 0 / 250% 100% no-repeat;
+  animation: plan-sheen 2.4s linear infinite;
+}
+/* Streaming answer text: each new stretch fades in tinted with the theme
+   accent and settles into the normal text colour (see applyStreamFade). The
+   last keyframe leaves colour out, so it lands on whatever the text inherits:
+   body, heading or link. */
+.stream-fresh { animation: stream-fresh-in .9s cubic-bezier(.25, .6, .3, 1) both; }
+@keyframes stream-fresh-in {
+  0%   { opacity: 0; color: color-mix(in srgb, var(--accent) 70%, currentColor); }
+  30%  { opacity: 1; color: color-mix(in srgb, var(--accent) 65%, currentColor); }
+  100% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) { .stream-fresh { animation: none; } }
+@keyframes plan-sheen {
+  from { -webkit-mask-position: 100% 0; mask-position: 100% 0; }
+  to   { -webkit-mask-position: 0 0; mask-position: 0 0; }
+}
+@keyframes plan-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  #plan-panel .plan-spin, #plan-panel .pcn-in, #plan-panel .pcn-out { animation: none; }
+  #plan-panel .plan-step.is-active .plan-text { animation: none; -webkit-mask: none; mask: none; }
+}
 @media (max-width: 600px) {
   /* Clear the 44px mobile topbar; compact + collapsed-by-default (set in JS) so
      it's a small "Plan N/N" chip instead of a screen-smothering card. */
@@ -6414,6 +6492,40 @@ body.remote-client .chat-scroll {
   white-space: nowrap;
   color: var(--fg-faint);
   font-size: 10px;
+}
+
+/* A folder row: the row picks the folder, the chevron opens its subfolders. */
+.project-menu .project-row {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+}
+.project-menu .project-row > .mm-row {
+  flex: 1;
+  min-width: 0;
+}
+.project-menu .project-drill {
+  flex-shrink: 0;
+  width: 28px;
+  display: inline-grid;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fg-faint);
+  cursor: pointer;
+}
+.project-menu .project-drill:hover,
+.project-menu .project-drill:focus-visible {
+  color: var(--fg);
+  background: var(--border-subtle);
+}
+.project-menu .project-back .mm-row-name {
+  font-weight: 600;
+}
+.project-menu .mm-row .project-row-caret {
+  margin-left: auto;
+  color: var(--fg-faint);
 }
 
 .mm-row {

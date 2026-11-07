@@ -17,7 +17,7 @@ Package it into a single windowed .exe (no console) with PyInstaller:
         --add-data "index.html;." --add-data "app.js;." --add-data "app.css;." ^
         --add-data "bridge-client.js;." --add-data "preview-runtime.js;." --add-data "appearance.js;." ^
         --add-data "glyph-field.js;." --add-data "dot-matrix.js;." --add-data "security-scan-field.js;." --add-data "rt-visuals.js;." ^
-        --add-data "agent-orb.js;." --add-data "ui-refresh.css;." ^
+        --add-data "agent-orb.js;." --add-data "ui-refresh.css;." --add-data "ghidra_worker.py;." ^
         --add-data "assets;assets" ^
         --add-data "colors_and_type.css;." --add-data "manifest.webmanifest;." ^
         --icon assets/icons/accuretta.ico accuretta_app.py
@@ -217,7 +217,7 @@ def _read_app_version() -> str:
             return m.group(1)
     except Exception:
         pass
-    return "1.0.5"
+    return "1.0.6"
 
 
 def _glyph_field_js() -> str:
