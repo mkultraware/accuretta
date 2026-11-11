@@ -249,6 +249,101 @@ _DESKTOP_SNAPSHOT_TTL_S = 180.0
 _DESKTOP_SNAPSHOT_CACHE_MAX = 12
 
 
+# ---- Child process environment ---------------------------------------------
+# Every program the bridge starts gets an environment built by _child_env()
+# instead of a copy of the bridge's own, so API keys, tokens and passwords that
+# sit in the bridge's environment never reach a child. Only the names listed
+# here are copied. Names match without regard to case (Windows treats them
+# that way); a trailing * matches every name with that prefix. To let one more
+# variable through, add it to the right list below.
+
+# What any program needs to start, find its files and reach the network.
+# SYSTEMROOT must stay: without it Windows networking fails in the child.
+_CHILD_ENV_BASE = (
+    # Windows
+    "PATH", "PATHEXT", "SYSTEMROOT", "SystemDrive", "WINDIR", "COMSPEC", "TEMP", "TMP",
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "HOME", "APPDATA", "LOCALAPPDATA",
+    "PROGRAMDATA", "ALLUSERSPROFILE", "PUBLIC",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "ProgramW6432",
+    "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL", "PROCESSOR_REVISION", "OS", "DriverData", "PSModulePath",
+    "USERNAME", "USERDOMAIN", "COMPUTERNAME",
+    # macOS and Linux
+    "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "DISPLAY", "WAYLAND_DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS", "XDG_*",
+    # Language
+    "LANG", "LANGUAGE", "LC_*",
+)
+
+_CHILD_ENV_PROXY = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY")
+
+# Extra groups a call site opts into with keep=(...).
+_CHILD_ENV_GROUPS = {
+    # Proxy plus company certificate files, so traffic through a corporate
+    # proxy still verifies. "network_public" is the same list minus any proxy
+    # value that carries a login (http://user:pass@host): for third-party code.
+    "network": _CHILD_ENV_PROXY + (
+        "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "PIP_CERT"),
+    # Where developer tools live. Folder paths and switches, never secrets.
+    "dev": (
+        "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV",
+        "PYTHONUTF8", "PYTHONIOENCODING", "JAVA_HOME", "GOPATH", "GOROOT",
+        "CARGO_HOME", "RUSTUP_HOME", "NVM_HOME", "NVM_SYMLINK", "ANDROID_HOME",
+        "DOTNET_ROOT"),
+    # SSH agent and git's ssh command. These let a program sign in with the
+    # user's SSH keys, so they never go to third-party code (MCP servers).
+    "ssh": ("SSH_AUTH_SOCK", "GIT_SSH", "GIT_SSH_COMMAND"),
+    # Which GPU llama-server uses and how its runtime behaves.
+    "gpu": (
+        "CUDA_*", "HIP_*", "ROCR_*", "HSA_*", "GPU_DEVICE_ORDINAL", "GGML_*",
+        "VULKAN_SDK", "VK_*", "ONEAPI_*", "SYCL_*", "ZES_*", "OMP_*"),
+}
+_CHILD_ENV_GROUPS["network_public"] = _CHILD_ENV_GROUPS["network"]
+
+# The usual set for tools the agent runs on the user's behalf (shell, Python,
+# git, tests, linters, decompilers, programs it opens).
+_ENV_TOOLS = ("network", "dev", "ssh")
+
+
+def _env_name_matches(name: str, patterns) -> bool:
+    upper = name.upper()
+    for pattern in patterns:
+        pattern = pattern.upper()
+        if pattern.endswith("*"):
+            if upper.startswith(pattern[:-1]):
+                return True
+        elif upper == pattern:
+            return True
+    return False
+
+
+def _child_env(extra: dict | None = None, *, keep: tuple[str, ...] = ()) -> dict:
+    """Environment for a child process, built from an empty dict.
+
+    Copies the base names, then the names of each group in `keep` (see
+    _CHILD_ENV_GROUPS), then applies `extra` on top. Nothing else from the
+    bridge's environment is passed on."""
+    env: dict[str, str] = {}
+    for name, value in os.environ.items():
+        if _env_name_matches(name, _CHILD_ENV_BASE):
+            env[name] = value
+    for group in keep:
+        patterns = _CHILD_ENV_GROUPS[group]
+        for name, value in os.environ.items():
+            if not _env_name_matches(name, patterns):
+                continue
+            if (group == "network_public" and "@" in value
+                    and _env_name_matches(name, _CHILD_ENV_PROXY)):
+                continue        # proxy with a login: third-party code doesn't get it
+            env[name] = value
+    for name, value in (extra or {}).items():
+        if value is not None:
+            env[str(name)] = str(value)
+    return env
+
+
 ROOT = Path(__file__).parent.resolve()
 DATA = Path(os.environ.get("ACCURETTA_DATA_DIR") or ROOT / "data").resolve()
 _research_store = ResearchStore(DATA / "research")
@@ -1650,6 +1745,16 @@ def _advisor_suggest_settings(settings: dict, observed: dict) -> dict:
         return {}
 
 
+def _advisor_changes(before: dict | None, updates: dict | None) -> list:
+    """Plain before/after rows for every setting a recommendation touches."""
+    before = before if isinstance(before, dict) else {}
+    updates = updates if isinstance(updates, dict) else {}
+    return [{"key": key, "label": _MODEL_ADVISOR_LABELS.get(key, key),
+             "from": before.get(key), "to": updates[key]}
+            for key in _MODEL_ADVISOR_CONFIG_KEYS + _MODEL_ADVISOR_OPTIONAL_KEYS
+            if key in updates]
+
+
 def _advisor_recommendation(model: str, config_key: str, cfg: dict,
                             settings: dict) -> dict | None:
     turns = int(cfg.get("turns", 0) or 0)
@@ -1661,16 +1766,14 @@ def _advisor_recommendation(model: str, config_key: str, cfg: dict,
     suggested = _advisor_suggest_settings(settings, observed)
     updates = {k: v for k, v in suggested.items()
                if k in _MODEL_ADVISOR_APPLY_KEYS and current.get(k) != v}
+    # An optional key left at 0 means "auto" and is absent from the snapshot,
+    # so absent -> 0 is not a change.
+    for key in _MODEL_ADVISOR_OPTIONAL_KEYS:
+        if key in updates and not updates[key] and not current.get(key):
+            updates.pop(key)
     if not updates:
         return None
-    changes = []
-    for key in _MODEL_ADVISOR_CONFIG_KEYS:
-        if key not in updates:
-            continue
-        changes.append({
-            "key": key, "label": _MODEL_ADVISOR_LABELS.get(key, key),
-            "from": current.get(key), "to": updates[key],
-        })
+    changes = _advisor_changes(current, updates)
     ctx = max(1, int(current.get("num_ctx", 0) or cfg.get("last_context", 0) or 1))
     peak = int(observed.get("p90_peak_context_tokens", 0) or 0)
     pressure = peak / ctx if ctx else 0
@@ -1749,7 +1852,10 @@ def _advisor_trial_public(row: dict, active_config: str) -> dict | None:
         "progress": min(progress, _MODEL_ADVISOR_TRIAL_TURNS),
         "target": _MODEL_ADVISOR_TRIAL_TURNS,
         "result": str(trial.get("result") or ""),
-        "changes": list(trial.get("changes") or []),
+        # Rebuilt from what was actually applied, so trials started before
+        # every setting was listed still show the full before/after.
+        "changes": (_advisor_changes(trial.get("previous"), trial.get("updates"))
+                    or list(trial.get("changes") or [])),
     }
 
 
@@ -1905,6 +2011,11 @@ def _public_model_health() -> dict:
             })
         comparison.sort(key=lambda m: m["turns"], reverse=True)
         comparison = comparison[:5]
+    rec_public = copy.deepcopy(rec) if rec and not trial else None
+    if rec_public:
+        rec_public["changes"] = (
+            _advisor_changes(_model_runtime_config(settings), rec_public.get("updates"))
+            or list(rec_public.get("changes") or []))
     advice = []
     context = max(0, int(current.get("last_context", 0) or settings.get("num_ctx") or 0))
     if turns >= 8 and context and float(observed.get("p90_peak_context_tokens", 0) or 0) >= context * 0.82:
@@ -1932,7 +2043,7 @@ def _public_model_health() -> dict:
             "sessions": sessions,
             "sessions_remaining": max(0, _MODEL_ADVISOR_BASELINE_SESSIONS - sessions),
         },
-        "recommendation": copy.deepcopy(rec) if rec and not trial else None,
+        "recommendation": rec_public,
         "notification_needed": bool(rec and not trial and not rec.get("notified_at")),
         "trial": trial,
         "privacy": ("Local performance numbers only, plus tool names and exit codes in a private "
@@ -2494,7 +2605,7 @@ def _run_small(argv: list[str], timeout: int = 8) -> dict:
             # Decode as UTF-8 regardless of the locale codepage: text=True on Windows
             # uses cp1252, which mojibakes non-ASCII tool output such as machine names
             # from `tailscale status --json`.
-            encoding="utf-8", errors="replace",
+            encoding="utf-8", errors="replace", env=_child_env(),
             creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
         )
         return {
@@ -2843,7 +2954,7 @@ def _run_remote_process(row: dict, command: str, *, timeout: int | None = None,
     try:
         proc = subprocess.Popen(
             [*argv, command], stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env(keep=_ENV_TOOLS),
             creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
         )
     except Exception as exc:
@@ -3234,6 +3345,7 @@ def _workspace_git_status(raw: str) -> dict:
     def git(*args):
         r = subprocess.run(["git", "-C", str(target), *args], capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=4,
+                           env=_child_env(keep=_ENV_TOOLS),
                            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0))
         return r.stdout if r.returncode == 0 else None
 
@@ -5371,7 +5483,76 @@ def _evidence_context():
     return EvidenceStore(DATA / "recon_evidence" / "receipts"), cid, str(mission["authorization_id"])
 
 
+_CHALLENGE_TEXT_FIELDS = ("expected_boundary", "demonstrated_impact", "alternative_explanation",
+                          "disproof_check", "limitations")
+
+
+def _finding_expand_shorthand(args):
+    """Build the nested review object from flat fields and the stored receipts.
+
+    Small models handle a handful of flat strings far better than a nested
+    object, and the bridge already holds what the object repeats: the receipts
+    record the endpoint, tool, method and parameters. The model supplies the
+    receipt ids, the control id, the proof text and its reasoning; everything
+    mechanical is read from the receipts. Every review rule still runs on the
+    result, and an explicit `challenge` value is never overwritten."""
+    if not isinstance(args, dict):
+        return args
+    ids = args.get("evidence_ids")
+    flat = ("control_id", "proof", "parameter", *_CHALLENGE_TEXT_FIELDS)
+    if not any(args.get(key) for key in flat) and (args.get("target") or not ids):
+        return args
+    out = dict(args)
+    if not out.get("description") and out.get("title"):
+        # The claim under review defaults to the title rather than failing the call.
+        out["description"] = out["title"]
+    challenge = dict(args["challenge"]) if isinstance(args.get("challenge"), dict) else {}
+    for field in _CHALLENGE_TEXT_FIELDS:
+        if isinstance(args.get(field), str) and not challenge.get(field):
+            challenge[field] = args[field]
+    control = dict(challenge["control"]) if isinstance(challenge.get("control"), dict) else {}
+    if args.get("control_id") and not control.get("evidence_id"):
+        control["evidence_id"] = str(args["control_id"]).strip()
+    if control:
+        challenge["control"] = control
+    first = None
+    try:
+        store, cid, mission_id = _evidence_context()
+        if isinstance(ids, list) and ids:
+            first = store.read(cid, mission_id, ids[0])
+    except (ValueError, OSError, KeyError, TypeError):
+        first = None
+    if first:
+        if not out.get("target"):
+            out["target"] = str(first.get("target") or "")
+        if not out.get("source_tool"):
+            out["source_tool"] = str(first.get("tool") or "")
+        if not out.get("evidence") and isinstance(args.get("proof"), str):
+            out["evidence"] = args["proof"]
+        test = dict(challenge["test"]) if isinstance(challenge.get("test"), dict) else {}
+        context = first.get("request_context") or {}
+        test.setdefault("method", context.get("method"))
+        parameter = args.get("parameter") if isinstance(args.get("parameter"), str) else test.get("parameter")
+        parameter = (parameter or "").strip()
+        if "location" not in test:
+            recorded = context.get("parameters") or {}
+            test["location"] = (next((where for where in ("query", "body", "header", "interaction")
+                                      if parameter in (recorded.get(where) or [])), "query")
+                                if parameter else "none")
+        test.setdefault("parameter", parameter)
+        if isinstance(args.get("proof"), str) and not isinstance(test.get("assertion"), dict):
+            result = first.get("result") if isinstance(first.get("result"), dict) else {}
+            field = next((key for key in ("body", "text", "snippet")
+                          if isinstance(result.get(key), str)), "body")
+            test["assertion"] = {"path": [field], "operation": "contains", "value": args["proof"]}
+        challenge["test"] = test
+    if challenge:
+        out["challenge"] = challenge
+    return out
+
+
 def _review_finding_args(args):
+    args = _finding_expand_shorthand(args)
     store, cid, mission_id = _evidence_context()
     ids = args.get("evidence_ids") or []
     if not isinstance(ids, list) or not 2 <= len(ids) <= 8:
@@ -5548,6 +5729,10 @@ def tool_record_finding(args: dict) -> dict:
     title = re.sub(r"\s+", " ", str(args.get("title") or "")).strip()[:180]
     if not title:
         return {"error": "title required"}
+    args = _finding_expand_shorthand(args)
+    if not args.get("description"):
+        # The claim under review defaults to the title rather than failing the call.
+        args = {**args, "description": title}
     requested = str(args.get("status") or "candidate").lower()
     status = requested if requested in _FINDING_STATUSES else "candidate"
     severity = str(args.get("severity") or "info").lower()
@@ -5800,6 +5985,82 @@ def _rt_endpoint_from_args(args: dict) -> tuple[str, int | None]:
     if port is None and "://" in raw:
         port = 443 if raw.lower().startswith("https") else 80
     return host, port
+
+
+# Every argument a tool might read a destination from. The guard checks all of
+# them, never just the first: a tool that prefers `host` over `target` (or takes
+# a list) must not be aimed somewhere the guard did not look.
+_RT_TARGET_ARG_KEYS = ("url", "base_url", "target", "host", "domain", "endpoint", "origin",
+                       "openapi_url", "graphql_url")
+_RT_TARGET_LIST_KEYS = ("targets", "urls", "hosts", "domains", "subdomains")
+_RT_NETWORK_SUFFIX_RE = re.compile(r"^([^/\s]+)/(\d{1,3})$")
+
+
+def _rt_target_values(args: dict) -> list[str]:
+    """Every destination string in a tool call: scalar keys and list keys."""
+    if not isinstance(args, dict):
+        return []
+    values: list[str] = []
+    for key in _RT_TARGET_ARG_KEYS:
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+    for key in _RT_TARGET_LIST_KEYS:
+        value = args.get(key)
+        if isinstance(value, str):
+            value = [value]
+        if isinstance(value, (list, tuple)):
+            values.extend(str(item).strip() for item in value
+                          if isinstance(item, (str, int, float)) and str(item).strip())
+    # A site-relative path ("/openapi.json") is joined onto the checked base URL.
+    return [v for v in values if not (v.startswith("/") and not v.startswith("//"))]
+
+
+def _rt_endpoints_from_args(args: dict) -> list[tuple[str, int | None, str]]:
+    """(host, port, raw) for every destination in a tool call."""
+    out: list[tuple[str, int | None, str]] = []
+    seen: set[tuple[str, int | None]] = set()
+    for raw in _rt_target_values(args):
+        host, port = _rt_endpoint_from_args({"target": raw, "port": args.get("port")})
+        if host and (host, port) not in seen:
+            seen.add((host, port))
+            out.append((host, port, raw))
+    return out
+
+
+def _rt_network_block(raw: str, allowed: list[str], denied: list[str]) -> str | None:
+    """Refuse `host/prefix` unless the whole range was authorized.
+
+    Scanners read 203.0.113.5/16 as 65,536 addresses, while a host check sees
+    only 203.0.113.5. A range is allowed when an in-scope CIDR contains all of
+    it and no out-of-scope entry falls inside it."""
+    match = _RT_NETWORK_SUFFIX_RE.match(raw.strip())
+    if not match:
+        return None
+    try:
+        network = ipaddress.ip_network(raw.strip(), strict=False)
+    except ValueError:
+        return (f"refused: {raw} asks for a network range around a hostname. Name the "
+                "single in-scope host, or an in-scope range written as an IP network.")
+    if network.num_addresses == 1:
+        return None
+
+    def as_network(token: str):
+        try:
+            return ipaddress.ip_network(token.strip().lstrip("*."), strict=False)
+        except ValueError:
+            return None
+
+    inside = any(n is not None and n.version == network.version and network.subnet_of(n)
+                 for n in (as_network(t) for t in allowed if "/" in t))
+    if not inside:
+        return (f"refused: {raw} is a range of {network.num_addresses} addresses and the "
+                "authorized scope does not cover all of it. Scan the single in-scope host instead.")
+    for token in denied:
+        n = as_network(token)
+        if n is not None and n.version == network.version and n.overlaps(network):
+            return f"refused: {raw} includes {token}, which is out of scope."
+    return None
 
 
 def _rt_scope_out_tokens(chat: dict | None) -> list[str]:
@@ -6130,6 +6391,9 @@ def _rt_browser_policy(chat: dict | None) -> dict | None:
         "denied": denied,
         "user_agent": _rt_clean_user_agent(mission.get("user_agent")),
         "self_ports": tuple(sorted(_rt_self_ports())),
+        "allow_destructive": mission.get("allow_destructive") is not False,
+        "rate_limit_rpm": _bounded_int(mission.get("rate_limit_rpm"), 0, 6000),
+        "request_cap": _bounded_int(mission.get("request_cap"), 0, 1000000),
     }
 
 
@@ -6302,6 +6566,16 @@ class _ScopedBrowserWorker:
 
         def route_request(route: Any, request: Any) -> None:
             reason = _rt_browser_url_block(request.url, state["policy"])
+            _policy = state["policy"]
+            if (not reason and _policy.get("allow_destructive") is False
+                    and str(request.method).upper() == "DELETE"):
+                reason = "DELETE is disabled for this engagement (non-destructive testing only)"
+            if (not reason and str(urllib.parse.urlsplit(request.url).scheme).lower()
+                    in {"http", "https"}):
+                # The page's own requests count against the engagement budget
+                # and land in the ledger, same as every other tool.
+                reason = _rt_gov_admit(_rt_url_host(request.url), request.method,
+                                       url=request.url, mission=_policy)
             event = {
                 "kind": "request",
                 "method": request.method,
@@ -6879,30 +7153,83 @@ def _rt_discovered_secret_submission_block(name: str, args: dict,
 
 
 _RT_DESTRUCTIVE_PATH_RE = re.compile(
-    r"(?i)(?:^|[/_\-.])(delete|destroy|purge|shutdown|drop|wipe|uninstall)(?:[/_\-.]|$)")
+    r"(?i)(?:^|[/_\-.])(delete|destroy|purge|shutdown|drop|wipe|uninstall|remove|truncate|erase)"
+    r"(?:[/_\-.]|$)")
+_RT_DESTRUCTIVE_WORDS = {"delete", "destroy", "purge", "shutdown", "drop", "wipe",
+                         "uninstall", "remove", "truncate", "erase"}
+# Query keys that name an operation: ?action=delete is a delete, ?q=delete is a search.
+_RT_ACTION_QUERY_KEYS = {"action", "act", "op", "operation", "cmd", "command", "do", "task",
+                         "method", "_method"}
+# Raw-socket payloads that wipe or stop a datastore or remove files (Redis,
+# memcached, SQL, FTP) and a hand-written HTTP DELETE request line.
+_RT_DESTRUCTIVE_PAYLOAD_RE = re.compile(
+    r"(?im)^\s*(?:flushall|flushdb|flush_all|shutdown|del|unlink|config\s+set|debug\s+segfault|"
+    r"drop|truncate|delete\s+from|dele|rmd|delete\s+\S+\s+http/)\b")
+# Tools whose URL arguments are sent to the target as given by the model. Crawlers
+# and scanners that discover their own URLs are not listed: a stylesheet called
+# drop-down.css must not stop a crawl.
+_RT_DESTRUCTIVE_URL_TOOLS = {
+    "http_request", "rt_browser", "fuzz", "batch_probe", "sql_injection", "sandbox_sqlmap",
+    "recon_injection_probe", "recon_auth_spray", "validate_finding", "observe_response",
+    "recon_capture_evidence", "cors_probe",
+}
+_RT_DESTRUCTIVE_HINT = ("Tick 'Allow destructive methods' when starting the engagement if this "
+                        "is intended, or show the finding with a request that changes nothing.")
+
+
+def _rt_destructive_url_reason(url: str) -> str | None:
+    try:
+        parts = urllib.parse.urlsplit(url if "://" in url else "//" + url)
+    except Exception:
+        return None
+    if _RT_DESTRUCTIVE_PATH_RE.search(parts.path or ""):
+        return f"the path '{parts.path[:120]}' looks destructive"
+    for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
+        if key.lower() in _RT_ACTION_QUERY_KEYS and value.strip().lower() in _RT_DESTRUCTIVE_WORDS:
+            return f"the query '{key}={value[:40]}' asks for a destructive action"
+    return None
 
 
 def _rt_destructive_block(name: str, args: dict) -> str | None:
-    """Block DELETE and destructive-looking paths when the engagement panel
-    left 'allow destructive methods' unchecked (allow_destructive is False)."""
-    if name != "http_request":
-        return None
-    method = str(args.get("method") or "").upper()
-    if not method:
-        method = "POST" if args.get("body") else "GET"
-    if method == "DELETE":
-        return ("refused: DELETE is disabled for this engagement (destructive methods "
-                "were not allowed on the authorization panel). Enable them for the "
-                "engagement or demonstrate the finding with a non-destructive request.")
-    url = str(args.get("url") or args.get("target") or "")
-    try:
-        path = urllib.parse.urlsplit(url if "://" in url else "//" + url).path
-    except Exception:
-        path = url
-    if _RT_DESTRUCTIVE_PATH_RE.search(path or ""):
-        return (f"refused: the path '{path[:120]}' looks destructive and this engagement "
-                f"is limited to non-destructive testing. Allow destructive methods on the "
-                f"engagement if this request is intended.")
+    """Refuse data-destroying requests when the engagement panel left 'Allow
+    destructive methods' unticked (allow_destructive is False).
+
+    Covers every tool that sends a model-chosen request: the DELETE method and
+    its override headers/fields, destructive-looking paths and action
+    parameters, and raw-socket commands that wipe or stop a datastore. PUT,
+    PATCH and POST stay available because ordinary testing needs them."""
+    args = args or {}
+    if name == "http_request":
+        method = str(args.get("method") or "").upper()
+        if not method:
+            method = "POST" if args.get("body") else "GET"
+        overrides = [str(v) for k, v in (args.get("headers") or {}).items()
+                     if str(k).lower() in ("x-http-method-override", "x-http-method",
+                                           "x-method-override")] \
+            if isinstance(args.get("headers"), dict) else []
+        body = args.get("body")
+        if isinstance(body, dict):
+            overrides.append(str(body.get("_method") or ""))
+        elif isinstance(body, str):
+            overrides.extend(re.findall(r"(?i)(?:^|[&\"{,\s])_method\"?\s*[=:]\s*\"?([a-z]+)", body))
+        if method == "DELETE" or any(v.strip().upper() == "DELETE" for v in overrides):
+            return ("refused: DELETE is disabled for this engagement (destructive methods "
+                    "were not allowed on the authorization panel). " + _RT_DESTRUCTIVE_HINT)
+    if name == "tcp_send":
+        data = args.get("data")
+        if data is None:
+            data = args.get("payload") or ""
+        hit = _RT_DESTRUCTIVE_PAYLOAD_RE.search(str(data))
+        if hit:
+            return (f"refused: the payload line '{hit.group(0).strip()[:40]}' wipes, stops or "
+                    "deletes data and this engagement is limited to non-destructive testing. "
+                    + _RT_DESTRUCTIVE_HINT)
+    if name in _RT_DESTRUCTIVE_URL_TOOLS:
+        for value in _rt_target_values(args):
+            reason = _rt_destructive_url_reason(value)
+            if reason:
+                return (f"refused: {reason} and this engagement is limited to "
+                        "non-destructive testing. " + _RT_DESTRUCTIVE_HINT)
     return None
 
 
@@ -6978,25 +7305,46 @@ def _rt_scope_block(name: str, args: dict) -> str | None:
         if _destructive:
             return _destructive
 
-    host, port = _rt_endpoint_from_args(args)
-    if not host:
+    endpoints = _rt_endpoints_from_args(args)
+    if not endpoints:
         return None
-    if port in _rt_self_ports() and _rt_resolves_to_local(host):
-        svc = "bridge" if int(port) == int(PORT) else "llama.cpp server"
-        return (f"refused: {host}:{port} is accuretta's OWN {svc}. Red-team tools "
-                f"never touch the app's own infrastructure. Aim at the target "
-                f"(e.g. the challenge on its own port), not localhost:{port}.")
-    for tok in _rt_scope_out_tokens(chat):
-        if _rt_tok_matches(tok, host, port):
-            where = f"{host}:{port}" if port else host
-            return (f"refused: {where} is OUT OF SCOPE (you marked '{tok}' out of "
-                    f"scope). Stay on the in-scope target.")
+    denied = _rt_scope_out_tokens(chat)
     allowed = _rt_scope_in_tokens(chat)
-    if not any(_rt_allow_matches(name, tok, host, port, args) for tok in allowed):
-        where = f"{host}:{port}" if port else host
-        return (f"refused: {where} is not in the user-authorized scope "
-                f"({', '.join(allowed) or 'no targets'}). Return to the confirmed target.")
+    for host, port, raw in endpoints:
+        if port in _rt_self_ports() and _rt_resolves_to_local(host):
+            svc = "bridge" if int(port) == int(PORT) else "llama.cpp server"
+            return (f"refused: {host}:{port} is accuretta's OWN {svc}. Red-team tools "
+                    f"never touch the app's own infrastructure. Aim at the target "
+                    f"(e.g. the challenge on its own port), not localhost:{port}.")
+        for tok in denied:
+            if _rt_tok_matches(tok, host, port):
+                where = f"{host}:{port}" if port else host
+                return (f"refused: {where} is OUT OF SCOPE (you marked '{tok}' out of "
+                        f"scope). Stay on the in-scope target.")
+        if not any(_rt_allow_matches(name, tok, host, port, args) for tok in allowed):
+            where = f"{host}:{port}" if port else host
+            return (f"refused: {where} is not in the user-authorized scope "
+                    f"({', '.join(allowed) or 'no targets'}). Return to the confirmed target.")
+        if "://" not in raw:
+            _network = _rt_network_block(raw, allowed, denied)
+            if _network:
+                return _network
     return None
+
+
+def _rt_connect_block(url_or_host: str, port: int | None = None) -> str | None:
+    """Scope check at the moment a connection is opened.
+
+    The argument guard above runs before a tool starts; this runs where the
+    tool actually dials, so a destination the tool derived itself (a crawled
+    link, a list entry, a second URL field) is held to the same allowlist.
+    No-op outside an active engagement."""
+    if not _rt_authorized_mission(_rt_context_chat()):
+        return None
+    args: dict = {"url": url_or_host} if "://" in str(url_or_host) else {"host": url_or_host}
+    if port is not None:
+        args["port"] = port
+    return _rt_scope_block("redirect", args)
 
 
 def _rt_mission_get(chat: dict) -> dict | None:
@@ -7116,7 +7464,7 @@ def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
     if not automated_allowed:
         facts.append("automated testing tools are disabled for this engagement")
     if not allow_destructive:
-        facts.append("destructive methods are blocked (non-destructive testing only)")
+        facts.append("non-destructive testing only: DELETE and delete/wipe-style requests are refused")
     mission = {
         "target": target[:120],
         "scope": scope[:300],
@@ -7288,6 +7636,120 @@ def _rt_incl_exploit_for(chat: dict | None, settings: dict | None = None) -> boo
                 and (m.get("engagement") == "pentest" or m.get("phase") == "exploit"))
 
 
+# ---- mission playbook --------------------------------------------------------
+# Rules tell a model what not to do; a small model also needs the order of
+# work. Each mode gets a short numbered route naming the tool for each step.
+# The bridge tracks which steps have been started from the tools actually
+# called, so the block always shows where the run is and what comes next.
+_RT_PLAYBOOKS: dict[str, list[dict]] = {
+    "passive_osint": [
+        {"do": "Who owns it", "tools": ("recon_rdap", "recon_dns")},
+        {"do": "What hosts exist", "tools": ("recon_subdomains", "recon_web_archive")},
+        {"do": "What is exposed, by public record", "tools": ("recon_shodan", "recon_cve_match")},
+        {"do": "Write down each issue as a candidate", "tools": ("record_finding",)},
+        {"do": "Answer the user, naming the public source behind each claim", "tools": ()},
+    ],
+    "recon": [
+        {"do": "Find the hosts and open ports", "tools": ("recon_subdomains", "recon_dns", "recon_port_scan")},
+        {"do": "Identify each web service", "tools": ("recon_http_fingerprint", "recon_tls_audit")},
+        {"do": "List pages, endpoints and parameters", "tools": ("recon_map", "recon_content_discovery")},
+        {"do": "Check for leaks and known-vulnerable versions",
+         "tools": ("recon_check_exposure", "scan_js_secrets", "recon_cve_match")},
+        {"do": "Write down each issue as a candidate", "tools": ("record_finding",)},
+        {"do": "Build the report", "tools": ("rt_generate_report",)},
+    ],
+    "pentest": [
+        {"do": "Identify the service, then list every endpoint and parameter",
+         "tools": ("recon_http_fingerprint", "recon_map")},
+        {"do": "Sweep the listed URLs for easy wins",
+         "tools": ("batch_probe", "recon_check_exposure", "scan_js_secrets")},
+        {"do": "Work each hit by hand until it is real or dead",
+         "tools": ("http_request", "sql_injection", "fuzz", "jwt_tool", "rt_browser")},
+        {"do": "Confirm: send the working request a second time, send one harmless control "
+               "request, then record_finding with status validated and those receipt ids",
+         "tools": ("record_finding",)},
+        {"do": "Build the report", "tools": ("rt_generate_report",)},
+    ],
+}
+_RT_PLAYBOOK_TOOLS = frozenset(t for steps in _RT_PLAYBOOKS.values() for s in steps for t in s["tools"])
+
+
+def _rt_mission_mark_tool(chat: dict, name: str) -> bool:
+    """Remember that a playbook tool ran in this engagement. True if new."""
+    mission = chat.get("mission") if isinstance(chat, dict) else None
+    canon = _resolve_tool_name(name)
+    if not isinstance(mission, dict) or canon not in _RT_PLAYBOOK_TOOLS:
+        return False
+    used = [str(t) for t in (mission.get("tools_used") or [])]
+    if canon in used:
+        return False
+    used.append(canon)
+    mission["tools_used"] = used[-40:]
+    return True
+
+
+def _rt_playbook_lines(mission: dict) -> list[str]:
+    """The numbered route for this engagement, with progress markers."""
+    steps = _RT_PLAYBOOKS.get(str(mission.get("engagement") or ""))
+    if not steps:
+        return []
+    hidden = set(_RT_AUTOMATED_TOOL_NAMES) if mission.get("automated_allowed") is False else set()
+    used = set(mission.get("tools_used") or [])
+    started = [bool(used.intersection(step["tools"])) for step in steps]
+    reached = max((i for i, hit in enumerate(started) if hit), default=-1)
+    # The next step is the first unstarted one after the furthest step reached:
+    # a run that skipped ahead is not sent back to the beginning.
+    upcoming = next((i for i in range(reached + 1, len(steps)) if not started[i]), None)
+    lines = ["steps (work in this order; go back a step when a later one turns up something new):"]
+    for i, step in enumerate(steps):
+        tools = [t for t in step["tools"] if t in TOOLS and t not in hidden]
+        mark = "started" if started[i] else ("NEXT" if i == upcoming else "to do")
+        line = f"{i + 1}. [{mark}] {step['do']}"
+        if tools and not ("record_finding" in tools and len(tools) == 1):
+            line += ": " + ", ".join(tools)
+        lines.append(line)
+    return lines
+
+
+# One concrete next move appended to a tool's result, so the model does not
+# have to work out what the output is for. Keyed by tool; `pentest` says
+# whether active testing is part of this engagement.
+def _rt_next_step(name: str, result: dict, pentest: bool) -> str:
+    if result.get("error") or result.get("scope_blocked") or result.get("rate_limited"):
+        return ""
+    if name in ("recon_subdomains", "recon_dns", "recon_web_archive"):
+        return "Run recon_http_fingerprint on each in-scope host you found."
+    if name in ("recon_port_scan", "sandbox_nmap"):
+        return ("Run recon_http_fingerprint on each open web port and recon_open_services "
+                "on the host for databases and caches.")
+    if name == "recon_http_fingerprint":
+        return "Run recon_map on this URL to list its pages, endpoints and parameters."
+    if name == "recon_map":
+        if pentest:
+            return ("Pass the URLs that carry query parameters to batch_probe "
+                    "(probe: sqli, then xss, ssti, lfi), and run recon_check_exposure on the base URL.")
+        return "Run recon_check_exposure and scan_js_secrets on the base URL."
+    if name == "recon_content_discovery":
+        return "Run recon_check_exposure on the base URL, then record each real exposure with record_finding."
+    if name in ("batch_probe", "recon_injection_probe", "sql_injection", "fuzz", "sandbox_sqlmap"):
+        if not pentest:
+            return "A hit is a candidate only. Record it with record_finding (status candidate)."
+        return ("A hit is a candidate only. Reproduce it by hand with http_request, send it a second "
+                "time, send one harmless control request, then record_finding with status validated. "
+                "No hits: move to the next step.")
+    if name in ("recon_check_exposure", "scan_js_secrets", "recon_cve_match", "recon_shodan",
+                "recon_subdomain_takeover", "recon_tls_audit", "recon_open_services", "cors_probe"):
+        return "Record each real issue with record_finding (status candidate), then continue with the next step."
+    if name == "record_finding":
+        if result.get("downgraded"):
+            return ("Stored as a candidate. To validate it, call record_finding again with: "
+                    "evidence_ids (the receipt ids of the two requests that worked), control_id "
+                    "(the receipt id of the harmless request) and proof (exact text that is in "
+                    "both working responses and not in the control).")
+        return "Continue with the next step, or build the report with rt_generate_report when testing is done."
+    return ""
+
+
 def _rt_mission_render(chat: dict, budget_chars: int | None = None) -> str:
     """Compact mission block for injection. Header fields always kept; facts
     trimmed oldest-first to fit budget_chars (the tail echo passes a budget)."""
@@ -7326,9 +7788,11 @@ def _rt_mission_render(chat: dict, budget_chars: int | None = None) -> str:
     if m.get("automated_allowed") is False:
         head.append("automated testing tools: disabled for this engagement")
     if m.get("allow_destructive") is False:
-        head.append("destructive methods: blocked (non-destructive testing only)")
+        head.append("non-destructive testing only: DELETE requests, delete/wipe-style URLs and "
+                    "data-wiping commands are refused. PUT/PATCH/POST work; change only test data you created.")
     if budget_chars is None:
-        head.append("Authorization controls actions; evidence controls conclusions. In Red Team mode, continue any permitted in-scope, non-destructive test without waiting for a finding to be promoted. For validated claims, preserve two response receipts and a meaningful control, then use review_finding. Scanner output alone is a candidate. Keep observed and inferred impact separate, link completed coverage to receipts, and describe blocked or incomplete checks as gaps.")
+        head.extend(_rt_playbook_lines(m))
+        head.append("evidence rules: every tool result carries an evidence_receipt id. Scanner output alone is a candidate. A finding is validated only by record_finding with two receipts of the working request plus one control receipt. Say what was observed separately from what you infer, and list blocked or unfinished checks as gaps.")
         coverage = [p for p in chat.get("security_coverage", []) if p.get("mission_id") == m.get("authorization_id")]
         if coverage:
             pending = [p for p in coverage if p.get("state", "untested") != "observed"]
@@ -7547,6 +8011,76 @@ def is_blocked_path(p: str) -> bool:
     return False
 
 
+# Accuretta's own data folder holds settings (with tokens), credentials,
+# chats and memories. File tools refuse it whatever the workspace says, even
+# with no workspace folders (open access). The agent may still read, never
+# change, the red-team reports and the evidence files they cite.
+# The MCP config sits in the app folder, not in DATA, but holds the MCP
+# servers' API keys, so it is refused the same way (read and write alike).
+DATA_PATH_ERROR = "path blocked (Accuretta's private data: settings, keys and chats)"
+_DATA_READABLE_SUBDIRS = ("reports", "recon_evidence")
+_KEY_FILE_NAMES = ("bridge_mcp_config.json", "bridge_mcp_config.json.tmp")
+
+
+def _path_within(path: str, folder: str) -> bool:
+    p = os.path.normcase(path)
+    f = os.path.normcase(folder).rstrip("\\/")
+    return p == f or p.startswith(f + os.sep)
+
+
+def _key_files() -> set[str]:
+    """Normalized paths of the MCP config (and the temp file it is saved
+    through), in the app folder and wherever _MCP_CONFIG_FILE points."""
+    folders = {ROOT}
+    cfg = globals().get("_MCP_CONFIG_FILE")
+    if cfg is not None:
+        folders.add(Path(cfg).parent)
+    files = {os.path.normcase(os.path.normpath(str(folder / name)))
+             for folder in folders for name in _KEY_FILE_NAMES}
+    # The email account file (mailbox password) is refused the same way; the
+    # email scripts read it themselves and never print the password.
+    email_cfg = globals().get("EMAIL_CONFIG_FILE") or ROOT / "email_plugin" / "email_config.json"
+    files.update(os.path.normcase(os.path.normpath(str(email_cfg) + suffix)) for suffix in ("", ".tmp"))
+    return files
+
+
+def is_key_file(p: str) -> bool:
+    n = normalize_path(p)
+    return bool(n) and os.path.normcase(n) in _key_files()
+
+
+def is_data_path(p: str, write: bool = False) -> bool:
+    """True when a file tool must refuse p: inside DATA, or an MCP key file."""
+    n = normalize_path(p)
+    if not n:
+        return False
+    if os.path.normcase(n) in _key_files():
+        return True
+    if not _path_within(n, str(DATA)):
+        return False
+    if not write:
+        for sub in _DATA_READABLE_SUBDIRS:
+            if _path_within(n, str(DATA / sub)):
+                return False
+    return True
+
+
+def _is_data_dir(path: str) -> bool:
+    """Cheap test for directory walks: is this directory DATA itself? Walks
+    prune it, so nothing below is visited. A symlink is resolved first."""
+    if os.path.islink(path):
+        return is_data_path(path, write=True)
+    return os.path.normcase(os.path.abspath(path)) == os.path.normcase(str(DATA))
+
+
+def _data_file_in_walk(path: str) -> bool:
+    """For files found by a walk: the MCP key file, or a symlink (the only way
+    into DATA once the DATA directory itself is pruned)."""
+    if os.path.basename(path).lower() in _KEY_FILE_NAMES:
+        return is_data_path(path)
+    return os.path.islink(path) and is_data_path(path)
+
+
 def _desktop_wide_enabled(settings: dict | None = None) -> bool:
     """Desktop automation toggle is the opt-in for system-wide tool use.
 
@@ -7568,7 +8102,12 @@ def is_in_workspace(p: str) -> bool:
     With desktop automation on, workspace tools may also operate system-wide
     (the user's opt-in). The hard blocks still apply downstream:
     is_blocked_path (Windows/System32, registry), _catastrophic_cmd,
-    bridge_self_threat, approval gates and the red-team scope blocks."""
+    bridge_self_threat, approval gates and the red-team scope blocks.
+
+    Accuretta's data folder is never inside the workspace (see is_data_path),
+    so any tool gated on this refuses it too."""
+    if is_data_path(p):
+        return False
     ws = get_workspace().get("folders", [])
     if not ws:
         return True
@@ -7882,7 +8421,7 @@ def _notch_registry_diff(cmd: str) -> dict:
         if value:
             argv += ["/v", value]
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=8,
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=8, env=_child_env(),
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except Exception:
             return None
@@ -8513,6 +9052,149 @@ def _soft_protected(resolved: tuple[str, str] | None) -> bool:
     return False
 
 
+# Accuretta's data folder (settings with tokens, credentials, chats, memories)
+# and the MCP key file (bridge_mcp_config.json, in the app folder). The file
+# tools refuse both outright (is_data_path); a command that names them, matches
+# them with a wildcard, or searches file contents through a folder that holds
+# them, asks in Soft mode and gates /goal. Reports and their evidence stay free
+# to read; so does bridge_mcp_config.example.json.
+_SOFT_DATA_REASON = "reads or changes Accuretta's data folder (settings, tokens, chats)"
+_SOFT_DATA_SEARCH_REASON = "searches through Accuretta's data folder (settings, tokens, chats)"
+_SOFT_KEYS_REASON = "reads or changes Accuretta's MCP key file (bridge_mcp_config.json)"
+_SOFT_KEYS_SEARCH_REASON = "searches through Accuretta's MCP key file (bridge_mcp_config.json)"
+_SOFT_KEYS_TEXT_RE = re.compile(r"bridge_mcp_config(?!\.example)", re.IGNORECASE)
+# Commands that only list names: a wildcard that happens to match the key
+# file or the data folder is harmless there unless the pipeline reads contents.
+_SOFT_LISTERS = {"get-childitem", "gci", "ls", "dir", "get-item", "gi", "test-path",
+                 "resolve-path", "rvpa", "split-path", "join-path"}
+# Commands that read file contents, and the ones that recurse with no flag.
+_SOFT_CONTENT_READERS = {
+    "select-string", "sls", "findstr", "grep", "egrep", "fgrep", "rg", "ag", "ack",
+    "get-content", "gc", "cat", "type", "copy-item", "cp", "copy", "cpi", "xcopy",
+    "robocopy", "compress-archive", "tar", "7z", "zip"}
+_SOFT_RECURSIVE_BY_DEFAULT = {"rg", "ag", "ack", "tar", "compress-archive", "7z"}
+_SOFT_RECURSIVE_FLAGS = {"-recurse", "-r", "/s", "/e", "/mir", "--recursive", "-a"}
+
+
+def _soft_glob_reason(pattern: str, listing: bool) -> str:
+    """A wildcard path that can match the key file or reach into DATA."""
+    sep = "\\" if os.name == "nt" else "/"
+    pat = os.path.normcase(pattern)
+    if not listing and any(fnmatch.fnmatchcase(k, pat) for k in _key_files()):
+        return _SOFT_KEYS_REASON
+    parts = pat.split(sep)
+    data_parts = os.path.normcase(str(DATA)).split(sep)
+    deeper = len(parts) > len(data_parts)
+    if ((deeper or (len(parts) == len(data_parts) and not listing))
+            and all(fnmatch.fnmatchcase(d, p) for d, p in zip(data_parts, parts))):
+        return _SOFT_DATA_REASON
+    return ""
+
+
+def _soft_private_reason(res: tuple[str, str] | None, listing: bool = False) -> str:
+    """Why a resolved argument touches the data folder or the key file."""
+    if not res or res[0] != "host":
+        return ""
+    path = res[1]
+    if "*" in path or "?" in path:
+        return _soft_glob_reason(path, listing)
+    if is_key_file(path):
+        return _SOFT_KEYS_REASON
+    return _SOFT_DATA_REASON if is_data_path(path) else ""
+
+
+def _soft_holds_private(res: tuple[str, str] | None) -> str:
+    """A folder somewhere above the data folder or the key file (the app
+    folder, home, C:\\): searching its contents searches them too."""
+    if not res or res[0] != "host":
+        return ""
+    path = os.path.normcase(res[1])
+    if _path_within(os.path.normcase(str(DATA)), path) and not _path_within(path, str(DATA)):
+        return _SOFT_DATA_SEARCH_REASON
+    if any(k != path and _path_within(k, path) for k in _key_files()):
+        return _SOFT_KEYS_SEARCH_REASON
+    return ""
+
+
+def _soft_data_text_reason(text: str) -> str:
+    """The key file's name, the data folder's path, or its environment
+    variable appears in the text (see _soft_data_text_hit)."""
+    if _SOFT_KEYS_TEXT_RE.search(text or ""):
+        return _SOFT_KEYS_REASON
+    return _SOFT_DATA_REASON if _soft_data_text_hit(text) else ""
+
+
+def _soft_data_text_hit(text: str) -> bool:
+    """The data folder's path, or its environment variable, appears in the
+    text: in a quoted argument, inline code, an escaped Python string."""
+    if "accuretta_data_dir" in (text or "").lower():
+        return True
+    data = str(DATA)
+    if os.name == "nt":
+        hay = re.sub(r"\\+", r"\\", (text or "").replace("/", "\\")).lower()
+        needle, sep = data.lower(), "\\"
+    else:
+        hay = re.sub(r"/+", "/", text or "")
+        needle, sep = data, "/"
+    start = 0
+    while (i := hay.find(needle, start)) >= 0:
+        start = i + 1
+        rest = hay[i + len(needle):]
+        if rest and (rest[0].isalnum() or rest[0] in "_-"):
+            continue                        # data2, data_old: another folder
+        tail = re.match(r"[^\s\"'`;|&<>,()]*", rest).group(0)
+        readable = any(
+            re.match(re.escape(sep + sub) + r"(?![\w-])", tail, re.IGNORECASE)
+            for sub in _DATA_READABLE_SUBDIRS)
+        if readable and ".." not in tail:
+            continue
+        return True
+    return False
+
+
+def _soft_data_concerns(text: str, code: str, lits: list[str], commands, cwd: str | None,
+                        posix: bool, preset: dict[str, str] | None) -> list[str]:
+    """Why a command touches the data folder or the key file; empty when it
+    doesn't."""
+    hit = _soft_data_text_reason(text)
+    if hit:
+        return [hit]
+    variables = {**(preset or {}), **_soft_assignments(code, lits, posix)}
+    readers = any(name in _SOFT_CONTENT_READERS for name, _, _ in commands)
+    cur = cwd
+    for name, args, head in commands:
+        if name in _SOFT_CD_VERBS:
+            dest = next((a for a in args if not a.startswith("-")), None)
+            res = _soft_resolve(dest, lits, variables, cur, posix) if dest else None
+            hit = _soft_private_reason(res)
+            if hit:
+                return [hit]
+            cur = res[1] if res else None
+            continue
+        if name in ("popd", "pop-location"):
+            cur = None
+            continue
+        resolved = [_soft_resolve(a, lits, variables, cur, posix)
+                    for a in args if a and not a.startswith("-")]
+        listing = name in _SOFT_LISTERS and not readers
+        hit = next((x for x in (_soft_private_reason(r, listing) for r in resolved) if x), "")
+        if hit:
+            return [hit]
+        flags = {a.lower() for a in args if a.startswith(("-", "/"))}
+        recursive = (name in _SOFT_RECURSIVE_BY_DEFAULT or bool(flags & _SOFT_RECURSIVE_FLAGS)
+                     or (name in ("grep", "egrep", "fgrep", "cp", "zip")
+                         and any(re.fullmatch(r"-[a-z]*r[a-z]*", f) for f in flags)))
+        if not (recursive and readers):
+            continue
+        folders = [r for r in resolved if r and r[0] == "host" and os.path.isdir(r[1])]
+        if not folders and cur and not cur.startswith("/"):
+            folders = [("host", os.path.normcase(os.path.normpath(cur)))]
+        hit = next((x for x in map(_soft_holds_private, folders) if x), "")
+        if hit:
+            return [hit]
+    return []
+
+
 def _soft_positional(args: list[str], path_params: tuple[str, ...]) -> tuple[list[str], list[str], set[str]]:
     """Split PowerShell-style arguments into (path-param values, positionals,
     other flags seen). Values of known value-taking parameters are skipped."""
@@ -8743,6 +9425,9 @@ def _soft_scan_code(code: str, lang: str, label: str, *, base_ok: bool, self_dir
     process runs from inside the workspace or temp. `self_dir_ok`: the code's
     own file sits there (it counts when the code builds paths from it)."""
     concerns = []
+    hit = _soft_data_text_reason(code)
+    if hit:
+        concerns.append(f"{label} {hit}")
     strings = [m.group(2) for m in _SOFT_CODE_STRING_RE.finditer(code)]
     outside, protected = [], []
     for s in strings:
@@ -8861,17 +9546,23 @@ def _soft_delete_reason(res: tuple[str, str] | None, shown: str) -> str:
 
 def _soft_command_concerns(cmd: str, kind: str = "powershell", cwd: str | None = None, *,
                            code_out: list | None = None, _depth: int = 0,
-                           _vars: dict[str, str] | None = None) -> list[str]:
+                           _vars: dict[str, str] | None = None,
+                           run_cwd: str | None = None) -> list[str]:
     """Why soft mode should ask before running this command line; empty when
     it can run. See the section comment above for the rules. Concerns that
     come from code the command runs are also added to `code_out` (/goal gates
-    on those, since its own check only reads the command line)."""
+    on those, since its own check only reads the command line). `run_cwd` is
+    the folder the command really runs in; only the data-folder check uses it
+    to place relative paths, the other rules keep needing an explicit cd."""
     text = cmd or ""
     if not text.strip():
         return []
     posix = kind == "sandbox"
     code, lits = _shell_code_view(text, posix)
     commands = _soft_split_commands(code, lits)
+    data = _soft_data_concerns(text, code, lits, commands, cwd or run_cwd, posix, _vars)
+    if data and code_out is not None:
+        code_out.extend(data)                # /goal stops for these too
     if (_SOFT_EVALUATOR_RE.search(code) or (not posix and _SOFT_HOST_SHELL_C_RE.search(code))
             or any(name in _SOFT_OPAQUE_HEADS or (name == "cmd" and any(a.lower() in ("/c", "/k", "/r") for a in args))
                    for name, args, _ in commands)):
@@ -8881,9 +9572,9 @@ def _soft_command_concerns(cmd: str, kind: str = "powershell", cwd: str | None =
             reasons = ["passes text to another shell (cmd /c, iex, ...), so it can't be checked"]
             if code_out is not None:
                 code_out.extend(reasons)
-            return reasons
-        return []
-    concerns: list[str] = []
+            return data + reasons
+        return data
+    concerns: list[str] = list(data)
     # Literals put back (separators blanked) for the argument-sensitive patterns.
     inlined = re.sub(r'"(\d+)"',
                      lambda m: '"' + re.sub(r"[\r\n;|&]", " ", lits[int(m.group(1))]) + '"', code)
@@ -9220,7 +9911,8 @@ def _parse_goal_command(text: str) -> tuple[str, str | None]:
     return rest, "on"
 
 
-def _goal_action_is_gated(kind, command: str, cwd: str | None = None) -> bool:
+def _goal_action_is_gated(kind, command: str, cwd: str | None = None,
+                          run_cwd: str | None = None) -> bool:
     """True when a request must keep its approval gate even under /goal: a
     deletion/destructive kind, a shell/git command line that deletes or
     overwrites data (rm, del, format, reg delete, git reset --hard, force
@@ -9230,7 +9922,7 @@ def _goal_action_is_gated(kind, command: str, cwd: str | None = None) -> bool:
     if kind in _SOFT_COMMAND_KINDS and kind != "git":
         code_concerns: list[str] = []
         try:
-            _soft_command_concerns(command or "", kind, cwd, code_out=code_concerns)
+            _soft_command_concerns(command or "", kind, cwd, code_out=code_concerns, run_cwd=run_cwd)
         except Exception:
             return True
         return bool(code_concerns)
@@ -9350,6 +10042,23 @@ _MCP_BROWSER_TOOL_RE = re.compile(
 )
 
 
+def _announce_approval(entry: dict) -> None:
+    """Tell every window about a new approval, and the device running the
+    turn first, down its own chat stream. That stream is live by definition;
+    the shared event stream can arrive minutes late on a remote browser
+    (measured: a Mac over Tailscale showed the card ~2 min after the PC)."""
+    emit = _chat_emitters.get(str(entry.get("chat_id") or ""))
+    if emit:
+        # Its own type: other windows ignore it and keep using approval:new,
+        # and a turn whose emitter only broadcasts (the notch) or drops events
+        # (Discord) loses nothing.
+        try:
+            emit({"type": "approval_request", "approval": entry})
+        except Exception:
+            pass               # the turn's client went away
+    broadcast_event({"type": "approval:new", "approval": entry})
+
+
 def request_approval(title: str, command: str, details: dict | None = None, timeout_s: int = 600) -> dict:
     """Create a pending approval, block the worker until the user responds, and
     return the decision. Soft mode allows routine, non-destructive project work;
@@ -9382,7 +10091,7 @@ def request_approval(title: str, command: str, details: dict | None = None, time
             # soft/medium/hard mode. Critical, force_prompt and web-tainted requests were
             # already excluded above; destructive ones fall through to the normal gate.
             if _chat_in_goal_mode(_get_current_chat()):
-                if _goal_action_is_gated(kind, command, details.get("cwd")):
+                if _goal_action_is_gated(kind, command, details.get("cwd"), details.get("run_cwd")):
                     details.setdefault("goal_gated", True)
                 else:
                     return {"status": "goal-auto-approved", "decision": "approve",
@@ -9422,7 +10131,8 @@ def request_approval(title: str, command: str, details: dict | None = None, time
                             verb = argv[0] if isinstance(argv, list) and argv else "command"
                             concerns = [f"changes the Git repository (git {verb})"]
                     else:
-                        concerns = _soft_command_concerns(command or "", kind, details.get("cwd"))
+                        concerns = _soft_command_concerns(command or "", kind, details.get("cwd"),
+                                                          run_cwd=details.get("run_cwd"))
                     if not concerns:
                         return {"status": "auto-approved", "decision": "approve", "auto": True, "details": details}
                     # Shown on the approval card: why Soft stopped for this one.
@@ -9447,7 +10157,7 @@ def request_approval(title: str, command: str, details: dict | None = None, time
         _approvals[aid] = entry
         _approval_events[aid] = ev
     save_json(PENDING_DIR / f"{aid}.json", entry)
-    broadcast_event({"type": "approval:new", "approval": entry})
+    _announce_approval(entry)
     deadline = time.monotonic() + timeout_s
     got = False
     while time.monotonic() < deadline:
@@ -9540,8 +10250,7 @@ def notch_start() -> bool:
             return True
         if not _notch_host_available():
             return False
-        env = dict(os.environ)
-        env["ACCURETTA_PORT"] = str(PORT)
+        env = _child_env({"ACCURETTA_PORT": str(PORT)}, keep=("dev",))
         try:
             _notch_proc = subprocess.Popen(
                 [sys.executable, str(_notch_host_script())],
@@ -9680,6 +10389,8 @@ def tool_list_directory(args: dict) -> dict:
     path = normalize_path(args.get("path") or str(Path.home()))
     if is_blocked_path(path):
         return {"error": "path blocked (Windows/System32)"}
+    if is_data_path(path):
+        return {"error": DATA_PATH_ERROR}
     if not os.path.isdir(path):
         return {"error": f"not a directory: {path}", "expected_type": "directory",
                 "actual_type": "file" if os.path.isfile(path) else "unknown"}
@@ -9863,6 +10574,8 @@ def tool_read_file(args: dict) -> dict:
         return {"error": f"not a file: {path}"}
     if is_blocked_path(path):
         return {"error": "path blocked (Windows/System32)"}
+    if is_data_path(path):
+        return {"error": DATA_PATH_ERROR}
     if not is_in_workspace(path):
         return {"error": "path outside workspace. Add folder in Workspace panel."}
     if is_ignored(path):
@@ -9951,6 +10664,7 @@ def _run_linter(path: str) -> str:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                env=_child_env(keep=_ENV_TOOLS),
                 creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
             )
             if res.returncode == 0:
@@ -9985,6 +10699,7 @@ def _run_linter(path: str) -> str:
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    env=_child_env(keep=_ENV_TOOLS),
                     creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
                 )
                 if res.returncode != 0:
@@ -10062,9 +10777,9 @@ def _open_folder_in_file_manager(raw_path: str) -> dict:
         if os.name == "nt":
             os.startfile(str(real))  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(real)])
+            subprocess.Popen(["open", str(real)], env=_child_env(keep=_ENV_TOOLS))
         else:
-            subprocess.Popen(["xdg-open", str(real)])
+            subprocess.Popen(["xdg-open", str(real)], env=_child_env(keep=_ENV_TOOLS))
     except Exception as e:
         return {"error": f"could not open: {e}"}
     return {"ok": True, "path": str(real)}
@@ -10193,6 +10908,8 @@ def tool_write_file(args: dict) -> dict:
     source_meta: dict = {}
     if not path:
         return {"error": "missing path"}
+    if is_data_path(path, write=True):
+        return {"error": DATA_PATH_ERROR}
     if args.get("source"):
         if isinstance(content, str) and content.strip():
             return {"error": "refused: provide either content or source, not both. No file was written."}
@@ -10340,6 +11057,8 @@ def tool_edit_file(args: dict) -> dict:
         return {"error": "edits must be a non-empty list of {old_text, new_text}"}
     if is_bridge_self_path(path):
         return {"error": "refused: bridge.py is the running server — edit it from your real IDE, not from a chat tool call. Restart the bridge afterward."}
+    if is_data_path(path, write=True):
+        return {"error": DATA_PATH_ERROR}
     _cerr = _critical_path_gate(path, "edit_file", "PROTECTED PATH - edit under Windows/System32")
     if _cerr:
         return _cerr
@@ -10464,7 +11183,9 @@ def tool_replace_ast_node(args: dict) -> dict:
     
     if not path or not node_type or not node_name or not new_text:
         return {"error": "Missing required arguments: path, node_type, node_name, new_text"}
-        
+    if is_data_path(path, write=True):
+        return {"error": DATA_PATH_ERROR}
+
     ext = os.path.splitext(path)[1].lower()
     try:
         import tree_sitter
@@ -10584,10 +11305,11 @@ def tool_find_references(args: dict) -> dict:
         
     for folder in folders:
         for root, dirs, files in os.walk(folder):
-            dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))]
+            dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))
+                       and not _is_data_dir(os.path.join(root, d))]
             for fname in files:
                 fpath = os.path.join(root, fname)
-                if is_ignored(fpath):
+                if is_ignored(fpath) or _data_file_in_walk(fpath):
                     continue
                     
                 ext = os.path.splitext(fname)[1].lower()
@@ -10748,6 +11470,8 @@ def tool_find_symbol(args: dict) -> dict:
         return None
 
     if only_path:
+        if is_data_path(only_path):
+            return {"error": DATA_PATH_ERROR}
         lf = lang_for(os.path.splitext(only_path)[1].lower())
         if not lf:
             return {"error": f"unsupported file type for outline: {only_path}"}
@@ -10763,10 +11487,11 @@ def tool_find_symbol(args: dict) -> dict:
     hits = []
     for folder in folders:
         for root, dirs, files in os.walk(folder):
-            dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))]
+            dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))
+                       and not _is_data_dir(os.path.join(root, d))]
             for fname in files:
                 fpath = os.path.join(root, fname)
-                if is_ignored(fpath):
+                if is_ignored(fpath) or _data_file_in_walk(fpath):
                     continue
                 lf = lang_for(os.path.splitext(fname)[1].lower())
                 if not lf:
@@ -10790,6 +11515,8 @@ def tool_delete_file(args: dict) -> dict:
         return {"error": f"not found: {path}"}
     if is_bridge_self_path(path):
         return {"error": "refused: bridge.py is the running server — won't delete the file backing this process."}
+    if is_data_path(path, write=True):
+        return {"error": DATA_PATH_ERROR}
     _cerr = _critical_path_gate(path, "delete", "PROTECTED PATH - delete under Windows/System32")
     if _cerr:
         return _cerr
@@ -10994,7 +11721,7 @@ def _terminate_process_tree(proc: subprocess.Popen, target: str) -> bool:
             try:
                 result = subprocess.run(
                     [taskkill, "/PID", str(proc.pid), "/T", "/F"],
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True, text=True, timeout=30, env=_child_env(),
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
                 try:
@@ -11111,7 +11838,7 @@ def _run_powershell(cmd: str, timeout: int = 120, max_stdout: int = 16000,
              _ps_script(cmd) if wrap else cmd],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding="utf-8" if wrap else None, errors="replace" if wrap else None,
-            cwd=process_cwd,
+            cwd=process_cwd, env=_child_env(keep=_ENV_TOOLS),
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except Exception as e:
@@ -11437,6 +12164,7 @@ def _run_host_command(cmd: str, requested_cwd: str, timeout, code_preview: str =
             "target": "host",
             "executes_code": executes_code,
             "red_team_context": red_team_context,
+            "run_cwd": process_cwd,          # Soft mode's data-folder check
         }
         if code_preview:
             details["code_preview"] = code_preview[:6000]
@@ -12077,6 +12805,8 @@ def tool_remote_copy_to(args: dict) -> dict:
     if not row:
         return {"error": "No verified Mac is selected."}
     source = normalize_path(args.get("source") or "")
+    if is_data_path(source):
+        return {"error": DATA_PATH_ERROR}
     if not is_in_workspace(source) or not os.path.isfile(source):
         return {"error": "Source must be an existing file inside the PC workspace."}
     try:
@@ -12112,6 +12842,8 @@ def tool_remote_copy_from(args: dict) -> dict:
     except ValueError as exc:
         return {"error": str(exc)}
     destination = normalize_path(args.get("destination") or "")
+    if is_data_path(destination, write=True):
+        return {"error": DATA_PATH_ERROR}
     if not is_in_workspace(destination):
         return {"error": "Destination must be inside the PC workspace."}
     meta = _remote_file_metadata(row, source)
@@ -12175,6 +12907,7 @@ class Session:
             shell=True,
             executable=shell_executable,
             cwd=cwd or None,
+            env=_child_env(keep=_ENV_TOOLS),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -13379,7 +14112,8 @@ def tool_open_program(args: dict) -> dict:
     if approval.get("decision") != "approve":
         return {"error": f"user denied launch ({approval.get('status')})"}
     try:
-        subprocess.Popen([path] + list(args.get("args", []) or []), shell=False)
+        subprocess.Popen([path] + list(args.get("args", []) or []), shell=False,
+                         env=_child_env(keep=_ENV_TOOLS))
         return {"ok": True, "path": path}
     except Exception as e:
         return {"error": str(e)}
@@ -13412,7 +14146,7 @@ def _resolve_git_cwd(path: str) -> tuple[str | None, dict | None]:
 
 
 def _git_env() -> dict:
-    env = dict(os.environ)
+    env = _child_env(keep=_ENV_TOOLS)
     # Refuse to prompt for credentials / passphrases / host keys; we can't
     # answer them through a subprocess pipe and the worker would hang.
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -13857,6 +14591,8 @@ def tool_git_clone(args: dict) -> dict:
         return {"error": "`dest` is required (directory inside workspace; will be created)"}
     dest_norm = normalize_path(dest)
     parent = str(Path(dest_norm).parent)
+    if is_data_path(dest_norm, write=True):
+        return {"error": DATA_PATH_ERROR}
     if not is_in_workspace(parent):
         return {"error": "dest is outside the workspace"}
     _cerr = _critical_path_gate(dest_norm, "git", "PROTECTED PATH - git clone destination under Windows/System32")
@@ -15444,7 +16180,7 @@ def _resolve_ytdlp_cmd() -> list[str]:
         try:
             probe = subprocess.run(
                 [*base, "-m", "yt_dlp", "--version"],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=30, env=_child_env(keep=_ENV_TOOLS),
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             if probe.returncode == 0:
@@ -15458,7 +16194,7 @@ def _resolve_ytdlp_cmd() -> list[str]:
 
 def _run_process_capture(cmd: list[str], timeout: int) -> tuple[int, str, str]:
     proc = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout,
+        cmd, capture_output=True, text=True, timeout=timeout, env=_child_env(keep=_ENV_TOOLS),
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
     return proc.returncode, proc.stdout or "", proc.stderr or ""
@@ -16389,7 +17125,7 @@ def tool_desktop_launch_app(args: dict) -> dict:
         return gate_err
     try:
         # shell=True lets 'notepad' / 'chrome' resolve from PATH/App Paths
-        subprocess.Popen(target, shell=True)
+        subprocess.Popen(target, shell=True, env=_child_env(keep=_ENV_TOOLS))
         return {"ok": True, "launched": target}
     except Exception as e:
         return {"error": str(e)}
@@ -16748,6 +17484,8 @@ def _fw_check_path(path: str, must_exist: bool = True) -> tuple[str, dict | None
         return p, {"error": f"not found: {p}"}
     if is_blocked_path(p):
         return p, {"error": "path blocked (Windows/System32)"}
+    if is_data_path(p):
+        return p, {"error": DATA_PATH_ERROR}
     if not is_in_workspace(p):
         return p, {"error": "path outside workspace. Add folder in Workspace panel."}
     return p, None
@@ -16950,7 +17688,7 @@ def tool_find_files(args: dict) -> dict:
     try:
         matches: list[dict] = []
         for p in Path(root).rglob(pattern):
-            if not p.is_file():
+            if not p.is_file() or is_data_path(str(p)):
                 continue
             try:
                 sz = p.stat().st_size
@@ -16988,6 +17726,8 @@ def tool_extract_archive(args: dict) -> dict:
     if "/" in dest_name or "\\" in dest_name or ".." in dest_name:
         return {"error": "dest_name must be a single folder name (no slashes)"}
     dest = src.parent / dest_name
+    if is_data_path(str(dest), write=True):
+        return {"error": DATA_PATH_ERROR}
     if dest.exists() and not args.get("overwrite"):
         return {"error": f"destination exists: {dest}. Pass overwrite:true or pick a new dest_name."}
 
@@ -17141,6 +17881,8 @@ def tool_carve_file(args: dict) -> dict:
     if "/" in dest_name or "\\" in dest_name or ".." in dest_name:
         return {"error": "dest_name must be a single filename (no slashes)"}
     dest = src.parent / dest_name
+    if is_data_path(str(dest), write=True):
+        return {"error": DATA_PATH_ERROR}
     if dest.exists() and not args.get("overwrite"):
         return {"error": f"destination exists: {dest}. Pass overwrite:true or pick a new dest_name."}
 
@@ -17215,6 +17957,8 @@ def tool_extract_squashfs(args: dict) -> dict:
     if "/" in dest_name or "\\" in dest_name or ".." in dest_name:
         return {"error": "dest_name must be a single folder name (no slashes)"}
     dest = src.parent / dest_name
+    if is_data_path(str(dest), write=True):
+        return {"error": DATA_PATH_ERROR}
     if dest.exists() and not args.get("overwrite"):
         return {"error": f"destination exists: {dest}. Pass overwrite:true or pick a new dest_name."}
 
@@ -17327,9 +18071,12 @@ def _grep_candidates(root: str):
         yield root
         return
     for cur_dir, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _GREP_SKIP_DIRS]
+        dirnames[:] = [d for d in dirnames if d not in _GREP_SKIP_DIRS
+                       and not _is_data_dir(os.path.join(cur_dir, d))]
         for fn in filenames:
-            yield os.path.join(cur_dir, fn)
+            fp = os.path.join(cur_dir, fn)
+            if not _data_file_in_walk(fp):
+                yield fp
 
 
 def tool_grep_files(args: dict) -> dict:
@@ -17899,6 +18646,8 @@ def tool_decompile_apk(args: dict) -> dict:
     if "/" in dest_name or "\\" in dest_name or ".." in dest_name:
         return {"error": "dest_name must be a single folder name (no slashes)"}
     dest = src.parent / dest_name
+    if is_data_path(str(dest), write=True):
+        return {"error": DATA_PATH_ERROR}
     overwrite = bool(args.get("overwrite"))
     if dest.exists() and not overwrite:
         return {"error": f"destination exists: {dest}. Pass overwrite:true or pick a new dest_name."}
@@ -17963,6 +18712,7 @@ def tool_decompile_apk(args: dict) -> dict:
             timeout=timeout,
             check=False,
             shell=False,
+            env=_child_env(keep=_ENV_TOOLS),
         )
     except subprocess.TimeoutExpired:
         return {"error": f"jadx timed out after {timeout}s. Try --no-res, narrower --classes filter, or a longer timeout."}
@@ -18075,6 +18825,17 @@ def _ghidra_idle_s(settings: dict | None = None) -> int:
     return int(max(0.5, minutes) * 60)
 
 
+def _ghidra_worker_env(env_extra: dict) -> dict:
+    """The worker's settings, Ghidra's own install variable (pyghidra falls
+    back to it) and the Java/Python paths it needs. Nothing else."""
+    extra = {}
+    install = os.environ.get("GHIDRA_INSTALL_DIR")
+    if install:
+        extra["GHIDRA_INSTALL_DIR"] = install
+    extra.update(env_extra or {})
+    return _child_env(extra, keep=("dev",))
+
+
 class _GhidraWorker:
     """Runs ghidra_worker.py on demand and talks to it over pipes.
 
@@ -18146,7 +18907,7 @@ class _GhidraWorker:
         try:
             self._proc = subprocess.Popen(
                 self._command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
-                env={**os.environ, **env_extra}, cwd=str(ROOT),
+                env=_ghidra_worker_env(env_extra), cwd=str(ROOT),
                 creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0))
         except Exception as e:
             return f"could not start the Ghidra worker: {type(e).__name__}: {e}"
@@ -18898,7 +19659,10 @@ def tool_yara_scan(args: dict) -> dict:
     elif os.path.isdir(path):
         if recursive:
             for root, _dirs, files in os.walk(path):
+                _dirs[:] = [d for d in _dirs if not _is_data_dir(os.path.join(root, d))]
                 for n in files:
+                    if _data_file_in_walk(os.path.join(root, n)):
+                        continue
                     targets.append(os.path.join(root, n))
                     if len(targets) >= max_files:
                         break
@@ -18908,7 +19672,7 @@ def tool_yara_scan(args: dict) -> dict:
             try:
                 for n in os.listdir(path):
                     fp = os.path.join(path, n)
-                    if os.path.isfile(fp):
+                    if os.path.isfile(fp) and not _data_file_in_walk(fp):
                         targets.append(fp)
                     if len(targets) >= max_files:
                         break
@@ -19052,6 +19816,8 @@ def tool_scan_secrets(args: dict) -> dict:
         return {"error": "path not found"}
     if is_blocked_path(str(target)):
         return {"error": "path blocked"}
+    if is_data_path(str(target)):
+        return {"error": DATA_PATH_ERROR}
         
     exts = args.get("extensions")
     if not exts:
@@ -19082,10 +19848,11 @@ def tool_scan_secrets(args: dict) -> dict:
         files_to_scan.append(target)
     else:
         for root, dirs, files in os.walk(target):
-            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            dirs[:] = [d for d in dirs if d not in skip_dirs
+                       and not _is_data_dir(os.path.join(root, d))]
             for f in files:
                 p = Path(root) / f
-                if p.suffix.lower() in exts:
+                if p.suffix.lower() in exts and not _data_file_in_walk(str(p)):
                     files_to_scan.append(p)
             if len(files_to_scan) >= max_files:
                 break
@@ -19758,14 +20525,21 @@ def tool_recon_port_scan(args: dict) -> dict:
     if _rt_is_local_host(host) or _rt_is_local_host(target_ip):
         _self = _rt_self_ports()
         port_list = [p for p in port_list if p not in _self]
+    _gov = _rt_gov_preflight(len(port_list))
+    if _gov:
+        return {"error": _gov, "rate_limited": True, "ports_requested": len(port_list)}
     random.shuffle(port_list)  # randomized order = less obvious sweep pattern
     timeout = max(0.3, min(float(args.get("timeout") or 1.5), 5.0))
     concurrency = max(1, min(int(args.get("concurrency") or 8), 32))
     jitter_ms = max(0, min(int(args.get("jitter_ms") or 40), 1000))
 
+    _scan_mission = _rt_authorized_mission(_rt_context_chat()) or {}
+
     def probe(port):
         if jitter_ms:
             time.sleep(random.uniform(0, jitter_ms / 1000.0))
+        if _rt_gov_admit(host, "TCP", url=f"tcp://{host}:{port}", mission=_scan_mission):
+            return None
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         try:
@@ -19842,6 +20616,9 @@ def tool_recon_tls_audit(args: dict) -> dict:
     port = int(args.get("port") or 443)
     timeout = max(2.0, min(float(args.get("timeout") or 6.0), 15.0))
     findings = []
+    _gov = _rt_gov_admit(host, "TLS", url=f"tls://{host}:{port}")
+    if _gov:
+        return {"error": _gov, "rate_limited": True}
 
     # First pass: verify against system CAs to learn validation status.
     validated = False
@@ -20023,6 +20800,9 @@ def tool_recon_http_fingerprint(args: dict) -> dict:
     status = None
     body = ""
     for _ in range(6):
+        _gov = _rt_gov_admit(_rt_url_host(cur), "GET", url=cur)
+        if _gov:
+            return {"error": _gov, "rate_limited": True, "url": cur}
         req = urllib.request.Request(cur, headers=_fp_headers)
         try:
             resp = opener.open(req, timeout=timeout)
@@ -20869,8 +21649,10 @@ def _rt_jitter() -> None:
 # suite makes through its shared fetch paths is admitted here, counted per
 # engagement, and appended to an on-disk ledger that doubles as proof of
 # restraint ("50 requests this hour"). In-memory counters reset on restart; the
-# ledger is the durable record. Sandbox scanners (nmap/sqlmap) manage their own
-# timing inside the guest and are not counted here.
+# ledger is the durable record. Raw sockets, the browser, the login spray and
+# the generic fetch tools are admitted the same way. Sandbox scanners
+# (nmap/sqlmap) send from inside the guest, so they cannot be counted one by
+# one; their pacing flags are derived from the engagement limit instead.
 _RT_GOV_LOCK = threading.Lock()
 _RT_GOV_LEDGER_LOCK = threading.Lock()
 _RT_GOV_STATE: dict[str, dict] = {}
@@ -21020,8 +21802,11 @@ class _ReconNoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _recon_fetch(url: str, timeout: float = 8.0, max_bytes: int = 8000,
-                 extra_headers: dict | None = None, follow: bool = True) -> dict:
+                 extra_headers: dict | None = None, follow: bool = True,
+                 scope_exempt: bool = False) -> dict:
     """Single GET (TLS verification off so self-signed targets still respond).
+    During an engagement the URL is scope-checked here, where the request is
+    made; scope_exempt is only for a user-approved third-party lookup.
     extra_headers override/add request headers (e.g. a Host override for vhost
     fuzzing). follow=False stops at the first 3xx so the caller can read the
     Location header (open-redirect / CRLF checks). {status, headers, body, url}."""
@@ -21032,6 +21817,10 @@ def _recon_fetch(url: str, timeout: float = 8.0, max_bytes: int = 8000,
     if extra_headers:
         hdrs.update(extra_headers)
     hdrs = _rt_apply_mission_user_agent(hdrs)
+    if not scope_exempt:
+        _scope = _rt_connect_block(url)
+        if _scope:
+            return {"error": _scope, "url": url, "scope_blocked": True}
     _gov = _rt_gov_admit(_rt_url_host(url), "GET", url=url)
     if _gov:
         return {"error": _gov, "url": url, "rate_limited": True}
@@ -21290,7 +22079,9 @@ def _recon_check_s3(host: str, explicit: list | None) -> dict:
     """Check candidate AWS S3 buckets for public listing. TOUCHES A THIRD PARTY
     (Amazon S3, outside the target), so it asks for approval first via an
     approval card. Read-only listing probes. {findings:[{severity,evidence}]}."""
-    buckets = [b for b in (explicit or _recon_s3_candidates(host)) if b][:16]
+    # A bucket name becomes part of a hostname, so it may only be a bucket name.
+    buckets = [b for b in (str(x).strip().lower() for x in (explicit or _recon_s3_candidates(host)))
+               if re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", b)][:16]
     if not buckets:
         return {"third_party": "aws-s3", "checked": 0, "findings": []}
     dec = request_approval(
@@ -21305,7 +22096,8 @@ def _recon_check_s3(host: str, explicit: list | None) -> dict:
                 "reason": "user declined the third-party AWS S3 check"}
     findings = []
     for b in buckets:
-        r = _recon_fetch(f"https://{b}.s3.amazonaws.com/?list-type=2", timeout=6.0, max_bytes=4000)
+        r = _recon_fetch(f"https://{b}.s3.amazonaws.com/?list-type=2", timeout=6.0, max_bytes=4000,
+                         scope_exempt=True)
         body, st = r.get("body", "") or "", r.get("status")
         if st == 200 and "<ListBucketResult" in body:
             keys = re.findall(r"<Key>([^<]+)</Key>", body)
@@ -22219,6 +23011,9 @@ def tool_recon_injection_probe(args: dict) -> dict:
 
 def _recon_tcp_cmd(host: str, port: int, payload: bytes, timeout: float = 4.0) -> bytes:
     """Open a TCP socket, send payload, return up to 4KB of response."""
+    _refusal = _rt_connect_block(host, port) or _rt_gov_admit(host, "TCP", url=f"tcp://{host}:{port}")
+    if _refusal:
+        raise ConnectionError(_refusal)
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
@@ -22286,6 +23081,10 @@ _RECON_DEFAULT_CREDS = [
 ]
 
 
+class _RateLimited(Exception):
+    """The engagement's request budget refused this request."""
+
+
 def _recon_try_login(url, mode, user, pw, opts, timeout):
     """One login attempt. Returns (success: bool, status: int|None)."""
     import base64
@@ -22297,6 +23096,8 @@ def _recon_try_login(url, mode, user, pw, opts, timeout):
     if _ph:
         _spray_handlers.append(_ph)
     opener = urllib.request.build_opener(*_spray_handlers)
+    if _rt_gov_admit(_rt_url_host(url), "GET" if mode == "basic" else "POST", url=url):
+        raise _RateLimited()
     if mode == "basic":
         token = base64.b64encode(f"{user}:{pw}".encode()).decode()
         req = urllib.request.Request(url, headers={"User-Agent": _rt_ua(),
@@ -22370,23 +23171,34 @@ def tool_recon_auth_spray(args: dict) -> dict:
     max_attempts = max(1, min(int(args.get("max_attempts") or 120), 300))
     capped = capped[:max_attempts]
 
-    valid, attempts, done_users = [], 0, set()
+    _gov = _rt_gov_preflight(len(capped))
+    if _gov:
+        return {"error": _gov, "rate_limited": True, "attempts_requested": len(capped)}
+    valid, attempts, done_users, stopped = [], 0, set(), False
     for (u, p) in capped:
         if u in done_users:  # already cracked this user, skip rest of their pairs
             continue
         if attempts:
             time.sleep(delay + random.uniform(0, delay))  # rate limit + jitter
+        try:
+            ok, status = _recon_try_login(url, mode, u, p, args, timeout)
+        except _RateLimited:
+            stopped = True
+            break
         attempts += 1
-        ok, status = _recon_try_login(url, mode, u, p, args, timeout)
         if ok:
             valid.append({"username": u, "password": p, "status": status})
             done_users.add(u)
-    return {
+    out = {
         "url": url, "mode": mode, "attempts": attempts,
         "valid_count": len(valid), "valid": valid,
         "note": ("VALID CREDENTIALS FOUND — verify and capture evidence." if valid
                  else "no valid credentials in the tested set."),
     }
+    if stopped:
+        out["rate_limited"] = True
+        out["note"] += " Stopped early: the engagement request budget was reached."
+    return out
 
 
 def tool_recon_capture_evidence(args: dict) -> dict:
@@ -22409,6 +23221,9 @@ def tool_recon_capture_evidence(args: dict) -> dict:
     if _ph:
         _capture_handlers.append(_ph)
     opener = urllib.request.build_opener(*_capture_handlers)
+    _gov = _rt_gov_admit(_rt_url_host(url), "GET", url=url)
+    if _gov:
+        return {"error": _gov, "rate_limited": True, "url": url}
     req = urllib.request.Request(url, headers={"User-Agent": _rt_ua()})
     ctype = ""
     try:
@@ -23303,7 +24118,7 @@ def tool_validate_finding(args: dict) -> dict:
     return {"url": url, "status": r.get("status"), "classification": cls,
             "likely_real": likely_real, "resource_signal_only": True, "reasons": reasons, "snippet": body[:200],
             "note": "This is a resource heuristic, not vulnerability validation. Both positive and negative signals require "
-                    "claim-specific evidence. Use observe_response for full captures and review_finding before promotion."}
+                    "claim-specific evidence. Use observe_response for full captures, then record_finding with status validated."}
 
 
 # Built-in payload sets per vuln class for batch_probe. Distinctive markers so a
@@ -23993,7 +24808,13 @@ def tool_cors_probe(args: dict) -> dict:
         ("attacker as subdomain of target", f"https://evil-{rand}.{host}"),
     ]
 
+    _gov = _rt_gov_preflight(len(tests))
+    if _gov:
+        return {"error": _gov, "rate_limited": True, "url": url}
+
     def probe(origin):
+        if _rt_gov_admit(_rt_url_host(url), "GET", url=url):
+            return {}
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -24069,6 +24890,12 @@ def tool_tcp_send(args: dict) -> dict:
     read_timeout = max(0.5, min(float(args.get("read_timeout") or 8.0), 40.0))
     max_bytes = 64 * 1024
 
+    _refusal = _rt_connect_block(host, port)
+    if _refusal:
+        return {"error": _refusal, "scope_blocked": True}
+    _refusal = _rt_gov_admit(host, "TCP", url=f"tcp://{host}:{port}")
+    if _refusal:
+        return {"error": _refusal, "rate_limited": True}
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(connect_timeout)
     try:
@@ -24421,7 +25248,8 @@ def tool_project_map(args: dict) -> dict:
         current_p = Path(current)
         dirs[:] = [d for d in dirs
                    if d.lower() not in _PROJECT_MAP_SKIP_DIRS
-                   and not is_ignored(str(current_p / d))]
+                   and not is_ignored(str(current_p / d))
+                   and not _is_data_dir(str(current_p / d))]
         for name in names:
             path = current_p / name
             if is_ignored(str(path)):
@@ -24639,6 +25467,8 @@ def tool_capability_report(args: dict) -> dict:
 
 def tool_read_skeleton(args: dict) -> dict:
     file_path = normalize_path(args.get("path", ""))
+    if is_data_path(file_path):
+        return {"error": DATA_PATH_ERROR}
     if not is_in_workspace(file_path):
         return {"error": "Path is outside workspace bounds."}
     if not os.path.exists(file_path):
@@ -24794,7 +25624,7 @@ def _check_css_syntax(file_path: str) -> dict:
         return _syntax_unchecked("The bundled CSS parser is missing.")
     try:
         source = Path(file_path).read_text(encoding="utf-8-sig")
-        environment = {key: value for key, value in os.environ.items()
+        environment = {key: value for key, value in _child_env().items()
                        if key.upper() not in {"NODE_OPTIONS", "NODE_PATH"}}
         completed = subprocess.run(
             [node_exe, str(checker), file_path], input=source, capture_output=True,
@@ -24814,6 +25644,8 @@ def _check_css_syntax(file_path: str) -> dict:
 
 def tool_check_syntax(args: dict) -> dict:
     path = normalize_path(args.get("path", ""))
+    if is_data_path(path):
+        return {"error": DATA_PATH_ERROR}
     if not is_in_workspace(path):
         return {"error": "Path is outside workspace bounds."}
     before = file_revision(path)
@@ -24853,7 +25685,8 @@ def _check_syntax_impl(args: dict) -> dict:
             return {"error": "A trusted Node.js executable was not found outside the workspace."}
         try:
             res = subprocess.run([node_exe, '--check', file_path], capture_output=True, text=True,
-                                 cwd=str(ROOT), creationflags=_NO_WINDOW, timeout=60)
+                                 cwd=str(ROOT), env=_child_env(), creationflags=_NO_WINDOW,
+                                 timeout=60)
             if res.returncode == 0:
                 return {"result": "Syntax OK"}
             return {"error": res.stderr.strip() or "Syntax check failed"}
@@ -24944,7 +25777,7 @@ def tool_run_tests(args: dict) -> dict:
         # mvnw.cmd or gradlew.bat failed with WinError 2. cmd.exe searches cwd.
         proc = subprocess.Popen(
             command if os.name == "nt" else argv, cwd=cwd, shell=os.name == "nt",
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env(keep=_ENV_TOOLS),
             text=True, creationflags=_NO_WINDOW,
         )
     except Exception as e:
@@ -25079,9 +25912,10 @@ class MCPClient:
             pass
 
     def start(self):
-        process_env = os.environ.copy()
-        process_env.update(self.env)
-        
+        # Third-party code: the basics plus the variables saved for this
+        # server in the MCP servers window, never the bridge's own environment.
+        process_env = _child_env(self.env, keep=("network_public",))
+
         try:
             self.process = subprocess.Popen(
                 [self.command] + self.args,
@@ -25196,7 +26030,7 @@ class MCPClient:
                 # shell=True means cmd.exe owns the real server (node/python);
                 # terminate() would leave that child running. Kill the tree.
                 subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                               capture_output=True, timeout=10,
+                               capture_output=True, timeout=10, env=_child_env(),
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             else:
                 proc.terminate()
@@ -25797,8 +26631,10 @@ TOOLS: dict[str, dict] = {
         "description": (
             "Create or update a structured red-team, blue-team, code-audit, or system finding. "
             "The ledger distinguishes candidate/validated/reproduced/mitigated/false-positive states. "
-            "Validated or reproduced claims require exact evidence IDs, a separate reproduction, "
-            "and an evidence-bound challenge review. Call review_finding first. Artifacts alone cannot confirm a claim."
+            "A candidate needs only title, severity and description. To mark one validated, send in "
+            "this same call: evidence_ids (receipt ids of the two requests that worked), control_id "
+            "(receipt id of a harmless request to the same endpoint), proof, and the five short "
+            "explanations. The harness checks them and replies with exactly what is missing."
         ),
         "parameters": {
             "type": "object",
@@ -27687,6 +28523,18 @@ _CHALLENGE_SCHEMA = {"type": "object", "properties": {
     "observations": {"type": "array", "items": _OBSERVATION_SCHEMA}, "control": _OBSERVATION_SCHEMA},
     "required": ["expected_boundary", "demonstrated_impact", "alternative_explanation", "disproof_check", "limitations", "control", "test"]}
 TOOLS["record_finding"]["parameters"]["properties"]["challenge"] = _CHALLENGE_SCHEMA
+TOOLS["record_finding"]["parameters"]["properties"]["challenge"] = {
+    "type": "object", "description": "Advanced only: the full review object, for a status-code or timing assertion instead of proof text."}
+TOOLS["record_finding"]["parameters"]["properties"].update({
+    "control_id": {"type": "string", "description": "Receipt id of the harmless control request."},
+    "proof": {"type": "string", "description": "Exact text (4+ characters) present in both working responses and absent from the control."},
+    "parameter": {"type": "string", "description": "The input that was tested, e.g. id. Leave empty when no input was changed."},
+    "expected_boundary": {"type": "string", "description": "What the application should have prevented."},
+    "demonstrated_impact": {"type": "string", "description": "What the responses actually show."},
+    "alternative_explanation": {"type": "string", "description": "The most likely innocent explanation."},
+    "disproof_check": {"type": "string", "description": "What you did to rule that explanation out."},
+    "limitations": {"type": "string", "description": "What was not tested or shown."},
+})
 TOOLS["record_finding"]["parameters"]["properties"]["inferred_impact"] = {"type": "string", "description": "Potential impact not demonstrated by the response assertion. Never present this as verified access."}
 TOOLS.update({
     "observe_response": {
@@ -28349,6 +29197,49 @@ TOOLS["switch_execution_target"] = {
 
 
 _RT_SCOPE_AWARE_GENERIC_TOOLS = {"web_fetch", "web_view_image", "web_render", "audit_http_headers"}
+# Schemas dropped from the wire while an engagement is active: every tool a
+# small model can see is one more it can pick by mistake. They stay registered,
+# so a call that names one still runs.
+_RT_MISSION_HIDDEN_TOOLS = {
+    "check_syntax", "project_map", "save_skill", "verification_guidance", "run_tests",
+    "review_finding", "git_status", "git_diff", "web_watch_video", "web_image_search",
+}
+
+
+def _rt_unify_target_args(name: str, args):
+    """Let every security tool accept the same destination names.
+
+    Tools grew up reading `url`, `host`, `target` or `domain`. A model that
+    uses the wrong one gets a "required" error and burns a turn, so a
+    destination given under any of those names is moved to the one this tool
+    reads. Nothing is added when the tool's own name is already present."""
+    if not isinstance(args, dict):
+        return args
+    tool = TOOLS.get(name) or {}
+    properties = ((tool.get("parameters") or {}).get("properties") or {})
+    accepted = [key for key in ("url", "host", "domain", "target") if key in properties]
+    if not accepted or any(isinstance(args.get(key), str) and args[key].strip() for key in accepted):
+        return args
+    given_key = next((key for key in ("url", "target", "host", "domain", "endpoint")
+                      if key not in accepted and isinstance(args.get(key), str)
+                      and args[key].strip()), None)
+    if not given_key:
+        return args
+    value = args[given_key].strip()
+    wanted = accepted[0]
+    repaired = {k: v for k, v in args.items() if k != given_key}
+    if wanted != "url" and "://" in value:
+        # A host-style argument was handed a full URL: keep the host, and the
+        # port when the tool takes one and the URL names it.
+        try:
+            parts = urllib.parse.urlsplit(value)
+            if parts.port and "port" in properties and repaired.get("port") in (None, ""):
+                repaired["port"] = parts.port
+            value = parts.hostname or value
+        except ValueError:
+            pass
+    repaired[wanted] = value
+    return repaired
 _RT_SCOPE_AWARE_COMMAND_TOOLS = {
     "run_powershell": "command",
     "run_python": "code",
@@ -28709,7 +29600,9 @@ def _scan_skills() -> dict[str, dict]:
     Cached on the directory's newest mtime (like .accurettaignore rules). A
     missing skills/ dir is never cached — it is rechecked so the first file
     the user drops in is picked up immediately."""
-    directories = [ROOT / "builtin_skills", SKILLS_DIR]
+    # email_plugin/ is a skill that ships with its own scripts (see
+    # _read_skill_body for how the skill finds them).
+    directories = [ROOT / "builtin_skills", ROOT / "email_plugin", SKILLS_DIR]
     paths = [p for directory in directories if directory.is_dir() for p in sorted(directory.glob("*.md"))]
     try:
         mtime = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) for p in paths)
@@ -28766,7 +29659,12 @@ def _read_skill_body(entry: dict) -> str | None:
     except Exception:
         return None
     m = _FRONTMATTER_RE.match(text)
-    return (text[m.end():].strip() if m else text.strip()) or None
+    body = text[m.end():].strip() if m else text.strip()
+    # A skill that ships scripts beside its .md writes {{skill_dir}} where it
+    # needs their location, so the text carries no machine-specific path.
+    if "{{skill_dir}}" in body:
+        body = body.replace("{{skill_dir}}", Path(entry["path"]).resolve().parent.as_posix())
+    return body or None
 
 
 def _skill_slug(value: str) -> str:
@@ -29174,6 +30072,15 @@ def _visible_tool_names(include_exploit: bool = True, chat_id: str = "") -> set[
             visible |= btools
     if active_rt:
         visible -= _DESKTOP_TOOL_NAMES
+        # Coding helpers the engagement never uses, unless this chat loaded a
+        # bundle that carries one. review_finding is folded into record_finding.
+        _kept = set()
+        for b in _unlocked_bundles_by_chat.get(chat_id, ()):
+            _kept |= _TOOL_BUNDLES.get(b) or set()
+        _hide = set(_RT_MISSION_HIDDEN_TOOLS)
+        if not _ready_remote_machines():
+            _hide.add("switch_execution_target")
+        visible -= _hide - _kept
         # Only the playwright MCP server stays visible during a mission: its
         # calls are URL-filtered at the wrapper (same gate as rt_browser),
         # which is what makes a third-party browser safe to extend the
@@ -30370,6 +31277,8 @@ def _invoke_tool_with_context(name: str, args: dict, call_id: str) -> dict:
 def invoke_tool(name: str, args: dict) -> dict:
     canon = _resolve_tool_name(name)
     args = _normalize_tool_argument_shapes(canon, args)
+    if canon in _RED_TEAM_TOOL_NAMES:
+        args = _rt_unify_target_args(canon, args)
     if _research_context()[1] and canon not in RESEARCH_TOOLS and canon != subagents.SPAWN_TOOL:
         return {"error": "Deep Research supports reading and evidence collection only.", "not_executed": True}
     if _offline_active and (canon.startswith(("web_", "recon_", "rt_", "browser_", "remote_", "mcp_", "sandbox_")) or canon in {"search_web", "fetch_url"}):
@@ -30394,6 +31303,15 @@ def invoke_tool(name: str, args: dict) -> dict:
                              store.folder(cid, mission_id))
             except (ValueError, OSError, KeyError) as exc:
                 result["evidence_warning"] = "Evidence was not recorded: " + str(exc)
+        if isinstance(result, dict):
+            _hint_chat = _rt_context_chat()
+            _hint_mission = _rt_authorized_mission(_hint_chat)
+            if _hint_mission:
+                _hint = _rt_next_step(canon, result, _rt_incl_exploit_for(_hint_chat))
+                # Never point at a tool this engagement has switched off.
+                if _hint and not (_hint_mission.get("automated_allowed") is False
+                                  and any(t in _hint for t in _RT_AUTOMATED_TOOL_NAMES)):
+                    result.setdefault("next_step", _hint)
         if isinstance(result, dict) and canon in _WRITE_CAPABLE_TOOLS and not result.get("error"):
             result["verification_next_step"] = verification_advice(str(result.get("path") or args.get("path") or ""))
         return result
@@ -30480,6 +31398,10 @@ def invoke_tool(name: str, args: dict) -> dict:
             _blk = _rt_scope_block(canon, args or {})
             if _blk:
                 return _finish({"error": _blk, "scope_blocked": True, "tool": canon})
+            _url = str((args or {}).get("url") or "")
+            _blk = _rt_gov_admit(_rt_url_host(_url), "GET", url=_url) if _url else None
+            if _blk:
+                return _finish({"error": _blk, "rate_limited": True, "tool": canon})
     elif canon in _RT_SCOPE_AWARE_COMMAND_TOOLS:
         _chat = _mission_chat
         if _rt_authorized_mission(_chat):
@@ -32195,13 +33117,18 @@ you may occasionally append exactly one of these to the absolute end of your res
                     "exploit tools. the bridge enforces this allowlist. report which "
                     "third-party source supports each material claim."
                 )
+            elif _rt_incl_exploit_for(_bp_chat, settings):
+                parts.append(
+                    "red team mode: the user authorized active testing of the in-scope target "
+                    "when they started this engagement. work through the mission steps in order "
+                    "without asking for permission again; the tools refuse anything out of scope."
+                )
             else:
                 parts.append(
-                    "recon vs attack: when the user asks to look around or recon a target, "
-                    "map and report the exposed surface before using exploit primitives. "
-                    "do not run injection probes, SQL exploitation, fuzzing, auth spray, "
-                    "or arbitrary attack requests unless the user explicitly asked for a "
-                    "vulnerability assessment or penetration test."
+                    "target recon mode: map and report the exposed surface. injection probes, "
+                    "SQL exploitation, fuzzing, auth spray and attack requests are not part of "
+                    "this mode; if the surface suggests a vulnerability, record it as a candidate "
+                    "and tell the user a Red Team engagement is needed to test it."
                 )
         if _sandbox_ready_cached():
             if compact_agent:
@@ -33178,9 +34105,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             _tail_secs: list = []
             _mission_shown = False
             if use_tools:
-                _tail_secs.append("Verification: for a bug fix, capture a reproducing check before editing and rerun it afterward. Match verification to the requested behavior; use verification_guidance for UI/startup changes. A trivial label or color edit needs only a focused check. Report untested behavior honestly.")
                 _mtxt = (_rt_mission_render(_rt_chat)
                          if _rt_on and settings.get("rt_mission_state", True) else "")
+                if not _mtxt:
+                    _tail_secs.append("Verification: for a bug fix, capture a reproducing check before editing and rerun it afterward. Match verification to the requested behavior; use verification_guidance for UI/startup changes. A trivial label or color edit needs only a focused check. Report untested behavior honestly.")
                 if _mtxt:
                     _tail_secs.append(
                         "=== MISSION (authorized run — hold this; do NOT drift off-task) ===\n"
@@ -34711,6 +35639,9 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         _t = _rt_target_from_args(name, args)
                         if _t and _rt_mission_note(_rt_chat, target=_t):
                             _rt_dirty = True
+                    if (_rt_on and isinstance(result, dict) and not result.get("error")
+                            and _rt_mission_mark_tool(_rt_chat, name)):
+                        _rt_dirty = True
                     # Phase is activity history for the rail. Tool availability
                     # comes from the user-selected engagement mode, not evidence
                     # status, so verification cannot deadlock its own capture.
@@ -35509,8 +36440,9 @@ def detect_hardware_specs() -> dict:
 
     try:
         # Check via nvidia-smi command first
-        res = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], 
-                             capture_output=True, text=True, timeout=2)
+        res = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=2,
+                             env=_child_env(keep=("gpu",)))
         if res.returncode == 0 and res.stdout.strip():
             gpu_name = res.stdout.strip().split("\n")[0]
             recommended_build = "CUDA"
@@ -35521,8 +36453,8 @@ def detect_hardware_specs() -> dict:
     if not is_nvidia:
         try:
             # Query via WMI on Windows
-            res = subprocess.run(["wmic", "path", "win32_VideoController", "get", "name"], 
-                                 capture_output=True, text=True, timeout=2)
+            res = subprocess.run(["wmic", "path", "win32_VideoController", "get", "name"],
+                                 capture_output=True, text=True, timeout=2, env=_child_env())
             if res.returncode == 0 and res.stdout.strip():
                 lines = [l.strip() for l in res.stdout.strip().split("\n")[1:] if l.strip()]
                 if lines:
@@ -35859,12 +36791,20 @@ def _wsl_args_enter_sandbox(args) -> bool:
     return False
 
 
+def _wsl_env() -> dict:
+    """WSL_UTF8 makes wsl.exe emit UTF-8; WSLENV (when the user set one) says
+    which Windows variables cross into the distro."""
+    extra = {"WSL_UTF8": "1"}
+    if os.environ.get("WSLENV"):
+        extra["WSLENV"] = os.environ["WSLENV"]
+    return _child_env(extra)
+
+
 def _wsl_run(args, timeout=60):
     """Run a wsl.exe command, return (returncode, combined_output).
     WSL_UTF8=1 makes wsl.exe emit UTF-8 (its native output is UTF-16LE, which
     otherwise arrives full of NUL bytes)."""
-    env = dict(os.environ)
-    env["WSL_UTF8"] = "1"
+    env = _wsl_env()
     executable = _wsl_exe()
     if not executable:
         return 127, "trusted wsl.exe was not found in the Windows system directory"
@@ -35906,8 +36846,7 @@ def _wsl_bash(distro, script, timeout=120, *, announce=False,
     (undefined vars become empty, bash quoting is ignored), so `bash -lc
     "<script>"` silently corrupts anything using shell variables. stdin avoids
     that mangling. Returns (returncode, output, killed, spawned)."""
-    env = dict(os.environ)
-    env["WSL_UTF8"] = "1"
+    env = _wsl_env()
     t_start = time.time()
     stream_chat_id = _current_chat_id.get() or _get_current_chat()
     stream_tool_name = _execution_tool_name("sandbox_run")
@@ -36221,8 +37160,7 @@ def _sbx_decompress_xz(src, dst) -> None:
 
 def _sbx_stream_provision(script, timeout=1800) -> int:
     """Run a provisioning script in the guest, streaming stdout into the log."""
-    env = dict(os.environ)
-    env["WSL_UTF8"] = "1"
+    env = _wsl_env()
     executable = _wsl_exe()
     if not executable:
         _sbx_log("trusted wsl.exe was not found in the Windows system directory")
@@ -36627,6 +37565,11 @@ def tool_sandbox_nmap(args: dict) -> dict:
         return {"error": "ports must look like '22,80,443' or '1-1024'"}
     timing = max(0, min(int(args.get("timing", 3)), 4))
     cmd = f"nmap -Pn -T{timing} --open -sV --version-light -oX - "
+    _mission = _rt_authorized_mission(_rt_context_chat()) or {}
+    _rpm = _rt_gov_limits(_mission)[0]
+    if _rpm:
+        # nmap takes packets per second and accepts fractions for slow limits.
+        cmd += f"--max-rate {_rpm / 60:.2f} --max-retries 1 "
     if ports:
         cmd += f"-p {ports} "
     cmd += shlex.quote(target)
@@ -36692,6 +37635,11 @@ def tool_sandbox_sqlmap(args: dict) -> dict:
         return {"error": blk, "scope_blocked": True}
     level = max(1, min(int(args.get("level", 1)), 5))
     risk = max(1, min(int(args.get("risk", 1)), 3))
+    _mission = _rt_authorized_mission(_rt_context_chat()) or {}
+    if _mission.get("allow_destructive") is False:
+        # sqlmap risk 3 adds OR-based payloads that can rewrite rows through an
+        # UPDATE or DELETE statement.
+        risk = min(risk, 2)
     techniques = str(args.get("techniques") or "BEU").upper()
     if techniques not in {"BEU", "BEUT"}:
         return {"error": "techniques must be BEU or BEUT", "invalid_arguments": True,
@@ -36707,6 +37655,9 @@ def tool_sandbox_sqlmap(args: dict) -> dict:
         parts.append("--tamper=between,space2comment")
     if args.get("flush_session"):
         parts.append("--flush-session")
+    _rpm = _rt_gov_limits(_mission)[0]
+    if _rpm:
+        parts.append(f"--delay={60.0 / _rpm:.2f}")
     proxy = (get_settings().get("rt_proxy") or "").strip()
     if proxy:
         parts.append(f"--proxy={shlex.quote(proxy)}")
@@ -37381,7 +38332,7 @@ STATIC_WHITELIST = {
     "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css", "glyph-field.js",
     "research-ui.js", "research-ui.css", "dropdown-menus.js",
     "security-scan-field.js", "rt-visuals.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css", "theme-flowlines.js",
-    "dot-matrix.js", "workbench.css", "opal.css", "sound-cues.js",
+    "dot-matrix.js", "workbench.css", "opal.css", "showcase.css", "showcase-field.js", "sound-cues.js",
     # notch overlay: the island UI (served unchanged) + its bridge wiring
     "accuretta-notch.html", "notch-wire.js", "notch-markdown.js",
     # brand assets — see index.html <link rel="..."> tags
@@ -37694,7 +38645,7 @@ class Handler(BaseHTTPRequestHandler):
             "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css",
             "research-ui.js", "research-ui.css", "dropdown-menus.js",
             "glyph-field.js", "security-scan-field.js", "rt-visuals.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css", "theme-flowlines.js",
-            "dot-matrix.js", "workbench.css", "opal.css", "sound-cues.js",
+            "dot-matrix.js", "workbench.css", "opal.css", "showcase.css", "showcase-field.js", "sound-cues.js",
             "accuretta-notch.html", "notch-wire.js", "notch-markdown.js",
         }
         cache_control = ("no-cache, must-revalidate" if live_ui_asset
@@ -37893,6 +38844,8 @@ class Handler(BaseHTTPRequestHandler):
             })
         if p == "/api/storage":
             return self._send_json(200, storage_report())
+        if p == "/api/email":
+            return self._send_json(200, {**email_settings(), "can_edit": self._peer_is_loopback()})
         if p == "/api/models/spec-drafts":
             # Draft GGUFs (DFlash/DSpark) available for the selected model,
             # best metadata-validated match first. `paired` is what auto-tune
@@ -38339,6 +39292,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(200, storage_clear(str(body.get("key") or "")))
             except ValueError as exc:
                 return self._send_json(400, {"error": str(exc)})
+        if p in {"/api/email", "/api/email/test"}:
+            # The mail account and its password belong to the machine itself;
+            # a paired device can see the account but not change or probe it.
+            if not self._peer_is_loopback():
+                return self._send_json(403, {"error": "The email account can only be changed on the machine running Accuretta."})
+            if p == "/api/email/test":
+                if _offline_active:
+                    return self._send_json(409, {"error": "Email is unavailable in offline mode."})
+                return self._send_json(200, email_test_connection())
+            try:
+                out = update_email_settings(body)
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            return self._send_json(200, {**out, "can_edit": True})
         if p in {"/api/mcp/servers", "/api/mcp/servers/delete", "/api/mcp/servers/restart", "/api/mcp/import"}:
             # A server entry is a command this machine will run, so only the
             # desktop window (loopback) may change them; a paired Tailscale
@@ -39958,7 +40925,7 @@ def detect_vram_gb() -> dict:
         try:
             r = subprocess.run(
                 [smi, "--query-gpu=memory.total,memory.free,name", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=3,
+                capture_output=True, text=True, timeout=3, env=_child_env(keep=("gpu",)),
                 creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
             )
             if r.returncode == 0 and r.stdout.strip():
@@ -41034,8 +42001,9 @@ def _system_ram_info():
                 return m.ullTotalPhys / 1e9, m.ullAvailPhys / 1e9
         elif sys.platform == "darwin":
             import subprocess as _sp
-            total = int(_sp.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
-            vm = _sp.check_output(["vm_stat"], text=True)
+            total = int(_sp.check_output(["sysctl", "-n", "hw.memsize"], text=True,
+                                         env=_child_env()).strip())
+            vm = _sp.check_output(["vm_stat"], text=True, env=_child_env())
             free_pages = 0
             for line in vm.splitlines():
                 if line.startswith("Pages free") or line.startswith("Pages inactive"):
@@ -41106,7 +42074,7 @@ def _running_instance_mem_mb() -> tuple[float, float]:
         if smi:
             r = subprocess.run(
                 [smi, "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=3,
+                capture_output=True, text=True, timeout=3, env=_child_env(keep=("gpu",)),
                 creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
             )
             if r.returncode == 0 and r.stdout.strip():
@@ -41137,7 +42105,7 @@ def _win_gpu_process_mem_mb(pid: int) -> float:
               f"[math]::Round(($s | Measure-Object CookedValue -Sum).Sum/1MB)")
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                           capture_output=True, text=True, timeout=15,
+                           capture_output=True, text=True, timeout=15, env=_child_env(),
                            creationflags=subprocess.CREATE_NO_WINDOW)
         value = (r.stdout or "").strip().splitlines()[-1] if (r.stdout or "").strip() else ""
         mb = float(value) if value.replace(".", "", 1).isdigit() else 0.0
@@ -41541,6 +42509,7 @@ def _fit_params_measure(model_path: str, ctx: int, *, ngl: int, n_cpu_moe: int, 
     result = None
     try:
         r = subprocess.run([exe] + args, capture_output=True, text=True, timeout=60,
+                           env=_child_env(keep=("gpu",)),
                            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0))
         devices, ctx_mib, host = {}, {}, 0.0
         for line in (r.stdout or "").splitlines():
@@ -42759,6 +43728,7 @@ def llama_caps(bin_path: str = "") -> dict:
     try:
         r = subprocess.run(
             [bin_path, "--help"], capture_output=True, text=True, timeout=8,
+            env=_child_env(keep=("gpu",)),
             creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
         )
         help_txt = (r.stdout or "") + "\n" + (r.stderr or "")
@@ -43317,6 +44287,166 @@ def _storage_measure(paths) -> tuple:
         files += 1
         newest = max(newest, st.st_mtime)
     return size, files, newest
+
+
+# ---- email account (Settings > Email) ---------------------------------------
+# The email skill's scripts read email_plugin/email_config.json. Settings edits
+# that file through these helpers; the password goes in and never comes out.
+EMAIL_PLUGIN_DIR = ROOT / "email_plugin"
+# ACCURETTA_EMAIL_CONFIG moves the file (the scripts honour it too), so a test
+# run never touches the real account.
+EMAIL_CONFIG_FILE = Path(os.environ.get("ACCURETTA_EMAIL_CONFIG") or EMAIL_PLUGIN_DIR / "email_config.json")
+_EMAIL_LOCK = threading.Lock()
+_EMAIL_ADDR_RE = re.compile(r"^[^@\s<>\"',;]+@[^@\s<>\"',;]+\.[^@\s<>\"',;]+$")
+_EMAIL_HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
+def _email_config_raw() -> dict:
+    data = load_json(EMAIL_CONFIG_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _email_port(value, default: int) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return default
+    return port if 1 <= port <= 65535 else default
+
+
+def _email_imap_host(cfg: dict) -> str:
+    host = str(cfg.get("imap_host") or "").strip()
+    if host:
+        return host
+    smtp = str(cfg.get("smtp_host") or "").strip()
+    return "imap." + smtp[len("smtp."):] if smtp.startswith("smtp.") else smtp
+
+
+def email_settings() -> dict:
+    """The email account as Settings shows it. Never includes the password."""
+    cfg = _email_config_raw()
+    sender = str(cfg.get("from") or "").strip()
+    contacts = cfg.get("contacts") if isinstance(cfg.get("contacts"), dict) else {}
+    identities = cfg.get("identities") if isinstance(cfg.get("identities"), list) else []
+    return {
+        "available": (EMAIL_PLUGIN_DIR / "email_send.py").is_file(),
+        "configured": bool(sender and cfg.get("smtp_host") and cfg.get("password")),
+        "password_set": bool(cfg.get("password")),
+        "from": sender,
+        "from_name": str(cfg.get("from_name") or ""),
+        "identities": [str(a) for a in identities if a and str(a) != sender],
+        "smtp_host": str(cfg.get("smtp_host") or ""),
+        "smtp_port": _email_port(cfg.get("smtp_port"), 465),
+        "imap_host": str(cfg.get("imap_host") or ""),
+        "imap_port": _email_port(cfg.get("imap_port"), 993),
+        "signature": str(cfg.get("signature") or ""),
+        "style": str(cfg.get("style") or ""),
+        "contacts": {str(k): str(v) for k, v in contacts.items()},
+    }
+
+
+def _email_text(value, field: str, limit: int, multiline: bool = False) -> str:
+    if not isinstance(value, str) or len(value) > limit:
+        raise ValueError(f"{field} must be text of at most {limit} characters")
+    allowed = "\n\t" if multiline else ""
+    if any(ord(ch) < 32 and ch not in allowed for ch in value.replace("\r\n", "\n")):
+        raise ValueError(f"{field} contains characters that are not allowed")
+    return value.replace("\r\n", "\n").strip()
+
+
+def _email_address(value, field: str, required: bool = True) -> str:
+    text = _email_text(value, field, 254)
+    if not text and not required:
+        return ""
+    if not _EMAIL_ADDR_RE.fullmatch(text):
+        raise ValueError(f"{field} is not an email address")
+    return text
+
+
+def update_email_settings(updates: dict) -> dict:
+    """Validate and save the fields Settings sends. Keys it does not send, and
+    keys only the scripts know (username, save_sent, sent_folder), are kept."""
+    with _EMAIL_LOCK:
+        cfg = _email_config_raw()
+        if "from" in updates:
+            cfg["from"] = _email_address(updates["from"], "Email address", required=False)
+        if "from_name" in updates:
+            cfg["from_name"] = _email_text(updates["from_name"], "Name", 80)
+        if "identities" in updates:
+            raw = updates["identities"]
+            if not isinstance(raw, list) or len(raw) > 20:
+                raise ValueError("Other addresses must be a list of at most 20")
+            cfg["identities"] = [_email_address(a, "Other address") for a in raw]
+        for key, label in (("smtp_host", "Outgoing server"), ("imap_host", "Incoming server")):
+            if key in updates:
+                host = _email_text(updates[key], label, 253)
+                if host and not _EMAIL_HOST_RE.fullmatch(host):
+                    raise ValueError(f"{label} must be a host name such as mail.example.com")
+                cfg[key] = host
+        for key, label in (("smtp_port", "Outgoing port"), ("imap_port", "Incoming port")):
+            if key in updates:
+                port = _email_port(updates[key], 0)
+                if not port:
+                    raise ValueError(f"{label} must be a number from 1 to 65535")
+                cfg[key] = port
+        if "smtp_port" in updates:
+            # 465 is encrypted from the first byte; other ports upgrade after connecting.
+            cfg["use_ssl"] = cfg["smtp_port"] == 465
+        # An empty password field means "keep the saved one".
+        if updates.get("password"):
+            password = updates["password"]
+            if not isinstance(password, str) or len(password) > 512 or any(ord(ch) < 32 for ch in password):
+                raise ValueError("Password is not valid")
+            cfg["password"] = password
+        if "signature" in updates:
+            cfg["signature"] = _email_text(updates["signature"], "Signature", 2000, multiline=True)
+        if "style" in updates:
+            cfg["style"] = _email_text(updates["style"], "Writing style", 2000, multiline=True)
+        if "contacts" in updates:
+            raw = updates["contacts"]
+            if not isinstance(raw, dict) or len(raw) > 500:
+                raise ValueError("Contacts must be a list of at most 500 people")
+            contacts = {}
+            for name, address in raw.items():
+                clean = _email_text(name, "Contact name", 80)
+                if not clean:
+                    raise ValueError("A contact needs a name")
+                contacts[clean] = _email_address(address, f"Address for {clean}")
+            cfg["contacts"] = contacts
+        EMAIL_PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
+        save_json(EMAIL_CONFIG_FILE, cfg)
+    return email_settings()
+
+
+def email_test_connection() -> dict:
+    """Log in to the outgoing and incoming servers. Sends and reads nothing."""
+    import imaplib
+    import smtplib
+    cfg = _email_config_raw()
+    sender = str(cfg.get("from") or "").strip()
+    host = str(cfg.get("smtp_host") or "").strip()
+    if not (sender and host and cfg.get("password")):
+        return {"ok": False, "message": "Fill in the address, password and outgoing server first."}
+    user = str(cfg.get("username") or sender)
+    port = _email_port(cfg.get("smtp_port"), 465)
+    stage = f"outgoing server {host}"
+    try:
+        if cfg.get("use_ssl", port == 465):
+            server = smtplib.SMTP_SSL(host, port, timeout=20)
+        else:
+            server = smtplib.SMTP(host, port, timeout=20)
+            server.starttls()
+        with server:
+            server.login(user, cfg["password"])
+        imap = _email_imap_host(cfg)
+        stage = f"incoming server {imap}"
+        with imaplib.IMAP4_SSL(imap, _email_port(cfg.get("imap_port"), 993), timeout=20) as conn:
+            conn.login(user, cfg["password"])
+    except (smtplib.SMTPAuthenticationError, imaplib.IMAP4.error):
+        return {"ok": False, "message": f"The {stage} refused the login. Check the address and password."}
+    except Exception as exc:
+        return {"ok": False, "message": f"Could not connect to the {stage}: {exc}"}
+    return {"ok": True, "message": f"Signed in as {sender}. Sending and reading both work."}
 
 
 def storage_report() -> dict:
@@ -44942,6 +46072,7 @@ class LlamaProcess:
                 bufsize=1,
                 encoding="utf-8",
                 errors="replace",
+                env=_child_env(keep=("gpu",)),
                 creationflags=creationflags,
             )
             _child_job.assign(p)
@@ -45936,7 +47067,7 @@ def _main_owned(httpd):
                     break
             if exe:
                 try:
-                    subprocess.Popen([exe, url], close_fds=True)
+                    subprocess.Popen([exe, url], close_fds=True, env=_child_env(keep=_ENV_TOOLS))
                     print(f"  [info] opened {choice} -> {url}")
                     return
                 except Exception as e:

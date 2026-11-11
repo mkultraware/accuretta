@@ -61,10 +61,10 @@
     scrollbar-width: none;
   }
   .wb-tab-strip::-webkit-scrollbar { display: none; }
-  /* Tabs read as tabs on any background, OLED black included: every tab
-     has a visible outline and a fill mixed from the text color; the active
-     one is brighter and carries an accent bar along its bottom edge. */
-  .wb-tab-strip { gap: 4px; }
+  /* Soft pill tabs: plain text until selected. The open session takes the
+     same quiet fill as the selected row in the sidebar, mixed from the text
+     color so it shows on any background, OLED black included. */
+  .wb-tab-strip { gap: 2px; }
   .wb-tab {
     position: relative;
     display: inline-flex;
@@ -74,37 +74,26 @@
     min-width: 76px;
     height: 28px;
     padding: 0 4px 0 10px;
-    border: 1px solid color-mix(in srgb, var(--fg) 14%, transparent);
-    border-radius: 7px;
-    background: color-mix(in srgb, var(--fg) 4%, transparent);
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
     color: var(--fg-muted);
-    font: 500 12px/1 var(--font-sans);
+    font: 400 12.5px/1 var(--font-sans);
     cursor: pointer;
     user-select: none;
     overflow: hidden;
-    transition: background-color .15s, color .15s, border-color .15s;
+    transition: background-color .15s, color .15s;
   }
   .wb-tab:hover {
-    background: color-mix(in srgb, var(--fg) 8%, transparent);
-    border-color: color-mix(in srgb, var(--fg) 22%, transparent);
+    background: color-mix(in srgb, var(--fg) 5%, transparent);
     color: var(--fg);
   }
   .wb-tab.active {
-    background: color-mix(in srgb, var(--fg) 12%, var(--bg));
-    border-color: color-mix(in srgb, var(--fg) 30%, transparent);
+    background: color-mix(in srgb, var(--fg) 10%, transparent);
     color: var(--fg);
-    font-weight: 600;
+    font-weight: 500;
   }
-  .wb-tab.active::after {
-    content: "";
-    position: absolute;
-    left: 8px;
-    right: 8px;
-    bottom: 0;
-    height: 2px;
-    border-radius: 2px 2px 0 0;
-    background: var(--accent);
-  }
+  .wb-tab .wb-mdot { width: 6px; height: 6px; box-shadow: none; }
   .wb-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .wb-tab-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .wb-tab-close {
@@ -127,11 +116,11 @@
   .wb-tab-new {
     display: inline-grid;
     place-items: center;
-    width: 26px;
-    height: 26px;
+    width: 28px;
+    height: 28px;
     flex: 0 0 auto;
     border: 0;
-    border-radius: 7px;
+    border-radius: 8px;
     background: transparent;
     color: var(--fg-faint);
     cursor: pointer;
@@ -156,24 +145,33 @@
 /* ---- topbar chips ---- */
 .wb-chips { display: none; }
 @media (min-width: 821px) {
-  .wb-chips { display: flex; align-items: center; gap: 6px; margin-right: 6px; }
+  .wb-chips { display: flex; align-items: center; gap: 2px; margin-right: 4px; }
 }
+/* Everything in the top row is one quiet control: no outline, 28px tall,
+   the same corner, and a soft fill on hover. */
 .wb-chip {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  height: 24px;
+  gap: 6px;
+  height: 28px;
   padding: 0 8px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 6px;
+  border: 0;
+  border-radius: 8px;
   background: transparent;
   color: var(--fg-muted);
-  font: 500 11px/1 var(--font-sans);
+  font: 400 12px/1 var(--font-sans);
   white-space: nowrap;
   cursor: pointer;
 }
 .wb-chip[hidden] { display: none; }
-.wb-chip:hover { color: var(--fg); border-color: var(--border-strong); }
+.wb-chip:hover { background: color-mix(in srgb, var(--fg) 5%, transparent); color: var(--fg); }
+@media (min-width: 601px) {
+  body.wb-on .topbar .client-context-control { height: 28px; border-color: transparent; background: transparent; }
+  body.wb-on .topbar .client-context-control:is(:hover, :focus-within) { background: color-mix(in srgb, var(--fg) 5%, transparent); }
+  body.wb-on .topbar .client-context-badge { font-size: 11.5px; }
+  body.wb-on .topbar #execution-target-select { font: 500 12px/1 var(--font-sans); }
+  body.wb-on .topbar .workflow-location { font-size: 12px; color: var(--fg-faint); }
+}
 .wb-chip[data-level="warn"] .ph { color: var(--warning); }
 .wb-diffstat { gap: 6px; font-family: var(--font-mono); }
 .wb-add { color: var(--success); font-weight: 600; }
@@ -2233,7 +2231,6 @@ body.wb-composer #app .perms-option .perms-check { margin-top: 3px; font-size: 1
 .wb-mp-search input::placeholder { color: var(--fg-faint); }
 .wb-mp-search input::-webkit-search-cancel-button { display: none; }
 .wb-mp-search .ph { font-size: 13px; }
-.wb-mp[data-view="effort"] .wb-mp-search { visibility: hidden; }
 .wb-mp-list { display: flex; flex-direction: column; gap: 1px; flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0 6px 6px; }
 .wb-mp-row { display: flex; align-items: center; gap: 8px; min-height: 38px; padding: 0 10px 0 4px; border-radius: 10px; cursor: pointer; }
 .wb-mp-row:hover { background: color-mix(in srgb, var(--fg) 5%, transparent); }
@@ -2288,6 +2285,66 @@ body.wb-composer #app .perms-option .perms-check { margin-top: 3px; font-size: 1
 .wb-mp-bars[data-level="4"] i:nth-child(-n+4),
 .wb-mp-bars[data-level="5"] i { background: var(--fg-muted); }
 .wb-mp-empty { padding: 18px 12px; color: var(--fg-faint); font: 400 12.5px/1.4 var(--font-sans); text-align: center; }
+
+/* Effort slider: one stop per level, a tick at each, a grey fill up to the
+   thumb. The top level swaps the fill for a dark track with a dot-matrix
+   stream (drawn in app.js) running toward the thumb. */
+/* The composer's effort pill opens the slider. */
+.effort-popover.has-slider { width: min(300px, calc(100vw - 24px)); padding: 12px 14px 14px; border-radius: 14px; }
+.effort-popover.has-slider > :is(.effort-popover-head, .effort-menu) { display: none; }
+.fx-effort[hidden] { display: none; }
+.fx-effort-head { display: flex; align-items: baseline; gap: 5px; font: 500 12.5px/1.2 var(--font-sans); }
+.fx-effort-title { color: var(--fg-faint); }
+.fx-effort-level { color: var(--fg); will-change: filter, opacity; }
+.fx-effort-ends {
+  display: flex; justify-content: space-between; margin: 8px 0 6px;
+  color: var(--fg-faint); font: 400 11.5px/1 var(--font-sans);
+}
+.fx-effort-track {
+  --pos: 0; --thumb-w: 22px; --slide: 340ms cubic-bezier(.25, 1.15, .4, 1);
+  position: relative; height: 28px; border-radius: 9px; overflow: hidden;
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  cursor: pointer; touch-action: none; user-select: none; outline: none;
+  transition: background-color 260ms ease, box-shadow 260ms ease;
+}
+.fx-effort-track:focus-visible { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent); }
+.fx-effort-fill {
+  position: absolute; inset: 0 auto 0 0;
+  width: calc(var(--pos) * (100% - var(--thumb-w)) + var(--thumb-w));
+  background: color-mix(in srgb, var(--fg) 9%, transparent);
+  transition: width var(--slide), opacity 200ms ease;
+}
+.fx-effort-ticks { position: absolute; inset: 0; pointer-events: none; transition: opacity 200ms ease; }
+.fx-effort-tick {
+  position: absolute; top: 50%; width: 1.5px; height: 10px; border-radius: 1px;
+  left: calc(var(--k) * (100% - var(--thumb-w)) + var(--thumb-w) / 2);
+  transform: translate(-50%, -50%);
+  background: color-mix(in srgb, var(--fg) 16%, transparent);
+  transition: background-color 200ms ease;
+}
+.fx-effort-tick.is-under { background: color-mix(in srgb, var(--fg) 26%, transparent); }
+.fx-effort-thumb {
+  position: absolute; top: 0; bottom: 0; width: var(--thumb-w);
+  left: calc(var(--pos) * (100% - var(--thumb-w)));
+  box-sizing: border-box; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-raised); box-shadow: 0 1px 3px rgba(0, 0, 0, .14);
+  transition: left var(--slide), background-color 260ms ease, border-color 260ms ease, transform 160ms ease;
+}
+.fx-effort-track:active .fx-effort-thumb { transform: scale(.94); }
+.fx-effort-track.is-dragging :is(.fx-effort-fill, .fx-effort-thumb) { transition-property: background-color, border-color, transform, opacity; }
+.fx-effort-dots {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  opacity: 0; pointer-events: none; transition: opacity 320ms ease;
+}
+/* Top level: slate in every theme so the jet reads the same. */
+.fx-effort-track.is-max { background: #30343c; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .06); }
+.fx-effort-track.is-max:focus-visible { box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .06), 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent); }
+.fx-effort-track.is-max .fx-effort-dots { opacity: 1; }
+.fx-effort-track.is-max :is(.fx-effort-fill, .fx-effort-ticks) { opacity: 0; }
+.fx-effort-track.is-max .fx-effort-thumb { background: #f3f5fa; border-color: rgba(255, 255, 255, .7); }
+@media (prefers-reduced-motion: reduce) {
+  .fx-effort-track { --slide: 0ms linear; }
+}
 
 /* Attachment tiles: a thumbnail, or a type icon over the name. While send
    uploads the tray, each file's edge fills with the accent and its corner
@@ -2634,6 +2691,15 @@ body.in-desktop-app #btn-shutdown-side { display: none; }
 /* Projects and Chats fold; each header's tool (add a project, clear chats)
    shows on hover. */
 .sb-section + .sb-section { margin-top: 10px; }
+/* The list scrolls; its sections never shrink. Safari squeezed them to fit
+   the column instead, so an open Projects spilled over Chats and hid it. */
+#chatlist > * { flex-shrink: 0; }
+/* With the workspace pane hidden, the list is alone in its column: fill it.
+   !important beats the inline height the old sessions/workspace divider
+   saved per browser (accuretta:sidebarSplit); that divider is hidden here,
+   so a height saved before the redesign could never be reset and kept the
+   list a few centimetres tall. */
+#sidebar.sb-v2 #chatlist { flex: 1 1 0% !important; height: auto !important; min-height: 0; }
 .sb-section-head { display: flex; align-items: center; gap: 2px; padding: 0 10px; }
 .sb-section-toggle {
   display: flex; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 0; height: 28px; padding: 0 10px;
@@ -2674,15 +2740,71 @@ button.sb-section-empty:hover { background: color-mix(in srgb, var(--fg) 5%, tra
   padding: 2px 6px; border-radius: 6px; background: color-mix(in srgb, var(--fg) 7%, transparent);
   color: var(--fg-muted); font: 500 11px/1.2 var(--font-sans);
 }
-.sb-files-row {
-  display: flex; align-items: center; gap: 8px; width: 100%; min-height: 30px; padding: 0 8px;
-  border: 0; border-radius: 8px; background: transparent; box-shadow: none;
-  color: var(--fg-faint); font: 400 13px/1.2 var(--font-sans); cursor: pointer;
+/* One row for everything in the sidebar. Menu items, projects, sessions,
+   files and the links at the bottom share a height, a corner, a text size,
+   an icon size and the same hover and selected fills. */
+#sidebar.sb-v2 {
+  --sb-row: 32px; --sb-radius: 8px; --sb-text: 13.5px; --sb-icon: 16px;
+  --sb-hover: color-mix(in srgb, var(--fg) 5%, transparent);
+  --sb-selected: color-mix(in srgb, var(--fg) 9%, transparent);
 }
-.sb-files-row:hover { background: color-mix(in srgb, var(--fg) 5%, transparent); color: var(--fg); }
-.sb-files-caret { margin-left: auto; font-size: 11px; transition: transform .15s ease; }
-.sb-files.open .sb-files-caret { transform: rotate(90deg); }
-.sb-files-tree { margin: 2px 0 4px; }
+#sidebar.sb-v2 :is(.workspace-nav-action, .wb-group-head, .sb-root-head, .sb-link, .sb-section-empty) {
+  gap: 10px; min-height: var(--sb-row); padding: 0 10px; border-radius: var(--sb-radius);
+  font: 400 var(--sb-text)/1.2 var(--font-sans); letter-spacing: 0; text-transform: none;
+}
+#sidebar.sb-v2 :is(.workspace-nav-action, .wb-group-head, .sb-root-head, .sb-link, .sb-section-empty) > .ph { font-size: var(--sb-icon); }
+#sidebar.sb-v2 :is(.workspace-nav-action, .wb-group-head, .sb-root-head, .sb-link, button.sb-section-empty):hover { background: var(--sb-hover); }
+#sidebar.sb-v2 #btn-search-sessions { min-height: var(--sb-row); }
+#sidebar.sb-v2 #chatlist .wb-group { position: relative; margin-bottom: 0; }
+#sidebar.sb-v2 #chatlist .wb-group-head { margin: 1px 10px; padding-right: 34px; }
+/* The guide line drops from the middle of the folder icon. */
+#sidebar.sb-v2 #chatlist .wb-group-body { margin: 0 0 4px 27px; padding-left: 2px; }
+#sidebar.sb-v2 .chatrow.wb-row { font-size: var(--sb-text); }
+#sidebar.sb-v2 .chatrow.wb-row .t { font-weight: 400; }
+#sidebar.sb-v2 .chatrow.wb-row.active { background: var(--sb-selected); }
+#sidebar.sb-v2 .chatrow.wb-row.active .t { font-weight: 500; }
+#sidebar.sb-v2 .wb-group-body .chatrow.wb-row { padding-left: 12px; }
+#sidebar.sb-v2 .chatrow.wb-row .wb-row-meta:not([data-state]) {
+  padding: 0; border-radius: 0; background: none; color: var(--fg-faint); font: 400 11.5px/1 var(--font-sans);
+}
+.sb-group-empty { height: 28px; padding: 0 12px; color: var(--fg-faint); font: 400 12.5px/28px var(--font-sans); }
+/* Opens the Files view on this project; shows with its row. */
+#sidebar.sb-v2 .sb-group-files { position: absolute; top: 5px; right: 14px; width: 24px; height: 24px; opacity: 0; }
+#sidebar.sb-v2 .wb-group-head:hover ~ .sb-group-files,
+#sidebar.sb-v2 .sb-group-files:is(:hover, :focus-visible) { opacity: 1; }
+
+/* Sessions / Files: two views of the list, never mixed. */
+.sb-views {
+  display: flex; gap: 2px; flex: 0 0 auto; margin: 0 10px 8px; padding: 2px;
+  border-radius: 8px; background: color-mix(in srgb, var(--fg) 6%, transparent);
+}
+.sb-views button {
+  flex: 1 1 0; height: 26px; padding: 0; border: 0; border-radius: 6px; background: transparent; box-shadow: none;
+  color: var(--fg-muted); font: 500 12.5px/1 var(--font-sans); cursor: pointer;
+}
+.sb-views button:hover { color: var(--fg); }
+.sb-views button.active { background: var(--bg-raised); box-shadow: 0 0 0 1px var(--border); color: var(--fg); }
+.sb-views button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+#sidebar.sb-v2[data-view="files"] #chatlist,
+#sidebar.sb-v2:not([data-view="files"]) #sb-files-view { display: none; }
+.sb-files-view { display: flex; flex-direction: column; flex: 1 1 0%; min-height: 0; overflow-y: auto; }
+.sb-files-view > * { flex-shrink: 0; }
+.sb-section-label {
+  display: flex; align-items: center; flex: 1 1 auto; min-width: 0; height: 28px; padding: 0 10px;
+  color: var(--fg-faint); font: 500 12.5px/1 var(--font-sans);
+}
+.sb-root-head {
+  display: flex; align-items: center; width: calc(100% - 20px); margin: 1px 10px;
+  border: 0; background: transparent; box-shadow: none; color: var(--fg); text-align: left; cursor: pointer;
+}
+.sb-root-icon { flex: 0 0 auto; color: var(--fg-muted); }
+.sb-root:not(.open) .sb-root-icon.is-open, .sb-root.open .sb-root-icon.is-closed { display: none; }
+.sb-root-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sb-files-tree { margin: 0 6px 4px 27px; padding: 0 0 0 2px; border-left: 1px solid color-mix(in srgb, var(--fg) 10%, transparent); }
+#sidebar.sb-v2 .sb-files-tree .tree-row { min-height: 28px; padding-top: 0; padding-bottom: 0; border-radius: var(--sb-radius); font-size: 12.5px; }
+#sidebar.sb-v2 .sb-files-tree .tree-row:hover { background: var(--sb-hover); }
+#sidebar.sb-v2 .sb-files-tree .tree-icon { font-size: 15px; }
+#sidebar.sb-v2 .sb-files-tree .tree-node.tree-dir > .tree-row > .tree-icon { color: var(--fg-muted); }
 .sb-bottom { display: flex; flex-direction: column; gap: 2px; flex: 0 0 auto; padding: 8px 10px 10px; border-top: 1px solid var(--border-subtle); }
 /* Theme stepper: back / current theme (its colors and name) / next. Full
    width so the arrows stay put while the names change. */
@@ -2737,6 +2859,7 @@ button.sb-section-empty:hover { background: color-mix(in srgb, var(--fg) 5%, tra
   #app.sidebar-collapsed > #sidebar.sb-v2 .sb-profile { flex: 0 0 auto; justify-content: center; width: 40px; height: 40px; padding: 0; border-radius: 50%; }
   #app.sidebar-collapsed > #sidebar.sb-v2 .sb-profile > :not(.sb-avatar) { display: none; }
   #app.sidebar-collapsed > #sidebar.sb-v2 .workspace-nav { align-items: center; padding: 10px 0; }
+  #app.sidebar-collapsed > #sidebar.sb-v2 .sb-views { display: none; }
   #app.sidebar-collapsed > #sidebar.sb-v2 #btn-search-sessions { min-height: 36px; margin: 0 0 4px; }
   #app.sidebar-collapsed > #sidebar.sb-v2 .sb-bottom { align-items: center; gap: 4px; padding: 10px 0 12px; }
   #app.sidebar-collapsed > #sidebar.sb-v2 .sb-theme { align-self: center; margin: 0; padding: 0; background: none; }
@@ -2788,7 +2911,9 @@ button.sb-section-empty:hover { background: color-mix(in srgb, var(--fg) 5%, tra
    box above the input, as soft rows, instead of stacking tabs on top of it.
    Long cards (red-team and research rails) scroll inside their row. */
 #app .composer > .composer-inbox { grid-area: deck; display: flex; flex-direction: column; gap: 6px; min-width: 0; margin: 0 0 4px; }
-#app .composer > .composer-inbox:not(:has(> :not(:empty):not(.hidden))) { display: none; }
+/* app.js sets .has-items (watchComposerInbox); a :has() rule here was not
+   re-checked by Safari when a card arrived, leaving it hidden. */
+#app .composer > .composer-inbox:not(.has-items) { display: none; }
 #app .composer-inbox > .revealer-deck {
   position: static; display: flex; flex-direction: column; gap: 6px; width: auto; max-width: none;
   max-height: min(42vh, 380px); margin: 0; padding: 0; overflow-y: auto; transform: none;

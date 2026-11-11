@@ -112,9 +112,9 @@ def _acquire_single_instance(lock_port: int = 8799) -> bool:
 
 # Themes whose splash background needs the dark-ink logo mark. Keep this in
 # sync with the actual palette luminance, including the softer and pastel sets.
-_LIGHT_THEMES = {"", "light", "soft", "pastel", "retro", "neumorphic", "neobrutalism", "aperture", "folio"}
+_LIGHT_THEMES = {"", "light", "soft", "pastel", "retro", "neumorphic", "neobrutalism", "aperture", "folio", "showcase"}
 _KNOWN_THEMES = {
-    "light", "dark", "dim", "retro", "opal",
+    "light", "dark", "dim", "retro", "opal", "showcase",
     "neumorphic", "neobrutalism", "aperture", "aperture-dark", "atelier", "soft",
     "pastel", "cartograph", "amaranth", "folio",
 }
@@ -217,7 +217,7 @@ def _read_app_version() -> str:
             return m.group(1)
     except Exception:
         pass
-    return "1.0.6"
+    return "1.0.7"
 
 
 def _glyph_field_js() -> str:

@@ -3681,6 +3681,16 @@ textarea.recon-input, #recon-notes-text { min-height: 62px; resize: vertical; li
   opacity: 0.78;
 }
 
+.compaction-inline-row.is-model-switch .fold-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.compaction-inline-row.is-model-switch .fold-label .ph {
+  font-size: 12px;
+}
+
 /* ---- skills: user-curated procedures ---- */
 
 .notification-dot.is-skill {
@@ -8513,18 +8523,19 @@ body.remote-client .chat-scroll {
 .advisor-toast-copy {
   min-width: 0;
   display: inline-flex;
-  flex: 1;
+  flex: 1 1 240px;
   flex-direction: column;
   gap: 2px;
 }
 
 .advisor-toast-copy strong { color: var(--fg); font-size: 11px; }
+/* The summary is the whole point of the notice, so it wraps instead of
+   being squeezed to an ellipsis by the buttons beside it. */
 .advisor-toast-copy small {
-  overflow: hidden;
   color: var(--fg-muted);
   font-size: 9px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .advisor-toast-apply,
@@ -8562,13 +8573,19 @@ body.remote-client .chat-scroll {
 .advisor-toast-dismiss:hover { color: var(--fg); background: var(--bg-sunken); }
 
 .revealer-card.notifications:has(.advisor-toast-copy) .notification-text,
+#revealer-deck .status-task-title:has(.advisor-toast-copy),
 .toast:has(.advisor-toast-copy) .toast-text {
   min-width: 0;
   display: flex;
   flex: 1;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 6px 8px;
+  white-space: normal;
 }
+
+/* The advisor notice brings its own close button. */
+#revealer-deck .revealer-card.notifications:has(.advisor-toast-copy) .status-tab-right { display: none; }
 
 @media (max-width: 600px) {
   .model-health-actions .btn { flex: 1 1 100%; }
@@ -11754,6 +11771,84 @@ body,
   .diff-card:not(.only-unified) .diff-unified { display: block; }
 }
 .diff-card.only-unified .diff-unified { display: block; }
+
+/* ---------- email cards (```email fences): a draft or a quoted message ---------- */
+.email-card {
+  margin: 12px 0;
+  max-width: 620px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--bg-raised);
+  color: var(--fg);
+  font-family: var(--font-sans);
+}
+.email-head {
+  padding: 12px 18px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.email-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 26px;
+}
+.email-kind {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-subtle);
+}
+.email-top .cc-act { background: transparent; margin-right: -6px; }
+.email-subject {
+  margin-top: 4px;
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+.email-subject.is-empty { color: var(--fg-faint); font-weight: 500; }
+.email-fields {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: 14px;
+  row-gap: 2px;
+  margin: 10px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.email-fields dt { color: var(--fg-subtle); }
+.email-fields dd { margin: 0; overflow-wrap: anywhere; }
+.email-addr, .email-sep { color: var(--fg-muted); }
+.email-body {
+  padding: 16px 18px 18px;
+  font-size: 14px;
+  line-height: 1.6;
+}
+.email-text, .email-quote { white-space: pre-wrap; overflow-wrap: anywhere; }
+.email-quote {
+  padding-left: 12px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--fg-muted);
+}
+.email-body > * + * { margin-top: 12px; }
+/* Settings > Email: host and port side by side, and the test result line. */
+#settings-drawer .email-server { display: flex; gap: 6px; }
+#settings-drawer .email-server > input[type="text"] { width: min(178px, 28vw); }
+#settings-drawer .email-server > input[type="number"] { width: 76px; }
+#settings-drawer.settings-window .settings-section-content > .form-row.email-test-row {
+  display: flex; flex-direction: row; align-items: center; justify-content: flex-start; gap: 12px; text-align: left;
+}
+#settings-drawer.settings-window .settings-section-content #email-test-result.is-ok { color: var(--success); }
+#settings-drawer.settings-window .settings-section-content #email-test-result.is-bad { color: var(--danger); }
+
+/* Inside the user's own bubble the card borrows the bubble's ink. */
+.bubble.user .email-card { background: transparent; color: inherit; border-color: currentColor; }
+.bubble.user .email-head { border-color: currentColor; }
+.bubble.user :is(.email-kind, .email-fields dt, .email-addr, .email-sep, .email-quote) { color: inherit; opacity: 0.75; }
 
 .setup-download-container {
   display: flex;
@@ -18139,9 +18234,10 @@ pre.code-card.streaming-plain code {
 
 /* Approval is the only thing the user can act on while a tool is blocked.
    Keep status and write cards mounted, but out of its way until it is decided. */
-[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck:has(> .revealer-card.permissions)
+/* .has-approval is set by renderApprovals (Safari skips re-checking :has()). */
+[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck.has-approval
   > .revealer-card:not(.permissions),
-[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck:has(> .revealer-card.permissions)
+[data-theme] :is(.composer-wrap, .composer-inbox) > .revealer-deck.has-approval
   > .status-tab {
   display: none;
 }

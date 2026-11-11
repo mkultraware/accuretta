@@ -63,6 +63,14 @@ versions/
 # MCP server config — holds API keys (Shodan, VirusTotal, etc.). Local per-machine.
 bridge_mcp_config.json
 
+# email plugin — the skill and scripts ship; the config (account, password, contacts)
+# and the pre-split originals stay on this machine.
+email_plugin/email_config.json*
+email_plugin/before-split/
+
+# working copy of the motion-graphics skill; the shipped one is skill_assets/
+/code-driven-motion-graphics/
+
 # user-curated skills (markdown procedures) — per-machine, may name local paths
 skills/
 

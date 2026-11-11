@@ -601,6 +601,93 @@
 
 
 /* ============================================================
+   SHOWCASE — a mid-tone theme: neither light nor dark.
+   The ground is cool steel, about a third as bright as a white
+   page, so it reads like a light theme on an OLED panel without
+   holding large areas at full brightness. Type is ink. Where the
+   other mid-tone theme (Retro) lifts its surfaces lighter than
+   the ground, this one sets them darker: whatever you act on or
+   have selected is a slate slab with pale type, and code and the
+   welcome plate are ink. One signal green marks what is live.
+   A live ASCII field owns the empty session (showcase-field.js);
+   structure lives in showcase.css.
+   ============================================================ */
+[data-theme="showcase"] {
+  color-scheme: light;
+
+  --bg:        #9AA4AE;
+  --bg-raised: #AEB7C0;
+  --bg-sunken: #8C96A0;
+  --bg-inset:  #A4AEB8;
+
+  --glass-bg:     #AEB7C0;
+  --glass-border: rgba(11, 15, 19, 0.12);
+  --glass-blur:   0px;
+
+  --bg-gradient: linear-gradient(#9AA4AE, #9AA4AE);
+
+  --fg:        #0B0F13;
+  --fg-muted:  #252B31;
+  --fg-subtle: #3F474F;
+  --fg-faint:  #5E6770;
+  --fg-invert: #EEF1F4;
+
+  --border:        #808A94;
+  --border-strong: #6D7781;
+  --border-subtle: #8C96A0;
+
+  /* Colour cannot be read as type on a mid-tone ground, so the accent used
+     for type and outlines is ink. The signal green is only ever a fill. */
+  --accent:        #0B0F13;
+  --accent-hover:  #1C232A;
+  --accent-subtle: rgba(11, 15, 19, 0.10);
+  --accent-fg:     #EEF1F4;
+
+  --success: #0A5C30;
+  --warning: #6B4100;
+  --danger:  #A31F08;
+  --info:    #17307A;
+  --success-subtle: rgba(10, 92, 48, 0.14);
+  --warning-subtle: rgba(107, 65, 0, 0.14);
+  --danger-subtle:  rgba(163, 31, 8, 0.13);
+  --info-subtle:    rgba(23, 48, 122, 0.12);
+
+  --sc-rule:   #838D97;
+  --sc-ink:    #0B0D10;
+  --sc-slate:  #4E565F;
+  --sc-pale:   #EEF1F4;
+  --sc-signal: #2CF07A;
+
+  --font-sans:    'Inter Tight', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: 'Inter Tight', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono:    "Fragment Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+
+  /* Generous corners; showcase.css turns them into superellipses. */
+  --r-xs: 6px;
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 18px;
+  --r-xl: 22px;
+  --r-2xl: 28px;
+
+  /* Flat: slabs are told apart by tone. Only floating menus cast a shadow. */
+  --shadow-xs: none;
+  --shadow-sm: none;
+  --shadow-md: 0 14px 34px -14px rgba(11, 15, 19, 0.38);
+  --shadow-lg: 0 22px 54px -18px rgba(11, 15, 19, 0.42);
+  --shadow-pop: 0 30px 70px -22px rgba(11, 15, 19, 0.48);
+  --shadow-inset: none;
+
+  --btn-shadow-rest:   none;
+  --btn-shadow-hover:  none;
+  --btn-shadow-active: none;
+
+  --btn-send-gradient: linear-gradient(#2CF07A, #2CF07A);
+  --btn-send-glow:     none;
+}
+
+
+/* ============================================================
    NEUMORPHIC — A distinctive soft, embossed UI.
    Uses a frosty light blue-grey (#E0E5EC) base where surfaces
    protrude or sink using structural shadows and highlights.

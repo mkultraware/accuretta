@@ -1,0 +1,639 @@
+/* ============================================================
+   SHOWCASE — structural layer (palette lives in colors_and_type.css).
+   A mid-tone theme: cool steel ground, ink type, dark slabs.
+   - FRAME    the sidebar, top row and chat share one steel plane.
+              Hairline rules divide it: one down the sidebar's edge,
+              one under the top row that carries on under the profile
+              row, and rules between the sidebar's sections.
+   - SLABS    what you act on or have selected is a slate slab with
+              pale type and superellipse corners: the composer, your
+              messages, the open session, the open tab. Code and the
+              welcome plate are ink. Surfaces go darker than the
+              ground here, never lighter.
+   - SIGNAL   one green, used only as a fill: the send key, a switch
+              that is on, selected text, the mark on what is live.
+   - FIELD    an empty session is a poster: an ink plate carrying a
+              live ASCII field (showcase-field.js) that keeps going
+              past the plate's edge over the sidebar and top row, then
+              the composer and two short lists. It all arrives in
+              sequence, and the field dissolves when a chat starts.
+   Loaded last and scoped through #app, like opal.css.
+   ============================================================ */
+
+@keyframes sc-rise {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes sc-plate {
+  from { opacity: 0; transform: scale(0.972); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+@keyframes sc-settle {
+  from { opacity: 0; transform: translateY(-16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+[data-theme="showcase"] body {
+  background: var(--bg);
+}
+
+/* The field's canvas sits inside the app, above its panels and below
+   anything that floats over the app (menus, windows). */
+[data-theme="showcase"] #app {
+  isolation: isolate;
+  background: transparent;
+}
+
+[data-theme="showcase"] ::selection {
+  background: var(--sc-signal);
+  color: var(--sc-ink);
+  -webkit-text-fill-color: var(--sc-ink);
+}
+
+/* Superellipse corners where the browser has them; plain rounding elsewhere. */
+[data-theme="showcase"] :is(.composer, .bubble, .wv-head, .code-card, pre, .terminal, .wb-tab, .wb-tab-new, .chatrow,
+    .workspace-nav-action, .wb-group-head, .sb-root-head, .sb-link, .sb-views, .sb-theme, .sb-usage, .sb-avatar,
+    .sb-profile, .avatar, .btn, .iconbtn, .wb-chip, .wb-add, .wv-row, .revealer-card, .tcard, .settings-window,
+    .settings-section-content, .modal, .wb-menu, .wb-menu-item, .wb-mp-row, .wb-mp-fam, .tree-row,
+    select, textarea, input, button) {
+  corner-shape: squircle;
+}
+
+/* A caption: monospace capitals. */
+[data-theme="showcase"] #app :is(.section-head, .settings-section-title, .sb-section-toggle, .sb-section-label,
+    .mm-label, .form-group, .wv-label, .workflow-location, .wb-chip, .client-context-badge, .bubble-meta) {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+/* The palette inside a slate slab. Everything drawn from the theme's tokens
+   (type, hairlines, tints, hover fills) follows, and the signal green can be
+   used for type here because it reads on a dark surface. */
+[data-theme="showcase"] #app :is(.composer-wrap > .composer, .bubble.user, .chatrow.wb-row.active, .wb-tab.active) {
+  --fg:        #EEF1F4;
+  --fg-muted:  #D0D5DA;
+  --fg-subtle: #B0B7BE;
+  --fg-faint:  #9199A1;
+  --fg-invert: #0B0F13;
+  --bg:        #4E565F;
+  --bg-raised: #5B636C;
+  --bg-sunken: #454C54;
+  --bg-inset:  #646C75;
+  --border:        #68707A;
+  --border-strong: #7A828C;
+  --border-subtle: #596069;
+  --accent:        #2CF07A;
+  --accent-hover:  #6AF5A2;
+  --accent-subtle: rgba(44, 240, 122, 0.16);
+  --accent-fg:     #0B0F13;
+  --success: #8DEBB3;
+  --warning: #F3CB97;
+  --danger:  #FFB1A1;
+  --info:    #B9C6FF;
+  color: var(--fg);
+}
+
+/* ...and inside an ink slab. */
+[data-theme="showcase"] #app :is(.code-card, pre, .terminal, .backend-log-pre, .wv-head) {
+  --fg:        #EEF1F4;
+  --fg-muted:  #B7BDC3;
+  --fg-subtle: #8B929A;
+  --fg-faint:  #626971;
+  --fg-invert: #0B0D10;
+  --bg:        #0B0D10;
+  --bg-raised: #16191D;
+  --bg-sunken: #060709;
+  --bg-inset:  #1F2328;
+  --border:        #2A2E33;
+  --border-strong: #3B4046;
+  --border-subtle: #1A1D21;
+  --accent:        #2CF07A;
+  --accent-hover:  #6AF5A2;
+  --accent-subtle: rgba(44, 240, 122, 0.16);
+  --accent-fg:     #0B0D10;
+  --success: #6FDC9C;
+  --warning: #F0B46A;
+  --danger:  #FF8166;
+  --info:    #9DB0FF;
+  color: var(--fg);
+  color-scheme: dark;
+}
+
+/* ============================================================
+   FRAME
+   ============================================================ */
+@media (min-width: 601px) {
+  [data-theme="showcase"] #app > .sidebar {
+    height: 100%;
+    margin: 0;
+    border: 0;
+    border-right: 1px solid var(--sc-rule);
+    border-radius: 0;
+    box-shadow: none;
+  }
+
+  [data-theme="showcase"] #app > .center {
+    grid-template-rows: 48px auto minmax(0, 1fr);
+    background: transparent;
+  }
+
+  [data-theme="showcase"] #app .topbar {
+    margin: 0;
+    padding: 0 12px 0 8px;
+    border: 0;
+    border-bottom: 1px solid var(--sc-rule);
+    border-radius: 0;
+    box-shadow: none;
+  }
+
+  /* The profile row is as tall as the top row, so the rule under the top
+     row carries straight on across the sidebar. */
+  [data-theme="showcase"] #app:not(.sidebar-collapsed) > .sidebar .brand {
+    box-sizing: border-box;
+    height: 48px;
+    padding: 0 8px 0 10px;
+    border-bottom: 1px solid var(--sc-rule);
+  }
+
+  /* Rules between the sidebar's sections: menu, list, foot, today. */
+  [data-theme="showcase"] #app:not(.sidebar-collapsed) > #sidebar.sb-v2 .workspace-nav {
+    margin-bottom: 10px;
+    padding-top: 10px;
+    border-bottom: 1px solid var(--sc-rule);
+  }
+
+  [data-theme="showcase"] #app:not(.sidebar-collapsed) > #sidebar.sb-v2 .sb-bottom {
+    padding: 10px 10px 0;
+    border-top: 1px solid var(--sc-rule);
+  }
+
+  [data-theme="showcase"] #app:not(.sidebar-collapsed) > #sidebar.sb-v2 .sb-usage {
+    width: auto;
+    margin: 8px -10px 0;
+    padding: 12px 14px 12px 20px;
+    border-top: 1px solid var(--sc-rule);
+    border-radius: 0;
+    background: transparent;
+  }
+
+  [data-theme="showcase"] #app:not(.sidebar-collapsed) > #sidebar.sb-v2 .sb-usage:hover {
+    background: color-mix(in srgb, var(--fg) 6%, transparent);
+  }
+}
+
+[data-theme="showcase"] #app .center .chat {
+  background: transparent;
+}
+
+/* Other sheets give these two a glass fill with heavier selectors. */
+:root[data-theme="showcase"] body #app > .sidebar,
+:root[data-theme="showcase"] body #app .topbar {
+  background: transparent !important;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+[data-theme="showcase"] #wb-statusbar {
+  background: var(--bg);
+  border-top: 1px solid var(--sc-rule);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.03em;
+}
+
+/* ---- sidebar ---- */
+[data-theme="showcase"] #sidebar.sb-v2 {
+  --sb-radius: 11px;
+  --sb-hover: color-mix(in srgb, var(--fg) 7%, transparent);
+  --sb-selected: var(--sc-slate);
+}
+
+[data-theme="showcase"] #app .sb-profile {
+  border-radius: 12px;
+}
+
+[data-theme="showcase"] #app .sb-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 9px;
+  background: var(--sc-slate);
+  color: var(--sc-pale);
+  font: 500 13px/1 var(--font-sans);
+}
+
+[data-theme="showcase"] #app .sb-avatar.is-mark {
+  background: transparent;
+}
+
+[data-theme="showcase"] #sidebar.sb-v2 #btn-search-sessions {
+  background: var(--bg-sunken);
+  color: var(--fg-subtle);
+}
+
+[data-theme="showcase"] #app kbd {
+  border: 0;
+  background: color-mix(in srgb, var(--fg) 9%, transparent);
+  color: var(--fg-muted);
+  font: 400 10px/1.2 var(--font-mono);
+  letter-spacing: 0.04em;
+}
+
+[data-theme="showcase"] #app > .sidebar .workspace-nav-new > .ph {
+  color: inherit;
+}
+
+[data-theme="showcase"] #app :is(.sb-section-toggle, .sb-section-label) {
+  color: var(--fg-subtle);
+}
+
+/* Two-cell switches: a sunken track, the chosen cell a slate slab. */
+[data-theme="showcase"] #app :is(.sb-views, .sb-theme) {
+  padding: 3px;
+  border-radius: 13px;
+  background: var(--bg-sunken);
+}
+
+[data-theme="showcase"] #app :is(.sb-views, .sb-theme) button {
+  border-radius: 10px;
+  box-shadow: none;
+  transition: background-color 160ms ease, color 160ms ease;
+}
+
+[data-theme="showcase"] #app .sb-views button {
+  height: 28px;
+  font: 400 10px/1 var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-subtle);
+}
+
+[data-theme="showcase"] #app .sb-views button.active,
+[data-theme="showcase"] #app .sb-theme .sb-theme-name {
+  background: var(--sc-slate);
+  color: var(--sc-pale);
+}
+
+[data-theme="showcase"] #app .sb-theme .sb-theme-name {
+  font: 400 10px/1 var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+[data-theme="showcase"] #app .sb-theme-swatch {
+  background: var(--sc-signal);
+  box-shadow: none;
+}
+
+[data-theme="showcase"] #app .chatrow.wb-row {
+  border: 0;
+  transition: background-color 140ms ease;
+}
+
+[data-theme="showcase"] #app > .sidebar .chatrow.wb-row.active {
+  background: var(--bg);
+  box-shadow: none;
+}
+
+[data-theme="showcase"] #app > .sidebar .chatrow.wb-row.active .t {
+  color: var(--fg);
+}
+
+[data-theme="showcase"] #app .chatrow.wb-row .wb-row-meta {
+  font: 400 10px/1 var(--font-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+[data-theme="showcase"] #app .sb-usage-icon {
+  display: none;
+}
+
+[data-theme="showcase"] #app .sb-usage-btn {
+  border: 0;
+  border-radius: 9px;
+  background: var(--sc-slate);
+  box-shadow: none;
+  color: var(--sc-pale);
+  font: 400 10px/1 var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+[data-theme="showcase"] #chatlist .wb-group-body,
+[data-theme="showcase"] #sidebar .sb-files-tree {
+  border-left-color: var(--sc-rule);
+}
+
+/* ---- top row ---- */
+[data-theme="showcase"] #app .topbar .workflow-location {
+  color: var(--fg-subtle);
+}
+
+[data-theme="showcase"] #app .wb-tab {
+  border-radius: 11px;
+  color: var(--fg-muted);
+}
+
+[data-theme="showcase"] #app .wb-tab:hover {
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+}
+
+[data-theme="showcase"] #app .wb-tab.active {
+  background: var(--bg);
+  color: var(--fg);
+}
+
+[data-theme="showcase"] #app .topbar .client-context-control {
+  border-radius: 10px;
+}
+
+/* ============================================================
+   SLABS
+   ============================================================ */
+/* ---- messages: yours on the right, on slate ---- */
+[data-theme="showcase"] #app .bubble.user {
+  border: 0 !important;
+  border-radius: 20px;
+  background: var(--bg) !important;
+  box-shadow: none !important;
+  color: var(--fg) !important;
+}
+
+[data-theme="showcase"] #app .bubble.user:hover {
+  box-shadow: none !important;
+}
+
+[data-theme="showcase"] #app .bubble.user :is(p, li, strong, em, span, a) {
+  color: var(--fg) !important;
+  -webkit-text-fill-color: var(--fg) !important;
+}
+
+[data-theme="showcase"] #app .bubble.user :not(pre) > code {
+  background: color-mix(in srgb, var(--fg) 12%, transparent) !important;
+  color: var(--fg) !important;
+  -webkit-text-fill-color: var(--fg) !important;
+}
+
+[data-theme="showcase"] #app .avatar.user {
+  border: 0;
+  border-radius: 9px;
+  background: var(--sc-slate);
+  color: var(--sc-pale);
+}
+
+/* Replies are type on the ground: no card. */
+[data-theme="showcase"] #app .bubble.agent {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+[data-theme="showcase"] #app .bubble.agent.quiet:hover {
+  box-shadow: none;
+}
+
+[data-theme="showcase"] #app .bubble-meta {
+  color: var(--fg-subtle);
+}
+
+[data-theme="showcase"] #app .bubble.agent :not(pre) > code {
+  background: color-mix(in srgb, var(--fg) 9%, transparent);
+  color: var(--fg);
+}
+
+/* Links in a reply: ink, underlined in the signal green. */
+[data-theme="showcase"] #app .bubble.agent a:not(.chat-link-card) {
+  color: var(--fg);
+  text-decoration: underline;
+  text-decoration-color: var(--sc-signal);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+
+/* ---- code: ink slabs ---- */
+[data-theme="showcase"] #app :is(.code-card, pre, .terminal, .backend-log-pre) {
+  border: 0;
+  border-radius: 18px;
+  background-color: var(--bg);
+  box-shadow: none;
+}
+
+[data-theme="showcase"] :is(.tok-keyword, .hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-literal, .hljs-name, .hljs-type, .hljs-section) { color: #7DF5AC; }
+[data-theme="showcase"] :is(.tok-string, .hljs-string, .hljs-addition, .hljs-symbol, .hljs-bullet, .hljs-regexp) { color: #FFB38A; }
+[data-theme="showcase"] :is(.tok-number, .hljs-number) { color: #FF8FBF; }
+[data-theme="showcase"] :is(.tok-fn, .hljs-title, .hljs-title.function_, .hljs-title.class_) { color: #F2F4EF; }
+[data-theme="showcase"] :is(.tok-comment, .hljs-comment, .hljs-quote) { color: #6B727A; font-style: italic; }
+[data-theme="showcase"] :is(.tok-tag, .tok-attr, .hljs-attr, .hljs-attribute, .hljs-property, .hljs-tag, .hljs-selector-id, .hljs-selector-class, .hljs-selector-pseudo) { color: #A9B8FF; }
+[data-theme="showcase"] :is(.tok-var, .hljs-variable, .hljs-template-variable, .tok-decorator) { color: #D3D8DD; }
+[data-theme="showcase"] :is(.tok-punct) { color: #8B929A; }
+
+/* ---- composer: a slate slab ---- */
+/* The hint in the empty box is set explicitly so it stays readable on slate. */
+:root[data-theme="showcase"] body #app .composer-wrap > .composer #composer-input::placeholder {
+  color: #B9C0C7;
+  opacity: 1;
+}
+
+/* :root in front so this outranks the workbench's own composer card. */
+:root[data-theme="showcase"] body.wb-composer #app .composer-wrap > .composer,
+:root[data-theme="showcase"] #app .composer-wrap > .composer {
+  border: 0 !important;
+  border-radius: 26px !important;
+  background: var(--bg) !important;
+  box-shadow: 0 0 0 0 transparent !important;
+  color-scheme: dark;
+  transition: box-shadow 180ms ease !important;
+}
+
+:root[data-theme="showcase"] body.wb-composer #app .composer-wrap > .composer:focus-within,
+:root[data-theme="showcase"] #app .composer-wrap > .composer:focus-within {
+  box-shadow: 0 0 0 2px var(--sc-ink) !important;
+}
+
+/* The line over the box (project, machine, context) is a caption on the
+   ground, not a tab tucked behind it. */
+[data-theme="showcase"] body.wb-composer #app .composer-wrap > .composer-projects {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 0 10px 6px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+[data-theme="showcase"] body.wb-composer #app.sidebar-collapsed .composer-wrap > .composer-projects { max-width: 980px; }
+[data-theme="showcase"] body.wb-composer #app.sidebar-collapsed.preview-collapsed .composer-wrap > .composer-projects { max-width: 1080px; }
+
+[data-theme="showcase"] body.wb-composer #app .composer-projects :is(.project-chip, .wb-ctx-row, .ctx-ring-label) {
+  font: 400 10px/1 var(--font-mono) !important;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+/* Send is the one lit key: signal green, ink arrow. */
+[data-theme="showcase"] #app #btn-send:not(.queue-mode) {
+  color: var(--sc-ink) !important;
+  box-shadow: none !important;
+}
+
+[data-theme="showcase"] #app #btn-send:not(.queue-mode):hover {
+  filter: brightness(1.08);
+}
+
+/* A switch that is on is green, with an ink knob. */
+[data-theme="showcase"] .sw.on {
+  background: var(--sc-signal);
+}
+
+[data-theme="showcase"] .sw.on::after {
+  background: var(--sc-ink);
+}
+
+/* The card waiting on your decision sits inside crop marks. */
+[data-theme="showcase"] #app .revealer-card.permissions {
+  position: relative;
+}
+
+[data-theme="showcase"] #app .revealer-card.permissions::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  --m: var(--accent);
+  background:
+    linear-gradient(var(--m), var(--m)) 0 0 / 10px 1px,
+    linear-gradient(var(--m), var(--m)) 0 0 / 1px 10px,
+    linear-gradient(var(--m), var(--m)) 100% 0 / 10px 1px,
+    linear-gradient(var(--m), var(--m)) 100% 0 / 1px 10px,
+    linear-gradient(var(--m), var(--m)) 0 100% / 10px 1px,
+    linear-gradient(var(--m), var(--m)) 0 100% / 1px 10px,
+    linear-gradient(var(--m), var(--m)) 100% 100% / 10px 1px,
+    linear-gradient(var(--m), var(--m)) 100% 100% / 1px 10px;
+  background-repeat: no-repeat;
+}
+
+/* ============================================================
+   FIELD — the empty session
+   ============================================================ */
+/* The ASCII field replaces the dot field here. */
+[data-theme="showcase"] #app .dot-field {
+  display: none;
+}
+
+@media (min-width: 601px) {
+  /* The poster is as tall as its parts; what is left over goes above and
+     below it. */
+  [data-theme="showcase"] #app .center .chat.is-welcome {
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+
+  [data-theme="showcase"] body.wb-composer #app .chat.is-welcome .chat-scroll {
+    padding: clamp(20px, 7vh, 88px) 22px 0;
+    overflow: hidden;
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+
+  [data-theme="showcase"] #app .chat.is-welcome .chat-inner {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 0;
+  }
+
+  [data-theme="showcase"] #app.sidebar-collapsed .chat.is-welcome .chat-inner { max-width: 980px; }
+  [data-theme="showcase"] #app.sidebar-collapsed.preview-collapsed .chat.is-welcome .chat-inner { max-width: 1080px; }
+
+  [data-theme="showcase"] #app .chat.is-welcome .welcome-screen {
+    width: 100%;
+    min-height: 0;
+    padding: 0 0 12px;
+    align-items: stretch;
+  }
+
+  /* The plate: an ink slab. showcase-field.js draws the characters on it. */
+  [data-theme="showcase"] #app .chat.is-welcome .wv-head {
+    box-sizing: border-box;
+    height: clamp(170px, 35vh, 340px);
+    padding: 26px 30px 26px;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0;
+    border-radius: 26px;
+    background: var(--bg);
+    animation: sc-plate 700ms cubic-bezier(0.2, 0.7, 0.1, 1) backwards;
+  }
+
+  [data-theme="showcase"] #app .chat.is-welcome .wv-a {
+    width: 40px;
+    height: 30px;
+  }
+
+  [data-theme="showcase"] #app .chat.is-welcome .wv-title {
+    max-width: 15ch;
+    color: var(--fg);
+    font-size: clamp(30px, 3.4vw, 46px);
+    font-weight: 400;
+    line-height: 1.02;
+    letter-spacing: -0.045em;
+    text-align: left;
+    text-wrap: balance;
+    animation: sc-rise 620ms 160ms cubic-bezier(0.2, 0.7, 0.1, 1) backwards;
+  }
+
+  /* The rest of the poster arrives after the plate, a beat apart. */
+  [data-theme="showcase"] #app .chat.is-welcome .composer-wrap {
+    animation: sc-rise 560ms 120ms cubic-bezier(0.2, 0.7, 0.1, 1) backwards;
+  }
+
+  [data-theme="showcase"] #app .chat.is-welcome .wv-below .wv-col {
+    animation: sc-rise 520ms 240ms cubic-bezier(0.2, 0.7, 0.1, 1) backwards;
+  }
+
+  [data-theme="showcase"] #app .chat.is-welcome .wv-below .wv-col + .wv-col {
+    animation-delay: 310ms;
+  }
+
+  /* A chat has started: the composer settles into its place at the foot. */
+  [data-theme="showcase"] #app .chat:not(.is-welcome) .composer-wrap {
+    animation: sc-settle 460ms cubic-bezier(0.2, 0.7, 0.1, 1) backwards;
+  }
+}
+
+/* The mark is printed pale on the plate. */
+[data-theme="showcase"] #app .wv-a circle {
+  fill: var(--fg) !important;
+}
+
+[data-theme="showcase"] #app .wv-project {
+  color: var(--accent);
+}
+
+[data-theme="showcase"] #app .wv-label {
+  color: var(--fg-subtle);
+}
+
+[data-theme="showcase"] #app .wv-row {
+  border-radius: 11px;
+  transition: background-color 140ms ease;
+}
+
+[data-theme="showcase"] #app .wv-row-m {
+  font: 400 10px/1 var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="showcase"] #app :is(.wv-head, .wv-title, .composer-wrap, .wv-col) {
+    animation: none !important;
+  }
+}

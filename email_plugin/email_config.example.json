@@ -1,0 +1,16 @@
+{
+  "from": "you@example.com",
+  "from_name": "Your Name",
+  "identities": ["info@example.com"],
+  "smtp_host": "smtp.example.com",
+  "smtp_port": 465,
+  "use_ssl": true,
+  "imap_host": "imap.example.com",
+  "imap_port": 993,
+  "password": "",
+  "signature": "Your Name\nexample.com",
+  "style": "Short, plain and direct. No emojis.",
+  "contacts": {
+    "Jane Doe": "jane@example.com"
+  }
+}

@@ -158,6 +158,7 @@
     const deck = $("#revealer-deck");
     if (!deck) return null;
 
+    const heightBefore = _deckHeightBefore(deck);
     const previous = key ? _toasts.get(key) : null;
     const row = previous?.isConnected ? previous : document.createElement("div");
     clearTimeout(row._dismissTimer);
@@ -191,12 +192,21 @@
       _syncDeckStack();
       if (deck.children.length === 0) deck.innerHTML = "";
     };
+    // Fade the notice while the tab closes over it, then take it out.
+    const closeRow = () => {
+      if (!row.isConnected || row.classList.contains("fade-out")) return;
+      const from = _deckHeightBefore(deck);
+      row.style.display = "none";
+      const to = _deckHeightNow(deck);
+      row.style.display = "";
+      row.classList.add("fade-out");
+      _deckHeightSlide(deck, from, to, removeRow);
+    };
     const dismissBtn = row.querySelector('[data-act="dismiss"]');
     if (dismissBtn) {
       dismissBtn.onclick = (e) => {
         e.stopPropagation();
-        row.classList.add("fade-out");
-        setTimeout(removeRow, 150);
+        closeRow();
       };
     }
 
@@ -205,14 +215,65 @@
     if (firstDeckCard) deck.insertBefore(row, firstDeckCard);
     else deck.appendChild(row);
     _syncDeckStack();
+    _deckHeightSlide(deck, heightBefore, _deckHeightNow(deck));
 
-    row._dismissTimer = setTimeout(() => {
-      row.classList.add("fade-out");
-      row._removeTimer = setTimeout(removeRow, 200);
-    }, ms);
+    row._dismissTimer = setTimeout(closeRow, ms);
 
     if (key) _toasts.set(key, row);
     return row;
+  }
+
+  // The tab above the composer changes height when a notice arrives or leaves.
+  // Slide between the two heights so the composer's top edge doesn't jump.
+  // The deck sits in the composer's inbox, which is hidden while empty and
+  // carries the spacing under it, so the inbox is the box that slides.
+  function _deckBox(deck) {
+    return deck.closest(".composer-inbox") || deck;
+  }
+
+  function _deckHeightBefore(deck) {
+    const box = _deckBox(deck);
+    const height = box.getBoundingClientRect().height;
+    box._heightAnim?.cancel();   // runs any pending removal, after measuring
+    return height;
+  }
+
+  function _deckHeightNow(deck) {
+    const box = _deckBox(deck);
+    // watchComposerInbox reveals the inbox a moment later; do it now so the
+    // height it is about to take can be measured.
+    if (box !== deck && deck.children.length) box.classList.add("has-items");
+    return box.getBoundingClientRect().height;
+  }
+
+  function _deckHeightSlide(deck, from, to, after = null) {
+    const box = _deckBox(deck);
+    const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    if (reduced || !box.animate || Math.abs(to - from) < 1) { after?.(); return; }
+    // Opening from nothing or closing to nothing: ease the gap under the box too.
+    const start = { height: `${from}px`, overflow: "hidden" };
+    const end = { height: `${to}px`, overflow: "hidden" };
+    if (from < 1) start.marginBottom = "0px";
+    if (to < 1) {
+      end.marginBottom = "0px";
+      // An emptied inbox is hidden straight away; hold it open while it closes.
+      const shown = getComputedStyle(box).display;
+      if (shown !== "none") start.display = end.display = shown;
+    }
+    const anim = box.animate([start, end], {
+      duration: 220, easing: "cubic-bezier(.2, .8, .2, 1)", fill: after ? "forwards" : "none",
+    });
+    box._heightAnim = anim;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (box._heightAnim === anim) box._heightAnim = null;
+      after?.();
+      anim.cancel();
+    };
+    anim.onfinish = finish;
+    anim.oncancel = finish;
   }
 
   // In the unified docked tab, avoid stacked floating card depth layers
@@ -429,6 +490,74 @@
       `<span class="fold-label">${esc(compactStatsLabel(stats))}</span>` +
       `<span class="fold-line" aria-hidden="true"></span>`;
     return el;
+  }
+
+  // Model-switch divider: same faint line · label · line as the fold divider.
+  // Each reply records the model that wrote it (msg.model, the GGUF stem), so
+  // the break is derived on render: it goes just before the turn whose reply
+  // came from a different model than the reply before it.
+  function modelSwitchLabel(model) {
+    const short = shortenModelName(model);
+    return `switched model · ${short || model}`;
+  }
+
+  function buildModelSwitchDivider(model) {
+    const el = document.createElement("div");
+    el.className = "compaction-inline-row is-divider is-model-switch";
+    el.setAttribute("role", "note");
+    el.innerHTML = `<span class="fold-line" aria-hidden="true"></span>` +
+      `<span class="fold-label"><i class="ph ph-shuffle" aria-hidden="true"></i>${esc(modelSwitchLabel(model))}</span>` +
+      `<span class="fold-line" aria-hidden="true"></span>`;
+    return el;
+  }
+
+  // Map of visible-message index -> new model, for each place a reply's model
+  // differs from the previous reply's. The index is the first message after
+  // the previous reply (the user turn the new model answered).
+  function modelSwitchPoints(messages) {
+    const points = new Map();
+    let prevModel = "";
+    let lastReplyIdx = -1;
+    (messages || []).forEach((m, i) => {
+      if (m.role !== "assistant") return;
+      if (m.model) {
+        if (prevModel && m.model !== prevModel) points.set(lastReplyIdx + 1, m.model);
+        prevModel = m.model;
+      }
+      lastReplyIdx = i;
+    });
+    return points;
+  }
+
+  // Stem of the model now loaded, in the same form replies record.
+  function liveModelStem() {
+    const path = String(state.settings?.model_path || "");
+    if (path) return path.split(/[\\/]/).pop().replace(/\.gguf$/i, "").slice(0, 80);
+    return wbLiveModel();
+  }
+
+  // Right after a model load, show the break at the end of the open chat
+  // (before the next message) if its last reply came from another model.
+  // Switching back to that model takes it away again. Once the new model
+  // replies, the rendered history carries the same divider at the same place.
+  function syncLiveModelSwitchDivider() {
+    const inner = $("#chat-inner");
+    if (!inner) return;
+    inner.querySelectorAll(":scope > .is-model-switch.is-live").forEach(el => el.remove());
+    if (!state.messages?.length) return;
+    let last = "";
+    for (let i = state.messages.length - 1; i >= 0; i--) {
+      const m = state.messages[i];
+      if (m.role === "assistant" && m.model) { last = m.model; break; }
+    }
+    const now = liveModelStem();
+    if (!last || !now || last === now) return;
+    const rows = inner.querySelectorAll(":scope > .bubble-row");
+    const lastRow = rows[rows.length - 1];
+    if (!lastRow) return;
+    const divider = buildModelSwitchDivider(now);
+    divider.classList.add("is-live");
+    lastRow.after(divider);
   }
 
   // Visible-message index of the fold boundary for a raw chat record.
@@ -1872,6 +2001,9 @@
       case "session_read":   return `Reading session output…`;
       case "session_stop":   return `Stopping the session…`;
       case "remote_shell":   return `Running on Mac…`;
+      case "remote_read_file": return `Reading ${fileKindPhrase(args.path)} on Mac…`;
+      case "remote_list_directory": return `Looking in ${shortPath(args.path) || "a folder"} on Mac…`;
+      case "remote_file_abort": return `Cancelling the Mac file transfer…`;
       case "remote_write_file": return `Writing ${fileKindPhrase(args.path)} on Mac…`;
       case "remote_file_begin": return `Preparing ${fileKindPhrase(args.path)} on Mac…`;
       case "remote_file_append": return `Sending the next file chunk to Mac…`;
@@ -1941,6 +2073,9 @@
       case "capability_report": return `Checked available capabilities`;
       case "switch_execution_target": return `Commands now target ${res.target_label || "the selected device"}`;
       case "remote_shell":   return `Mac command completed`;
+      case "remote_read_file": return res.path ? `Read ${fileKindPhrase(res.path)} on Mac` : "Read a file on Mac";
+      case "remote_list_directory": return `Looked in ${shortPath(res.path) || "a folder"} on Mac`;
+      case "remote_file_abort": return `Cancelled the Mac file transfer`;
       case "remote_write_file": return `Wrote ${fileKindPhrase(res.path)} on Mac${res.bytes != null ? ` (${res.bytes} bytes)` : ""}`;
       case "remote_file_begin": return `Mac file ready for chunks`;
       case "remote_file_append": return `Sent chunk ${res.chunks || ""}${res.bytes != null ? ` · ${res.bytes} bytes total` : ""}`;
@@ -2788,6 +2923,92 @@
     return `<div class="diff-card">${head}${rawHolder}<div class="diff-split">${renderDiffSplit(rows)}</div>${unified}</div>`;
   }
 
+  // ---------- email cards (```email fences) ----------
+  // A draft (or a quoted message) written as mail headers, a blank line, then
+  // the body. Rendered as a letter instead of a code block. A fence with no
+  // recognisable header returns "" and falls back to the plain code card.
+  const EMAIL_HEADER_RE = /^[*_\s]*(from|to|cc|bcc|reply-to|subject|date)[*_\s]*:[*_]*\s*(.*)$/i;
+  function parseEmailFence(raw) {
+    const lines = String(raw).replace(/\r\n?/g, "\n").replace(/^\n+/, "").split("\n");
+    const headers = {};
+    let i = 0, last = "";
+    for (; i < lines.length; i++) {
+      const ln = lines[i];
+      if (!ln.trim()) { i++; break; }
+      const m = EMAIL_HEADER_RE.exec(ln);
+      if (m) { last = m[1].toLowerCase(); headers[last] = m[2].replace(/[*_]+$/, "").trim(); continue; }
+      if (last && /^[ \t]+\S/.test(ln)) { headers[last] += " " + ln.trim(); continue; }   // folded header
+      break;   // first non-header line starts the body
+    }
+    if (!Object.keys(headers).length) return null;
+    return { headers, body: lines.slice(i).join("\n").replace(/^\n+|\s+$/g, "") };
+  }
+
+  // "Name <a@b.c>, d@e.f" -> name in full ink, address quieter. Splits only on
+  // separators outside quotes and angle brackets ("Doe, Jane" <j@x.y> is one).
+  function emailAddressHtml(value) {
+    const parts = [];
+    let cur = "", inQuote = false, inAngle = false;
+    for (const ch of String(value)) {
+      if (ch === '"') inQuote = !inQuote;
+      else if (ch === "<" && !inQuote) inAngle = true;
+      else if (ch === ">" && !inQuote) inAngle = false;
+      if ((ch === "," || ch === ";") && !inQuote && !inAngle) { parts.push(cur); cur = ""; }
+      else cur += ch;
+    }
+    parts.push(cur);
+    return parts.map(p => p.trim()).filter(Boolean).map(p => {
+      const m = /^"?([^"<]*?)"?\s*<([^>]+)>$/.exec(p);
+      if (m && m[1].trim())
+        return `<span class="email-who">${esc(m[1].trim())}</span> <span class="email-addr">${esc(m[2].trim())}</span>`;
+      return `<span class="email-who">${esc(m ? m[2].trim() : p)}</span>`;
+    }).join(`<span class="email-sep">, </span>`);
+  }
+
+  // Body stays plain text; runs of ">" lines become a quoted block.
+  function emailBodyHtml(body) {
+    const out = [];
+    let buf = [], quoted = false;
+    const flush = () => {
+      const text = buf.join("\n").replace(/^\n+|\n+$/g, "");
+      buf = [];
+      if (!text) return;
+      out.push(`<div class="${quoted ? "email-quote" : "email-text"}">${esc(text)}</div>`);
+    };
+    for (const ln of String(body).split("\n")) {
+      const isQuote = /^\s*>/.test(ln);
+      if (isQuote !== quoted) { flush(); quoted = isQuote; }
+      buf.push(isQuote ? ln.replace(/^\s*>\s?/, "") : ln);
+    }
+    flush();
+    return out.join("");
+  }
+
+  function renderEmailCard(raw) {
+    const mail = parseEmailFence(raw);
+    if (!mail) return "";
+    const h = mail.headers;
+    const fields = [["from", "From"], ["to", "To"], ["cc", "Cc"], ["bcc", "Bcc"], ["reply-to", "Reply to"]]
+      .filter(([key]) => h[key])
+      .map(([key, label]) => `<dt>${label}</dt><dd>${emailAddressHtml(h[key])}</dd>`)
+      .join("");
+    // No Date header means it has not been sent: it is a draft.
+    const kind = h.date ? esc(h.date) : "Draft";
+    const subject = h.subject
+      ? `<div class="email-subject">${esc(h.subject)}</div>`
+      : `<div class="email-subject is-empty">No subject</div>`;
+    return `<div class="email-card${h.date ? "" : " is-draft"}">` +
+      `<textarea class="email-raw" hidden>${esc(mail.body)}</textarea>` +
+      `<div class="email-head">` +
+        `<div class="email-top"><span class="email-kind">${kind}</span>` +
+        `<button type="button" class="cc-act cc-copy" title="Copy message text"><i class="ph ph-copy"></i></button></div>` +
+        subject +
+        (fields ? `<dl class="email-fields">${fields}</dl>` : "") +
+      `</div>` +
+      (mail.body ? `<div class="email-body">${emailBodyHtml(mail.body)}</div>` : "") +
+    `</div>`;
+  }
+
   // Paragraph break the app inserts between agent steps (see tool_start), led by
   // an invisible separator (U+2063) so it can be told apart from model text.
   const STEP_BREAK = "⁣\n\n";
@@ -2850,6 +3071,7 @@
   // bodies get the benefit of the doubt so real snippets never flicker.
   function fenceBodyLooksLikeCode(body, infoStr) {
     const lang = (infoStr || "").split(/\s+/)[0].toLowerCase();
+    if (lang === "email") return true;   // prose by nature; the card renders as it streams
     if (lang && _isKnownLang(lang)) return true;
     if (/path=/i.test(infoStr || "")) return true;
     const b = String(body || "");
@@ -3195,6 +3417,10 @@
       if (displayLang === "diff") {
         const dpm = (infoStr || "").match(/path=([^\s]+)/i);
         return renderDiffCard(src, dpm ? dpm[1] : "");
+      }
+      if (displayLang === "email") {
+        const emailCard = renderEmailCard(src);
+        if (emailCard) return emailCard;
       }
       const hl = highlightForCard(src, displayLang, { streaming });
       if (hl.lang) displayLang = hl.lang;
@@ -4659,7 +4885,7 @@
       { kind: "cmd", icon: "ph-plugs", label: "MCP servers", action: () => { closePalette(); wbMcpOpen(); } },
       { kind: "cmd", icon: "ph-brain", label: "Open Long-term memory", action: () => { closePalette(); openSettings(); setTimeout(() => revealSettingsControl("#btn-mem-refresh"), 80); } },
       { kind: "cmd", icon: "ph-arrow-counter-clockwise", label: "Regenerate last reply", action: () => { closePalette(); regenerateLast(); } },
-      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / opal / neumorphic / amaranth / aperture / aperture-dark / atelier / soft / pastel / cartograph / folio / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
+      { kind: "cmd", icon: "ph-moon", label: "Cycle theme (dark / dim / retro / opal / showcase / neumorphic / amaranth / aperture / aperture-dark / atelier / soft / pastel / cartograph / folio / light)", action: async () => { closePalette(); const next = nextTheme(state.settings.theme || "light"); await saveSettings({ theme: next }); applyTheme(next); } },
       { kind: "cmd", icon: "ph-browser", label: "Toggle preview pane", action: () => { closePalette(); app.classList.toggle("preview-collapsed"); } },
       { kind: "cmd", icon: "ph-camera", label: "Screenshot preview", action: () => { closePalette(); screenshotPreview(); } },
       { kind: "cmd", icon: "ph-package", label: "Export project", action: () => { closePalette(); exportProjectZip(); } },
@@ -4794,7 +5020,7 @@
         groups.get(g.key).ids.push(id);
       }
       // Every project folder shows, sessions or not, and carries its path
-      // for the Files row.
+      // for the jump to the Files view.
       for (const folder of state.workspace?.folders || []) {
         const key = `proj:${wbNorm(folder)}`;
         if (!groups.has(key)) groups.set(key, { key, label: folderLeafName(folder), icon: "ph-folder-simple", ids: [] });
@@ -4837,8 +5063,20 @@
         const body = document.createElement("div");
         body.className = "wb-group-body";
         for (const id of g.ids) { body.appendChild(wbChatRow(id, state.chats.chats[id], true)); rendered++; }
-        if (g.path) body.appendChild(sbFilesRow(g.path));
+        if (!g.ids.length) body.innerHTML = `<div class="sb-group-empty">No sessions yet</div>`;
         box.append(head, body);
+        // Files live in the sidebar's Files view, never among the sessions;
+        // this jumps there with the project's folder open.
+        if (sections && g.path) {
+          const files = document.createElement("button");
+          files.type = "button";
+          files.className = "iconbtn sb-group-files";
+          files.title = "Browse this project's files";
+          files.setAttribute("aria-label", `Browse files in ${g.label}`);
+          files.innerHTML = `<i class="ph ph-files" aria-hidden="true"></i>`;
+          files.addEventListener("click", () => sbSetView("files", g.path));
+          box.appendChild(files);
+        }
         (sections ? sections.projects : wrap).appendChild(box);
       }
       if (sections) sbFillEmptySections(sections);
@@ -4874,6 +5112,7 @@
     }
     wbRenderTabs();
     wbSyncCollapseAll();
+    sbRenderFilesView();
   }
 
   // One line per session: the title, and a single status slot on the right
@@ -4965,7 +5204,11 @@
       });
       inner.appendChild(history);
     }
+    const modelSwitches = modelSwitchPoints(state.messages);
     for (const [offset, m] of state.messages.slice(start).entries()) {
+      if (modelSwitches.has(start + offset)) {
+        inner.appendChild(buildModelSwitchDivider(modelSwitches.get(start + offset)));
+      }
       if (m.invisible) continue;
       const row = renderBubble(m);
       row.dataset.messageIndex = String(start + offset);
@@ -7704,7 +7947,7 @@
       const fence = scanOpenFenceState(answer);
       const fenceLang = (fence.infoStr || "").split(/\s+/)[0].toLowerCase();
       if (fence.inFence && fence.bodyLen > 4000
-          && fenceLang !== "tool_code" && fenceLang !== "tool_call"
+          && fenceLang !== "tool_code" && fenceLang !== "tool_call" && fenceLang !== "email"
           && fenceBodyLooksLikeCode(answer.slice(fence.bodyStart), fence.infoStr)) {
         usedPlainCode = true;
         const now = Date.now();
@@ -7759,6 +8002,13 @@
 
   function handleEvent(evt, ctx) {
     const { bubble, toolStack, toolCards, row } = ctx;
+    if (evt.type === "approval_request") {
+      // The same approval as the shared stream's approval:new, sent down this
+      // turn's own stream, which is live even when the shared one lags (a
+      // remote browser could wait minutes for the card).
+      if (evt.approval?.id) receiveApproval(evt.approval);
+      return;
+    }
     if (evt.type === "steering_applied") {
       const queue = messageQueue(evt.chat_id);
       const index = queue.findIndex(item => item.id === evt.id);
@@ -12550,6 +12800,8 @@
     if (!deck) return;
     
     const approvals = [...state.approvals.values()];
+    const heightBefore = _deckHeightBefore(deck);
+    deck.classList.toggle("has-approval", approvals.length > 0);
     const liveIds = new Set(approvals.map(a => String(a.id)));
     const existing = new Map();
     deck.querySelectorAll(".revealer-card.permissions").forEach(card => {
@@ -12558,6 +12810,7 @@
     });
     if (!approvals.length) {
       if (deck.children.length === 0) deck.innerHTML = "";
+      _deckHeightSlide(deck, heightBefore, _deckHeightNow(deck));
       return;
     }
     const newestIndex = approvals.length - 1;
@@ -12696,9 +12949,24 @@
 
       deck.appendChild(card);
     });
+    _deckHeightSlide(deck, heightBefore, _deckHeightNow(deck));
+  }
+
+  // A new approval can arrive twice (the turn's own stream and the shared
+  // one); only the first draws the card and plays the sound. One already
+  // decided here never comes back.
+  const decidedApprovals = new Set();
+  function receiveApproval(approval) {
+    const id = approval.id;
+    if (state.approvals.has(id) || decidedApprovals.has(id)) return;
+    state.approvals.set(id, approval);
+    reflectApprovalInLiveTurn(approval, "pending");
+    renderApprovals();
+    notifyApproval();
   }
 
   async function decideApproval(id, decision, always) {
+    decidedApprovals.add(id);
     state.approvals.delete(id);
     renderApprovals();
     await fetch("/api/approvals/decide", {
@@ -12733,10 +13001,30 @@
     }
   }
 
+  // The box above the input (approval cards, notices, queued updates) shows
+  // only when something is in it. That was a CSS :has() rule, and Safari
+  // doesn't always re-check :has() when children are added later: on a Mac
+  // the approval card sat in a hidden box until some other change restyled it.
+  // A class set here works the same in every browser.
+  function watchComposerInbox() {
+    const inbox = document.querySelector(".composer-inbox");
+    if (!inbox) return;
+    const sync = () => {
+      const on = [...inbox.children].some(child => !child.classList.contains("hidden")
+        && (child.children.length > 0 || child.textContent.trim() !== ""));
+      if (inbox.classList.contains("has-items") !== on) inbox.classList.toggle("has-items", on);
+    };
+    new MutationObserver(sync).observe(inbox, {
+      childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["class"],
+    });
+    sync();
+  }
+
   let approvalSyncStarted = false;
   function startApprovalSync() {
     if (approvalSyncStarted) return;
     approvalSyncStarted = true;
+    watchComposerInbox();
     // SSE `approval:new` / `approval:decided` is the primary path. These
     // catch-ups cover a push missed while the tab was backgrounded or the
     // connection was down: resync the pending list when the tab is visible again.
@@ -12939,11 +13227,9 @@
         if (handleForeignEvent(evt)) return;
       }
       if (evt.type === "approval:new") {
-        state.approvals.set(evt.approval.id, evt.approval);
-        reflectApprovalInLiveTurn(evt.approval, "pending");
-        renderApprovals();
-        notifyApproval();
+        if (evt.approval?.id) receiveApproval(evt.approval);
       } else if (evt.type === "approval:decided") {
+        decidedApprovals.add(evt.id);
         const approval = state.approvals.get(evt.id);
         reflectApprovalInLiveTurn(approval, evt.decision || "deny");
         state.approvals.delete(evt.id);
@@ -13258,6 +13544,7 @@
     "tailscale-remote-access": "ph-device-mobile",
     "discord-remote-bridge": "ph-discord-logo",
     "github-integration": "ph-github-logo",
+    email: "ph-envelope-simple",
     "desktop-automation": "ph-mouse",
     "long-term-memory": "ph-database"
   });
@@ -13360,6 +13647,7 @@
     profile: () => renderSettingsProfile(),
     skills: () => loadSkills(true).then(renderSettingsSkills),
     storage: () => loadSettingsStorage(),
+    email: () => loadEmailSettings(),
   };
   // Sections a panel replaces: MCP servers' "Manage" row opened the window
   // that now sits on the same page.
@@ -13585,6 +13873,116 @@
     initSettingsOwnPages(body);
   }
 
+  // ---------- Settings > Email ----------
+  // The account lives in its own file beside the email skill's scripts, not in
+  // settings.json, and goes through /api/email. The password is write-only:
+  // the bridge never sends it back, so the field stays empty once saved.
+  const EMAIL_TEXT_FIELDS = {
+    "#set-email-name": "from_name",
+    "#set-email-from": "from",
+    "#set-email-smtp-host": "smtp_host",
+    "#set-email-imap-host": "imap_host",
+    "#set-email-signature": "signature",
+    "#set-email-style": "style",
+  };
+  const EMAIL_PORT_FIELDS = { "#set-email-smtp-port": "smtp_port", "#set-email-imap-port": "imap_port" };
+  const EMAIL_INPUTS = [...Object.keys(EMAIL_TEXT_FIELDS), ...Object.keys(EMAIL_PORT_FIELDS),
+    "#set-email-password", "#set-email-identities", "#set-email-contacts", "#btn-email-test"];
+
+  const emailContactsToText = (contacts) =>
+    Object.entries(contacts || {}).map(([name, address]) => `${name} <${address}>`).join("\n");
+
+  // "Name <a@b.c>", "Name: a@b.c" and "Name a@b.c" all work; the address is
+  // the last word with an @ in it and the rest is the name.
+  function emailContactsFromText(text) {
+    const contacts = {};
+    for (const raw of String(text || "").split("\n")) {
+      const line = raw.trim();
+      if (!line) continue;
+      const m = /^(.*?)[\s<:,=]*([^\s<>:,=]+@[^\s<>:,=]+)>?$/.exec(line);
+      const name = m ? m[1].replace(/^["']|["']$/g, "").trim() : "";
+      if (!m || !name) throw new Error(`"${line}" needs a name and an address, like: Sam Rivera <sam@example.com>`);
+      contacts[name] = m[2];
+    }
+    return contacts;
+  }
+
+  function showEmailStatus(data) {
+    const status = $("#email-conn-status");
+    if (status) status.textContent = data.configured ? `set up for ${data.from}` : "not set up";
+    const pw = $("#set-email-password");
+    if (pw) pw.placeholder = data.password_set ? "saved. type a new one to replace it" : "mailbox password";
+    EMAIL_INPUTS.forEach(sel => { const el = $(sel); if (el) el.disabled = data.can_edit === false; });
+    const result = $("#email-test-result");
+    if (result && data.can_edit === false) result.textContent = "the email account can only be changed on the machine running Accuretta.";
+  }
+
+  function fillEmailSettings(data) {
+    const set = (sel, value) => { const el = $(sel); if (el && document.activeElement !== el) el.value = value ?? ""; };
+    Object.entries(EMAIL_TEXT_FIELDS).forEach(([sel, key]) => set(sel, data[key]));
+    Object.entries(EMAIL_PORT_FIELDS).forEach(([sel, key]) => set(sel, data[key]));
+    set("#set-email-identities", (data.identities || []).join(", "));
+    set("#set-email-contacts", emailContactsToText(data.contacts));
+    showEmailStatus(data);
+  }
+
+  async function loadEmailSettings() {
+    try {
+      const data = await api("/api/email");
+      if (data && !data.error) fillEmailSettings(data);
+    } catch (_) { /* bridge unreachable: leave the form as it is */ }
+  }
+
+  async function saveEmailSettings(update) {
+    try {
+      const saved = await api("/api/email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(update),
+      });
+      if (!saved || saved.error) throw new Error(saved?.error || "Email settings could not be saved");
+      showEmailStatus(saved);
+      return true;
+    } catch (err) {
+      toast(err.message, "warn", 4000);
+      return false;
+    }
+  }
+
+  function initEmailSettings() {
+    Object.entries(EMAIL_TEXT_FIELDS).forEach(([sel, key]) =>
+      $(sel)?.addEventListener("change", (e) => saveEmailSettings({ [key]: e.target.value.trim() })));
+    Object.entries(EMAIL_PORT_FIELDS).forEach(([sel, key]) =>
+      $(sel)?.addEventListener("change", (e) => saveEmailSettings({ [key]: Number(e.target.value) })));
+    $("#set-email-password")?.addEventListener("change", async (e) => {
+      if (!e.target.value) return;   // empty keeps the saved password
+      if (await saveEmailSettings({ password: e.target.value })) e.target.value = "";
+    });
+    $("#set-email-identities")?.addEventListener("change", (e) =>
+      saveEmailSettings({ identities: e.target.value.split(/[,;\s]+/).filter(Boolean) }));
+    $("#set-email-contacts")?.addEventListener("change", (e) => {
+      try { saveEmailSettings({ contacts: emailContactsFromText(e.target.value) }); }
+      catch (err) { toast(err.message, "warn", 5000); }
+    });
+    $("#btn-email-test")?.addEventListener("click", async (e) => {
+      const btn = e.currentTarget, result = $("#email-test-result");
+      btn.disabled = true;
+      result.className = "hint";
+      result.textContent = "signing in…";
+      try {
+        const out = await api("/api/email/test", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        });
+        result.textContent = out.message || out.error || "No answer from the bridge.";
+        result.classList.add(out.ok ? "is-ok" : "is-bad");
+      } catch (_) {
+        result.textContent = "Could not reach the bridge.";
+        result.classList.add("is-bad");
+      }
+      btn.disabled = false;
+    });
+  }
+
   function wbMcpShown() {
     const drawer = $("#settings-drawer");
     return !!drawer?.classList.contains("open") && drawer.dataset.settingsPage === "tools";
@@ -13619,6 +14017,7 @@
     { group: "Connections", pages: [
       { id: "skills", label: "Skills", icon: "ph-book-open-text", sections: [] },
       { id: "github", label: "GitHub", icon: "ph-github-logo", sections: ["github-integration"] },
+      { id: "email", label: "Email", icon: "ph-envelope-simple", sections: ["email"] },
       { id: "remote", label: "Remote", icon: "ph-device-mobile", sections: ["tailscale-remote-access", "discord-remote-bridge"] },
     ] },
   ];
@@ -13948,9 +14347,11 @@
         const detail = measuring
           ? `${trial.progress || 0} of ${trial.target || 10} comparison turns finished.`
           : (trial.result || "The comparison is complete.");
+        const trialChanges = modelHealthChanges(trial.changes);
         recommendationEl.innerHTML = `
           <div class="model-health-rec-head"><span><i class="ph ${worse ? "ph-warning" : "ph-gauge"}"></i>${esc(title)}</span><small>${measuring ? "measuring" : esc(trial.status || "complete")}</small></div>
           <p>${esc(detail)}</p>
+          ${trialChanges ? `<div class="model-health-changes">${trialChanges}</div>` : ""}
           <div class="model-health-trial-track"><span style="width:${Math.min(100, ((trial.progress || 0) / Math.max(1, trial.target || 10)) * 100)}%"></span></div>
           <div class="model-health-actions">
             ${!measuring && !worse ? '<button type="button" class="btn accent" data-model-health-action="keep">Keep settings</button>' : ""}
@@ -14056,9 +14457,10 @@
     if (!recommendation?.id || recommendation.id === _modelAdvisorNotificationId) return;
     _modelAdvisorNotificationId = recommendation.id;
     clearModelAdvisorNotifications();
-    const summary = (recommendation.changes || []).slice(0, 3)
-      .map(change => `${change.label}: ${modelHealthValue(change.from)} to ${modelHealthValue(change.to)}`)
-      .join("; ");
+    const changes = Array.isArray(recommendation.changes) ? recommendation.changes : [];
+    const summary = changes.slice(0, 3)
+      .map(change => `${change.label || change.key} ${modelHealthValue(change.from)} → ${modelHealthValue(change.to)}`)
+      .join(" · ") + (changes.length > 3 ? ` · +${changes.length - 3} more` : "");
     const row = toast(
       `<span class="advisor-toast-copy"><strong>A better setup is ready</strong><small>${esc(summary || recommendation.reason || "Measured from normal local use.")}</small></span>` +
       `<button type="button" class="advisor-toast-apply">Use recommended settings</button>` +
@@ -15541,12 +15943,13 @@
     operator: "opal",
     velvet: "opal",
   });
-  const THEME_CYCLE = ["dark", "dim", "retro", "opal", "neumorphic", "amaranth", "aperture", "aperture-dark", "atelier", "soft", "pastel", "cartograph", "folio", "light"];
+  const THEME_CYCLE = ["dark", "dim", "retro", "opal", "showcase", "neumorphic", "amaranth", "aperture", "aperture-dark", "atelier", "soft", "pastel", "cartograph", "folio", "light"];
   const THEME_ICONS = {
     dark:              "ph ph-moon",
     dim:               "ph ph-moon-stars",
     retro:             "ph ph-sun-horizon",
     opal:              "ph ph-diamond",
+    showcase:          "ph ph-frame-corners",
     neumorphic:        "ph ph-drop-half",
     amaranth:          "ph ph-circle-half",
     aperture:          "ph ph-aperture",
@@ -17325,6 +17728,7 @@
       setTimeout(() => control.classList.remove("is-changing"), 260);
     }
     syncThinkingBudgetControl();
+    syncEffortSliders();
   }
 
   function renderReasoningEffort() {
@@ -17338,6 +17742,7 @@
       $("#reasoning-effort-popover")?.classList.remove("open");
       $("#reasoning-effort-pill")?.setAttribute("aria-expanded", "false");
       syncThinkingBudgetControl();
+      syncEffortSliders();
       return;
     }
     const wasHidden = control.classList.contains("hidden");
@@ -17363,6 +17768,11 @@
     const popover = $("#reasoning-effort-popover");
     const menu = $("#reasoning-effort-menu");
     if (!control || !pill || !popover || !menu) return;
+    // The popover shows the effort slider; the hidden list stays as the
+    // record of levels that setReasoningEffort keeps in sync.
+    const slider = buildEffortSlider({ isShown: () => popover.classList.contains("open") });
+    popover.classList.add("has-slider");
+    popover.appendChild(slider.el);
     const close = () => {
       popover.classList.remove("open");
       pill.setAttribute("aria-expanded", "false");
@@ -17372,7 +17782,10 @@
       const open = !popover.classList.contains("open");
       popover.classList.toggle("open", open);
       pill.setAttribute("aria-expanded", String(open));
-      if (open) menu.querySelector(".effort-option.active")?.focus({ preventScroll: true });
+      if (open) {
+        effortSliderOpened(slider);
+        slider.el.querySelector(".fx-effort-track")?.focus({ preventScroll: true });
+      }
     });
     menu.addEventListener("click", (event) => {
       const opt = event.target.closest(".effort-option");
@@ -17403,6 +17816,313 @@
     });
     renderReasoningEffort();
   }
+
+  // ---- effort slider ----
+  // One stop per level, in the same order and names as the effort menu
+  // (Default, then the model's own levels). Clicking slides the thumb to a
+  // stop; dragging follows the pointer and snaps on release. The highest
+  // level turns the track dark and runs a dot-matrix stream toward the thumb.
+  const effortSliders = new Set();
+  let effortDotsRaf = 0;
+  const effortMotion = matchMedia("(prefers-reduced-motion: reduce)");
+
+  function buildEffortSlider(opts = {}) {
+    const el = document.createElement("div");
+    el.className = "fx-effort";
+    el.innerHTML = `<div class="fx-effort-head"><span class="fx-effort-title">Effort</span>`
+      + `<span class="fx-effort-level" aria-hidden="true"></span></div>`
+      + `<div class="fx-effort-ends" aria-hidden="true"><span>Faster</span><span>Smarter</span></div>`
+      + `<div class="fx-effort-track" role="slider" tabindex="0" aria-label="Reasoning effort">`
+      + `<canvas class="fx-effort-dots" aria-hidden="true"></canvas>`
+      + `<span class="fx-effort-fill" aria-hidden="true"></span>`
+      + `<span class="fx-effort-ticks" aria-hidden="true"></span>`
+      + `<span class="fx-effort-thumb" aria-hidden="true"></span></div>`;
+    const slider = { el, isShown: opts.isShown || (() => el.isConnected), idx: -1, sig: "", levels: [] };
+    const track = el.querySelector(".fx-effort-track");
+    const posOf = (clientX) => {
+      const r = track.getBoundingClientRect();
+      const tw = el.querySelector(".fx-effort-thumb").offsetWidth || 22;
+      return Math.max(0, Math.min(1, (clientX - r.left - tw / 2) / Math.max(1, r.width - tw)));
+    };
+    const commit = (idx) => {
+      const level = slider.levels[idx];
+      if (level && level !== state.reasoningEffort) setReasoningEffort(level);
+      else syncEffortSlider(slider);
+    };
+    let drag = null;
+    track.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0 || slider.levels.length < 2) return;
+      e.preventDefault();
+      track.focus({ preventScroll: true });
+      track.setPointerCapture(e.pointerId);
+      drag = { id: e.pointerId, x: e.clientX, moved: false };
+      // A press slides the thumb to the nearest stop; moving then drags it.
+      const n = slider.levels.length - 1;
+      showEffortStop(slider, Math.round(posOf(e.clientX) * n), null);
+    });
+    track.addEventListener("pointermove", (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      if (!drag.moved && Math.abs(e.clientX - drag.x) < 3) return;
+      drag.moved = true;
+      track.classList.add("is-dragging");
+      const p = posOf(e.clientX);
+      showEffortStop(slider, Math.round(p * (slider.levels.length - 1)), p);
+    });
+    const release = (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      drag = null;
+      track.classList.remove("is-dragging");
+      commit(slider.shownIdx);
+    };
+    track.addEventListener("pointerup", release);
+    track.addEventListener("pointercancel", release);
+    track.addEventListener("keydown", (e) => {
+      const n = slider.levels.length - 1;
+      const step = { ArrowRight: 1, ArrowUp: 1, ArrowLeft: -1, ArrowDown: -1 }[e.key];
+      let next = null;
+      if (step) next = Math.max(0, Math.min(n, slider.idx + step));
+      else if (e.key === "Home") next = 0;
+      else if (e.key === "End") next = n;
+      if (next === null) return;
+      e.preventDefault();
+      e.stopPropagation();
+      commit(next);
+    });
+    // The caller mounts it, then syncs it; the stream loop drops it once it
+    // leaves the page.
+    effortSliders.add(slider);
+    return slider;
+  }
+
+  // Put the thumb on stop `idx`, or at `pos` (0..1) while dragging, and
+  // update the label, ticks and the top-level state to match.
+  function showEffortStop(slider, idx, pos) {
+    const { el, levels } = slider;
+    const n = Math.max(1, levels.length - 1);
+    const track = el.querySelector(".fx-effort-track");
+    track.style.setProperty("--pos", String(pos ?? idx / n));
+    const changed = slider.shownIdx !== idx;
+    slider.shownIdx = idx;
+    const level = levels[idx];
+    const label = effortLabel(level);
+    track.setAttribute("aria-valuemin", "0");
+    track.setAttribute("aria-valuemax", String(n));
+    track.setAttribute("aria-valuenow", String(idx));
+    track.setAttribute("aria-valuetext", label);
+    const isMax = levels.length > 1 && idx === levels.length - 1;
+    if (track.classList.contains("is-max") !== isMax) {
+      track.classList.toggle("is-max", isMax);
+      if (isMax) effortLaunch(el.querySelector(".fx-effort-dots"));
+      kickEffortDots();
+    }
+    el.querySelectorAll(".fx-effort-tick").forEach((t, i) => t.classList.toggle("is-under", i <= idx));
+    const out = el.querySelector(".fx-effort-level");
+    if (!changed && out.textContent) return;
+    // The new level name comes in out of a short blur, as in the reference.
+    // The text is set first so it is right even if the animation never runs.
+    const first = !out.textContent;
+    out.textContent = label;
+    if (first || effortMotion.matches || !out.animate) return;
+    out.getAnimations().forEach(a => a.cancel());
+    out.animate([{ opacity: 0, filter: "blur(3px)" }, { opacity: 1, filter: "blur(0)" }],
+      { duration: 200, easing: "ease-out" });
+  }
+
+  function syncEffortSlider(slider) {
+    const { el } = slider;
+    if (!el.isConnected) return;
+    const ctl = $("#reasoning-effort-control");
+    const on = !!ctl && !ctl.classList.contains("hidden");
+    el.hidden = !on;
+    if (!on) return;
+    const levels = effortLevels();
+    const sig = levels.join(",");
+    if (sig !== slider.sig) {
+      slider.sig = sig;
+      slider.levels = levels;
+      const n = Math.max(1, levels.length - 1);
+      el.querySelector(".fx-effort-ticks").innerHTML = levels
+        .map((_, i) => `<i class="fx-effort-tick" style="--k:${i / n}"></i>`).join("");
+    }
+    let idx = levels.indexOf(state.reasoningEffort);
+    if (idx < 0) idx = 0;
+    slider.idx = idx;
+    showEffortStop(slider, idx, null);
+    kickEffortDots();
+  }
+
+  function syncEffortSliders() {
+    for (const s of [...effortSliders]) syncEffortSlider(s);
+  }
+
+  // A panel holding a slider just opened: sync it, and if it sits on the top
+  // level, ignite the jet so it arrives with the panel.
+  function effortSliderOpened(slider) {
+    if (!slider) return;
+    syncEffortSlider(slider);
+    const track = slider.el.querySelector(".fx-effort-track");
+    if (track?.classList.contains("is-max")) effortLaunch(slider.el.querySelector(".fx-effort-dots"));
+    kickEffortDots();
+  }
+
+  // ---- top-level stream ----
+  // The thumb is an engine and the track shows its exhaust, drawn on a dot
+  // grid: a solid jet that leaves the thumb white-hot, runs vivid blue and
+  // tapers to a point about two thirds of the way left. Its edges ripple like
+  // a flame and the ripples flow away from the thumb. Sparse white specks
+  // streak left past it. Reaching the level ignites the jet: it grows out of
+  // the thumb. Every light sits on a grid dot, like the house dot matrix.
+  const effortStreams = new WeakMap();
+
+  function effortHash(i, j) {
+    const h = Math.sin(i * 127.1 + j * 311.7) * 43758.5453;
+    return h - Math.floor(h);
+  }
+
+  // Smooth wobble from two sines; cheap and has no visible repeat.
+  function effortWave(z, seed) {
+    return .62 * Math.sin(z + seed) + .38 * Math.sin(z * 2.27 + seed * 1.9 + 1.3);
+  }
+
+  function effortStream(canvas, w, rows) {
+    let st = effortStreams.get(canvas);
+    if (st && st.rows === rows && st.w === w) return st;
+    st = { rows, w, last: 0, launch: st?.launch || 0, specks: [] };
+    for (let n = 0; n < Math.round(w / 26); n++) st.specks.push(effortSpawn(st, w, rows, Math.random() * w));
+    effortStreams.set(canvas, st);
+    return st;
+  }
+
+  // A speck enters from the thumb side and streaks left.
+  function effortSpawn(st, w, rows, x) {
+    return {
+      x: x ?? w + Math.random() * w * .4,
+      row: Math.floor(Math.random() * rows),
+      v: 260 + Math.random() * 520,
+      len: 1 + Math.floor(Math.random() * 4),
+      b: .55 + Math.random() * .45,
+    };
+  }
+
+  // Re-ignite the jet (called when the top level is reached).
+  function effortLaunch(canvas) {
+    const st = effortStreams.get(canvas);
+    if (st) st.launch = performance.now();
+    else effortStreams.set(canvas, { rows: -1, w: -1, launch: performance.now() });
+  }
+
+  function drawEffortDots(canvas, now) {
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    if (!w || !h) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const P = 3;
+    const cols = Math.max(2, Math.floor((w - 3) / P) + 1);
+    const rows = Math.max(1, Math.floor((h - 3) / P) + 1);
+    const ox = (w - (cols - 1) * P) / 2, oy = (h - (rows - 1) * P) / 2;
+    const st = effortStream(canvas, w, rows);
+    const still = effortMotion.matches;
+    const dt = still || !st.last ? 0 : Math.min(.05, (now - st.last) / 1000);
+    st.last = now;
+    const t = still ? 1.7 : now / 1000;
+    const mid = (rows - 1) / 2 || 1;
+
+    // Ignition: the jet grows out of the thumb, overshooting a touch.
+    let reach = 1;
+    if (st.launch && !still) {
+      const k = Math.min(1, (now - st.launch) / 520);
+      reach = 1 + 2.2 * Math.pow(k - 1, 3) + 1.2 * Math.pow(k - 1, 2);
+      if (k >= 1) st.launch = 0;
+    }
+    // How far the jet reaches from the thumb (0..1 of the track), breathing.
+    const L = Math.max(.001, (.74 + .04 * Math.sin(t * 3.1)) * Math.max(0, reach));
+
+    // Specks: move left, stamp a short trail behind them (toward the thumb).
+    const speck = new Float32Array(cols * rows);
+    for (let n = 0; n < st.specks.length; n++) {
+      const p = st.specks[n];
+      p.x -= p.v * dt;
+      if (p.x + p.len * P < 0) { st.specks[n] = effortSpawn(st, w, rows); continue; }
+      const head = Math.round((p.x - ox) / P);
+      for (let k = 0; k <= p.len; k++) {
+        const c = head + k;
+        if (c < 0 || c >= cols) continue;
+        const f = 1 - k / (p.len + 1);
+        speck[p.row * cols + c] = Math.max(speck[p.row * cols + c], p.b * f);
+      }
+    }
+
+    for (let c = 0; c < cols; c++) {
+      const u = 1 - c / (cols - 1);            // 0 at the thumb, 1 at the far end
+      const along = Math.max(0, 1 - u / L);    // 1 at the thumb, 0 at the tip
+      // Flame edges: separate ripples top and bottom, flowing away from the thumb.
+      const flow = u * 6 - t * 8;
+      const taper = Math.pow(along, .6);
+      const top = taper * (.84 + .3 * effortWave(flow, 0.3) * (1 - along * .6));
+      const bot = taper * (.84 + .3 * effortWave(flow * 1.13, 4.1) * (1 - along * .6));
+      // Inner shimmer, also flowing away from the thumb.
+      const shimmer = .9 + .1 * Math.sin(u * 34 - t * 26);
+      for (let j = 0; j < rows; j++) {
+        const yc = (j - (rows - 1) / 2) / mid;  // -1 top .. 1 bottom
+        const edge = yc < 0 ? top : bot;
+        const ay = Math.abs(yc);
+        let jet = 0, heat = 0;
+        if (edge > .02 && ay < edge) {
+          const depth = 1 - ay / edge;          // 1 on the axis, 0 at the edge
+          const soft = Math.min(1, depth / .14);
+          jet = soft * (.7 + .3 * along) * shimmer;
+          heat = Math.pow(depth, .6) * Math.pow(along, .7);
+        }
+        const sp = speck[j * cols + c];
+        const x = ox + c * P, y = oy + j * P;
+        if (jet > .04) {
+          // White-hot core near the thumb, vivid blue body, deep blue rim.
+          const hh = Math.min(1, heat * 1.15 + sp * .4);
+          const light = 54 + 42 * Math.pow(hh, 1.6);
+          const sat = 98 - 20 * Math.pow(hh, 2);
+          ctx.fillStyle = `hsla(${(220 - 6 * hh).toFixed(0)},${sat.toFixed(0)}%,${light.toFixed(0)}%,${(.72 + .28 * jet).toFixed(3)})`;
+          ctx.beginPath();
+          ctx.arc(x, y, .85 + .55 * jet, 0, Math.PI * 2);
+          ctx.fill();
+        } else if (sp > .05) {
+          ctx.fillStyle = `rgba(236,241,255,${(.35 + .65 * sp).toFixed(3)})`;
+          ctx.beginPath();
+          ctx.arc(x, y, .6 + .55 * sp, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          ctx.fillStyle = `rgba(205,212,228,${(.1 + .05 * effortHash(c, j)).toFixed(3)})`;
+          ctx.beginPath();
+          ctx.arc(x, y, .55, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+  }
+
+  function effortDotsTick(now) {
+    effortDotsRaf = 0;
+    if (document.hidden) return;
+    let live = false;
+    for (const s of [...effortSliders]) {
+      if (!s.el.isConnected) { effortSliders.delete(s); continue; }
+      const track = s.el.querySelector(".fx-effort-track");
+      if (s.el.hidden || !track.classList.contains("is-max") || !s.isShown()) continue;
+      drawEffortDots(s.el.querySelector(".fx-effort-dots"), now);
+      live = true;
+    }
+    if (live && !effortMotion.matches) effortDotsRaf = requestAnimationFrame(effortDotsTick);
+  }
+
+  function kickEffortDots() {
+    if (!effortDotsRaf) effortDotsRaf = requestAnimationFrame(effortDotsTick);
+  }
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) kickEffortDots(); });
 
   // Reload the model list, then re-mirror it everywhere it shows (settings
   // dropdown, pill, dropdown menu). Module scope so loadModelByPath and
@@ -17446,6 +18166,7 @@
       await requestModelLoad(modelPath);
       await loadSettings();
       await refreshModels();
+      try { syncLiveModelSwitchDivider(); } catch {}
       const ctx = Number(state.settings?.num_ctx || 0);
       toast(ctx ? `model loaded (ctx ${ctx.toLocaleString()})` : "model loaded", "ok", 2500, "model-load");
       return true;
@@ -17476,11 +18197,11 @@
   // open so the "loaded" indicator matches what the bridge is running.
   // ---- model menu ----
   // A rail of model families beside the list. Files of one model fold into a
-  // row whose "N versions" chip lists them by bit level and size, and the
-  // loaded row carries the reasoning-effort chip. Names, groups, families,
+  // row whose "N versions" chip lists them by bit level and size. Effort
+  // lives in its own pill and slider, not here. Names, groups, families,
   // logos and bit levels come from /api/models (model_display_info in
   // bridge.py); a family without a logo shows its first letter.
-  const mp = { family: "", query: "", open: new Set(), view: "models" };
+  const mp = { family: "", query: "", open: new Set() };
 
   function wbModelGroups() {
     const groups = new Map();
@@ -17517,15 +18238,11 @@
     const multi = g.files.length > 1;
     const single = g.files[0];
     const open = multi && mp.open.has(g.key);
-    const effortCtl = $("#reasoning-effort-control");
-    const effortOn = isLoaded && effortCtl && !effortCtl.classList.contains("hidden");
-    const effortLabel = $("#reasoning-effort-value")?.textContent.trim() || "Default";
     let html = `<div class="wb-mp-row${isLoaded ? " loaded" : ""}" data-mp-group="${esc(g.key)}">`
       + `<button type="button" class="wb-mp-pick" role="option" aria-selected="${isLoaded}"`
       + (multi ? ` data-mp-versions aria-expanded="${open}" title="${esc(g.name)}: ${g.files.length} files"`
         : ` data-mp-path="${esc(single.path)}" title="${esc(single.name)}"`)
       + `><span class="wb-mp-name">${esc(g.name)}</span>${multi ? "" : wbDraftBadge(single)}</button>`
-      + (effortOn ? `<button type="button" class="wb-mp-chip" data-mp-effort title="Reasoning effort for the next message">${esc(effortLabel)}<i class="ph ph-caret-right" aria-hidden="true"></i></button>` : "")
       + (multi
         ? `<button type="button" class="wb-mp-chip" data-mp-versions aria-expanded="${open}">${g.files.length} versions<i class="ph ph-caret-${open ? "down" : "right"}" aria-hidden="true"></i></button>`
         : `<span class="wb-mp-meta">${esc(wbBitsLabel(single))}</span>`)
@@ -17542,16 +18259,6 @@
     }
     return html;
   }
-  function wbEffortRowsHtml() {
-    return `<button type="button" class="wb-mp-item wb-mp-back" data-mp-back><i class="ph ph-caret-left" aria-hidden="true"></i><span class="wb-mp-name">Effort</span></button>`
-      + [...document.querySelectorAll("#reasoning-effort-menu .effort-option")].map(opt => {
-        const on = opt.classList.contains("active");
-        const icon = [...(opt.querySelector("i.ph")?.classList || [])].find(c => c.startsWith("ph-")) || "ph-brain";
-        return `<button type="button" class="wb-mp-item${on ? " loaded" : ""}" data-mp-level="${esc(opt.dataset.level)}" role="menuitemradio" aria-checked="${on}">`
-          + `<i class="ph ${icon}" aria-hidden="true"></i><span class="wb-mp-name">${esc(opt.querySelector("span")?.textContent.trim() || opt.dataset.level)}</span>`
-          + `<i class="ph ph-check wb-mp-check" aria-hidden="true"></i></button>`;
-      }).join("");
-  }
   function wbRenderModelList() {
     const menu = $("#model-pill-menu");
     const shell = menu?.querySelector(".wb-mp");
@@ -17567,17 +18274,12 @@
     const loaded = groups.find(g => g.files.some(wbFileLoaded));
     if (!families.has(mp.family)) mp.family = loaded?.family || fams[0]?.key || "";
     const q = mp.query.trim().toLowerCase();
-    shell.dataset.view = mp.view;
     shell.querySelector(".wb-mp-rail").innerHTML = fams.map(f => {
       const on = !q && f.key === mp.family;
       return `<button type="button" class="wb-mp-fam${on ? " on" : ""}" data-mp-family="${esc(f.key)}" aria-pressed="${on}"`
         + ` aria-label="${esc(f.label)}" title="${esc(f.label)} · ${f.count}">${wbFamilyGlyph(f.logo, f.label)}</button>`;
     }).join("");
     const list = shell.querySelector(".wb-mp-list");
-    if (mp.view === "effort") {
-      list.innerHTML = wbEffortRowsHtml();
-      return;
-    }
     const shown = q
       ? groups.filter(g => g.name.toLowerCase().includes(q) || g.files.some(m => String(m.name).toLowerCase().includes(q)))
       : groups.filter(g => g.family === mp.family);
@@ -17599,7 +18301,6 @@
         + `<div class="wb-mp-list" role="listbox" aria-label="Models"></div></div></div>`;
       menu.querySelector(".wb-mp-search input").addEventListener("input", (e) => {
         mp.query = e.target.value;
-        mp.view = "models";
         wbRenderModelList();
       });
     }
@@ -17649,7 +18350,6 @@
       const willOpen = !menu.classList.contains("open");
       if (willOpen) {
         // Open on the loaded model's family, its versions showing.
-        mp.view = "models";
         mp.query = "";
         mp.family = "";
         const loaded = wbModelGroups().find(g => g.files.some(wbFileLoaded));
@@ -17675,26 +18375,9 @@
       if (fam) {
         mp.family = fam.dataset.mpFamily;
         mp.query = "";
-        mp.view = "models";
         const input = menu.querySelector(".wb-mp-search input");
         if (input) input.value = "";
         return rerender(`[data-mp-family="${CSS.escape(mp.family)}"]`);
-      }
-      if (t.closest("[data-mp-back]")) {
-        mp.view = "models";
-        return rerender("[data-mp-effort]");
-      }
-      if (t.closest("[data-mp-effort]")) {
-        mp.view = "effort";
-        return rerender(".wb-mp-item.loaded");
-      }
-      const level = t.closest("[data-mp-level]");
-      if (level) {
-        // Picking an effort is a choice made, like picking a model: close.
-        close();
-        btn.focus({ preventScroll: true });
-        document.querySelector(`#reasoning-effort-menu .effort-option[data-level="${CSS.escape(level.dataset.mpLevel)}"]`)?.click();
-        return;
       }
       const row = t.closest("[data-mp-group]");
       const versions = t.closest("[data-mp-versions]") || (row && !t.closest("[data-mp-path]") && row.querySelector("[data-mp-versions]"));
@@ -17719,10 +18402,6 @@
         const step = e.key === "ArrowDown" ? 1 : -1;
         const next = at < 0 ? (step > 0 ? 0 : items.length - 1) : (at + step + items.length) % items.length;
         items[next].focus({ preventScroll: false });
-      } else if (e.key === "ArrowLeft" && mp.view === "effort") {
-        e.preventDefault();
-        mp.view = "models";
-        rerender("[data-mp-effort]");
       }
     });
     document.addEventListener("click", (e) => {
@@ -18484,10 +19163,25 @@
     
     $("#btn-shutdown-no-save")?.addEventListener("click", async () => {
       window.__allowClose = true;
-      try { await api("/api/shutdown", { method: "POST", body: { save: false } }); } catch (e) {}
-      if (window.pywebview?.api?.close_window) window.pywebview.api.close_window();
-      else window.close();
+      // The body must be a JSON string: a plain object went out as
+      // "[object Object]", the bridge refused it, and only the desktop
+      // window's own close ever quit the app (never from a remote browser).
+      try { await api("/api/shutdown", { method: "POST", body: JSON.stringify({ save: false }) }); } catch (e) {}
+      closeAfterShutdown();
     });
+
+    // The desktop window closes itself. A browser tab the page didn't open
+    // can't, so say plainly that the app on the other computer has stopped.
+    function closeAfterShutdown() {
+      if (window.pywebview?.api?.close_window) { window.pywebview.api.close_window(); return; }
+      window.close();
+      setTimeout(() => {
+        document.body.innerHTML = '<main style="min-height:100vh;display:grid;place-items:center;'
+          + 'font:15px/1.6 system-ui,sans-serif;color:var(--text,#888);background:var(--bg,transparent);text-align:center;padding:24px">'
+          + '<div><p style="margin:0 0 6px;font-weight:600">Accuretta has shut down.</p>'
+          + '<p style="margin:0;opacity:.75">You can close this tab.</p></div></main>';
+      }, 400);
+    }
     
     $("#btn-shutdown-save")?.addEventListener("click", async () => {
       const btnSave = $("#btn-shutdown-save");
@@ -18529,7 +19223,8 @@
       }, 1100);
       
       try {
-        await api("/api/shutdown", { method: "POST", body: { save: true, messages: state.messages } });
+        const res = await api("/api/shutdown", { method: "POST", body: JSON.stringify({ save: true, messages: state.messages }) });
+        if (!res?.ok) throw new Error(res?.error || "The bridge did not confirm the shutdown");
       } catch (e) {
         console.error("Shutdown save failed", e);
         clearInterval(interval);
@@ -18566,10 +19261,7 @@
       }
       
       // Wait 1.8 seconds so the user can see the checkmark, then close
-      setTimeout(() => {
-        if (window.pywebview?.api?.close_window) window.pywebview.api.close_window();
-        else window.close();
-      }, 1800);
+      setTimeout(closeAfterShutdown, 1800);
     });
 
     window.addEventListener("beforeunload", (e) => {
@@ -18746,6 +19438,7 @@
         refreshSandboxStatus();
       } catch (err) { toast("remove failed: " + err.message, "error"); }
     });
+    initEmailSettings();
     // Discord controls auto-save on change; "save & quit" doesn't flush settings.
     const _saveDiscord = () => saveSettings({
       discord_enabled: $("#sw-discord-enabled")?.classList.contains("on") || false,
@@ -19856,7 +20549,7 @@
       // mirroring the desktop cycle.
       const cur = document.documentElement.getAttribute("data-theme") || "light";
       const next = nextTheme(cur);
-      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", opal: "Opal", neumorphic: "Neumorphic", amaranth: "Amaranth", aperture: "Aperture", "aperture-dark": "Aperture Dark", atelier: "Atelier", soft: "Soft", pastel: "Pastel", cartograph: "Cartograph", folio: "Folio", light: "Light" }[next] || next;
+      const niceName = { dark: "Dark", dim: "Dim", retro: "Retro", opal: "Opal", showcase: "Showcase", neumorphic: "Neumorphic", amaranth: "Amaranth", aperture: "Aperture", "aperture-dark": "Aperture Dark", atelier: "Atelier", soft: "Soft", pastel: "Pastel", cartograph: "Cartograph", folio: "Folio", light: "Light" }[next] || next;
       const lbl = $("#mm-theme-label");
       if (lbl) lbl.textContent = `Switch to ${niceName.toLowerCase()}`;
       const targetSelect = $("#execution-target-select");
@@ -20184,9 +20877,9 @@
       if (!copyBtn) return;
       try {
         let text = "";
-        const diffCard = copyBtn.closest(".diff-card");
-        if (diffCard) {
-          text = diffCard.querySelector(".diff-raw")?.value || "";
+        const rawCard = copyBtn.closest(".diff-card, .email-card");
+        if (rawCard) {
+          text = rawCard.querySelector(".diff-raw, .email-raw")?.value || "";
         } else {
           const pre = copyBtn.closest("pre");
           text = pre ? getCodeText(pre) : "";
@@ -21276,8 +21969,8 @@
     wbSyncModeChip();
   }
 
-  // Model group: model and effort read as one control; the model menu also
-  // carries the effort levels and the context summary. The context ring
+  // Model group: model and effort sit side by side; the effort pill opens
+  // the effort slider and the model menu lists models only. The context ring
   // lives at the right end of the strip above the box, with its percentage.
   function wbInitModelGroup() {
     const pill = $("#model-pill");
@@ -21362,7 +22055,8 @@
 
   // ---- sidebar ----
   // Profile on top, Quick search, New session, Security overview, Customize,
-  // projects holding their sessions and a Files row each, then the theme
+  // a Sessions / Files switch over the list (projects holding their sessions,
+  // or each project folder's file tree), then the theme
   // toggle, Support, Settings and today's usage. The old controls keep their
   // handlers (the new rows press them); what the new layout drops is hidden.
   function renderSidebarProfile() {
@@ -21410,32 +22104,120 @@
     if (line.textContent !== text) line.textContent = text;
   }
 
-  // A project's Files row opens its file tree under its sessions. Open trees
-  // survive the list re-rendering; closing one drops it, so reopening reads
+  // The list under the menu has two views that never mix: Sessions (projects
+  // and their conversations) and Files (each project folder's file tree).
+  const SB_VIEW_KEY = "accuretta:sb:view";
+  let sbFilesStarted = false;
+  function sbView() {
+    return wbStore.get(SB_VIEW_KEY, "sessions") === "files" ? "files" : "sessions";
+  }
+  function sbSyncView() {
+    const sidebar = $("#sidebar");
+    if (!sidebar) return;
+    const view = sbView();
+    sidebar.dataset.view = view;
+    sidebar.querySelectorAll(".sb-views [data-view]").forEach(btn => {
+      const on = btn.dataset.view === view;
+      btn.classList.toggle("active", on);
+      btn.setAttribute("aria-selected", String(on));
+      btn.tabIndex = on ? 0 : -1;
+    });
+  }
+  function sbSetView(view, openPath = "") {
+    wbStore.set(SB_VIEW_KEY, view === "files" ? "files" : "sessions");
+    if (view === "files") {
+      if (openPath) sbOpenFiles.add(openPath);
+      sbFilesStarted = false;
+      sbRenderFilesView(true);
+      if (openPath) {
+        const target = [...document.querySelectorAll("#sb-files-view .sb-root")].find(el => el.dataset.path === openPath);
+        target?.scrollIntoView({ block: "nearest" });
+      }
+    }
+    sbSyncView();
+  }
+  // Every folder that can hold files: projects with sessions first (newest
+  // first, as in the Sessions view), then project folders with none yet.
+  function sbProjectRoots() {
+    const roots = new Map();
+    const add = (path, label) => {
+      const key = path ? wbNorm(path) : "";
+      if (key && !roots.has(key)) roots.set(key, { path, label: label || folderLeafName(path) });
+    };
+    const chats = state.chats?.chats || {};
+    [...(state.chats?.order || [])].filter(id => chats[id])
+      .sort((a, b) => (chats[b].updated || 0) - (chats[a].updated || 0))
+      .forEach(id => { const g = wbChatGroup(chats[id]); add(g.path, g.label); });
+    for (const folder of state.workspace?.folders || []) add(folder);
+    return [...roots.values()];
+  }
+  function sbRenderFilesView(force = false) {
+    const host = $("#sb-files-view");
+    if (!host) return;
+    const roots = sbProjectRoots();
+    // Arriving with nothing open: start with the open session's project, or
+    // the only project there is. Once per visit, so closing it sticks.
+    if (sbView() === "files" && !sbFilesStarted && roots.length) {
+      sbFilesStarted = true;
+      if (!sbOpenFiles.size) {
+        const current = wbChatGroup(state.chats?.chats?.[state.chatId] || {}).path;
+        const start = roots.find(r => current && wbNorm(r.path) === wbNorm(current)) || (roots.length === 1 ? roots[0] : null);
+        if (start) { sbOpenFiles.add(start.path); force = true; }
+      }
+    }
+    // The session list re-renders on every chat event; the trees only need
+    // rebuilding when the set of project folders changes.
+    const signature = roots.map(r => `${r.path}\t${r.label}`).join("\n");
+    if (!force && host._signature === signature) return;
+    host._signature = signature;
+    host.innerHTML = `<div class="sb-section-head"><span class="sb-section-label">Project files</span>`
+      + `<button type="button" class="iconbtn sb-section-tool" data-act="refresh" title="Reload the file lists" aria-label="Reload the file lists"><i class="ph ph-arrow-clockwise" aria-hidden="true"></i></button>`
+      + `<button type="button" class="iconbtn sb-section-tool" data-act="add" title="Add a project folder" aria-label="Add a project folder"><i class="ph ph-plus" aria-hidden="true"></i></button></div>`;
+    host.querySelector('[data-act="add"]').addEventListener("click", addProjectFolder);
+    host.querySelector('[data-act="refresh"]').addEventListener("click", () => {
+      sbFileTrees.clear();
+      sbRenderFilesView(true);
+    });
+    if (!roots.length) {
+      const empty = document.createElement("button");
+      empty.type = "button";
+      empty.className = "sb-section-empty";
+      empty.innerHTML = `<i class="ph ph-plus" aria-hidden="true"></i><span>Add a project folder</span>`;
+      empty.addEventListener("click", addProjectFolder);
+      host.appendChild(empty);
+      return;
+    }
+    for (const root of roots) host.appendChild(sbFilesRoot(root));
+  }
+
+  // One project folder in the Files view: a row that opens its file tree.
+  // Open trees survive re-rendering; closing one drops it, so reopening reads
   // the folder again.
   const sbOpenFiles = new Set();
   const sbFileTrees = new Map();
-  function sbFilesRow(path) {
+  function sbFilesRoot({ path, label }) {
     const wrap = document.createElement("div");
-    wrap.className = "sb-files";
+    wrap.className = "sb-root";
+    wrap.dataset.path = path;
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "sb-files-row";
+    btn.className = "sb-root-head";
     btn.title = path;
-    btn.innerHTML = `<i class="ph ph-files" aria-hidden="true"></i><span>Files</span><i class="ph ph-caret-right sb-files-caret" aria-hidden="true"></i>`;
+    btn.innerHTML = `<i class="ph ph-folder-simple sb-root-icon is-closed" aria-hidden="true"></i><i class="ph ph-folder-open sb-root-icon is-open" aria-hidden="true"></i>`
+      + `<span class="sb-root-name">${esc(label)}</span>`;
     wrap.appendChild(btn);
     const show = async () => {
       let tree = sbFileTrees.get(path);
       if (!tree) {
         tree = document.createElement("div");
         tree.className = "ws-tree sb-files-tree";
-        tree.innerHTML = `<div class="tree-loading" style="--depth:1">loading…</div>`;
+        tree.innerHTML = `<div class="tree-loading" style="--depth:0">loading…</div>`;
         sbFileTrees.set(path, tree);
         const entries = await fetchFolderListing(path);
         tree.innerHTML = "";
-        if (entries._error) tree.innerHTML = `<div class="tree-empty" style="--depth:1">${esc(entries._error)}</div>`;
-        else if (!entries.length) tree.innerHTML = `<div class="tree-empty" style="--depth:1">empty</div>`;
-        else for (const child of entries) tree.appendChild(renderTreeNode(child, 1, path));
+        if (entries._error) tree.innerHTML = `<div class="tree-empty" style="--depth:0">${esc(entries._error)}</div>`;
+        else if (!entries.length) tree.innerHTML = `<div class="tree-empty" style="--depth:0">empty</div>`;
+        else for (const child of entries) tree.appendChild(renderTreeNode(child, 0, path));
       }
       if (sbOpenFiles.has(path)) wrap.appendChild(tree);
     };
@@ -21558,6 +22340,30 @@
     if (cost) new MutationObserver(renderSidebarUsage).observe(cost, { childList: true, characterData: true, subtree: true });
     syncSidebarTheme();
     renderSidebarUsage();
+    // Sessions / Files switch above the list, and the Files view beside it.
+    const views = document.createElement("div");
+    views.className = "sb-views";
+    views.setAttribute("role", "tablist");
+    views.setAttribute("aria-label", "Sidebar view");
+    views.innerHTML = `<button type="button" role="tab" data-view="sessions">Sessions</button>`
+      + `<button type="button" role="tab" data-view="files">Files</button>`;
+    views.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-view]");
+      if (btn) sbSetView(btn.dataset.view);
+    });
+    views.addEventListener("keydown", (e) => {
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      e.preventDefault();
+      sbSetView(sbView() === "files" ? "sessions" : "files");
+      views.querySelector(".active")?.focus();
+    });
+    sidebar.querySelector(".sidebar-scroll")?.before(views);
+    const filesView = document.createElement("div");
+    filesView.id = "sb-files-view";
+    filesView.className = "sb-files-view";
+    $("#chatlist")?.after(filesView);
+    if (sbView() === "files") sbSetView("files"); else sbSyncView();
+
     // The list may have drawn before this layout existed; redraw it in sections.
     if (state.chats) renderChatList();
   }
