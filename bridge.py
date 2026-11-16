@@ -1731,9 +1731,7 @@ def _advisor_suggest_settings(settings: dict, observed: dict) -> dict:
     if not model_path or not safe_exists(model_path):
         return {}
     try:
-        vram = float(settings.get("vram_tier_gb") or 0)
-        if vram <= 0:
-            vram = _free_vram_gb_for_tune()
+        vram = _tune_budget_gb()
         if vram <= 0:
             return {}
         current_ctx = max(8192, int(settings.get("num_ctx") or 8192))
@@ -1859,8 +1857,245 @@ def _advisor_trial_public(row: dict, active_config: str) -> dict | None:
     }
 
 
+# ---- load-time speed check (dense models) -----------------------------------
+# On Windows a dense model whose context doesn't quite fit in VRAM still loads:
+# the driver moves part of it into system RAM and decoding slows down with no
+# error. Memory counters can't tell that apart reliably; speed can. Right after
+# each load a short fixed generation is timed (temperature 0, fresh server) and
+# the advisor compares those numbers across context sizes of the same setup.
+# Validated on a 4090 with Qwen3.8-27B: healthy loads 82.4-83.2 tok/s at
+# 100k-147k context, spilled loads 70.1 and 30.7 tok/s at 160k.
+_LOAD_PROBE_PROMPT = ("Write one paragraph, about 120 words, describing an old "
+                      "lighthouse on a rocky coast.")
+_LOAD_PROBE_TOKENS = 96
+_LOAD_SAMPLE_CAP = 40
+_LOAD_SAMPLE_MAX_AGE_S = 60 * 24 * 3600
+_FIT_SLOW = 0.90        # below 90% of a smaller context's speed: it didn't fit
+_FIT_SAME = 0.95        # within 5%: same speed
+_FIT_CHECK_STEP = 8     # the one-time check loads with 1/8 less context
+# Prompt batch sizes change prompt reading, not generation speed.
+_FIT_IGNORED_KEYS = ("num_ctx", "num_batch", "n_ubatch")
+
+
+def _fit_group(snapshot: dict) -> str:
+    """Setups that differ only in context and batch size decode alike."""
+    return _model_config_signature({k: v for k, v in (snapshot or {}).items()
+                                    if k not in _FIT_IGNORED_KEYS})
+
+
+def _fit_key(model_path: str) -> str:
+    return _model_profile_key(Path(str(model_path or "")).stem)
+
+
+def _measure_load_speed(base_url: str) -> float:
+    """Decode tok/s of a short fixed generation; 0.0 when it can't be measured."""
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/v1/chat/completions", method="POST",
+            headers={"Content-Type": "application/json"},
+            data=json.dumps({
+                "model": "local", "stream": False, "max_tokens": _LOAD_PROBE_TOKENS,
+                "temperature": 0, "seed": 1, "cache_prompt": False,
+                "chat_template_kwargs": {"enable_thinking": False},
+                "messages": [{"role": "user", "content": _LOAD_PROBE_PROMPT}],
+            }).encode("utf-8"))
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            timings = json.loads(resp.read()).get("timings") or {}
+        if int(timings.get("predicted_n") or 0) < _LOAD_PROBE_TOKENS // 2:
+            return 0.0
+        return round(float(timings.get("predicted_per_second") or 0.0), 1)
+    except Exception:
+        return 0.0
+
+
+def _record_load_sample(model_path: str, ctx: int, tok_s: float,
+                        settings: dict | None = None) -> None:
+    if tok_s <= 0 or ctx <= 0 or not model_path:
+        return
+    s = settings if isinstance(settings, dict) else get_settings()
+    sample = {"ts": int(time.time()), "group": _fit_group(_model_runtime_config(s)),
+              "ctx": int(ctx), "tok_s": float(tok_s)}
+    with _MODEL_RUNTIME_LOCK:
+        data = load_json(MODEL_RUNTIME_FILE, {"version": 2, "models": {}})
+        if not isinstance(data, dict):
+            data = {"version": 2, "models": {}}
+        rows = data.setdefault("load_samples", {}).setdefault(_fit_key(model_path), [])
+        rows.append(sample)
+        data["load_samples"][_fit_key(model_path)] = rows[-_LOAD_SAMPLE_CAP:]
+        save_json(MODEL_RUNTIME_FILE, data)
+
+
+def _fit_speeds(samples, group: str) -> dict:
+    """Latest load-time speed per context for one setup (newest evidence wins)."""
+    cutoff = int(time.time()) - _LOAD_SAMPLE_MAX_AGE_S
+    out: dict = {}
+    for x in sorted((x for x in (samples or []) if isinstance(x, dict)),
+                    key=lambda x: int(x.get("ts", 0) or 0)):
+        if (x.get("group") == group and int(x.get("ts", 0) or 0) >= cutoff
+                and int(x.get("ctx", 0) or 0) > 0 and float(x.get("tok_s", 0) or 0) > 0):
+            out[int(x["ctx"])] = float(x["tok_s"])
+    return out
+
+
+def _fit_ceiling(speeds: dict) -> int:
+    """Largest context that ran at full speed below the smallest one measured
+    slow; 0 when no context has been measured slow."""
+    slow = [c for c, v in speeds.items()
+            if any(c2 < c and v < v2 * _FIT_SLOW for c2, v2 in speeds.items())]
+    if not slow:
+        return 0
+    first_slow = min(slow)
+    below = {c: v for c, v in speeds.items() if c < first_slow}
+    best = max(below.values())
+    fast = [c for c, v in below.items() if v >= best * _FIT_SAME]
+    return max(fast) if fast else 0
+
+
+def _fit_ceiling_for(model_path: str, settings: dict | None = None) -> int:
+    try:
+        s = settings if isinstance(settings, dict) else get_settings()
+        data = load_json(MODEL_RUNTIME_FILE, {})
+        samples = ((data.get("load_samples") or {}) if isinstance(data, dict) else {}).get(
+            _fit_key(model_path)) or []
+        return _fit_ceiling(_fit_speeds(samples, _fit_group(_model_runtime_config(s))))
+    except Exception:
+        return 0
+
+
+def _silent_spill_possible() -> bool:
+    """Windows' GPU driver spills an oversized load into system RAM instead of
+    failing it; elsewhere such a load fails at boot."""
+    return os.name == "nt"
+
+
+def _fit_full_gpu_dense(model_path: str, snapshot: dict) -> bool:
+    return (_model_is_dense(model_path) and not int(snapshot.get("n_cpu_moe") or 0)
+            and int(snapshot.get("num_gpu") or 99) >= 99)
+
+
+def _advisor_fit_advice(data: dict, settings: dict) -> dict:
+    """The speed-check card: {"recommendation": ...} and/or {"result": ...}.
+
+    Three cases, all from load-time speed of the same setup at different
+    contexts: the current context ran slow next to a smaller one (suggest the
+    largest fast one); a one-time check at 1/8 less context found no difference
+    (suggest going back); or nothing smaller was ever measured on Windows, where
+    a silent spill is possible (suggest the one-time check)."""
+    model_path = str(settings.get("model_path") or "")
+    snap = _model_runtime_config(settings)
+    ctx = int(snap.get("num_ctx") or 0)
+    if not model_path or not ctx or not _fit_full_gpu_dense(model_path, snap):
+        return {}
+    key = _fit_key(model_path)
+    state = ((data.get("fit_state") or {}).get(key) or {}) if isinstance(data, dict) else {}
+    samples = ((data.get("load_samples") or {}).get(key) or []) if isinstance(data, dict) else []
+    speeds = _fit_speeds(samples, _fit_group(snap))
+    here = speeds.get(ctx)
+    if not here:
+        return {"result": state.get("result")} if state.get("result") else {}
+    dismissed = set(state.get("dismissed") or [])
+
+    def rec(kind: str, target: int, reason: str, tradeoff: str) -> dict:
+        rid = hashlib.sha256(f"{key}|{kind}|{ctx}|{target}".encode("utf-8")).hexdigest()[:18]
+        if rid in dismissed:
+            return {}
+        return {"recommendation": {
+            "id": rid, "kind": kind, "reason": reason, "tradeoff": tradeoff,
+            "updates": {"num_ctx": int(target)},
+            "changes": _advisor_changes(snap, {"num_ctx": int(target)}),
+        }}
+
+    ceiling = _fit_ceiling(speeds)
+    if ceiling and ctx > ceiling:
+        slow_pct = round((1 - here / speeds[ceiling]) * 100)
+        return rec("fit_down", ceiling,
+                   f"Right after loading, this model generated {here:.0f} tok/s at {ctx:,} context but "
+                   f"{speeds[ceiling]:.0f} tok/s at {ceiling:,}. {slow_pct}% slower means the larger "
+                   f"context doesn't fit in VRAM and part of the model is running from system RAM.",
+                   "Less context, full speed. Nothing else about the model changes.")
+    check_from = int(state.get("check_from") or 0)
+    if check_from > ctx and check_from in speeds and speeds[check_from] >= here * _FIT_SAME:
+        return rec("fit_up", check_from,
+                   f"The speed check found no difference: {speeds[check_from]:.0f} tok/s at "
+                   f"{check_from:,} context and {here:.0f} tok/s at {ctx:,}. The larger context fits "
+                   f"in VRAM, so it's safe to go back to it.",
+                   "More context at the same speed.")
+    if (_silent_spill_possible() and ctx < _FIT_CTX_CAP and not check_from
+            and not any(c < ctx for c in speeds)):
+        target = max(8192, (ctx - ctx // _FIT_CHECK_STEP) // 1024 * 1024)
+        if target < ctx:
+            out = rec("fit_check", target,
+                      f"On Windows, a model that doesn't quite fit in VRAM still loads, but part of it "
+                      f"runs from system RAM and generation slows down with no error. Loading once at "
+                      f"{target:,} context and timing it against the {here:.0f} tok/s measured at "
+                      f"{ctx:,} shows whether that's happening here.",
+                      "One reload at slightly less context. If the speed is the same, the advisor "
+                      "suggests going back.")
+            if state.get("result"):
+                out["result"] = state["result"]
+            return out
+    return {"result": state.get("result")} if state.get("result") else {}
+
+
+def _fit_settle(data: dict, settings: dict) -> bool:
+    """Close a finished one-time check with a plain result line. True if the
+    state changed."""
+    model_path = str(settings.get("model_path") or "")
+    key = _fit_key(model_path)
+    state = (data.get("fit_state") or {}).get(key) if isinstance(data, dict) else None
+    if not isinstance(state, dict) or not state.get("check_from"):
+        return False
+    snap = _model_runtime_config(settings)
+    speeds = _fit_speeds((data.get("load_samples") or {}).get(key) or [], _fit_group(snap))
+    big, small = int(state["check_from"]), int(state.get("check_to") or 0)
+    if big not in speeds or small not in speeds:
+        return False
+    if speeds[big] < speeds[small] * _FIT_SLOW:
+        state["result"] = (f"Speed check: {big:,} context ran at {speeds[big]:.0f} tok/s and "
+                           f"{small:,} at {speeds[small]:.0f}. The larger context didn't fit in VRAM, "
+                           f"so {small:,} stays and the tuner won't go back above it.")
+        state.pop("check_from", None)
+        state.pop("check_to", None)
+        return True
+    return False
+
+
+def _fit_action(action: str, rec_id: str) -> dict:
+    settings = get_settings()
+    model_path = str(settings.get("model_path") or "")
+    with _MODEL_RUNTIME_LOCK:
+        data = load_json(MODEL_RUNTIME_FILE, {"version": 2, "models": {}})
+        if not isinstance(data, dict):
+            data = {"version": 2, "models": {}}
+        advice = _advisor_fit_advice(data, settings).get("recommendation") or {}
+        if not advice or advice.get("id") != rec_id:
+            return {"ok": False, "error": "recommendation is no longer current"}
+        state = data.setdefault("fit_state", {}).setdefault(_fit_key(model_path), {})
+        if action == "fit_dismiss":
+            state["dismissed"] = (list(state.get("dismissed") or []) + [rec_id])[-20:]
+            save_json(MODEL_RUNTIME_FILE, data)
+            return {"ok": True}
+        target = int(advice["updates"]["num_ctx"])
+        current = int(settings.get("num_ctx") or 0)
+        state.pop("result", None)
+        if advice.get("kind") == "fit_check":
+            state["check_from"], state["check_to"] = current, target
+        else:
+            state.pop("check_from", None)
+            state.pop("check_to", None)
+        settings["num_ctx"] = target
+        save_json(SETTINGS_FILE, settings)
+        if model_path:
+            _save_model_config(model_path, {"num_ctx": target})
+        save_json(MODEL_RUNTIME_FILE, data)
+    broadcast_event({"type": "settings:update"})
+    return {"ok": True, "settings": settings, "reload": True, "model_path": model_path}
+
+
 def _model_health_action(action: str, recommendation_id: str = "") -> dict:
     action = str(action or "").strip().lower()
+    if action in {"fit_apply", "fit_dismiss"}:
+        return _fit_action(action, recommendation_id)
     settings = get_settings()
     model = _model_profile_key(settings.get("model_path") or settings.get("model") or "")
     runtime_key = _model_profile_key(settings.get("model") or model)
@@ -1982,10 +2217,13 @@ def _public_model_health() -> dict:
             trial = _advisor_trial_public(row, active_config)
             if row.get("trial") != trial_before:
                 changed = True
+            if _fit_settle(data, settings):
+                changed = True
+            fit = _advisor_fit_advice(data, settings) if enabled else {}
             if changed:
                 save_json(MODEL_RUNTIME_FILE, data)
     except Exception:
-        row, cfg, observed, rec, trial = {}, {}, {}, None, None
+        row, cfg, observed, rec, trial, fit = {}, {}, {}, None, None, {}
     current = cfg if cfg else row
     turns = max(0, int(current.get("turns", 0) or 0))
     sessions = len(current.get("sessions") or []) if cfg else 0
@@ -2046,6 +2284,7 @@ def _public_model_health() -> dict:
         "recommendation": rec_public,
         "notification_needed": bool(rec and not trial and not rec.get("notified_at")),
         "trial": trial,
+        "fit": fit or None,
         "privacy": ("Local performance numbers only, plus tool names and exit codes in a private "
                     "comparison dataset (model_usage_dataset.jsonl). Prompts, replies, tool "
                     "arguments, tool output, commands, files, screenshots, peer addresses, and "
@@ -5522,6 +5761,20 @@ def _finding_expand_shorthand(args):
             first = store.read(cid, mission_id, ids[0])
     except (ValueError, OSError, KeyError, TypeError):
         first = None
+    # rt_access_check sends the control itself: the same request, signed out or
+    # as the other account. When that control was refused, the refusal is the
+    # expected result, so fill in what the review needs to accept a denial.
+    if control.get("evidence_id") and "expected_status" not in control:
+        try:
+            held = store.read(cid, mission_id, control["evidence_id"])
+        except (NameError, ValueError, OSError, KeyError, TypeError):
+            held = None
+        if (held and held.get("tool") == "rt_access_check"
+                and held.get("state") == "authentication_unavailable"):
+            control["expected_status"] = (held.get("result") or {}).get("status")
+            control.setdefault("purpose", "The same request sent by rt_access_check without the "
+                                          "owner's sign-in; a refusal is the expected result.")
+            challenge["control"] = control
     if first:
         if not out.get("target"):
             out["target"] = str(first.get("target") or "")
@@ -5536,9 +5789,15 @@ def _finding_expand_shorthand(args):
         parameter = (parameter or "").strip()
         if "location" not in test:
             recorded = context.get("parameters") or {}
-            test["location"] = (next((where for where in ("query", "body", "header", "interaction")
-                                      if parameter in (recorded.get(where) or [])), "query")
-                                if parameter else "none")
+            found = next((where for where in ("query", "body", "header", "interaction")
+                          if parameter and parameter in (recorded.get(where) or [])), None)
+            if parameter and found is None and first.get("tool") == "rt_access_check":
+                # An access check replays one request unchanged and varies only the
+                # account. A model naming the object id in the path ("id") is
+                # describing the URL, not an input the test changed.
+                parameter = ""
+            test["location"] = (found or "query") if parameter else "none"
+            test["parameter"] = parameter
         test.setdefault("parameter", parameter)
         if isinstance(args.get("proof"), str) and not isinstance(test.get("assertion"), dict):
             result = first.get("result") if isinstance(first.get("result"), dict) else {}
@@ -6310,6 +6569,231 @@ def _rt_clean_required_headers(value: Any) -> dict:
     return out
 
 
+# ---- engagement test accounts (Access Control playbook) ----------------------
+# The questionnaire collects a sign-in (a cookie or an auth header) for two test
+# accounts. The values stay out of chats.json and out of the model's context:
+# the mission record lists only the labels, the values live in their own file
+# keyed by the engagement's authorization id, and the model names an account
+# ("A", "B" or "anonymous") for the bridge to attach. They are deleted when the
+# engagement ends.
+_RT_IDENTITY_LABELS = ("A", "B")
+_RT_IDENTITY_ANON = "anonymous"
+_RT_IDENTITY_HEADER_MAX = 6
+_RT_IDENTITY_VALUE_MAX = 8192
+# Headers that describe the request rather than who is signed in. A sign-in may
+# not set them: the engagement, the tool or the HTTP client owns each one.
+_RT_IDENTITY_BLOCKED_HEADERS = {
+    "host", "content-length", "content-type", "transfer-encoding", "connection",
+    "user-agent", "accept-encoding",
+}
+_RT_IDENTITY_ALIASES = {
+    "anonymous", "anon", "none", "guest", "public", "unauthenticated",
+    "signed out", "logged out", "no auth", "not signed in", "no account",
+}
+_RT_IDENTITIES_FILE = DATA / "redteam" / "identities.json"
+_RT_IDENTITIES_LOCK = threading.Lock()
+# (authorization id, label) -> when the target last answered that account
+# differently from a signed-out request, i.e. the sign-in was seen to work.
+_RT_IDENTITY_SEEN: dict[tuple[str, str], float] = {}
+_RT_IDENTITY_SEEN_TTL = 1200.0
+# Sign-ins of an engagement left open (never reported, chat abandoned) are
+# deleted at the next startup once it is this old.
+_RT_IDENTITY_KEEP_SECONDS = 7 * 86400
+
+
+def _rt_clean_identity_headers(value: Any) -> dict:
+    """One account's sign-in headers from the gate panel (bounded, latin-1 safe)."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, raw in list(value.items())[:_RT_IDENTITY_HEADER_MAX * 3]:
+        name = str(key or "").strip()
+        text = str(raw or "").strip()
+        if (not _RT_HEADER_NAME_RE.match(name) or name.lower() in _RT_IDENTITY_BLOCKED_HEADERS
+                or not text or len(text) > _RT_IDENTITY_VALUE_MAX):
+            continue
+        if any(ord(char) < 32 or ord(char) == 127 for char in text):
+            continue
+        try:
+            text.encode("latin-1")
+        except UnicodeEncodeError:
+            continue
+        if any(name.lower() == existing.lower() for existing in out):
+            continue
+        out[name] = text
+        if len(out) >= _RT_IDENTITY_HEADER_MAX:
+            break
+    return out
+
+
+def _rt_clean_identities(value: Any) -> dict:
+    """label -> sign-in headers for every account the panel filled in."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for label in _RT_IDENTITY_LABELS:
+        headers = _rt_clean_identity_headers(value.get(label))
+        if headers:
+            out[label] = headers
+    return out
+
+
+def _rt_identities_usable(value: Any) -> bool:
+    """The Access Control playbook needs both accounts, and they must differ."""
+    cleaned = _rt_clean_identities(value)
+    if len(cleaned) != len(_RT_IDENTITY_LABELS):
+        return False
+    lowered = [{k.lower(): v for k, v in cleaned[label].items()} for label in _RT_IDENTITY_LABELS]
+    return lowered[0] != lowered[1]
+
+
+def _rt_clean_owned_urls(value: Any) -> list[str]:
+    """URLs (or site-relative paths) the user says belong to account A."""
+    if isinstance(value, str):
+        value = value.splitlines()
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[str] = []
+    for item in list(value)[:40]:
+        text = str(item or "").strip()
+        if not text or len(text) > 400 or any(ord(char) < 33 or ord(char) == 127 for char in text):
+            continue
+        if not (text.startswith(("http://", "https://")) or (text.startswith("/") and not text.startswith("//"))):
+            continue
+        if text not in out:
+            out.append(text)
+        if len(out) >= 10:
+            break
+    return out
+
+
+def _rt_identities_read() -> dict:
+    stored = load_json(_RT_IDENTITIES_FILE, {})
+    return stored if isinstance(stored, dict) else {}
+
+
+def _rt_identities_save(key: str, identities: dict) -> None:
+    with _RT_IDENTITIES_LOCK:
+        stored = _rt_identities_read()
+        stored[str(key)] = identities
+        _RT_IDENTITIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        save_json(_RT_IDENTITIES_FILE, stored)
+
+
+def _rt_identities_for(mission: dict | None) -> dict:
+    """label -> sign-in headers for the accounts a mission was started with."""
+    if not isinstance(mission, dict):
+        return {}
+    labels = [label for label in (mission.get("identities") or []) if label in _RT_IDENTITY_LABELS]
+    key = str(mission.get("authorization_id") or "")
+    if not labels or not key:
+        return {}
+    with _RT_IDENTITIES_LOCK:
+        cleaned = _rt_clean_identities(_rt_identities_read().get(key))
+    return {label: cleaned[label] for label in labels if label in cleaned}
+
+
+def _rt_active_identities() -> dict:
+    """The test accounts of the active, authorized engagement (empty otherwise)."""
+    return _rt_identities_for(_rt_authorized_mission(_rt_context_chat()))
+
+
+def _rt_identities_forget(mission: dict | None) -> None:
+    """Delete an engagement's stored sign-ins. Safe to call for any mission."""
+    key = str((mission or {}).get("authorization_id") or "") if isinstance(mission, dict) else ""
+    if not key:
+        return
+    for seen in [k for k in _RT_IDENTITY_SEEN if k[0] == key]:
+        _RT_IDENTITY_SEEN.pop(seen, None)
+    try:
+        with _RT_IDENTITIES_LOCK:
+            stored = _rt_identities_read()
+            if key in stored:
+                stored.pop(key, None)
+                save_json(_RT_IDENTITIES_FILE, stored)
+    except Exception:
+        traceback.print_exc()
+
+
+def _rt_identities_sweep() -> int:
+    """At startup, delete sign-ins whose engagement is no longer active (closed,
+    replaced, or its chat deleted while the app was not running)."""
+    with _RT_IDENTITIES_LOCK:
+        stored = _rt_identities_read()
+        if not stored:
+            return 0
+        active = set()
+        cutoff = time.time() - _RT_IDENTITY_KEEP_SECONDS
+        for chat in (get_chats().get("chats") or {}).values():
+            mission = _rt_authorized_mission(chat) if isinstance(chat, dict) else None
+            # An engagement nobody closed is not kept alive forever: a sign-in
+            # that old has expired at the target anyway.
+            if mission and float(mission.get("authorized_at") or 0) >= cutoff:
+                active.add(str(mission.get("authorization_id") or ""))
+        ended = [key for key in stored if key not in active]
+        for key in ended:
+            stored.pop(key, None)
+        if ended:
+            save_json(_RT_IDENTITIES_FILE, stored)
+        return len(ended)
+
+
+def _rt_identity_label(value: Any) -> str:
+    """Normalize how a model names an account: 'a', 'Account A', 'user_b',
+    'signed out'. Returns 'A', 'B', 'anonymous', or '' when unrecognized."""
+    text = re.sub(r"[\s_\-]+", " ", str(value or "").strip().lower()).strip(" :'\".")
+    if text in _RT_IDENTITY_ALIASES:
+        return _RT_IDENTITY_ANON
+    text = re.sub(r"^(?:test )?(?:account|user|identity|session)\s*", "", text).strip(" :'\".")
+    if text in _RT_IDENTITY_ALIASES:
+        return _RT_IDENTITY_ANON
+    return text.upper() if text.upper() in _RT_IDENTITY_LABELS else ""
+
+
+def _rt_identities_missing_reason() -> str:
+    """Why no test account can be used right now, in words the user can act on."""
+    mission = _rt_authorized_mission(_rt_context_chat()) or {}
+    if mission.get("identities"):
+        return ("The sign-ins for this engagement's test accounts are no longer stored (an engagement "
+                "left open for a week has them deleted). Tell the user to start the Access Control "
+                "playbook again with fresh sign-ins.")
+    return ("This engagement has no test accounts. Named accounts exist only in an engagement "
+            "started from the Access Control playbook.")
+
+
+def _rt_identity_request(value: Any) -> dict:
+    """Resolve a model-supplied account name to {'label', 'headers'} or {'error'}."""
+    identities = _rt_active_identities()
+    if not identities:
+        return {"error": _rt_identities_missing_reason()}
+    label = _rt_identity_label(value)
+    if label == _RT_IDENTITY_ANON:
+        return {"label": label, "headers": {}}
+    if label not in identities:
+        return {"error": f"Unknown account {str(value)[:40]!r}. Use one of: "
+                         + ", ".join([*identities, _RT_IDENTITY_ANON]) + "."}
+    return {"label": label, "headers": dict(identities[label])}
+
+
+def _rt_identity_reserved_headers() -> set[str]:
+    """Header names (lowercase) that carry a sign-in in this engagement."""
+    names = {"authorization", "cookie"}
+    for headers in _rt_active_identities().values():
+        names |= {str(name).lower() for name in headers}
+    return names
+
+
+def _rt_identity_mark_seen(label: str) -> None:
+    key = str((_rt_authorized_mission(_rt_context_chat()) or {}).get("authorization_id") or "")
+    if key and label in _RT_IDENTITY_LABELS:
+        _RT_IDENTITY_SEEN[(key, label)] = time.time()
+
+
+def _rt_identity_seen(label: str) -> bool:
+    key = str((_rt_authorized_mission(_rt_context_chat()) or {}).get("authorization_id") or "")
+    return bool(key) and time.time() - _RT_IDENTITY_SEEN.get((key, label), 0.0) < _RT_IDENTITY_SEEN_TTL
+
+
 def _rt_scope_tokens_from_panel(value: Any) -> list[str]:
     """Normalize a structured in/out scope field (list or delimited string)."""
     if isinstance(value, str):
@@ -6394,6 +6878,9 @@ def _rt_browser_policy(chat: dict | None) -> dict | None:
         "allow_destructive": mission.get("allow_destructive") is not False,
         "rate_limit_rpm": _bounded_int(mission.get("rate_limit_rpm"), 0, 6000),
         "request_cap": _bounded_int(mission.get("request_cap"), 0, 1000000),
+        # Pacing reads these two; see _rt_gov_interval.
+        "engagement": str(mission.get("engagement") or ""),
+        "automated_allowed": mission.get("automated_allowed") is not False,
     }
 
 
@@ -6573,9 +7060,15 @@ class _ScopedBrowserWorker:
             if (not reason and str(urllib.parse.urlsplit(request.url).scheme).lower()
                     in {"http", "https"}):
                 # The page's own requests count against the engagement budget
-                # and land in the ledger, same as every other tool.
+                # and land in the ledger, same as every other tool. Fonts,
+                # scripts and images it draws with are ledgered but not
+                # counted, and the hook never stalls the page (wait=False):
+                # navigations wait for their turn before they start instead.
+                _asset = (str(request.method).upper() == "GET"
+                          and request.resource_type in _RT_BROWSER_ASSET_TYPES)
                 reason = _rt_gov_admit(_rt_url_host(request.url), request.method,
-                                       url=request.url, mission=_policy)
+                                       url=request.url, mission=_policy,
+                                       kind="asset" if _asset else "request", wait=False)
             event = {
                 "kind": "request",
                 "method": request.method,
@@ -6730,6 +7223,10 @@ class _ScopedBrowserWorker:
         page = state["page"]
         timeout_ms = int(max(2.0, min(float(payload.get("timeout") or 20.0), 40.0)) * 1000)
         page.set_default_timeout(timeout_ms)
+        # Actions that can load a page wait for the engagement's next paced
+        # slot first, so a run of clicks reads like a person using the site.
+        if action in {"open", "navigate", "click", "fill", "press"}:
+            _rt_gov_wait_turn(policy)
 
         def finish(result: dict) -> dict:
             blocked = [event for event in state.get("events", []) if event.get("blocked")]
@@ -7171,7 +7668,7 @@ _RT_DESTRUCTIVE_PAYLOAD_RE = re.compile(
 _RT_DESTRUCTIVE_URL_TOOLS = {
     "http_request", "rt_browser", "fuzz", "batch_probe", "sql_injection", "sandbox_sqlmap",
     "recon_injection_probe", "recon_auth_spray", "validate_finding", "observe_response",
-    "recon_capture_evidence", "cors_probe",
+    "recon_capture_evidence", "cors_probe", "rt_access_check",
 }
 _RT_DESTRUCTIVE_HINT = ("Tick 'Allow destructive methods' when starting the engagement if this "
                         "is intended, or show the finding with a request that changes nothing.")
@@ -7199,7 +7696,7 @@ def _rt_destructive_block(name: str, args: dict) -> str | None:
     parameters, and raw-socket commands that wipe or stop a datastore. PUT,
     PATCH and POST stay available because ordinary testing needs them."""
     args = args or {}
-    if name == "http_request":
+    if name in ("http_request", "rt_access_check"):
         method = str(args.get("method") or "").upper()
         if not method:
             method = "POST" if args.get("body") else "GET"
@@ -7241,6 +7738,60 @@ _RT_NETWORK_CMD_RE = re.compile(
 )
 
 
+_RT_CMD_FILE_EXTS = (".py", ".js", ".txt", ".gz", ".xz", ".img", ".bin", ".zip", ".tar",
+                     ".json", ".md", ".html", ".css", ".apk", ".so", ".elf", ".yar",
+                     ".pcap", ".evtx", ".ps1", ".csv", ".log", ".xml", ".yaml", ".yml")
+# Endings a host outside a URL is taken to have: every two-letter country
+# ending plus the common generic ones. Code like re.findall, json.loads or
+# $c.Length ends in a word that is none of these, so it no longer reads as a
+# website. Anything after "://" or "@" counts whatever its ending.
+_RT_CMD_GENERIC_TLDS = frozenset((
+    "com net org io dev app ai co info biz gov edu mil int xyz online site tech cloud "
+    "shop store page me tv cc ninja live pro work world web blog news one top club "
+    "agency digital network systems solutions services email link click host space "
+    "website fun icu vip lol bet casino finance bank money wtf").split())
+
+
+def _rt_command_hosts(scrub: str) -> set[str]:
+    """Literal hosts in a lower-cased shell command, without code identifiers."""
+    hosts = set(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", scrub))
+    for match in re.finditer(r"(?<![\w$.])((?:[a-z0-9-]+\.)+[a-z]{2,})\b(\s*\()?", scrub):
+        host = match.group(1)
+        if host.endswith(_RT_CMD_FILE_EXTS):
+            continue
+        start = match.start(1)
+        in_url = scrub[max(0, start - 3):start] == "://" or scrub[start - 1:start] == "@"
+        if not in_url:
+            if match.group(2):                   # re.findall( / os.path.join(
+                continue
+            tld = host.rsplit(".", 1)[1]
+            if len(tld) != 2 and tld not in _RT_CMD_GENERIC_TLDS:
+                continue
+        hosts.add(host)
+    return hosts
+
+
+def _rt_command_data_block(command: str) -> str | None:
+    """Refuse an engagement shell command that names Accuretta's data folder.
+
+    File tools already refuse that folder; a shell command could otherwise
+    read or write it anyway (a run once wrote a 650 KB scratch file there).
+    The reports and evidence folders stay reachable, as they are for the file
+    tools, so a run can still copy its own evidence out to work on it."""
+    low = command.lower().replace("/", "\\")
+    root = os.path.normcase(str(DATA)).lower().replace("/", "\\").rstrip("\\")
+    start = low.find(root)
+    while start >= 0:
+        rest = low[start + len(root):]
+        sub = re.match(r"\\+([^\\\s'\"`;|&]*)", rest)
+        if not (sub and sub.group(1) in _DATA_READABLE_SUBDIRS):
+            return ("refused: Accuretta's own data folder (settings, keys and chats) is off "
+                    "limits to commands. Keep working files in the workspace; evidence "
+                    "under data\\recon_evidence and reports may be read.")
+        start = low.find(root, start + 1)
+    return None
+
+
 def _rt_command_scope_block(command: str, chat: dict | None) -> str | None:
     """Scope network-capable generic shell commands during an engagement."""
     if not _rt_authorized_mission(chat):
@@ -7249,11 +7800,10 @@ def _rt_command_scope_block(command: str, chat: dict | None) -> str | None:
     if _rt_passive_mission(chat) and _RT_NETWORK_CMD_RE.search(scrub):
         return ("refused: passive OSINT forbids shell-driven network access. "
                 "Use the public-source OSINT tools supplied for this mission.")
-    hosts = set(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", scrub))
-    hosts |= {h for h in re.findall(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", scrub)
-              if not h.endswith((".py", ".js", ".txt", ".gz", ".xz", ".img", ".bin",
-                                 ".zip", ".tar", ".json", ".md", ".html", ".css",
-                                 ".apk", ".so", ".elf", ".yar", ".pcap", ".evtx"))}
+    data_block = _rt_command_data_block(str(command or ""))
+    if data_block:
+        return data_block
+    hosts = _rt_command_hosts(scrub)
     if _RT_NETWORK_CMD_RE.search(scrub) and not hosts:
         return ("refused: this active red-team mission uses a network-capable generic command, "
                 "but its destination is not a literal host the harness can scope-check. Use the "
@@ -7296,6 +7846,10 @@ def _rt_scope_block(name: str, args: dict) -> str | None:
     if name in _RT_EXPLOIT_TOOL_NAMES and not _rt_incl_exploit_for(chat, settings):
         return ("refused: this action is outside Target Recon mode. Start an authorized Red Team "
                 "assessment for active testing. Finding validation affects reporting, not tool access.")
+    if mission.get("engagement") == "bug_bounty" and name in _RT_BOUNTY_HIDDEN_TOOLS:
+        return ("refused: bug bounty runs do not extract data, guess passwords or scan the "
+                "hosting network. Prove the bug with the smallest request the program allows "
+                "(http_request or rt_browser) and record it.")
     if mission.get("automated_allowed") is False and name in _RT_AUTOMATED_TOOL_NAMES:
         return ("refused: the engagement questionnaire disables automated testing tools "
                 "(scanners, sprayers, fuzzers). Test manually with http_request, rt_browser, "
@@ -7430,6 +7984,9 @@ def _rt_result_confirms_finding(name: str, result: dict | None) -> bool:
     return False
 
 
+_RT_NOTES_MAX = 6000
+
+
 def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
     """Create a fresh server-side mission from the authorization panel.
 
@@ -7447,8 +8004,15 @@ def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
     constraints = str(panel.get("constraints") or "").strip()
     user_agent = _rt_clean_user_agent(panel.get("user_agent"))
     engagement = str(panel.get("engagement") or "recon").strip().lower()
-    if engagement not in ("passive_osint", "frontend_secrets", "recon", "pentest"):
+    if engagement not in ("passive_osint", "frontend_secrets", "recon", "pentest", "access_control",
+                          "bug_bounty"):
         engagement = "recon"
+    # Only the Access Control playbook carries test accounts, and it cannot run
+    # without two different ones: refuse the engagement rather than start a run
+    # whose every check would fail.
+    identities = _rt_clean_identities(panel.get("identities")) if engagement == "access_control" else {}
+    if engagement == "access_control" and not _rt_identities_usable(identities):
+        return False
     # Structured engagement policy. The freeform `scope` string stays for display
     # and backwards compatibility; the enforcement paths consume these
     # machine-readable fields instead of re-parsing prose.
@@ -7478,6 +8042,10 @@ def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
         "automated_allowed": automated_allowed,
         "allow_destructive": allow_destructive,
         "keep_log": keep_log,
+        # Operator notes ride the mission block every turn, so they survive folds.
+        # For a bug bounty they hold the program's rules; the full program text
+        # goes only in the opening instruction, which the chat already keeps.
+        "notes": str(panel.get("notes") or "").strip()[:_RT_NOTES_MAX],
         "facts": facts,
         "phase": "recon",
         "engagement": engagement,
@@ -7488,10 +8056,263 @@ def _rt_mission_apply_panel(chat: dict, panel: dict) -> bool:
         "authorized_at": int(time.time()),
         "ts": int(time.time()),
     }
+    if identities:
+        mission["identities"] = list(identities)
+        mission["owned_urls"] = _rt_clean_owned_urls(panel.get("owned_urls"))
     # A new engagement ends the previous one; drop its logs if it kept none.
     _rt_log_mission_ended(chat.get("mission"))
+    if identities:
+        _rt_identities_save(mission["authorization_id"], identities)
     chat["mission"] = mission
     return True
+
+
+# ---- bug bounty program reader ------------------------------------------------
+# The Bug Bounty questionnaire takes the program text as the platform shows it.
+# One call to the loaded model copies its testing rules into the form; plain
+# code then checks every value against the text, so a misreading can leave a
+# field empty or raise a question but can never widen what the run may touch.
+# The user reviews the filled form before anything is authorized.
+_RT_PROGRAM_TEXT_MAX = 80000
+_RT_PROGRAM_CALL_TIMEOUT_S = 300
+# Store listings name the mobile apps a program covers; they are not hosts a
+# web run can test, and allowing them would point the run at the store.
+_RT_APP_STORE_HOSTS = {
+    "play.google.com", "apps.apple.com", "itunes.apple.com", "appgallery.huawei.com",
+    "www.amazon.com", "apps.microsoft.com", "microsoft.com",
+}
+_RT_PROGRAM_INSTR = (
+    "You read bug bounty program pages and copy their testing rules into a form. "
+    "Reply with one JSON object and nothing else. Copy values from the program text; "
+    "never invent a host, header, number or rule. When the program does not say, use null "
+    "or an empty list.\n\n"
+    "Fields:\n"
+    '"scope_in": every web host or URL the program lists as in scope, written exactly as the '
+    "program writes it. Leave out mobile app store links.\n"
+    '"scope_out": every host the program names as out of scope, e.g. "*.example.pt".\n'
+    '"subdomains_in_scope": true if the program allows subdomains of the listed hosts, false if '
+    "it excludes them, null if it does not say.\n"
+    '"user_agent_text": the exact text the program requires in the User-Agent header, or null.\n'
+    '"user_agent_mode": "append" if that text is added to a normal User-Agent, "replace" if it '
+    "is the whole User-Agent, or null.\n"
+    '"required_headers": list of {"name": ..., "value": ...} headers the program requires on '
+    "every request (not the User-Agent).\n"
+    '"rate_limit_rpm": the request limit in requests per minute (convert per second x60), or null.\n'
+    '"automated_scanning_allowed": false if automated scanning or scanners are forbidden, true if '
+    "explicitly allowed, null if not mentioned.\n"
+    '"destructive_allowed": false if deleting or changing other data is forbidden, else null.\n'
+    '"account_rule": how test accounts must be created (e.g. which email alias), or null.\n'
+    '"mobile_apps_in_scope": true if mobile apps are listed in scope.\n'
+    '"rules": up to 30 short plain sentences the tester must follow: what is forbidden, the '
+    "limits on proof for each bug type, what the report must contain, how severity is scored, "
+    "and one line listing the bug types the program does not pay for.\n"
+    '"questions": only what must be decided before testing starts because the program is unclear '
+    "or contradicts itself about WHICH HOSTS may be tested, WHICH HEADERS or LIMITS apply, or WHETHER "
+    "a kind of testing is allowed (e.g. an API host that may or may not be in scope). Nothing about "
+    "rewards, duplicates or how to write reports, and nothing about mobile apps. Up to 4."
+)
+
+
+def _rt_program_host(raw: str) -> str:
+    """Host part of a scope entry: scheme, path, port and spaces removed."""
+    tok = str(raw or "").strip().lower()
+    tok = re.sub(r"^[a-z][a-z0-9+.-]*://", "", tok)
+    tok = tok.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].strip(" .,;:'\"()[]{}<>")
+    if ":" in tok and tok.rsplit(":", 1)[1].isdigit():
+        tok = tok.rsplit(":", 1)[0]
+    return tok[:120]
+
+
+def _rt_program_json(text: str) -> dict:
+    """First JSON object in a model reply (tolerates fences and think blocks)."""
+    text = re.sub(r"<think>.*?</think>", "", str(text or ""), flags=re.S).strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+    try:
+        out = json.loads(text)
+        return out if isinstance(out, dict) else {}
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            out = json.loads(text[start:end + 1])
+            return out if isinstance(out, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _rt_program_fields(raw: dict, program_text: str) -> dict:
+    """Turn the model's reading into form values, checked against the program text.
+
+    In-scope hosts survive only when they are written in the program; anything
+    else is dropped and named in `flags` for the user."""
+    low_text = program_text.lower()
+    flags: list[str] = []
+
+    def _strs(value: Any, limit: int) -> list[str]:
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, (list, tuple)):
+            return []
+        return [str(v).strip() for v in list(value)[:limit] if str(v or "").strip()]
+
+    scope_in: list[str] = []
+    stores_dropped = False
+    for entry in _strs(raw.get("scope_in"), 80):
+        host = _rt_program_host(entry)
+        if not host or "." not in host:
+            continue
+        if host.lstrip("*.") in _RT_APP_STORE_HOSTS:
+            stores_dropped = True
+            continue
+        bare = host.lstrip("*.")
+        if "*" in bare:
+            flags.append(f"\"{entry}\" is a pattern Accuretta can't use, so it was left out. "
+                         "Add each site it covers to In scope by hand.")
+            continue
+        # A whole-host match: "example.com" must not pass because the program
+        # mentions "www.example.com", since the bare domain would also allow
+        # every subdomain.
+        written = (host in low_text if host.startswith("*.") else
+                   re.search(r"(?<![a-z0-9.*-])" + re.escape(bare) + r"(?![a-z0-9-]|\.[a-z0-9])",
+                             low_text) is not None)
+        if not written:
+            flags.append(f"{host} isn't written in the program, so it was left out of In scope.")
+            continue
+        if host not in scope_in:
+            scope_in.append(host)
+    if stores_dropped or raw.get("mobile_apps_in_scope") is True:
+        flags.append("The program lists mobile apps. Accuretta tests web hosts only, so the app "
+                     "store links were left out of In scope.")
+    if raw.get("subdomains_in_scope") is False:
+        broad = [h for h in scope_in if h.startswith("*.")]
+        if broad:
+            flags.append("The program puts subdomains out of scope, but these entries would allow "
+                         "them: " + ", ".join(broad) + ". Check them before running.")
+
+    scope_out: list[str] = []
+    for entry in _strs(raw.get("scope_out"), 50):
+        host = _rt_program_host(entry)
+        if host and "." in host and "*" not in host.lstrip("*.") and host not in scope_out:
+            scope_out.append(host)
+
+    user_agent = ""
+    ua_text = str(raw.get("user_agent_text") or "").strip()
+    if ua_text:
+        if ua_text.lower() not in low_text:
+            flags.append(f"The required User-Agent text \"{ua_text}\" isn't written in the program "
+                         "exactly like that. Check the User agent field.")
+        mode = str(raw.get("user_agent_mode") or "append").strip().lower()
+        user_agent = _rt_clean_user_agent(ua_text if mode == "replace"
+                                          else f"{_RT_UA_POOL[0]} {ua_text}")
+
+    headers: dict[str, str] = {}
+    raw_headers = raw.get("required_headers")
+    if isinstance(raw_headers, dict):
+        raw_headers = [{"name": k, "value": v} for k, v in raw_headers.items()]
+    for item in (raw_headers if isinstance(raw_headers, list) else [])[:10]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        value = str(item.get("value") or "").strip()
+        if not name or not value or name.lower() == "user-agent":
+            continue
+        headers[name] = value
+        if re.search(r"[<>{}\[\]]|\byour[_ -]|\busername\b", value, re.I):
+            flags.append(f"The {name} header has a placeholder in it. Replace it with your "
+                         "own value before running.")
+    headers = _rt_clean_required_headers(headers)
+
+    rate = raw.get("rate_limit_rpm")
+    rate_limit_rpm = _bounded_int(rate, 0, 6000) if rate not in (None, "", False) else 0
+
+    automated = raw.get("automated_scanning_allowed")
+    automated_allowed = None if automated is None else automated is True
+    if automated_allowed is None:
+        flags.append("The program doesn't say whether automated scanning is allowed. "
+                     "Check before leaving automated tools on.")
+    destructive = raw.get("destructive_allowed")
+
+    notes_lines: list[str] = []
+    account_rule = str(raw.get("account_rule") or "").strip()
+    if account_rule:
+        notes_lines.append(f"- Test accounts: {account_rule[:300]}")
+    for rule in _strs(raw.get("rules"), 30):
+        notes_lines.append(f"- {rule[:400]}")
+    notes = "\n".join(notes_lines)[:_RT_NOTES_MAX]
+
+    apps_flagged = any("mobile apps" in f for f in flags)
+    for question in _strs(raw.get("questions"), 6):
+        # The app-store note above already covers mobile apps; a model that
+        # asks about them again only repeats it.
+        if apps_flagged and re.search(r"\b(mobile|ios|android|app store|play store)\b", question, re.I):
+            continue
+        flags.append(question[:300])
+
+    if not scope_in:
+        flags.insert(0, "No in-scope web host could be confirmed from the program. Fill in "
+                        "Target and In scope yourself.")
+    return {
+        "target": scope_in[0].lstrip("*.") if scope_in else "",
+        "scope_in": scope_in,
+        "scope_out": scope_out,
+        "user_agent": user_agent,
+        "required_headers": headers,
+        "rate_limit_rpm": rate_limit_rpm,
+        "automated_allowed": automated_allowed,
+        "allow_destructive": False if destructive is not True else True,
+        "notes": notes,
+        "flags": flags[:12],
+    }
+
+
+def _rt_read_program(program_text: str) -> dict:
+    """Read a pasted bug bounty program into questionnaire fields."""
+    text = str(program_text or "").strip()
+    if len(text) < 200:
+        return {"ok": False, "error": "Paste the whole program page: scope, rules and all."}
+    if len(text) > _RT_PROGRAM_TEXT_MAX:
+        return {"ok": False, "error": f"The program text is over {_RT_PROGRAM_TEXT_MAX:,} characters. "
+                                      "Leave out reward tables and report counts and try again."}
+    if not llama_ready():
+        return {"ok": False, "error": "Load a model first. Reading the program uses the loaded model."}
+    ctx = _llama_props_ctx()
+    need = _approx_tokens(_RT_PROGRAM_INSTR) + _approx_tokens(text) + 2600
+    if ctx and need > ctx:
+        return {"ok": False, "error": f"The program is too long for the loaded model's context "
+                                      f"({ctx:,} tokens; it needs about {need:,}). Leave out the "
+                                      "reward tables and report counts, or load the model with more context."}
+    payload = {
+        "model": "local",
+        "messages": [
+            {"role": "system", "content": _RT_PROGRAM_INSTR},
+            {"role": "user", "content": "PROGRAM TEXT:\n" + text},
+        ],
+        "stream": False,
+        "temperature": 0.0,
+        "max_tokens": 2400,
+        "chat_template_kwargs": {"enable_thinking": False, "thinking_budget": 0},
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        try:
+            resp = llama_post("/v1/chat/completions", payload, timeout=_RT_PROGRAM_CALL_TIMEOUT_S)
+        except urllib.error.HTTPError:
+            # Older servers reject response_format; the parser copes without it.
+            payload.pop("response_format", None)
+            resp = llama_post("/v1/chat/completions", payload, timeout=_RT_PROGRAM_CALL_TIMEOUT_S)
+    except Exception as exc:
+        return {"ok": False, "error": f"The model call failed: {type(exc).__name__}: {exc}"}
+    choice = (resp.get("choices") or [{}])[0]
+    reply = (choice.get("message") or {}).get("content", "") or ""
+    raw = _rt_program_json(reply)
+    if not raw:
+        return {"ok": False, "error": "The model's answer wasn't readable. Try again, or fill in the form by hand."}
+    fields = _rt_program_fields(raw, text)
+    fields["ok"] = True
+    return fields
 
 
 # ---- engagement logs the user chose not to keep ----------------------------
@@ -7596,7 +8417,9 @@ def _rt_log_purge(key: str) -> None:
 
 
 def _rt_log_mission_ended(mission: dict | None) -> None:
-    """Purge a finished engagement's logs when the user chose not to keep them."""
+    """Clean up after a finished engagement: always delete its stored test-account
+    sign-ins, and purge its logs when the user chose not to keep them."""
+    _rt_identities_forget(mission)
     if _rt_keeps_log(mission) or not mission.get("authorization_id"):
         return
     threading.Thread(target=_rt_log_purge, args=(str(mission["authorization_id"]),),
@@ -7633,7 +8456,8 @@ def _rt_incl_exploit_for(chat: dict | None, settings: dict | None = None) -> boo
         return True
     m = chat.get("mission") if isinstance(chat, dict) else None
     return bool(isinstance(m, dict)
-                and (m.get("engagement") == "pentest" or m.get("phase") == "exploit"))
+                and (m.get("engagement") in ("pentest", "access_control", "bug_bounty")
+                     or m.get("phase") == "exploit"))
 
 
 # ---- mission playbook --------------------------------------------------------
@@ -7670,6 +8494,41 @@ _RT_PLAYBOOKS: dict[str, list[dict]] = {
          "tools": ("record_finding",)},
         {"do": "Build the report", "tools": ("rt_generate_report",)},
     ],
+    "access_control": [
+        {"do": "List the pages and API endpoints while signed in as account A (pass identity A)",
+         "tools": ("recon_map",)},
+        {"do": "Send each URL that names one of account A's own objects as every account",
+         "tools": ("rt_access_check",)},
+        {"do": "Confirm a candidate: run the same rt_access_check a second time, then "
+               "record_finding with status validated and the receipt ids it gives you",
+         "tools": ("record_finding",)},
+        {"do": "Build the report", "tools": ("rt_generate_report",)},
+    ],
+    "bug_bounty": [
+        {"do": "Identify the in-scope web app, then list its pages, endpoints and parameters",
+         "tools": ("recon_http_fingerprint", "recon_map", "rt_browser")},
+        {"do": "Look for the bug types the program pays for, by hand and at a gentle pace",
+         "tools": ("http_request", "recon_injection_probe", "cors_probe", "scan_js_secrets")},
+        {"do": "Prove each one with the smallest proof the program allows: send it twice, send one "
+               "harmless control request, then record_finding with status validated, those receipt "
+               "ids and a cvss_vector scored on what the proof shows",
+         "tools": ("record_finding",)},
+        {"do": "Build the report: one per bug, even when it appears on several sites",
+         "tools": ("rt_generate_report",)},
+    ],
+}
+# Off-brief for an access-control check: hidden (not refused) in that engagement
+# so a small model stays on the two-account comparison.
+_RT_ACCESS_HIDDEN_TOOLS = {
+    "sql_injection", "batch_probe", "recon_auth_spray", "tcp_send",
+    "sandbox_sqlmap", "recon_injection_probe",
+}
+# Bug bounty programs pay for a proven web bug and forbid pulling data out,
+# guessing passwords and touching the hosting network. These tools exist to
+# do exactly that, so a bug bounty run does not carry them.
+_RT_BOUNTY_HIDDEN_TOOLS = {
+    "sql_injection", "sandbox_sqlmap", "recon_auth_spray", "tcp_send",
+    "recon_port_scan", "sandbox_nmap", "recon_open_services",
 }
 _RT_PLAYBOOK_TOOLS = frozenset(t for steps in _RT_PLAYBOOKS.values() for s in steps for t in s["tools"])
 
@@ -7714,9 +8573,34 @@ def _rt_playbook_lines(mission: dict) -> list[str]:
 # One concrete next move appended to a tool's result, so the model does not
 # have to work out what the output is for. Keyed by tool; `pentest` says
 # whether active testing is part of this engagement.
-def _rt_next_step(name: str, result: dict, pentest: bool) -> str:
+def _rt_next_step(name: str, result: dict, pentest: bool, engagement: str = "") -> str:
     if result.get("error") or result.get("scope_blocked") or result.get("rate_limited"):
         return ""
+    if engagement == "access_control":
+        # The two-account comparison has its own route; the injection-oriented
+        # hints below would send it off-brief.
+        if name == "recon_http_fingerprint":
+            return "Run recon_map on this URL with identity 'A' to list what a signed-in account can reach."
+        if name in ("recon_map", "recon_content_discovery"):
+            return ("Run rt_access_check on each discovered URL that names one of account A's own "
+                    "objects (an id in the path or query). Use real URLs, not {id} templates.")
+        if name != "record_finding":
+            return ""
+    if engagement == "bug_bounty":
+        # The pentest hints push toward fan-out probing and data extraction,
+        # which bug bounty programs forbid; this route stays on minimal proof.
+        if name == "recon_http_fingerprint":
+            return ("List the app's pages, endpoints and parameters: recon_map if automated tools "
+                    "are allowed, otherwise open the main pages with rt_browser or http_request.")
+        if name in ("recon_map", "recon_content_discovery"):
+            return ("Pick the endpoints that take input or name an object, and test them by hand "
+                    "for the bug types the program pays for.")
+        if name in ("recon_injection_probe", "batch_probe", "fuzz", "cors_probe", "scan_js_secrets"):
+            return ("A hit is a candidate only. Reproduce it with http_request using the smallest "
+                    "proof the program rules allow, send it a second time, send one harmless "
+                    "control request, then record_finding with status validated and a cvss_vector.")
+        if name == "record_finding" and not result.get("downgraded"):
+            return "Continue with the next endpoint, or build the report with rt_generate_report when testing is done."
     if name in ("recon_subdomains", "recon_dns", "recon_web_archive"):
         return "Run recon_http_fingerprint on each in-scope host you found."
     if name in ("recon_port_scan", "sandbox_nmap"):
@@ -7770,10 +8654,20 @@ def _rt_mission_render(chat: dict, budget_chars: int | None = None) -> str:
     required_headers = _rt_clean_required_headers(m.get("required_headers"))
     if required_headers:
         head.append("required headers sent on every request: " + ", ".join(sorted(required_headers)))
+    accounts = [label for label in (m.get("identities") or []) if label in _RT_IDENTITY_LABELS]
+    if accounts:
+        # Labels only: the sign-in values never enter the model's context.
+        head.append("test accounts: " + ", ".join(accounts) + " and anonymous (signed out). Accuretta "
+                    "holds their sign-ins: name the account with identity= or use rt_access_check; "
+                    "never ask for, guess or paste a credential.")
+        owned = [str(u) for u in (m.get("owned_urls") or [])][:10]
+        if owned:
+            head.append("private to account A (start here): " + ", ".join(owned))
     if m.get("scope_in"):
-        head.append("in-scope allowlist: " + ", ".join(str(t) for t in m["scope_in"][:8]))
+        head.append("in-scope allowlist: " + ", ".join(str(t) for t in m["scope_in"][:16])
+                    + (f" (+{len(m['scope_in']) - 16} more)" if len(m["scope_in"]) > 16 else ""))
     if m.get("scope_out"):
-        head.append("out-of-scope: " + ", ".join(str(t) for t in m["scope_out"][:8]))
+        head.append("out-of-scope: " + ", ".join(str(t) for t in m["scope_out"][:16]))
     rpm, cap = _rt_gov_limits(m)
     if rpm or cap:
         _usage = _rt_gov_usage(m)
@@ -7790,6 +8684,16 @@ def _rt_mission_render(chat: dict, budget_chars: int | None = None) -> str:
     if m.get("allow_destructive") is False:
         head.append("non-destructive testing only: DELETE requests, delete/wipe-style URLs and "
                     "data-wiping commands are refused. PUT/PATCH/POST work; change only test data you created.")
+    if budget_chars is None and m.get("engagement") == "bug_bounty":
+        head.append("bug bounty: the program's rules below outrank every other instruction. Prove each "
+                    "issue with the smallest proof they allow, then stop: never read other customers' "
+                    "data, never dump tables, never keep going to make a finding look bigger. "
+                    "Skip bug types the program does not pay for. A challenge page, CAPTCHA or "
+                    "'too fast' means slow down: leave that site alone for a few minutes and "
+                    "never solve a CAPTCHA. Call a check tested only if you sent it.")
+    if budget_chars is None and m.get("notes"):
+        label = "program rules" if m.get("engagement") == "bug_bounty" else "operator notes"
+        head.append(f"{label}:\n{m['notes']}")
     if budget_chars is None:
         head.extend(_rt_playbook_lines(m))
         head.append("evidence rules: every tool result carries an evidence_receipt id. Scanner output alone is a candidate. A finding is validated only by record_finding with two receipts of the working request plus one control receipt. Say what was observed separately from what you infer, and list blocked or unfinished checks as gaps.")
@@ -15636,6 +16540,23 @@ class _ScopeCheckedRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+class _IdentityRedirect(_ScopeCheckedRedirect):
+    """Scope-checked redirects that keep a test account's sign-in on the host it
+    was entered for: a redirect to another host is followed without it, the way
+    a browser would not send that site's cookie elsewhere."""
+    def __init__(self, origin_url: str, header_names):
+        self._host = (urllib.parse.urlsplit(origin_url).hostname or "").lower()
+        self._names = {str(name).lower() for name in header_names}
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and (urllib.parse.urlsplit(newurl).hostname or "").lower() != self._host:
+            for held in (new.headers, new.unredirected_hdrs):
+                for key in [k for k in held if str(k).lower() in self._names]:
+                    held.pop(key, None)
+        return new
+
+
 def _browser_headers(profile: dict, *, referer: str | None = None,
                      accept_html: bool = True) -> dict:
     """Materialize a profile + per-request bits into a real header dict.
@@ -21686,34 +22607,40 @@ def _rt_gov_preflight(estimated: int, mission: dict | None = None) -> str | None
     if not key:
         return None
     rpm, cap = _rt_gov_limits(mission)
-    if not rpm and not cap:
+    interval = _rt_gov_interval(mission)
+    if not cap and not interval:
         return None
     estimate = max(1, int(estimated or 1))
     with _RT_GOV_LOCK:
         state = _rt_gov_state(key)
-        window_used, total_used, window_start = (
-            state["window_count"], state["total"], state["window_start"])
+        total_used = state["total"]
     if cap and total_used + estimate > cap:
         return (f"refused: this engagement's total request cap is {cap} and "
                 f"{total_used} requests have already been sent; this call would send "
                 f"about {estimate}. Raise the engagement cap or narrow the call.")
-    if rpm and window_used + estimate > rpm:
-        wait = max(1, 60 - int(time.time() - window_start))
-        return (f"refused: the engagement rate limit is {rpm}/minute and {window_used} "
-                f"requests were sent in the current window; this call would send about "
-                f"{estimate}. Wait about {wait}s or raise the engagement limit.")
+    # Requests are paced, so a batch larger than a minute's allowance is fine;
+    # it just takes longer. Refuse only one that would tie the run up.
+    minutes = estimate * interval * _RT_GOV_JITTER[1] / 60.0
+    if minutes > _RT_GOV_PREFLIGHT_MAX_MIN:
+        return (f"refused: at this engagement's pace ({rpm or round(60 / interval)}/minute) "
+                f"this call's {estimate} requests would take about {int(minutes)} minutes. "
+                f"Narrow it to the most likely candidates.")
     return None
 
 
-def _rt_gov_ledger_append(key: str, host: str, method: str, url: str) -> None:
+def _rt_gov_ledger_append(key: str, host: str, method: str, url: str,
+                          kind: str = "request") -> None:
     try:
         folder = DATA / "redteam"
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / "request_ledger.jsonl"
-        line = json.dumps({
-            "t": int(time.time()), "mission": key, "host": str(host)[:120],
+        row = {
+            "t": round(time.time(), 2), "mission": key, "host": str(host)[:120],
             "method": str(method or "GET")[:12], "url": str(url)[:500],
-        }, ensure_ascii=False)
+        }
+        if kind != "request":
+            row["kind"] = kind
+        line = json.dumps(row, ensure_ascii=False)
         with _RT_GOV_LEDGER_LOCK:
             try:
                 if path.exists() and path.stat().st_size > _RT_GOV_LEDGER_MAX_BYTES:
@@ -21729,32 +22656,113 @@ def _rt_gov_ledger_append(key: str, host: str, method: str, url: str) -> None:
         pass
 
 
-def _rt_gov_admit(host: str, method: str, url: str = "", mission: dict | None = None) -> str | None:
+# Pacing. A per-minute limit alone lets a tool or a page load send the whole
+# minute's allowance in one second, which is exactly what bot protection flags
+# ("that was too fast") and what a program means by hammering. So requests are
+# spaced like a person working by hand: each one takes the next slot, at least
+# 60/rpm seconds after the previous one plus a random extra, and the sending
+# thread waits for its slot. A bug bounty run, or any run with automated tools
+# off, is paced at about one request a second even without a set limit.
+_RT_GOV_JITTER = (1.0, 1.5)        # never faster than the limit, sometimes slower
+_RT_GOV_SOFT_INTERVAL_S = 1.0
+_RT_GOV_MAX_WAIT_S = 120.0         # beyond this a backlog is refused, not queued
+_RT_GOV_PREFLIGHT_MAX_MIN = 10.0   # a single batch may take this long at the pace
+# Files a browser fetches to draw a page. In scope they are what every visitor
+# downloads, so they go in the ledger but do not spend the request budget;
+# counting them is what broke pages before (a font over budget, a page half drawn).
+_RT_BROWSER_ASSET_TYPES = frozenset({"stylesheet", "script", "font", "image", "media", "manifest"})
+
+
+def _rt_gov_interval(mission: dict | None) -> float:
+    """Seconds between paced requests for this engagement (0 = unpaced)."""
+    m = mission or {}
+    rpm, _cap = _rt_gov_limits(m)
+    if rpm:
+        return 60.0 / rpm
+    if m.get("engagement") == "bug_bounty" or m.get("automated_allowed") is False:
+        return _RT_GOV_SOFT_INTERVAL_S
+    return 0.0
+
+
+def _rt_gov_sleep_until(when: float) -> bool:
+    """Sleep until `when`; False if the user pressed Stop meanwhile."""
+    chat_id = _current_chat_id.get()
+    with _chat_cancels_lock:
+        entry = _chat_cancels.get(chat_id) if chat_id else None
+    cancel = entry.get("cancel") if entry else None
+    while True:
+        left = when - time.time()
+        if left <= 0:
+            return True
+        if cancel is not None:
+            if cancel.wait(min(left, 0.5)):
+                return False
+        else:
+            time.sleep(min(left, 0.5))
+
+
+def _rt_gov_wait_turn(mission: dict | None) -> None:
+    """Wait until the next paced slot is free without taking it (the browser
+    waits here before a navigation; the page's own request then takes it)."""
+    key = str((mission or {}).get("authorization_id") or "")
+    if not key or not _rt_gov_interval(mission):
+        return
+    with _RT_GOV_LOCK:
+        when = float(_rt_gov_state(key).get("next_at") or 0.0)
+    if 0 < when - time.time() <= _RT_GOV_MAX_WAIT_S:
+        _rt_gov_sleep_until(when)
+
+
+def _rt_gov_admit(host: str, method: str, url: str = "", mission: dict | None = None,
+                  kind: str = "request", wait: bool = True) -> str | None:
     """Count one outbound request against the engagement budget, ledger it,
-    and return a refusal when the request is over budget."""
+    and return a refusal when the request is over budget.
+
+    wait=True paces the request: the caller sleeps until its slot. The browser's
+    request hook passes wait=False because it cannot stall the page; it takes
+    the slot and is refused only past the per-minute limit. kind="asset" is a
+    page file the browser loads in scope: ledgered, not counted."""
     mission = mission if mission is not None else _rt_authorized_mission(_rt_context_chat())
     key = str((mission or {}).get("authorization_id") or "")
     if not key:
         return None
+    if kind == "asset":
+        _rt_gov_ledger_append(key, host, method, url, kind="asset")
+        return None
     rpm, cap = _rt_gov_limits(mission)
-    if not rpm and not cap:
+    interval = _rt_gov_interval(mission)
+    if not rpm and not cap and not interval:
         # No explicit budget: still ledger every engagement request as the
         # audit trail a program or client may ask for.
         _rt_gov_ledger_append(key, host, method, url)
         return None
+    slot = 0.0
     with _RT_GOV_LOCK:
         state = _rt_gov_state(key)
         if cap and state["total"] >= cap:
             state["blocked"] += 1
             return (f"refused: this engagement's request cap ({cap}) is reached; "
                     f"no further requests will be sent for it.")
-        if rpm and state["window_count"] >= rpm:
-            state["blocked"] += 1
-            wait = max(1, 60 - int(time.time() - state["window_start"]))
-            return (f"refused: the engagement rate limit ({rpm}/minute) is reached for "
-                    f"this window. Retry in about {wait}s or raise the limit.")
+        now = time.time()
+        if interval and wait:
+            slot = max(now, float(state.get("next_at") or 0.0))
+            if slot - now > _RT_GOV_MAX_WAIT_S:
+                state["blocked"] += 1
+                return (f"refused: {int(slot - now)}s of requests are already queued for this "
+                        f"engagement's pace. Send fewer requests at once.")
+            state["next_at"] = slot + interval * random.uniform(*_RT_GOV_JITTER)
+        else:
+            if rpm and state["window_count"] >= rpm:
+                state["blocked"] += 1
+                left = max(1, 60 - int(now - state["window_start"]))
+                return (f"refused: the engagement rate limit ({rpm}/minute) is reached for "
+                        f"this window. Retry in about {left}s or raise the limit.")
+            if interval:
+                state["next_at"] = max(now, float(state.get("next_at") or 0.0)) + interval
         state["window_count"] += 1
         state["total"] += 1
+    if slot and not _rt_gov_sleep_until(slot):
+        return "refused: the run was stopped while this request waited for its turn."
     _rt_gov_ledger_append(key, host, method, url)
     return None
 
@@ -21784,7 +22792,8 @@ def _rt_gov_ledger_count(key: str) -> int:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     try:
-                        if json.loads(line).get("mission") == key:
+                        row = json.loads(line)
+                        if row.get("mission") == key and row.get("kind") != "asset":
                             total += 1
                     except Exception:
                         continue
@@ -22657,6 +23666,11 @@ def tool_recon_map(args: dict) -> dict:
         extra.update({str(k): str(v) for k, v in args["headers"].items() if v is not None})
     if args.get("cookies"):
         extra["Cookie"] = str(args["cookies"])
+    # Access Control engagements: identity A or B crawls signed in as that stored
+    # test account. Any other identity value stays a plain coverage label.
+    access_accounts = _rt_active_identities()
+    if access_accounts and _rt_identity_label(args.get("identity")) in access_accounts:
+        extra.update(access_accounts[_rt_identity_label(args.get("identity"))])
 
     seen_pages, seen_tmpl = set(), set()
     endpoints, forms, js_files = {}, [], []
@@ -22869,6 +23883,13 @@ def tool_recon_map(args: dict) -> dict:
         nxt += (f" GraphQL is live at {graphql_url} ({len(graphql_ops)} operations in "
                 "graphql_operations): test each with http_request (POST a query naming its "
                 "args), and try alias/batching abuse and field-level authz.")
+    if access_accounts:
+        # This engagement compares accounts; it does not run injection sweeps.
+        nxt = ("Run rt_access_check on each endpoint whose path_id is true or that takes an id "
+               "parameter, using its real url (not the {id} template) and owner = the account the "
+               "object belongs to."
+               + ("" if extra else " This crawl was signed out: repeat it with identity 'A' to "
+                  "reach the pages behind sign-in."))
 
     notes = []
     if spec_count:
@@ -23567,6 +24588,36 @@ def tool_http_request(args: dict) -> dict:
     headers: dict = {}
     for k, v in (args.get("headers") or {}).items():
         headers[str(k)] = str(v)
+    # A named test account (Access Control playbook): the bridge attaches the
+    # sign-in the user entered on the engagement form, so the model never handles
+    # the credential. It cannot be mixed with credentials the model supplies,
+    # otherwise the recorded account would not be the one the server saw.
+    account, account_headers = "", {}
+    if args.get("identity") not in (None, ""):
+        chosen = _rt_identity_request(args.get("identity"))
+        if chosen.get("error"):
+            return {"error": chosen["error"], "invalid_arguments": True, "not_executed": True}
+        account, account_headers = chosen["label"], chosen["headers"]
+        reserved = _rt_identity_reserved_headers()
+        clash = sorted(k for k in headers if k.lower() in reserved)
+        if clash or args.get("cookies") or args.get("session"):
+            return {"error": ("identity sends the request as a stored test account, so it cannot be "
+                              "combined with session, cookies or a sign-in header"
+                              + (f" ({', '.join(clash)})" if clash else "")
+                              + ". Remove those, or drop identity to send your own credentials."),
+                    "invalid_arguments": True, "not_executed": True}
+
+    def _sent_fingerprint(sent: dict) -> str:
+        if account_headers:
+            return digest({"account": account,
+                           "sign_in": {k.lower(): v for k, v in account_headers.items()}})
+        return identity_fingerprint(sent)
+
+    def _transcript_headers(sent: dict) -> dict:
+        """Request headers for a saved proof file, without a stored sign-in."""
+        hidden = {k.lower() for k in account_headers}
+        return {k: (f"[account {account} sign-in, held by Accuretta]" if k.lower() in hidden else v)
+                for k, v in sent.items()}
     # Optional cookie jar: when a `session` name is given, we merge previously
     # captured cookies for that session (explicit `cookies` still win) and, on
     # the way back, remember any Set-Cookie the server sends. Opt-in so the
@@ -23593,6 +24644,8 @@ def tool_http_request(args: dict) -> dict:
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     timeout = max(2.0, min(float(args.get("timeout") or 15.0), 30.0))
     identity_label = _http_identity_label(session, headers, cookies)
+    if account:
+        identity_label = account if account == _RT_IDENTITY_ANON else f"account {account}"
 
     def _headers_of(msg) -> tuple[dict, list]:
         """Response headers as a dict, plus the FULL list of Set-Cookie values
@@ -23629,14 +24682,20 @@ def tool_http_request(args: dict) -> dict:
         tried.append(profile)
         req_headers = _browser_headers(profile, accept_html=True)
         req_headers.update(headers)  # caller-supplied headers/cookies win
+        for _name, _value in account_headers.items():
+            for _key in [k for k in req_headers if k.lower() == _name.lower()]:
+                req_headers.pop(_key, None)
+            req_headers[_name] = _value
         req_headers = _rt_apply_mission_user_agent(req_headers)
         _gov = _rt_gov_admit(_rt_url_host(url), method, url=url)
         if _gov:
-            return {"error": _gov, "url": url, "method": method, "rate_limited": True}
+            return {"error": _gov, "url": url, "method": method, "rate_limited": True,
+                    **({"request_identity": account} if account else {})}
         attempt_started = time.monotonic()
         try:
             req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
-            _request_handlers = [_ScopeCheckedRedirect()]
+            _request_handlers = [_IdentityRedirect(url, account_headers) if account_headers
+                                 else _ScopeCheckedRedirect()]
             _ph = _rt_proxy_handler()
             if _ph:
                 _request_handlers.append(_ph)
@@ -23658,9 +24717,11 @@ def tool_http_request(args: dict) -> dict:
                 "elapsed_ms": round((time.monotonic() - attempt_started) * 1000, 1),
                 "attempt": attempt + 1,
                 "potentially_truncated": len(raw) > 1024 * 1024,
-                "request_identity_fingerprint": identity_fingerprint(req_headers),
+                "request_identity_fingerprint": _sent_fingerprint(req_headers),
                 "user_agent": req_headers.get("User-Agent", ""),
             }
+            if account:
+                result["request_identity"] = account
             previous = _http_compare_with_previous(
                 method, url, identity_label, status, resp_headers, resp_body_text, set_cookie)
             if previous:
@@ -23670,7 +24731,7 @@ def tool_http_request(args: dict) -> dict:
             if args.get("save_evidence"):
                 ev = _save_http_request_evidence(
                     args.get("evidence_label") or args.get("save_evidence"),
-                    method, url, req_headers, data, status, resp_headers, resp_body_text)
+                    method, url, _transcript_headers(req_headers), data, status, resp_headers, resp_body_text)
                 if ev:
                     result.update(ev)
             return result
@@ -23701,10 +24762,12 @@ def tool_http_request(args: dict) -> dict:
                 "elapsed_ms": round((time.monotonic() - attempt_started) * 1000, 1),
                 "attempt": attempt + 1,
                 "potentially_truncated": len(error_body) > 1024 * 1024,
-                "request_identity_fingerprint": identity_fingerprint(req_headers),
+                "request_identity_fingerprint": _sent_fingerprint(req_headers),
                 "user_agent": req_headers.get("User-Agent", ""),
                 "note": f"HTTP {e.code}",
             }
+            if account:
+                result["request_identity"] = account
             previous = _http_compare_with_previous(
                 method, url, identity_label, status, resp_headers, body_txt, set_cookie)
             if previous:
@@ -23714,7 +24777,7 @@ def tool_http_request(args: dict) -> dict:
             if args.get("save_evidence"):
                 ev = _save_http_request_evidence(
                     args.get("evidence_label") or args.get("save_evidence"),
-                    method, url, req_headers, data, status, resp_headers, body_txt)
+                    method, url, _transcript_headers(req_headers), data, status, resp_headers, body_txt)
                 if ev:
                     result.update(ev)
             return result
@@ -23724,7 +24787,353 @@ def tool_http_request(args: dict) -> dict:
             last_exc = e
             time.sleep(0.3 + random.random() * 0.4)
             continue
-    return {"error": f"request failed: {last_exc}", "url": url, "method": method}
+    return {"error": f"request failed: {last_exc}", "url": url, "method": method,
+            **({"request_identity": account} if account else {})}
+
+
+_ACCESS_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+# Token overlap at or above this counts as "the same content". Session tokens,
+# timestamps and CSRF fields make byte equality too strict for real pages.
+_ACCESS_SAME = 0.9
+_ACCESS_PREVIEW_CHARS = 500
+
+
+def _access_similarity(first: str, second: str) -> float:
+    """Share of word tokens two response bodies have in common (0.0 to 1.0)."""
+    from collections import Counter
+    if first == second:
+        return 1.0
+    a = Counter(re.findall(r"[A-Za-z0-9_@.\-]{2,}", (first or "")[:200000])[:20000])
+    b = Counter(re.findall(r"[A-Za-z0-9_@.\-]{2,}", (second or "")[:200000])[:20000])
+    size = max(sum(a.values()), sum(b.values()))
+    if not size:
+        return 0.0
+    return round(sum((a & b).values()) / size, 3)
+
+
+def _access_segments(body: str) -> list[str]:
+    """Quotable pieces of a response: JSON leaf values, or text between tags."""
+    text = (body or "")[:200000]
+    found: list[str] = []
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        stack = [parsed]
+        while stack and len(found) < 600:
+            item = stack.pop()
+            if isinstance(item, dict):
+                stack.extend(item.values())
+            elif isinstance(item, list):
+                stack.extend(item)
+            elif isinstance(item, str):
+                if 4 <= len(item.strip()) <= 200:
+                    found.append(item.strip())
+            elif isinstance(item, (int, float)) and not isinstance(item, bool) and len(str(item)) >= 4:
+                found.append(str(item))
+    else:
+        for chunk in re.split(r"<[^>]*>|[\r\n]+", text):
+            chunk = chunk.strip()
+            if 6 <= len(chunk) <= 200:
+                found.append(chunk)
+                if len(found) >= 600:
+                    break
+    return list(dict.fromkeys(found))
+
+
+def _access_proof_candidates(owner_body: str, other_body: str, anonymous_body: str,
+                             limit: int = 5) -> list[str]:
+    """Exact strings from the owner's response that the other account also
+    received and a signed-out request did not: ready to quote as proof."""
+    shared = [seg for seg in _access_segments(owner_body)
+              if seg in other_body and seg not in (anonymous_body or "")]
+    # Prefer values that look like personal data (an address, a number) and
+    # then the longer ones: a nav label proves less than an email address.
+    shared.sort(key=lambda seg: (("@" in seg) + bool(re.search(r"\d{3,}", seg)), len(seg)), reverse=True)
+    return shared[:limit]
+
+
+def _access_final_path(result: dict, fallback: str) -> str:
+    try:
+        return urllib.parse.urlsplit(str(result.get("final_url") or fallback)).path or "/"
+    except ValueError:
+        return "/"
+
+
+def _access_verdict(result: dict, owner: dict | None, url: str) -> tuple[str, float | None]:
+    """How one account's response compares with the owner's.
+
+    denied / not_found / rejected / redirected: the account did not get the
+    owner's content. same_as_owner: it did. different_content: a successful
+    response that is not the owner's. same_status_only: both succeeded with an
+    empty body, so only the status could be compared."""
+    status = result.get("status")
+    if not isinstance(status, int):
+        return "no_response", None
+    if status == 429 or status >= 500:
+        return "inconclusive", None
+    if response_state(result) == "authentication_unavailable":
+        return "denied", None
+    if status in (404, 410):
+        return "not_found", None
+    if 300 <= status < 400:
+        return "redirected", None
+    if status >= 400:
+        return "rejected", None
+    if not owner or not isinstance(owner.get("status"), int):
+        return "responded", None
+    if _access_final_path(result, url) != _access_final_path(owner, url):
+        return "redirected", None
+    body = result.get("body") if isinstance(result.get("body"), str) else ""
+    owner_body = owner.get("body") if isinstance(owner.get("body"), str) else ""
+    similarity = _access_similarity(owner_body, body)
+    if status == owner["status"] and not body.strip() and not owner_body.strip():
+        return "same_status_only", None
+    if status == owner["status"] and similarity >= _ACCESS_SAME:
+        return "same_as_owner", similarity
+    return "different_content", similarity
+
+
+def _access_owner_ok(result: dict) -> bool:
+    """The owner got a real, successful response: the baseline everything else
+    is compared with. A 404 or an error page is a response, but not a baseline."""
+    status = result.get("status")
+    return (isinstance(status, int) and 200 <= status < 300
+            and response_state(result) == "observed")
+
+
+def _access_row(label: str, result: dict, url: str, receipt_id: str) -> dict:
+    row: dict = {"account": label}
+    if not isinstance(result.get("status"), int):
+        row["error"] = str(result.get("error") or "no response")[:240]
+        return row
+    body = result.get("body") if isinstance(result.get("body"), str) else ""
+    row.update({"status": result["status"], "body_characters": len(body), "body_sha256": digest(body)})
+    final_url = str(result.get("final_url") or "")
+    if final_url and final_url != str(result.get("url") or url):
+        row["final_url"] = final_url[:400]
+    preview = _http_body_preview(body, str(result.get("content_type") or ""))
+    for key in ("text", "preview", "markup_start"):
+        if isinstance(preview.get(key), str):
+            preview[key] = preview[key][:_ACCESS_PREVIEW_CHARS]
+    preview.pop("omitted_characters", None)
+    row["preview"] = preview
+    if result.get("potentially_truncated"):
+        row["truncated_at_capture"] = True
+    if receipt_id:
+        row["evidence_id"] = receipt_id
+    return row
+
+
+def tool_rt_access_check(args: dict) -> dict:
+    """AUTHORIZED PENTEST. Send one request as each stored test account and once
+    signed out, then compare who received the owner's content: the two-account
+    replay behind an IDOR / broken-access-control check.
+
+    The accounts come from the Access Control questionnaire; the bridge attaches
+    their sign-ins, so the model names accounts and never handles a credential.
+    Every response is stored as its own evidence receipt, so a repeated check
+    yields the two supporting receipts and the control that record_finding
+    needs. The outcome is a comparison, never a confirmed finding."""
+    if not get_settings().get("red_team_enabled"):
+        return {"error": "red team tools are disabled. Enable them in Settings."}
+    identities = _rt_active_identities()
+    if not identities:
+        return {"error": _rt_identities_missing_reason(), "not_executed": True}
+    url = str(args.get("url") or args.get("target") or "").strip()
+    if not url:
+        return {"error": "url required"}
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    headers = args.get("headers") or {}
+    if not isinstance(headers, dict):
+        return {"error": "headers must be a name->value map.", "invalid_arguments": True, "not_executed": True}
+    headers = {str(k): str(v) for k, v in headers.items()}
+    reserved = _rt_identity_reserved_headers()
+    clash = sorted(k for k in headers if k.lower() in reserved)
+    if clash or args.get("cookies") or args.get("session") or args.get("identity"):
+        return {"error": ("rt_access_check attaches each account's sign-in itself. Remove identity, "
+                          "session, cookies and any sign-in header"
+                          + (f" ({', '.join(clash)})" if clash else "") + "."),
+                "invalid_arguments": True, "not_executed": True}
+    body = args.get("body")
+    method = str(args.get("method") or ("POST" if body else "GET")).upper()
+    safe = method in _ACCESS_SAFE_METHODS
+    owner = _rt_identity_label(args.get("owner") or _RT_IDENTITY_LABELS[0])
+    if owner not in identities:
+        return {"error": f"owner must be one of: {', '.join(identities)}. It names the account the "
+                         "page or object belongs to.",
+                "invalid_arguments": True, "not_executed": True}
+    others = [label for label in _RT_IDENTITY_LABELS if label in identities and label != owner]
+    if not safe and args.get("confirm_state_change") is not True:
+        return {"error": (f"{method} can change data on the target, and this check sends it once per "
+                          f"account ({len(others) + 2} requests). Use it only on test data you created, "
+                          "then repeat the call with confirm_state_change=true. GET needs no confirmation."),
+                "state_change_unconfirmed": True, "not_executed": True}
+    # Reads go owner first: when the owner cannot read the URL the comparison is
+    # meaningless, so the remaining requests are not spent. Writes go least
+    # privileged first, so the owner's own legitimate write cannot mask the result.
+    order = [owner, *others, _RT_IDENTITY_ANON] if safe else [_RT_IDENTITY_ANON, *others, owner]
+
+    call_id = _current_tool_call_id.get() or uuid.uuid4().hex
+    try:
+        store, cid, mission_id = _evidence_context()
+    except ValueError:
+        store, cid, mission_id = None, "", ""
+    raw: dict[str, dict] = {}
+    receipts: dict[str, str] = {}
+    stopped = ""
+    for label in order:
+        request = {"url": url, "method": method, "identity": label}
+        if headers:
+            request["headers"] = dict(headers)
+        if body not in (None, ""):
+            request["body"] = body
+        result = tool_http_request(request)
+        raw[label] = result
+        if store is not None and isinstance(result.get("status"), int):
+            try:
+                receipts[label] = store.record(cid, mission_id, f"{call_id}:{label}",
+                                               "rt_access_check", request, dict(result))["id"]
+            except (ValueError, OSError, KeyError):
+                pass
+        if result.get("rate_limited"):
+            stopped = "budget"
+            break
+        if safe and label == owner and not _access_owner_ok(result):
+            stopped = "owner"
+            break
+
+    owner_result = raw.get(owner) or {}
+    owner_ok = _access_owner_ok(owner_result)
+    anonymous_result = raw.get(_RT_IDENTITY_ANON) or {}
+    anonymous_body = anonymous_result.get("body") if isinstance(anonymous_result.get("body"), str) else ""
+
+    def like_signed_out(result: dict) -> bool:
+        """Whether a response is indistinguishable from the signed-out one."""
+        if not isinstance(result.get("status"), int) or not isinstance(anonymous_result.get("status"), int):
+            return False
+        if result["status"] != anonymous_result["status"]:
+            return False
+        if _access_final_path(result, url) != _access_final_path(anonymous_result, url):
+            return False
+        text = result.get("body") if isinstance(result.get("body"), str) else ""
+        return _access_similarity(text, anonymous_body) >= _ACCESS_SAME
+
+    # An account the target answers differently from a signed-out visitor has a
+    # working sign-in. Remembered briefly, so a later refusal that looks exactly
+    # like the signed-out one can be read as "refused", not "sign-in expired".
+    for label in identities:
+        if isinstance((raw.get(label) or {}).get("status"), int) and isinstance(anonymous_result.get("status"), int):
+            if not like_signed_out(raw[label]):
+                _rt_identity_mark_seen(label)
+
+    rows, verdicts = [], {}
+    for label in order:
+        if label not in raw:
+            rows.append({"account": label, "not_sent": True})
+            continue
+        row = _access_row(label, raw[label], url, receipts.get(label, ""))
+        if label == owner:
+            row["role"] = "owner"
+            row["verdict"] = "baseline" if owner_ok else "owner_failed"
+        else:
+            verdict, similarity = _access_verdict(raw[label], owner_result if owner_ok else None, url)
+            verdicts[label] = verdict
+            row["verdict"] = verdict
+            if similarity is not None:
+                row["similarity_to_owner"] = similarity
+        rows.append(row)
+
+    try:
+        names_object = bool(_map_path_id(url) or urllib.parse.urlsplit(url).query or body)
+    except ValueError:
+        names_object = bool(body)
+    leaking = [label for label in others if verdicts.get(label) in ("same_as_owner", "same_status_only")]
+    open_to_all = verdicts.get(_RT_IDENTITY_ANON) in ("same_as_owner", "same_status_only")
+    refused = ("denied", "not_found", "rejected", "redirected")
+    unverified = [label for label in others
+                  if verdicts.get(label) in refused and like_signed_out(raw[label])
+                  and not _rt_identity_seen(label)]
+    proof: list[str] = []
+    out: dict = {"ok": True, "url": url, "method": method, "owner": owner}
+
+    if not owner_ok:
+        outcome = "owner_could_not_read"
+        summary = (f"Account {owner} did not get a normal response from this URL, so there is nothing "
+                   "to compare. No conclusion about access control.")
+        step = (f"Check the URL, or pass owner='{others[0]}' if it belongs to the other account. If "
+                f"account {owner} is refused everywhere, its sign-in has expired: tell the user."
+                if others else "Check the URL. If the account is refused everywhere, its sign-in has expired: tell the user.")
+    elif stopped == "budget" or any(v in ("no_response", "inconclusive") for v in verdicts.values()) \
+            or len(verdicts) < len(others) + 1:
+        outcome = "inconclusive"
+        summary = ("Not every account's request got a usable response (request budget, server error or "
+                   "network failure), so the comparison is incomplete.")
+        step = "Repeat the check later. Do not record a finding from this result."
+    elif open_to_all:
+        outcome = "open_without_sign_in"
+        summary = ("A signed-out request received the same content as the owner. This URL is not "
+                   "protected by sign-in at all, so it is not an account-to-account leak.")
+        step = ("Report it only if this content is meant to be private: record_finding with status "
+                "candidate, then continue with the next URL.")
+    elif leaking:
+        outcome = "candidate" if names_object else "candidate_if_restricted"
+        label = leaking[0]
+        proof = _access_proof_candidates(
+            owner_result.get("body") if isinstance(owner_result.get("body"), str) else "",
+            raw[label].get("body") if isinstance(raw[label].get("body"), str) else "",
+            anonymous_body)
+        if names_object:
+            summary = (f"Account {label} received the same content as owner {owner}, and a signed-out "
+                       "request did not. That is a candidate, not a confirmed finding.")
+        else:
+            summary = (f"Account {label} received the same content as owner {owner}, and a signed-out "
+                       "request did not. The URL names no specific object, so this may simply be a page "
+                       "every signed-in account shares. It is a candidate only if account "
+                       f"{label} should not have this page at all (for example an admin-only page).")
+        step = ("To confirm: call rt_access_check again with the same arguments, then record_finding "
+                f"with status validated, evidence_ids = the account {label} evidence_id from each of "
+                "the two runs, control_id = the anonymous evidence_id, and proof = one proof_candidates "
+                "string copied exactly."
+                + ("" if proof else " No quotable string was found automatically: read the responses "
+                   "with security_coverage(evidence_id=...) and pick text that is private to the owner."))
+        out["confirm_with"] = {"evidence_id": receipts.get(label, ""),
+                               "control_id": receipts.get(_RT_IDENTITY_ANON, "")}
+    elif any(verdicts.get(label) == "different_content" for label in others):
+        outcome = "inspect"
+        label = next(label for label in others if verdicts.get(label) == "different_content")
+        summary = (f"Account {label} got a successful response whose content differs from owner "
+                   f"{owner}'s. That is normal when each account sees its own data, and a leak only "
+                   f"if account {label}'s response contains account {owner}'s private data.")
+        step = ("Compare the two previews. If unsure, read both full responses with "
+                "security_coverage(evidence_id=...). Otherwise move to the next URL.")
+    elif unverified:
+        outcome = "sign_in_unverified"
+        label = unverified[0]
+        summary = (f"Account {label} was refused, but its response is identical to the signed-out one "
+                   f"and account {label}'s sign-in has not been seen working yet. This cannot tell "
+                   "'correctly refused' from 'sign-in expired or wrong'.")
+        step = (f"Run rt_access_check with owner='{label}' on a page account {label} can normally open "
+                "(its own profile, dashboard or 'me' endpoint), then repeat this check. If account "
+                f"{label} is refused there too, tell the user its sign-in is not working.")
+    else:
+        outcome = "enforced"
+        summary = (f"Only owner {owner} received this content; the other account and the signed-out "
+                   "request were refused. The boundary held for this URL.")
+        step = "No finding here. Continue with the next URL."
+
+    out.update({"outcome": outcome, "summary": summary, "responses": rows})
+    if proof:
+        out["proof_candidates"] = proof
+    out["signed_in_seen"] = {label: _rt_identity_seen(label) for label in identities}
+    out["requests_sent"] = len(raw)
+    out["next_step"] = step
+    out["note"] = ("Accounts are the sign-ins entered on the engagement form; a label is not proof of "
+                   "which user the server saw. Previews are shortened: every full response is stored "
+                   "under its evidence_id.")
+    return out
 
 
 def tool_encode_decode(args: dict) -> dict:
@@ -26822,11 +28231,28 @@ TOOLS: dict[str, dict] = {
                 "cookies": {"type": "object", "description": "Cookies as a name->value map (folded into Cookie)."},
                 "body": {"type": "string", "description": "Raw request body (form-encoded 'a=1&b=2' or JSON)."},
                 "session": {"type": "string", "description": "Session name: reuse captured cookies and remember new Set-Cookies (multi-step auth)."},
+                "identity": {"type": "string", "description": "Access Control engagements only: send as a stored test account, A, B or anonymous. Accuretta attaches the sign-in. Do not combine with session, cookies or a sign-in header."},
                 "save_evidence": {"type": "string", "description": "Label: persist this request+response to recon_evidence/ (returns path + sha256) as proof."},
             },
             "required": ["url"],
         },
         "fn": tool_http_request,
+    },
+    "rt_access_check": {
+        "description": "AUTHORIZED PENTEST. Access-control (IDOR) check: sends ONE request as each stored test account and once signed out, then compares who received the owner's content. Returns an outcome (enforced, candidate, candidate_if_restricted, open_without_sign_in, inspect, sign_in_unverified, owner_could_not_read, inconclusive), a per-account row with status, similarity and an evidence_id, and the next step. Accuretta attaches the sign-ins: never pass credentials. A candidate is not a finding until the same check is repeated and recorded.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "A real URL that belongs to one account, e.g. https://host/api/orders/1042. Not a {id} template."},
+                "owner": {"type": "string", "enum": ["A", "B"], "description": "The account this page or object belongs to. Default A."},
+                "method": {"type": "string", "description": "Default GET. Any other method needs confirm_state_change."},
+                "headers": {"type": "object", "description": "Extra non-sign-in headers as a name->value map (e.g. Accept)."},
+                "body": {"type": "string", "description": "Raw request body for a non-GET method."},
+                "confirm_state_change": {"type": "boolean", "description": "Required for non-GET methods: the request is sent once per account and may change data. Only on test data you created."},
+            },
+            "required": ["url"],
+        },
+        "fn": tool_rt_access_check,
     },
     "rt_browser": {
         "description": "AUTHORIZED PENTEST. Persistent scope-enforced Chromium for JavaScript-heavy in-scope testing and reproduction. Every HTTP, WebSocket, iframe, popup, redirect, and subresource request is checked against the engagement allowlist before it leaves the browser. Use navigate, snapshot, click, fill, press, wait, requests, pages, select_page, screenshot, or close. Downloads and arbitrary JavaScript evaluation are intentionally unavailable.",
@@ -27068,7 +28494,7 @@ TOOLS: dict[str, dict] = {
                 "render_pages": {"type": "integer", "description": "How many pages to render when render=true (default 4, max 12)."},
                 "session": {"type": "string", "description": "rt_browser session name to reuse for rendering (default 'recon_map'); point it at a session where you already logged in for an authenticated map."},
                 "seed_coverage": {"type": "boolean", "description": "Record each discovered endpoint as an 'untested' row in security_coverage so the report shows the whole surface vs. what was tested."},
-                "identity": {"type": "string", "description": "Label for seeded coverage rows (e.g. 'admin', 'user A'). Default inferred from whether auth was supplied."},
+                "identity": {"type": "string", "description": "Label for seeded coverage rows (e.g. 'admin'). Default inferred from whether auth was supplied. In an Access Control engagement, A or B also crawls signed in as that stored test account."},
                 "timeout": {"type": "number", "description": "Per-request timeout in seconds (default 6)."}
             },
             "required": ["url"],
@@ -28600,6 +30026,7 @@ _ANALYSIS_TOOL_NAMES = {
 _TOOL_RESULT_CAPS = {
     "security_coverage": 24000,
     "compare_evidence": 16000,
+    "rt_access_check": 12000,
     "review_finding": 12000,
     "record_finding": 12000,
     # read_file pages its own 20KB chunks with an offset hint. This cap must sit
@@ -28964,6 +30391,9 @@ _RT_EXPLOIT_TOOL_NAMES = {
     # flag suspicion.
     "http_request",
     "rt_browser",
+    # Two-account replay (IDOR / broken access control). Shown only when the
+    # engagement was started with test accounts (see _excluded_tools).
+    "rt_access_check",
     # JWT decode/forge/crack — modern auth attacks (alg:none, weak-secret).
     "jwt_tool",
     # sqlmap-lite and param fuzzer/enumerator.
@@ -30010,6 +31440,14 @@ def _excluded_tools(include_exploit: bool = True, chat_id: str = "") -> set[str]
         _mission = _rt_mission_get(chat) if isinstance(chat, dict) else None
         if _mission and _mission.get("automated_allowed") is False:
             excluded |= _RT_AUTOMATED_TOOL_NAMES
+        # The account comparison only works with stored test accounts, and an
+        # access-control run does not carry the injection and spray tools.
+        if not (_mission and _mission.get("identities")):
+            excluded.add("rt_access_check")
+        if _mission and _mission.get("engagement") == "access_control":
+            excluded |= _RT_ACCESS_HIDDEN_TOOLS
+        if _mission and _mission.get("engagement") == "bug_bounty":
+            excluded |= _RT_BOUNTY_HIDDEN_TOOLS
     if not s.get("analysis_tools_enabled"):
         excluded |= _ANALYSIS_SUITE_TOOL_NAMES
     if (not s.get("remote_access_enabled", True)
@@ -31307,7 +32745,8 @@ def invoke_tool(name: str, args: dict) -> dict:
             _hint_chat = _rt_context_chat()
             _hint_mission = _rt_authorized_mission(_hint_chat)
             if _hint_mission:
-                _hint = _rt_next_step(canon, result, _rt_incl_exploit_for(_hint_chat))
+                _hint = _rt_next_step(canon, result, _rt_incl_exploit_for(_hint_chat),
+                                      str(_hint_mission.get("engagement") or ""))
                 # Never point at a tool this engagement has switched off.
                 if _hint and not (_hint_mission.get("automated_allowed") is False
                                   and any(t in _hint for t in _RT_AUTOMATED_TOOL_NAMES)):
@@ -39432,6 +40871,13 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/chat/note":
             result = _chat_note(str(body.get("chat_id") or ""), str(body.get("text") or ""))
             return self._send_json(200 if result.get("ok") else 400, result)
+        if p == "/api/redteam/read-program":
+            # Bug Bounty questionnaire: read a pasted program into form values.
+            # Nothing is authorized here; the user reviews the form and runs it.
+            if not get_settings().get("red_team_enabled"):
+                return self._send_json(403, {"ok": False, "error": "Enable Red team tools in Settings first."})
+            result = _rt_read_program(str(body.get("text") or ""))
+            return self._send_json(200 if result.get("ok") else 400, result)
         if p == "/api/chat/goal":
             # Toggle the /goal hands-free latch for a chat without a turn. The
             # composer calls this for a bare "/goal" / "/goal off" and for the
@@ -39601,17 +41047,11 @@ class Handler(BaseHTTPRequestHandler):
             vram = float(body.get("vram_gb") or 0)
             min_ctx = int(body.get("min_ctx") or 0)
             detected = None
-            if vram <= 0:
+            if vram <= 0 and not float(get_settings().get("vram_tier_gb") or 0):
                 detected = detect_vram_gb()
-                vram = float(detected.get("free_total_gb") or detected.get("gb") or 0)
-                try:
-                    _ram_mb, _vram_mb = _running_instance_mem_mb()
-                    if _vram_mb > 0:
-                        # A save+reload follows the suggest — that swap frees
-                        # the running instance's VRAM before the new load.
-                        vram += _vram_mb / 1024.0
-                except Exception:
-                    pass
+            # Same budget as every other tuner entry point (a save+reload follows
+            # the suggest, so the running instance's VRAM counts as free).
+            vram = _tune_budget_gb(vram)
             profile = inspect_model(mp)
             suggested = auto_tune(mp, vram, profile=profile, min_ctx=min_ctx,
                                   proven_cfg=_proven_cfg(mp))
@@ -39738,12 +41178,11 @@ class Handler(BaseHTTPRequestHandler):
             tune_applied = False
             tune_notes: list = []
             try:
-                vram = float(get_settings().get("vram_tier_gb") or 0)
-                if vram <= 0:
-                    vram = _free_vram_gb_for_tune()
+                vram = _tune_budget_gb()
                 if vram > 0:
                     profile = inspect_model(want)
-                    suggested = auto_tune(want, vram, profile=profile)
+                    suggested = auto_tune(want, vram, profile=profile,
+                                          proven_cfg=_proven_cfg(want))
                     if suggested.get("num_ctx"):
                         suggested["spec_strategy_source"] = "auto"
                         s2 = get_settings()
@@ -40432,6 +41871,11 @@ class Handler(BaseHTTPRequestHandler):
                     or not str(mission_panel.get("target") or "").strip()):
                 return self._send_json(400, {
                     "error": "red-team mission requires an explicit authorization confirmation and target"
+                })
+            if (str(mission_panel.get("engagement") or "").strip().lower() == "access_control"
+                    and not _rt_identities_usable(mission_panel.get("identities"))):
+                return self._send_json(400, {
+                    "error": "The Access Control playbook needs a sign-in for two different test accounts."
                 })
 
         # Two paths for incoming images:
@@ -42132,6 +43576,17 @@ def _free_vram_gb_for_tune() -> float:
     return round(gb, 2)
 
 
+def _mmproj_on_cpu(caps: dict) -> bool:
+    """Run the vision projector on the CPU whenever the build can.
+
+    It only runs when an image arrives. Measured on a 4090 with Qwen3.8-27B
+    (F16 mmproj, ~900-token screenshots): CPU frees ~1.1 GB of VRAM (~30k more
+    context) for ~7 s more per image; text decode speed is unchanged. The spawn
+    and the tuner both ask here, so the VRAM the tuner reserves always matches
+    where the projector actually runs."""
+    return bool((caps or {}).get("no_mmproj_offload"))
+
+
 def _resolve_mmproj_for_tune(model_path: str, s: dict) -> str:
     """The mmproj (if any) a load of `model_path` would boot with, so
     auto_tune can reserve its VRAM. Mirrors the spawn path exactly."""
@@ -42344,6 +43799,36 @@ def _gpu_bandwidth_gbps(name: str, total_gb: float) -> tuple[float, str]:
     gb = float(total_gb or 0)
     guess = 900.0 if gb >= 23 else 600.0 if gb >= 15 else 450.0 if gb >= 11 else 300.0 if gb >= 7 else 200.0
     return guess, f"unknown GPU, {gb:.0f} GB class (est.)"
+
+
+def _tune_budget_gb(explicit_gb: float = 0.0) -> float:
+    """The VRAM budget every tuner entry point uses: a tier the caller passed,
+    else the saved tier, else live free VRAM plus what the running instance
+    holds (a reload frees it)."""
+    try:
+        if float(explicit_gb or 0) > 0:
+            return float(explicit_gb)
+        tier = float(get_settings().get("vram_tier_gb") or 0)
+    except (TypeError, ValueError):
+        tier = 0.0
+    return tier if tier > 0 else _free_vram_gb_for_tune()
+
+
+def _tune_card_gb(vram_gb: float) -> float:
+    """Size of the GPU(s) being tuned for: the VRAM tier when the user set one
+    (it caps the card), else the detected physical total, else `vram_gb`."""
+    try:
+        tier = float(get_settings().get("vram_tier_gb") or 0)
+    except (TypeError, ValueError):
+        tier = 0.0
+    if tier > 0:
+        return tier
+    try:
+        totals = [float(g.get("total_gb") or 0) for g in (detect_vram_gb().get("gpus") or [])]
+    except Exception:
+        totals = []
+    total = round(sum(totals), 1)
+    return total if total > 0 else float(vram_gb or 0)
 
 
 def _tune_gpus(vram_gb: float) -> list[dict]:
@@ -42574,6 +44059,11 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     n_layer = profile.get("block_count", 0) or 0
     src = profile.get("metadata_source", "filename")
     vram = max(float(vram_gb or 0), 0)
+    # Card-size decisions (batch, f16 KV, the small-GPU q4 escape) follow the
+    # card's size, never how much of it is free right now: callers pass either
+    # the VRAM tier or live free VRAM (22.8 GB on a 24 GB card), and one machine
+    # must get one answer. `vram` stays the memory budget.
+    card = _tune_card_gb(vram)
 
     # Default flags everyone gets
     out = {
@@ -42634,12 +44124,15 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     # not spend, or tuned loads with vision on can OOM at boot.
     mmproj_mb = 0.0
     _mp_name = ""
+    _mp_cpu = False
     try:
         _mp = _resolve_mmproj_for_tune(model_path, _s_tune)
         if _mp:
             _mp_name = os.path.basename(_mp)
-            mmproj_mb = os.path.getsize(_mp) / (1024 * 1024)
-            budget_mb = max(budget_mb - mmproj_mb, 256.0)
+            _mp_cpu = _mmproj_on_cpu(llama_caps(find_llama_bin() or ""))
+            if not _mp_cpu:
+                mmproj_mb = os.path.getsize(_mp) / (1024 * 1024)
+                budget_mb = max(budget_mb - mmproj_mb, 256.0)
     except Exception:
         mmproj_mb = 0.0
     # Speculative intent — decided BEFORE the draft reserve so an auto-tuned
@@ -42705,6 +44198,9 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
             f"vision projector: {mmproj_mb:.0f} MB reserved "
             f"({_mp_name} loads alongside the model — disable mmproj to reclaim it)."
         )
+    elif _mp_cpu:
+        notes.append(f"vision projector: {_mp_name} runs on the CPU, so it takes no VRAM "
+                     f"(images take a few seconds longer to read; text speed is unchanged).")
     if draft_mb:
         notes.append(
             f"speculative draft: {draft_mb:.0f} MB reserved "
@@ -42717,7 +44213,7 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     if kv_pref != "auto":
         out["kv_cache_type"] = kv_pref
         notes.append(f"KV cache: K {kv_pref} (your choice in Auto-tune).")
-    elif vram >= 24 and size_gb < vram * 0.4:
+    elif card >= 24 and size_gb < card * 0.4:
         out["kv_cache_type"] = "f16"
         notes.append("KV cache: f16 (you have headroom).")
     else:
@@ -42837,7 +44333,7 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     mtp_compute_per_512 = 0.0    # MTP draft compute, per 512 tokens of ubatch
     # The ubatch the batch heuristics below will settle on (full GPU: 1024
     # from 24 GB up, else 512) — the exact fit re-prices with the real one.
-    _ub_assumed = 1024 if vram >= 24 else 512
+    _ub_assumed = 1024 if card >= 24 else 512
     if has_mtp and nextn and n_layer and size_mb > 0:
         mtp_fixed_mb = nextn * (size_mb / n_layer) + (3 * 150.0 if hy["hybrid"] else 0.0)
         mtp_compute_per_512 = 2 * 200.0
@@ -43281,7 +44777,7 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     #   q4_0/q4_0  never measured to completion (slow path)
     # So q8_0/q8_0 is both the accuracy pick and the fast pick.
     if (kv_pref == "auto" and not kv_v_pref and out["kv_cache_type"] != "f16"
-            and vram <= 12.0 and chosen_ctx < 32768):
+            and card <= 12.0 and chosen_ctx < 32768):
         # Escape hatch: q4_0 only on small GPUs (≤12 GB VRAM) with starved
         # context — below 16k we accept a 1.5× gain, between 16k and 32k we
         # demand 2×. Above 32k the conversation already has room to work, and
@@ -43412,9 +44908,9 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
     if cpu_offload:
         out["num_batch"] = 2048
         notes.append("batch: 2048 (offloading).")
-    elif vram >= 24:
+    elif card >= 24:
         out["num_batch"] = 2048
-    elif vram >= 16:
+    elif card >= 16:
         out["num_batch"] = 1024
 
     # Sanity: batch must never exceed ctx (llama.cpp rejects n_batch > n_ctx).
@@ -43644,6 +45140,16 @@ def auto_tune(model_path: str, vram_gb: float, profile: dict = None, min_ctx: in
 
     out["moe_cache_mib"] = int(cache_mb)
 
+    # -- Measured ceiling (dense) --
+    # A context the load-time speed check measured slow on this machine (part
+    # of the model ran from system RAM) outranks every estimate above.
+    if not is_moe:
+        _fit_cap = _fit_ceiling_for(model_path, _s_tune)
+        if _fit_cap and int(out["num_ctx"]) > _fit_cap:
+            notes.append(f"measured ceiling: larger contexts ran slower right after loading on this "
+                         f"machine, so context is held at {_fit_cap:,}.")
+            out["num_ctx"] = _fit_cap
+
     # -- Speed verdict --
     # Judged at the user's usual chat size: past the offload the solver already
     # traded against context (MoE), the window size itself costs no decode
@@ -43715,7 +45221,7 @@ def llama_caps(bin_path: str = "") -> dict:
             "checkpoint_every_n": False,
             # Newer flags: fail-closed until seen in --help (an unknown flag
             # hard-exits the server at boot).
-            "moe_cache": False, "fit_target": False}
+            "moe_cache": False, "fit_target": False, "no_mmproj_offload": False}
     if not bin_path:
         return caps
     try:
@@ -43760,6 +45266,7 @@ def llama_caps(bin_path: str = "") -> dict:
             # newer builds take --load-mode, older ones --no-mmap.
             caps["load_mode"] = "--load-mode" in help_txt
             caps["no_mmap"] = "--no-mmap" in help_txt
+            caps["no_mmproj_offload"] = "--no-mmproj-offload" in help_txt
     except Exception:
         pass
     _LLAMA_CAPS_CACHE[key] = caps
@@ -45242,9 +46749,7 @@ def _auto_tune_for_load(model_path: str) -> bool:
             return True
         if not get_settings().get("auto_tune_on_load", True):
             return False
-        vram = float(get_settings().get("vram_tier_gb") or 0)
-        if vram <= 0:
-            vram = _free_vram_gb_for_tune()  # FREE VRAM + what the running instance holds
+        vram = _tune_budget_gb()
         if vram <= 0:
             return False
         profile = inspect_model(model_path)
@@ -45254,7 +46759,8 @@ def _auto_tune_for_load(model_path: str) -> bool:
         # still holds the previous model's window, which is no floor for this one.
         _min_ctx_saved = (int(get_settings().get("num_ctx") or 0)
                           if _llama.loaded_model() == model_path else 0)
-        suggested = auto_tune(model_path, vram, profile=profile, min_ctx=_min_ctx_saved)
+        suggested = auto_tune(model_path, vram, profile=profile, min_ctx=_min_ctx_saved,
+                              proven_cfg=_proven_cfg(model_path))
         if not suggested.get("num_ctx"):
             return False
         suggested["spec_strategy_source"] = "auto"
@@ -45875,6 +47381,8 @@ class LlamaProcess:
             # Loads the vision tower + projector. After this, /v1/chat/completions
             # accepts {type:"image_url", image_url:{url:"data:..."}} content blocks.
             cmd += ["--mmproj", mmproj_path]
+            if _mmproj_on_cpu(caps):
+                cmd += ["--no-mmproj-offload"]
             if "moondream" in Path(model_path).stem.lower():
                 # Moondream 2 has no built-in jinja template that works with llama.cpp's
                 # multimodal message extraction; without one it emits a stop token at once or
@@ -46116,6 +47624,18 @@ class LlamaProcess:
                 except Exception:
                     _live_ctx = None
                 _stamp_proven_boot(model_path, int(_live_ctx or ctx))
+                # Load-time speed sample for the setup advisor (dense, fully on
+                # the GPU): what tells a context that fits from one that spilled.
+                try:
+                    if (s.get("passive_model_telemetry", True) and ngl == -1 and n_cpu_moe == 0
+                            and _model_is_dense(model_path)):
+                        _tok_s = _measure_load_speed(base_url)
+                        _record_load_sample(model_path, int(_live_ctx or ctx), _tok_s, s)
+                        if _tok_s:
+                            self._append_log(f"[accuretta] load speed check: {_tok_s:.1f} tok/s "
+                                             f"at {int(_live_ctx or ctx):,} context")
+                except Exception:
+                    pass
             return {"ok": True, "pid": p.pid, "model": model_path,
                     "ready": True, "mmproj": mmproj_path,
                     "vision_capable": bool(mmproj_path)}
@@ -46462,6 +47982,11 @@ def _run_discord_turn(user_text: str, chat_id: str, use_tools: bool) -> str:
         return f"error: {e}"
 
 
+# Shorter than the shortest approval timeout (300 s) by a margin that leaves
+# time to react from a phone.
+_APPROVAL_DM_AFTER_S = 120.0
+
+
 def _discord_approval_listener(client) -> None:
     """Subscribe to the event bus and mirror every approval:new to the owner's
     DM as a ✅/❌ reaction prompt. A reaction resolves the same approval the
@@ -46477,12 +48002,17 @@ def _discord_approval_listener(client) -> None:
             title = entry.get("title", "approval")
             cmd = str(entry.get("command", ""))[:1500]
             msg = await ch.send(f"approve: **{title}**\n```\n{cmd}\n```\nreact ✅ approve · ❌ deny")
-            await msg.add_reaction("✅")
-            await msg.add_reaction("❌")
             with _discord_approvals_lock:
                 _discord_approvals[msg.id] = entry.get("id")
+            await msg.add_reaction("✅")
+            await msg.add_reaction("❌")
+            return True
         except Exception as e:
             print(f"[discord] approval post failed: {e}", flush=True)
+            # Only a card that never posted is a failure the escalator should
+            # retry; a posted card with a missing reaction still works.
+            with _discord_approvals_lock:
+                return entry.get("id") in _discord_approvals.values()
 
     while _discord_state.get("running"):
         try:
@@ -46497,15 +48027,16 @@ def _discord_approval_listener(client) -> None:
 
                 def _send_approval_dm(e=entry) -> bool:
                     try:
-                        asyncio.run_coroutine_threadsafe(post_approval(e), loop).result(timeout=30)
-                        return True
+                        return bool(asyncio.run_coroutine_threadsafe(post_approval(e), loop).result(timeout=30))
                     except Exception as err:
                         print(f"[discord] approval post failed: {err}", flush=True)
                         return False
 
                 # Suppress-then-escalate: held while the user looks active, delivered as soon
-                # as they look absent or at the escalation deadline. The pending approval is
-                # durable bridge state, so a held DM can never lose a gate.
+                # as they look absent, or after two minutes still unanswered. Approvals expire
+                # (and deny) after 5-10 minutes, so the DM has to land with time left to react;
+                # answering in-app first cancels it. The pending approval is durable bridge
+                # state, so a held DM can never lose a gate.
                 _presence_notify.post_external(
                     key=f"approval:{approval_id}",
                     kind="approval",
@@ -46515,6 +48046,7 @@ def _discord_approval_listener(client) -> None:
                     resolved=lambda aid=approval_id: aid and all(
                         str(a.get("id")) != aid for a in list_approvals()
                     ),
+                    escalate_after_s=_APPROVAL_DM_AFTER_S,
                 )
         elif isinstance(evt, dict) and evt.get("type") == "approval:decided":
             _presence_notify.resolve(f"approval:{evt.get('id')}")
@@ -46965,6 +48497,12 @@ def _main_owned(httpd):
             print(f"  evidence: deleted logs of {_unkept} ended engagement(s) set to not keep logs")
     except Exception as e:
         print(f"  evidence: could not sweep unkept engagement logs: {e}")
+    try:
+        _stale_accounts = _rt_identities_sweep()
+        if _stale_accounts:
+            print(f"  accounts: deleted the test-account sign-ins of {_stale_accounts} ended engagement(s)")
+    except Exception as e:
+        print(f"  accounts: could not sweep ended engagements' test-account sign-ins: {e}")
 
     # first-run system context scan (creates data/ACCURETTA.md if missing)
     if not SYSTEM_CONTEXT_FILE.exists():

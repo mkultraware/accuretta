@@ -3361,6 +3361,19 @@ button {
 .recon-limits-row { display: flex; gap: 8px; margin-top: 8px; }
 #recon-modal.recon-secret-mode [data-recon-secret-only] { display: block; }
 #recon-modal.recon-secret-mode [data-recon-suite-only] { display: none; }
+#recon-modal [data-recon-access-only] { display: none; }
+#recon-modal.recon-access-mode [data-recon-access-only] { display: block; }
+#recon-modal.recon-access-mode [data-recon-no-access] { display: none; }
+#recon-modal [data-recon-bounty-only] { display: none; }
+#recon-modal.recon-bounty-mode [data-recon-bounty-only] { display: block; }
+#recon-modal.recon-bounty-mode [data-recon-no-bounty] { display: none; }
+.recon-program { margin-bottom: 16px; }
+#recon-program-text { min-height: 96px; font-size: 12px; }
+#recon-program-text.recon-drop-over { border-color: var(--accent); }
+.recon-program-actions { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.recon-program-status { font-size: 12px; color: var(--fg-subtle); }
+#recon-program-flags ul { margin: 4px 0 0; padding-left: 16px; }
+#recon-program-flags li + li { margin-top: 3px; }
 #recon-modal.recon-secret-mode .recon-secret-options {
   margin: 8px 0 2px;
   padding: 4px 12px;

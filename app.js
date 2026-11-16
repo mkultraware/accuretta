@@ -619,8 +619,12 @@
         ? state.liveTurn.row
         : Array.from(inner.querySelectorAll(".bubble-row"))
             .find(candidate => candidate.querySelector(".bubble-meta.streaming"));
-      if (liveRow) inner.insertBefore(row, liveRow);
+      // Under the reply that is streaming, where the reader is looking: above
+      // a long reply it sat off screen and the run looked stuck. The finished
+      // divider is placed at the real fold point (finishCompactionRow).
+      if (liveRow) inner.insertBefore(row, liveRow.nextSibling);
       else inner.appendChild(row);
+      row._liveAnchor = liveRow || null;
       state.compactionRows.set(chatId, row);
       if (follow) requestAnimationFrame(() => scrollToBottom(true));
     }
@@ -656,10 +660,16 @@
           t: undefined,
         };
       }
-      const div = buildFoldDivider(stats, { el: row, chatId });
-      div.classList.add("is-done");
+      // The working row sat under the live reply so it stayed in view; the
+      // settled divider marks the fold, which is just before the reply being
+      // written. Move the row there as it turns into the divider.
       state.compactionRows.delete(chatId);
       const follow = isNearBottom();
+      const liveRow = row._liveAnchor;
+      if (liveRow?.isConnected && liveRow.parentNode === row.parentNode) liveRow.before(row);
+      row._liveAnchor = null;
+      const div = buildFoldDivider(stats, { el: row, chatId });
+      div.classList.add("is-done");
       if (follow) requestAnimationFrame(() => scrollToBottom(true));
       return;
     }
@@ -1013,7 +1023,9 @@
   // One of the bridge's two "is the user active?" signals (the other is host
   // input idle). Held external notifications (Discord approval DMs, security
   // alerts) are released once this says the user is away, or at the escalation
-  // deadline. Sent only on focus changes or every 30s while the tab is visible.
+  // deadline. A tab that had focus in the last few minutes still counts, so
+  // switching to an IDE does not read as "away". Sent only on focus changes or
+  // every 30s while the tab is visible.
   const PRESENCE_ID = (() => {
     try {
       let id = sessionStorage.getItem("accuretta:presence-id");
@@ -4978,6 +4990,8 @@
   // still get their own category.
   const MISSION_CATEGORIES = {
     pentest: { label: "Red Team", icon: "ph-shield-chevron" },
+    access_control: { label: "Access Control", icon: "ph-user-switch" },
+    bug_bounty: { label: "Bug Bounty", icon: "ph-bug" },
     frontend_secrets: { label: "Frontend Secrets", icon: "ph-file-js" },
     recon: { label: "Target Recon", icon: "ph-crosshair" },
     passive_osint: { label: "Passive OSINT", icon: "ph-binoculars" },
@@ -14217,6 +14231,10 @@
     const learning = data?.learning || {};
     const recommendation = data?.recommendation || null;
     const trial = data?.trial || null;
+    // Load-time speed check (dense models): measured right after each load, so
+    // it doesn't wait for the 25-turn baseline.
+    const fitRec = data?.fit?.recommendation || null;
+    const fitResult = data?.fit?.result || "";
     const sessions = Math.max(0, Number(learning.sessions) || 0);
     const turnsRequired = Math.max(1, Number(learning.turns_required) || 25);
     const sessionsRequired = Math.max(1, Number(learning.sessions_required) || 3);
@@ -14237,6 +14255,10 @@
       card.dataset.state = "collecting";
       badge.textContent = "waiting";
       subtitle.textContent = "Choose a model to begin";
+    } else if (fitRec) {
+      card.dataset.state = "attention";
+      badge.textContent = "speed check";
+      subtitle.textContent = "Measured right after loading";
     } else if (!ready) {
       card.dataset.state = "collecting";
       badge.textContent = `${Math.min(turns, turnsRequired)}/${turnsRequired} turns`;
@@ -14329,8 +14351,22 @@
 
     const recommendationEl = $("#model-health-recommendation");
     if (recommendationEl) {
-      recommendationEl.hidden = !(recommendation || trial);
-      if (recommendation) {
+      recommendationEl.hidden = !(recommendation || trial || fitRec || fitResult);
+      const fitTitle = fitRec?.kind === "fit_down" ? "Context doesn't fit in VRAM"
+        : fitRec?.kind === "fit_up" ? "Larger context fits" : "Check that the context fits";
+      const fitApply = fitRec?.kind === "fit_check" ? "Run the check" : "Use this context";
+      const fitHtml = fitRec ? `
+          <div class="model-health-rec-head"><span><i class="ph ph-gauge"></i>${esc(fitTitle)}</span><small>measured</small></div>
+          <p>${esc(fitRec.reason || "")}</p>
+          <div class="model-health-changes">${modelHealthChanges(fitRec.changes)}</div>
+          <small class="model-health-tradeoff">${esc(fitRec.tradeoff || "")}</small>
+          <div class="model-health-actions">
+            <button type="button" class="btn accent" data-model-health-action="fit_apply" data-recommendation-id="${esc(fitRec.id || "")}">${esc(fitApply)}</button>
+            <button type="button" class="btn sm" data-model-health-action="fit_dismiss" data-recommendation-id="${esc(fitRec.id || "")}">Not now</button>
+          </div>` : (fitResult ? `<p>${esc(fitResult)}</p>` : "");
+      if (fitRec) {
+        recommendationEl.innerHTML = fitHtml;
+      } else if (recommendation) {
         recommendationEl.innerHTML = `
           <div class="model-health-rec-head"><span><i class="ph ph-sliders-horizontal"></i>Recommended setup</span><small>high confidence</small></div>
           <p>${esc(recommendation.reason || "A better local configuration is ready.")}</p>
@@ -14357,6 +14393,10 @@
             ${!measuring && !worse ? '<button type="button" class="btn accent" data-model-health-action="keep">Keep settings</button>' : ""}
             <button type="button" class="btn sm ${worse ? "danger" : ""}" data-model-health-action="undo">Undo recommended settings</button>
           </div>`;
+      } else if (fitResult) {
+        recommendationEl.innerHTML = `
+          <div class="model-health-rec-head"><span><i class="ph ph-gauge"></i>Speed check</span><small>done</small></div>
+          ${fitHtml}`;
       }
       recommendationEl.querySelectorAll("[data-model-health-action]").forEach(button => {
         button.addEventListener("click", () => runModelHealthAction(
@@ -14400,7 +14440,9 @@
     try {
       await requestModelLoad(result.model_path);
       await refreshModels();
-      toast(action === "undo" ? "previous settings restored" : "recommended settings applied; the ten-turn check starts now", "ok", 5000, tid);
+      toast(action === "undo" ? "previous settings restored"
+        : action === "fit_apply" ? "reloaded; the speed check measured it right after loading"
+        : "recommended settings applied; the ten-turn check starts now", "ok", 5000, tid);
     } finally {
       state._reloading = false;
       renderStatus();
@@ -14425,7 +14467,7 @@
       }
       if (action === "apply" || action === "dismiss") clearModelAdvisorNotifications();
       await reloadModelHealthSettings(result, action);
-      if (action === "dismiss") toast("recommendation dismissed for this setup", "info", 2200);
+      if (action === "dismiss" || action === "fit_dismiss") toast("recommendation dismissed for this setup", "info", 2200);
       if (action === "keep") toast("recommended settings kept", "ok", 2200);
       await loadModelHealth();
     } catch (error) {
@@ -20079,6 +20121,10 @@
 
     // ----- authorized recon / pentest: gate -> target -> invisible prompt -----
     let reconObjective = "recon";
+    // Bug Bounty program reader: a sequence number drops a reply that comes
+    // back after the form was closed or reopened.
+    let reconProgramSeq = 0;
+    let reconProgramBusy = false;
     const reconClose = () => {
       $("#recon-scrim")?.classList.remove("open");
       $("#recon-modal")?.classList.remove("open");
@@ -20090,13 +20136,43 @@
                                  ($("#recon-scope-out")?.value || "").trim()].filter(Boolean).join(" ");
     const reconConstraintVal = () => document.querySelectorAll("#recon-constraint-chips .recon-chip.active").length
       || ($("#recon-constraint-text")?.value || "").trim();
+    // Access Control: one test account's sign-in, typed as "Header: value" lines.
+    // A bare cookie string or bearer token is accepted too, since that is what
+    // people copy out of a browser. Returns null when a line can't be read.
+    const RECON_SIGNIN_BLOCKED = new Set(["host", "content-length", "content-type", "transfer-encoding", "connection", "user-agent", "accept-encoding"]);
+    const reconParseSignIn = (raw) => {
+      const out = {};
+      for (const line of String(raw || "").split(/\r?\n/)) {
+        const text = line.trim();
+        if (!text) continue;
+        let name = "", value = "";
+        const header = text.match(/^([A-Za-z0-9-]{1,64}):\s*(\S.*)$/);
+        if (header) { name = header[1]; value = header[2].trim(); }
+        else if (/^bearer\s+\S/i.test(text)) { name = "Authorization"; value = text; }
+        else if (/^eyJ[\w-]+\.[\w-]+\.[\w-]*$/.test(text)) { name = "Authorization"; value = `Bearer ${text}`; }
+        else if (/^[^\s=;:]+=/.test(text)) { name = "Cookie"; value = text; }
+        else return null;
+        if (RECON_SIGNIN_BLOCKED.has(name.toLowerCase()) || value.length > 8192) return null;
+        if (Array.from(value).some(ch => { const c = ch.codePointAt(0); return c < 32 || c === 127 || c > 255; })) return null;
+        if (Object.keys(out).some(k => k.toLowerCase() === name.toLowerCase())) return null;
+        out[name] = value;
+      }
+      const count = Object.keys(out).length;
+      return count && count <= 6 ? out : null;
+    };
+    const reconSignInKey = (headers) => JSON.stringify(Object.keys(headers).map(k => [k.toLowerCase(), headers[k]]).sort());
     const reconGate = () => {
       const passive = reconObjective === "passive_osint";
       const secretAudit = reconObjective === "frontend_secrets";
+      const accessCheck = reconObjective === "access_control";
       const authed = passive || !!$("#recon-auth-check")?.checked;
       const hasTarget = !!($("#recon-target-input")?.value || "").trim();
-      const go = $("#recon-go"); if (go) go.disabled = !(authed && hasTarget);
-      const anyBlank = !passive && !secretAudit && (!reconScopeVal() || !($("#recon-objective-text")?.value || "").trim() || !reconConstraintVal());
+      const hasAccounts = !accessCheck || (!!($("#recon-account-a")?.value || "").trim() && !!($("#recon-account-b")?.value || "").trim());
+      const go = $("#recon-go"); if (go) go.disabled = !(authed && hasTarget && hasAccounts);
+      const readBtn = $("#recon-program-read");
+      if (readBtn) readBtn.disabled = reconProgramBusy || ($("#recon-program-text")?.value || "").trim().length < 200;
+      const bounty = reconObjective === "bug_bounty";
+      const anyBlank = !passive && !secretAudit && (!reconScopeVal() || (!accessCheck && !bounty && !($("#recon-objective-text")?.value || "").trim()) || !reconConstraintVal());
       $("#recon-blank-notice")?.classList.toggle("hidden", !anyBlank);
     };
     const reconOpen = (objective) => {
@@ -20108,34 +20184,70 @@
       const passive = reconObjective === "passive_osint";
       const access = reconObjective === "gain_access";
       const secretAudit = reconObjective === "frontend_secrets";
+      const accessCheck = reconObjective === "access_control";
+      const bounty = reconObjective === "bug_bounty";
       const modal = $("#recon-modal");
       modal?.classList.toggle("recon-passive-mode", passive);
       modal?.classList.toggle("recon-secret-mode", secretAudit);
+      modal?.classList.toggle("recon-access-mode", accessCheck);
+      modal?.classList.toggle("recon-bounty-mode", bounty);
       const h3 = $("#recon-modal h3");
-      if (h3) h3.textContent = passive ? "Passive OSINT" : secretAudit ? "Frontend Secret Audit" : access ? "Red Team" : "Target Recon";
+      if (h3) h3.textContent = passive ? "Passive OSINT" : secretAudit ? "Frontend Secret Audit" : accessCheck ? "Access Control" : bounty ? "Bug Bounty" : access ? "Red Team" : "Target Recon";
+      if (h3 && (accessCheck || bounty)) h3.insertAdjacentHTML("beforeend", `<span class="beta-badge">beta</span>`);
       const modalIcon = $("#recon-modal-icon");
-      if (modalIcon) modalIcon.className = passive ? "ph ph-binoculars" : secretAudit ? "ph ph-file-js" : access ? "ph ph-shield-chevron" : "ph ph-crosshair";
+      if (modalIcon) modalIcon.className = passive ? "ph ph-binoculars" : secretAudit ? "ph ph-file-js" : accessCheck ? "ph ph-user-switch" : bounty ? "ph ph-bug" : access ? "ph ph-shield-chevron" : "ph ph-crosshair";
       const go = $("#recon-go");
-      if (go) { go.textContent = passive ? "Start OSINT" : secretAudit ? "Audit frontend" : access ? "Start assessment" : "Run recon"; go.disabled = true; }
+      if (go) { go.textContent = passive ? "Start OSINT" : secretAudit ? "Audit frontend" : accessCheck ? "Start check" : bounty ? "Start hunt" : access ? "Start assessment" : "Run recon"; go.disabled = true; }
       const disclaimer = $("#recon-disclaimer-text");
       if (disclaimer) disclaimer.innerHTML = passive
         ? "<strong>No direct target contact.</strong> Accuretta queries public search, registry, DNS, certificate and archive providers. It will not connect directly to the target or its hosts."
         : secretAudit
           ? "<strong>Read-only frontend audit.</strong> Accuretta fetches the authorized page, linked JavaScript, lazy chunks, and source maps. Exact confirmed values are shown in the report. Discovered credentials are never used or submitted for validation."
+        : bounty
+          ? "<strong>The program's rules are the limit.</strong> Accuretta tests only the hosts in scope, follows the rules you give it and stops at the smallest proof the program accepts. Breaking a program's rules can void rewards and may be illegal. You are responsible for how these tools are used."
         : "<strong>Authorized testing only.</strong> Test only systems you own or have explicit written permission to test. Unauthorized scanning may be illegal where you are. You alone are responsible for how these tools are used and for the consequences.";
+      const authText = $("#recon-auth-text");
+      if (authText) authText.textContent = bounty
+        ? "I'm taking part in this program, and its rules allow me to test these hosts."
+        : "I own this target or have written authorization to test it.";
+      const notesLabel = $("#recon-notes-label");
+      if (notesLabel) notesLabel.innerHTML = bounty ? `Program rules <span class="recon-opt">optional</span>` : `Additional notes to agent <span class="recon-opt">optional</span>`;
+      const notesHint = $("#recon-notes-hint");
+      if (notesHint) notesHint.textContent = bounty
+        ? "Filled in from the program. The model is shown these every turn, so keep the rules that matter and remove anything wrong."
+        : "Free text, sent to the model along with the engagement scope.";
+      reconProgramSeq++;
+      reconProgramBusy = false;
+      const programText = $("#recon-program-text"); if (programText) programText.value = "";
+      const programStatus = $("#recon-program-status"); if (programStatus) programStatus.textContent = "";
+      $("#recon-program-flags")?.classList.add("hidden");
+      const flagList = $("#recon-program-flag-list"); if (flagList) flagList.innerHTML = "";
       const disclaimerIcon = $("#recon-disclaimer-icon");
       if (disclaimerIcon) disclaimerIcon.className = passive ? "ph ph-eye-slash" : secretAudit ? "ph ph-file-magnifying-glass" : "ph ph-warning";
       const targetLabel = $("#recon-target-label");
       if (targetLabel) targetLabel.textContent = passive ? "Domain" : secretAudit ? "Page URL" : "Target domain or host";
       ["#recon-target-input", "#recon-scope-in", "#recon-scope-out", "#recon-user-agent",
        "#recon-required-headers", "#recon-rate-limit", "#recon-request-cap",
-       "#recon-objective-text", "#recon-constraint-text", "#recon-notes-text"]
+       "#recon-objective-text", "#recon-constraint-text", "#recon-notes-text",
+       "#recon-account-a", "#recon-account-b", "#recon-owned-urls"]
         .forEach(s => { const el = $(s); if (el) el.value = ""; });
-      const autoChk = $("#recon-automated-check"); if (autoChk) autoChk.checked = true;
+      // Most bug bounty programs forbid automated scanning: start unticked there
+      // and let the program reader tick it when the program allows it.
+      const autoChk = $("#recon-automated-check"); if (autoChk) autoChk.checked = !bounty;
       const destrChk = $("#recon-destructive-check"); if (destrChk) destrChk.checked = false;
       const keepLogChk = $("#recon-keep-log"); if (keepLogChk) keepLogChk.checked = true;
       const targetInput = $("#recon-target-input");
       if (targetInput) targetInput.placeholder = secretAudit ? "https://example.com/app" : "example.com";
+      // Access Control hides Objective and keeps sign-ins out of the notes, which
+      // the model reads: reword the two texts that would say otherwise.
+      const notesInput = $("#recon-notes-text");
+      if (notesInput) notesInput.placeholder = accessCheck
+        ? "Anything the fields above don't capture: endpoints to prioritize, what each account is meant to see, rules of engagement… Do not paste sign-ins here; the model reads these notes."
+        : "Anything the fields above don't capture: endpoints to prioritize, test credentials you're providing, rules of engagement, out-of-band details…";
+      const blankNotice = $("#recon-blank-notice span");
+      if (blankNotice) blankNotice.textContent = (accessCheck || bounty)
+        ? "Blank In scope is limited to the target above. Blank constraints let the run choose its own pace within that target and may take longer."
+        : "Blank In scope is limited to the target above. Blank objective or constraints let the run choose broader coverage within that allowed target and may take longer.";
       const chk = $("#recon-auth-check"); if (chk) chk.checked = false;
       const thorough = $("#recon-secret-thorough"); if (thorough) thorough.checked = true;
       const candidates = $("#recon-secret-candidates"); if (candidates) candidates.checked = false;
@@ -20166,6 +20278,30 @@
         }
       }
       if (!target) { toast("That doesn't look like a domain.", "warn", 2200); return; }
+      // Access Control: both sign-ins must parse and differ before anything is sent.
+      const accessCheck = reconObjective === "access_control";
+      let identities = null;
+      let ownedUrls = [];
+      if (accessCheck) {
+        const accountA = reconParseSignIn($("#recon-account-a")?.value);
+        const accountB = reconParseSignIn($("#recon-account-b")?.value);
+        const bad = !accountA ? "A" : !accountB ? "B" : "";
+        if (bad) {
+          toast(`Account ${bad} sign-in: use one header per line, like "Cookie: session=…" or "Authorization: Bearer …".`, "warn", 4200);
+          return;
+        }
+        if (reconSignInKey(accountA) === reconSignInKey(accountB)) {
+          toast("Account A and account B have the same sign-in. Use two different test accounts.", "warn", 3600);
+          return;
+        }
+        identities = { A: accountA, B: accountB };
+        ownedUrls = ($("#recon-owned-urls")?.value || "").split(/\r?\n/).map(u => u.trim()).filter(Boolean);
+        if (ownedUrls.length > 10 || ownedUrls.some(u => u.length > 400 || /\s/.test(u) || !(/^https?:\/\/\S/i.test(u) || /^\/[^/]/.test(u) || u === "/"))) {
+          toast("Pages only account A should see: up to 10 full http(s) URLs or /paths, one per line.", "warn", 3800);
+          return;
+        }
+        ownedUrls = [...new Set(ownedUrls)];
+      }
       // Collect the scope/auth panel into a mission the bridge seeds via
       // _rt_mission_seed / _rt_mission_note (flows into the sysprompt).
       const scIn = ($("#recon-scope-in")?.value || "").trim();
@@ -20206,8 +20342,10 @@
       const automatedAllowed = $("#recon-automated-check")?.checked !== false;
       const allowDestructive = !!$("#recon-destructive-check")?.checked;
       const keepLog = $("#recon-keep-log")?.checked !== false;
-      const objective = ($("#recon-objective-text")?.value || "").trim()
-        || (passive ? "Build a public-source intelligence profile." : secretAudit ? "Audit frontend resources for exposed credentials." : "");
+      const objective = (reconObjective === "bug_bounty" ? "" : ($("#recon-objective-text")?.value || "").trim())
+        || (passive ? "Build a public-source intelligence profile." : secretAudit ? "Audit frontend resources for exposed credentials."
+          : accessCheck ? "Find pages and data one test account can reach but should not."
+          : reconObjective === "bug_bounty" ? "Find and minimally prove bugs the program pays for, within its rules." : "");
       const conChips = Array.from(document.querySelectorAll("#recon-constraint-chips .recon-chip.active")).map(c => c.dataset.val);
       const conText = ($("#recon-constraint-text")?.value || "").trim();
       const constraints = passive
@@ -20219,7 +20357,9 @@
       // enabling Red team tools in Settings alone doesn't let a model invoke them.
       // Free-text operator notes are stored on the mission (so they survive folds)
       // and appended to the opening instruction.
-      const notes = ($("#recon-notes-text")?.value || "").trim().slice(0, 2000);
+      const bounty = reconObjective === "bug_bounty";
+      const notes = ($("#recon-notes-text")?.value || "").trim().slice(0, 6000);
+      const programText = bounty ? ($("#recon-program-text")?.value || "").trim().slice(0, 80000) : "";
       const mission = {
         target, scope, objective, constraints, notes, user_agent: userAgent,
         scope_in: scopeTokens(scIn || target),
@@ -20231,8 +20371,11 @@
         allow_destructive: allowDestructive,
         keep_log: keepLog,
         authorized: true,
-        engagement: passive ? "passive_osint" : secretAudit ? "frontend_secrets" : reconObjective === "gain_access" ? "pentest" : "recon",
+        engagement: passive ? "passive_osint" : secretAudit ? "frontend_secrets" : accessCheck ? "access_control" : bounty ? "bug_bounty" : reconObjective === "gain_access" ? "pentest" : "recon",
       };
+      // The sign-ins go to the bridge with the mission and nowhere else: they are
+      // not part of the prompt, the chat record or anything the model reads.
+      if (accessCheck) { mission.identities = identities; mission.owned_urls = ownedUrls; }
       reconClose();
       const userAgentTmpl = userAgent
         ? `Accuretta will enforce the required User-Agent ${JSON.stringify(userAgent)} on HTTP requests for this engagement. Do not replace it or claim a different value was sent. `
@@ -20294,9 +20437,53 @@
         `6) PROVE IT — for every confirmed access or extracted secret, re-send the winning request with save_evidence set (archives request+response with a sha256), or use recon_capture_evidence.\n` +
         `STEALTH — a signature IDS matches the raw request text, so to stay quiet keep recon low-footprint (quiet=true) and obfuscate payloads (url-encode via encode_decode, vary keyword case, use alternate separators); the server still decodes and executes them while the signature misses.\n` +
         `If a tool is blocked by scope or a constraint, record the gap and continue with other permitted work; do not hammer the same gate. Only stop when you have genuinely exhausted the permitted scope. Then write a report: Executive summary (did you get in, how deep, what you reached), What's broken (each finding with severity + evidence), Loot (data, secrets, and credentials extracted), Recommendations. Never claim access or a finding you did not verify with a tool result or a captured artifact — but do not leave a real avenue unexplored. Be factual AND thorough. Once you deliver that report the engagement is CLOSED: treat any later message as a debrief — answer it directly and conversationally, and do NOT run recon or exploit tools again unless the user explicitly tells you to resume or keep testing.`;
-      const basePrompt = passive ? passiveTmpl : secretAudit ? secretTmpl : reconObjective === "gain_access" ? accessTmpl : reconTmpl;
-      const notesTmpl = notes ? `\n\nADDITIONAL OPERATOR NOTES (these are instructions for this engagement — follow them):\n${notes}` : "";
-      send({ prompt: basePrompt + notesTmpl, invisible: true, mission });
+      const accessMapStep = automatedAllowed
+        ? `MAP — call recon_map on ${target} with identity "A" to list what a signed-in account can reach, then again with identity "B". Keep the endpoints that name one object: an id in the path or the query (orders/1042, ?invoice=77, a username, a uuid). Use each endpoint's real url, never the {id} template.`
+        : `MAP — the crawler is disabled for this engagement, so collect URLs by hand: open the target's main pages with http_request and identity "A", then identity "B", and note every link or API call that names one object (an id in the path or the query).`;
+      const accessCtlTmpl =
+        `Authorized access-control test on ${target}. I have confirmed I am authorized to test this target, and both test accounts are mine to use. ` +
+        userAgentTmpl + headerTmpl + budgetTmpl + policyTmpl + untrustedTmpl +
+        `GOAL — find pages and data that one signed-in account can read or change although they belong to another account (IDOR / broken access control). That is the whole job: no injection testing, no password guessing, no hunting for other bug classes. If the boundaries hold, the correct result is "no access-control findings", not an invented one.\n` +
+        `ACCOUNTS — two test accounts are stored for this engagement, named A and B. Accuretta holds their sign-ins and attaches them for you. You will never see a cookie, token or password and must never ask for, guess or type one. Refer to accounts only by name. Never put a Cookie or Authorization header in a request yourself.\n` +
+        `THE CHECK — rt_access_check({url, owner}) sends the same request as account A, as account B and signed out, then returns an outcome. owner is the account the page or object belongs to. Read the outcome like this:\n` +
+        `- enforced: only the owner got the content. No finding. Next URL.\n` +
+        `- candidate: the other account received the owner's content and a signed-out request did not. Confirm it (step 4).\n` +
+        `- candidate_if_restricted: the same, but the URL names no specific object. It is a problem only if the other account should not have that page at all (an admin page, another team's page). If every signed-in user is meant to see it, it is not a finding.\n` +
+        `- open_without_sign_in: anyone can read it signed out. Not an account-to-account leak. Record it as a candidate only if the content is clearly private.\n` +
+        `- inspect: the other account got different content. That is normal when each account sees its own data. Compare the two previews; it is a leak only if the other account's response contains the owner's private data.\n` +
+        `- sign_in_unverified, owner_could_not_read, inconclusive: do what next_step in the result says. Never record a finding from these.\n` +
+        `Work in this order:\n` +
+        (ownedUrls.length
+          ? `1) START — these belong to account A; run rt_access_check on each with owner "A": ${ownedUrls.join(" , ")}\n`
+          : `1) START — run rt_access_check with owner "A" on a page account A can open after signing in (its profile, account or dashboard page) to see that both sign-ins work.\n`) +
+        `2) ${accessMapStep}\n` +
+        `3) CHECK BOTH DIRECTIONS — run rt_access_check on account A's object URLs with owner "A" and on account B's with owner "B". One call per URL. Do not guess or enumerate ids you have not seen.\n` +
+        `4) CONFIRM — for each candidate, call rt_access_check again with exactly the same arguments. Then call record_finding with status "validated", evidence_ids = the other account's evidence_id from both runs, control_id = the anonymous evidence_id, proof = one proof_candidates string copied exactly, and one plain sentence each for expected_boundary, demonstrated_impact, alternative_explanation, disproof_check and limitations. If record_finding keeps it as a candidate, read why and fix that, or leave it as a candidate.\n` +
+        `5) CHANGES LAST — only after the read checks, and only on test data these two accounts created: for an endpoint that edits an object, call rt_access_check with its method and body and confirm_state_change=true. It sends the change once per account. Never delete anything.\n` +
+        `6) REPORT — call rt_generate_report, then call list_findings and tell me: how many URLs were checked and in which directions, each confirmed finding with the two accounts and its proof text, candidates you could not confirm and why, and what was not covered. Copy every proof text and response detail from list_findings exactly; never write them from memory, and leave a detail out if you cannot find it there. Never claim a leak you did not confirm with two runs.\n` +
+        `If a tool is blocked by scope or a constraint, note the gap and continue with other permitted checks. Once you deliver the report the engagement is CLOSED: treat any later message as a debrief and do not run checks again unless I explicitly tell you to resume.`;
+      const bountyTmpl =
+        `Authorized bug bounty hunt on ${target}. I am taking part in this program, and its rules allow me to test the in-scope hosts. ` +
+        userAgentTmpl + headerTmpl + budgetTmpl + policyTmpl + untrustedTmpl +
+        `This is a REAL bug bounty program, not a CTF. The program's rules (given below, and repeated every turn as "program rules") outrank everything else in this message. Where a step below and a program rule disagree, the rule wins.\n` +
+        `GOAL — find bugs in the in-scope web app that the program pays for, and prove each one with the smallest proof the program allows. "No qualifying findings" is a correct result; never invent or inflate a finding.\n` +
+        `Work in this order:\n` +
+        `1) MAP — identify the app with recon_http_fingerprint, then list its pages, endpoints and parameters (recon_map if automated tools are allowed, otherwise rt_browser or http_request by hand). Stay on the hosts in scope.\n` +
+        `2) HUNT — test by hand, at a gentle pace, for the bug types the program pays for: XSS and other injection, SQL injection, IDOR and access control, authentication and session flaws, business logic with real impact, SSRF/LFI/XXE, CORS and CSRF with real impact, open redirect, exposed secrets. Skip the types the program lists as not paid.\n` +
+        `3) PROVE MINIMALLY — use the proof the program allows and nothing more (for example alert() for XSS, the database version for SQL injection, id or whoami for code execution). Never read other customers' data, never dump tables, never change anyone else's data, never send more than one test message through a form. Do not register accounts yourself; if a check needs a signed-in account, list it as a gap for me.\n` +
+        `4) CONFIRM — send the working request a second time, send one harmless control request, then record_finding with status validated, those receipt ids, and a cvss_vector scored only on what the proof shows (use the program's scoring rules if it gives them).\n` +
+        `5) REPORT — call rt_generate_report, then write one report per bug (the same bug on several sites of the program is one report) with: title, affected URL, description, numbered steps to reproduce, request/response evidence, the CVSS v3.1 vector with a short reason for each metric, and the demonstrated impact. Redact any personal data in the evidence.\n` +
+        `SITE PROTECTION — if the site starts challenging or blocking you (403 challenge pages, a CAPTCHA, "too fast"), that is the site asking you to slow down: stop sending to that site for several minutes, then continue gently. Never try to solve a CAPTCHA, and do not move to another of the program's sites just to get around a block.\n` +
+        `HONESTY — call something tested only when you sent the requests that tested it, and say how many variants you tried ("one search for laptop" is not "open redirect tested"). Keep your working files in the workspace; do not list or read my other folders and files unless I point you to them.\n` +
+        `If a tool is blocked by scope or a rule, note the gap and move on; do not retry the same gate. Once you deliver the report the engagement is CLOSED: treat later messages as a debrief and do not test again unless I explicitly tell you to resume.`;
+      const basePrompt = passive ? passiveTmpl : secretAudit ? secretTmpl : accessCheck ? accessCtlTmpl : bounty ? bountyTmpl : reconObjective === "gain_access" ? accessTmpl : reconTmpl;
+      const notesTmpl = !notes ? ""
+        : bounty ? `\n\nPROGRAM RULES (summary — follow them):\n${notes}`
+        : `\n\nADDITIONAL OPERATOR NOTES (these are instructions for this engagement — follow them):\n${notes}`;
+      const programTmpl = programText
+        ? `\n\nBUG BOUNTY PROGRAM (the full text as the program published it; its rules outrank anything above):\n${programText}`
+        : "";
+      send({ prompt: basePrompt + notesTmpl + programTmpl, invisible: true, mission });
     };
     $("#quick-passive-osint")?.addEventListener("click", () => {
       $("#toolbar-overflow-menu")?.classList.remove("open");
@@ -20318,12 +20505,106 @@
       $("#btn-toolbar-overflow")?.classList.remove("open");
       reconOpen("gain_access");
     });
+    $("#quick-access-control")?.addEventListener("click", () => {
+      $("#toolbar-overflow-menu")?.classList.remove("open");
+      $("#btn-toolbar-overflow")?.classList.remove("open");
+      reconOpen("access_control");
+    });
+    $("#quick-bug-bounty")?.addEventListener("click", () => {
+      $("#toolbar-overflow-menu")?.classList.remove("open");
+      $("#btn-toolbar-overflow")?.classList.remove("open");
+      reconOpen("bug_bounty");
+    });
+    // Bug Bounty: the loaded model reads the pasted program and the bridge
+    // returns form values it has checked against the text. Filling the form
+    // authorizes nothing; the user reviews it and clicks Start hunt.
+    const reconReadProgram = async () => {
+      const text = ($("#recon-program-text")?.value || "").trim();
+      if (text.length < 200) { toast("Paste the whole program page first.", "warn", 2400); return; }
+      const seq = ++reconProgramSeq;
+      const status = $("#recon-program-status");
+      reconProgramBusy = true;
+      reconGate();
+      if (status) status.textContent = "Reading the program…";
+      let res;
+      try {
+        const r = await fetch("/api/redteam/read-program", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        res = await r.json();
+      } catch (e) {
+        res = { ok: false, error: `Request failed: ${e.message || e}` };
+      }
+      if (seq !== reconProgramSeq) return;
+      reconProgramBusy = false;
+      if (!res || !res.ok) {
+        if (status) status.textContent = "";
+        toast(res?.error || "Couldn't read the program.", "warn", 5000);
+        reconGate();
+        return;
+      }
+      const setVal = (sel, value) => { const el = $(sel); if (el && value) el.value = value; };
+      setVal("#recon-target-input", res.target);
+      setVal("#recon-scope-in", (res.scope_in || []).join(", "));
+      setVal("#recon-scope-out", (res.scope_out || []).join(", "));
+      setVal("#recon-user-agent", res.user_agent);
+      setVal("#recon-required-headers", Object.entries(res.required_headers || {}).map(([k, v]) => `${k}: ${v}`).join("\n"));
+      setVal("#recon-rate-limit", res.rate_limit_rpm ? String(res.rate_limit_rpm) : "");
+      setVal("#recon-notes-text", res.notes);
+      const autoChk = $("#recon-automated-check");
+      if (autoChk && typeof res.automated_allowed === "boolean") autoChk.checked = res.automated_allowed;
+      const destrChk = $("#recon-destructive-check");
+      if (destrChk) destrChk.checked = res.allow_destructive === true;
+      const flags = Array.isArray(res.flags) ? res.flags : [];
+      const list = $("#recon-program-flag-list");
+      if (list) {
+        list.innerHTML = "";
+        flags.forEach(f => { const li = document.createElement("li"); li.textContent = String(f); list.appendChild(li); });
+      }
+      $("#recon-program-flags")?.classList.toggle("hidden", !flags.length);
+      if (status) status.textContent = "Filled in. Check each field below.";
+      reconGate();
+    };
+    $("#recon-program-read")?.addEventListener("click", reconReadProgram);
+    $("#recon-program-text")?.addEventListener("input", reconGate);
+    // A dropped .md or .txt file fills the program box. Text dragged from a
+    // page still drops normally.
+    const programBox = $("#recon-program-text");
+    if (programBox) {
+      const hasFile = (e) => Array.from(e.dataTransfer?.types || []).includes("Files");
+      programBox.addEventListener("dragover", (e) => {
+        if (!hasFile(e)) return;
+        e.preventDefault(); e.stopPropagation();
+        programBox.classList.add("recon-drop-over");
+      });
+      programBox.addEventListener("dragleave", () => programBox.classList.remove("recon-drop-over"));
+      programBox.addEventListener("drop", async (e) => {
+        programBox.classList.remove("recon-drop-over");
+        if (!hasFile(e)) return;
+        e.preventDefault(); e.stopPropagation();
+        const file = e.dataTransfer.files[0];
+        if (!file || !/\.(md|markdown|txt)$/i.test(file.name)) {
+          toast("Drop a .md or .txt file with the program text.", "warn", 3000);
+          return;
+        }
+        if (file.size > 400 * 1024) { toast("That file is too large for a program page.", "warn", 3000); return; }
+        try {
+          programBox.value = await file.text();
+          reconGate();
+        } catch (_) {
+          toast("Couldn't read that file.", "warn", 2600);
+        }
+      });
+    }
     $("#recon-cancel")?.addEventListener("click", reconClose);
     $("#btn-close-recon")?.addEventListener("click", reconClose);
     $("#recon-scrim")?.addEventListener("click", reconClose);
     $("#recon-auth-check")?.addEventListener("change", reconGate);
     // Re-gate on any input so the button state + wider-targeting notice stay live.
-    ["#recon-target-input", "#recon-scope-in", "#recon-scope-out", "#recon-user-agent", "#recon-objective-text", "#recon-constraint-text"]
+    ["#recon-target-input", "#recon-scope-in", "#recon-scope-out", "#recon-user-agent", "#recon-objective-text", "#recon-constraint-text",
+     "#recon-account-a", "#recon-account-b"]
       .forEach(s => $(s)?.addEventListener("input", reconGate));
     // Objective chips are a quick-fill for the free-text objective (single pick).
     document.querySelectorAll("#recon-objective-chips .recon-chip").forEach(chip => {
@@ -21736,6 +22017,7 @@
     "quick-recon-target": "Scoped DNS, TLS, HTTP, ports",
     "quick-frontend-secrets": "Exposed keys in JavaScript",
     "quick-gain-access": "Recon, validate, report",
+    "quick-access-control": "Two accounts, who sees what",
     "quick-health-check": "Read-only host triage",
     "quick-persistence-hunt": "Read-only startup sweep",
   };
@@ -21749,11 +22031,15 @@
       if (el.classList.contains("overflow-section-label")) { section = el.textContent.trim(); continue; }
       if (!el.id || !el.id.startsWith("quick-")) continue;
       const icon = [...(el.querySelector("i.ph")?.classList || [])].find(c => c.startsWith("ph-")) || "ph-lightning";
-      out.push({ id: el.id, section, icon, label: el.textContent.trim().replace(/\s*\(read-only\)$/i, ""), title: el.title || "" });
+      // The label is the button's own text; a "beta" marker inside it is carried
+      // separately so the row can draw it as a badge.
+      const text = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join("");
+      out.push({ id: el.id, section, icon, label: text.trim().replace(/\s*\(read-only\)$/i, ""), title: el.title || "",
+        beta: !!el.querySelector(".beta-badge") });
     }
     return out;
   }
-  function wbMenuRow({ act = "", sub = "", back = "", icon, tile = "", label, note = "", role = "menuitem", checked = null, disabled = false, title = "" }) {
+  function wbMenuRow({ act = "", sub = "", back = "", icon, tile = "", label, note = "", role = "menuitem", checked = null, disabled = false, title = "", beta = false }) {
     const attrs = [`type="button"`, `class="wb-menu-item${checked ? " on" : ""}${back ? " wb-menu-back" : ""}"`, `role="${role}"`];
     if (checked !== null) attrs.push(`aria-checked="${checked}"`);
     if (disabled) attrs.push(`aria-disabled="true"`);
@@ -21766,7 +22052,7 @@
       : `<i class="ph ${icon}" aria-hidden="true"></i>`;
     const trail = sub ? `<i class="ph ph-caret-right wb-menu-caret" aria-hidden="true"></i>`
       : checked !== null ? `<i class="ph ph-check wb-menu-check" aria-hidden="true"></i>` : "";
-    return `<button ${attrs.join(" ")}>${glyph}<span class="wb-menu-text"><b>${esc(label)}</b>`
+    return `<button ${attrs.join(" ")}>${glyph}<span class="wb-menu-text"><b>${esc(label)}${beta ? `<span class="beta-badge">beta</span>` : ""}</b>`
       + `${note ? `<small>${esc(note)}</small>` : ""}</span>${trail}</button>`;
   }
   // The menu drills in instead of opening a second floating layer: Playbooks
@@ -21784,7 +22070,7 @@
           if (section) html += `<div class="wb-menu-label">${esc(section)}</div>`;
         }
         html += wbMenuRow({ act: `quick:${p.id}`, icon: p.icon, tile: WB_PLAYBOOK_TILES[section.toLowerCase()] || "gray",
-          label: p.label, note: WB_PLAYBOOK_NOTES[p.id] || "", title: p.title });
+          label: p.label, note: WB_PLAYBOOK_NOTES[p.id] || "", title: p.title, beta: p.beta });
       }
       menu.innerHTML = html;
       return;

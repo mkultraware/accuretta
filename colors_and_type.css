@@ -602,61 +602,66 @@
 
 /* ============================================================
    SHOWCASE — a mid-tone theme: neither light nor dark.
-   The ground is cool steel, about a third as bright as a white
+   The ground is sunlit clay, about a third as bright as a white
    page, so it reads like a light theme on an OLED panel without
-   holding large areas at full brightness. Type is ink. Where the
-   other mid-tone theme (Retro) lifts its surfaces lighter than
-   the ground, this one sets them darker: whatever you act on or
-   have selected is a slate slab with pale type, and code and the
-   welcome plate are ink. One signal green marks what is live.
-   A live ASCII field owns the empty session (showcase-field.js);
-   structure lives in showcase.css.
+   holding large areas at full brightness. A mid-tone is the one
+   ground you can draw on in both directions, and the theme is
+   built on that: type is warm ink, structure is drawn in lines of
+   white light, and whatever you touch or that floats (the prompt
+   box, your messages, menus, windows) is a sheet of pale glass.
+   There is no accent colour: what is live is ink or light.
+   Structure lives in showcase.css; the empty session's scene
+   (guide lines, lettering) is set up by showcase-field.js.
    ============================================================ */
 [data-theme="showcase"] {
   color-scheme: light;
 
-  --bg:        #9AA4AE;
-  --bg-raised: #AEB7C0;
-  --bg-sunken: #8C96A0;
-  --bg-inset:  #A4AEB8;
+  --bg:        #DBA27C;
+  --bg-raised: #EAC3B0;
+  --bg-sunken: #C99572;
+  --bg-inset:  #E3B699;
 
-  --glass-bg:     #AEB7C0;
-  --glass-border: rgba(11, 15, 19, 0.12);
+  --glass-bg:     #EAC3B0;
+  --glass-border: rgba(255, 255, 255, 0.55);
   --glass-blur:   0px;
 
-  --bg-gradient: linear-gradient(#9AA4AE, #9AA4AE);
+  --bg-gradient: linear-gradient(#DBA27C, #DBA27C);
 
-  --fg:        #0B0F13;
-  --fg-muted:  #252B31;
-  --fg-subtle: #3F474F;
-  --fg-faint:  #5E6770;
-  --fg-invert: #EEF1F4;
+  --fg:        #170E0A;
+  --fg-muted:  #32231A;
+  --fg-subtle: #4E372A;
+  --fg-faint:  #6D4F3C;
+  --fg-invert: #FFF6F0;
 
-  --border:        #808A94;
-  --border-strong: #6D7781;
-  --border-subtle: #8C96A0;
+  --border:        #B48465;
+  --border-strong: #987055;
+  --border-subtle: #C5926F;
 
-  /* Colour cannot be read as type on a mid-tone ground, so the accent used
-     for type and outlines is ink. The signal green is only ever a fill. */
-  --accent:        #0B0F13;
-  --accent-hover:  #1C232A;
-  --accent-subtle: rgba(11, 15, 19, 0.10);
-  --accent-fg:     #EEF1F4;
+  /* Colour cannot be read as type on a mid-tone ground, so the accent is ink. */
+  --accent:        #170E0A;
+  --accent-hover:  #2E1D15;
+  --accent-subtle: rgba(23, 14, 10, 0.10);
+  --accent-fg:     #FFF6F0;
 
-  --success: #0A5C30;
-  --warning: #6B4100;
-  --danger:  #A31F08;
-  --info:    #17307A;
+  --success: #0B4F2A;
+  --warning: #5C3300;
+  --danger:  #8E1206;
+  --info:    #162C74;
   --success-subtle: rgba(10, 92, 48, 0.14);
   --warning-subtle: rgba(107, 65, 0, 0.14);
   --danger-subtle:  rgba(163, 31, 8, 0.13);
   --info-subtle:    rgba(23, 48, 122, 0.12);
 
-  --sc-rule:   #838D97;
-  --sc-ink:    #0B0D10;
-  --sc-slate:  #4E565F;
-  --sc-pale:   #EEF1F4;
-  --sc-signal: #2CF07A;
+  /* Light: the lines the frame is drawn in, and the glass of a sheet. */
+  --sc-line:      rgba(255, 255, 255, 0.6);
+  --sc-line-hot:  rgba(255, 255, 255, 1);
+  --sc-line-dim:  rgba(255, 255, 255, 0.34);
+  --sc-glass:     rgba(252, 220, 227, 0.26);
+  --sc-glass-hi:  rgba(252, 220, 227, 0.36);
+  --sc-sheet:     #EAC3B0;
+  --sc-ink:    #170E0A;
+  --sc-pale:   #FFF6F0;
+  --sc-shade:  rgba(74, 28, 8, 0.5);
 
   --font-sans:    'Inter Tight', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-display: 'Inter Tight', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -670,19 +675,19 @@
   --r-xl: 22px;
   --r-2xl: 28px;
 
-  /* Flat: slabs are told apart by tone. Only floating menus cast a shadow. */
+  /* Slabs are flat and told apart by tone. Only what floats casts a shadow. */
   --shadow-xs: none;
   --shadow-sm: none;
-  --shadow-md: 0 14px 34px -14px rgba(11, 15, 19, 0.38);
-  --shadow-lg: 0 22px 54px -18px rgba(11, 15, 19, 0.42);
-  --shadow-pop: 0 30px 70px -22px rgba(11, 15, 19, 0.48);
+  --shadow-md: 0 16px 36px -16px rgba(74, 28, 8, 0.4);
+  --shadow-lg: 0 26px 56px -22px rgba(74, 28, 8, 0.44);
+  --shadow-pop: 0 34px 72px -26px rgba(74, 28, 8, 0.5);
   --shadow-inset: none;
 
   --btn-shadow-rest:   none;
   --btn-shadow-hover:  none;
   --btn-shadow-active: none;
 
-  --btn-send-gradient: linear-gradient(#2CF07A, #2CF07A);
+  --btn-send-gradient: linear-gradient(#170E0A, #170E0A);
   --btn-send-glow:     none;
 }
 

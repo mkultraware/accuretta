@@ -480,6 +480,7 @@ class NotchHost:
     SHOW_GRACE_S = 6.0            # how long a notification keeps it up
     FIRST_SHOW_S = 6.0            # one confirmation when the overlay starts
     COLLAPSE_HIDE_S = 0.62        # widget spring is 0.5s: let it land first
+    COLLAPSE_FORCE_S = 0.6        # then hide even if a running command keeps it busy
     LEAVE_SLIDE_S = 0.34        # slide-up into the bezel before we hide
 
     def show_island(self, reason: str = "") -> None:
@@ -571,10 +572,25 @@ class NotchHost:
     def _tick_collapse(self) -> None:
         if not self._hide_at:
             return
-        if self.island_state in ("idle", "off") and time.monotonic() >= self._hide_at:
-            reason, self._hide_at = self._hide_reason, 0.0
-            self.sticky = False
-            self.hide_island(reason)
+        now = time.monotonic()
+        if now < self._hide_at:
+            return
+        # Normally the page lands on the idle pill first. While a command runs,
+        # though, its next progress update puts the island straight back into
+        # "work" and idle never comes, so the notch used to stay up after an
+        # approval although the owner had tucked it away. Past a short grace,
+        # hide whatever the state, unless a new approval or prompt now needs
+        # the owner (then it stays, and leaves again once that is handled).
+        settled = self.island_state in ("idle", "off")
+        if not settled and now < self._hide_at + self.COLLAPSE_FORCE_S:
+            return
+        if (not settled and self._hide_reason == "approval handled"
+                and self.island_state in self._QUIET_HOLD_STATES):
+            self._hide_at = 0.0
+            return
+        reason, self._hide_at = self._hide_reason, 0.0
+        self.sticky = False
+        self.hide_island(reason)
 
     def _auto_hide_check(self) -> None:
         if not self.visible or self.sticky:

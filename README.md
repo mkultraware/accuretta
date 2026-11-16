@@ -187,8 +187,11 @@ The suite includes:
 - scope-enforced Chromium sessions for JavaScript-heavy validation after a finding is confirmed
 - CVE matching, finding records, report generation, and retained evidence hashes
 - a standalone front-end secret scanner for HTML, JavaScript bundles, lazy-loaded chunks, and source maps
+- an access-control (IDOR) check that replays one request as two test accounts and signed out, then compares who received the owner's content
 
 The front-end scanner returns exact high-confidence matches for reporting, separates public identifiers, and hides weak candidates unless requested. It never submits a discovered credential to its provider or uses it for a liveness check.
+
+The **Access Control** playbook asks for the sign-in of two test accounts (a Cookie or Authorization header each) and, optionally, pages only the first account should see. The sign-ins are stored apart from the chat, never shown to the model, and deleted when the engagement ends; the model names an account and the bridge attaches its sign-in. `rt_access_check` reports whether a boundary held, and a leak is only marked validated after the same check has been run twice with a refused signed-out request as the control.
 
 Browser-backed validation uses a first-party Playwright worker (`rt_browser`). It opens pages in the installed Edge or Chrome, which keep themselves updated, always with Chromium's sandbox on; Playwright's bundled Chromium is only a fallback when neither is installed, and it is sandboxed too. Every network request a session makes, including redirects, popups, iframes, subresources, and WebSockets, is checked against the engagement allowlist; only `about`, `data`, and `blob` schemes are exempt, and they carry no network traffic. Downloads and arbitrary JavaScript evaluation are unavailable. Install the optional browser once with `python -m playwright install chromium` after installing `requirements.txt`.
 

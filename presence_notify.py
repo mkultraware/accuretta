@@ -4,21 +4,27 @@ and future security alerts.
 The bridge historically mirrored every event to the owner's phone even while
 they sat in front of the web UI. This module answers two questions instead:
 
-  1. Is the user active right now?  Two cheap signals are OR-ed so a single
+  1. Is the user active right now?  Cheap signals are OR-ed so a single
      broken or stale signal cannot wrongly suppress notifications:
        - a fresh *focused* web-UI heartbeat (works for remote devices too —
          a phone actively browsing Accuretta counts as present);
        - low local input idle via Windows GetLastInputInfo (the OS maintains
-         the timestamp whether or not a monitor is on; no polling involved).
-     When neither signal can say anything, the verdict is ABSENT (fail-open:
-     deliver externally immediately — that is today's behaviour).
+         the timestamp whether or not a monitor is on; no polling involved);
+       - an Accuretta tab focused within the last ten minutes on any device:
+         switching to an IDE or terminal on a remote machine leaves the host
+         idle, but the user is still around. Mere visibility is NOT used: a
+         desktop window left open on an empty desk reports "visible" forever.
+     When no signal says "active", the verdict is ABSENT (fail-open:
+     deliver externally immediately).
 
   2. Where should an attention-needing event go, and when? "Suppress then
      escalate": while the user looks ACTIVE, external delivery (e.g. a
      Discord DM) is held. A held notification is never lost — the escalator
      delivers it the moment the user looks inactive or when the escalation
-     deadline passes, and in-app resolution cancels it silently. The worst
-     outcome is a late notification, never a silent one.
+     deadline passes, and in-app resolution cancels it silently. Callers pick
+     a deadline that leaves the user time to act: approvals expire (and are
+     denied) after a few minutes, so their DM must land well before that.
+     The worst outcome is a late notification, never a silent one.
 
 Compute cost is negligible: no WMI/process polling, one microsecond OS API
 call consulted lazily when events fire, plus a slow background tick that
@@ -35,6 +41,7 @@ from typing import Callable
 
 DEFAULT_WEB_ACTIVE_WINDOW_S = 90.0   # heartbeat fresher than this counts
 DEFAULT_IDLE_ACTIVE_S = 150.0        # input idle below this counts as active
+DEFAULT_RECENT_FOCUS_S = 600.0       # an Accuretta tab focused this recently counts
 DEFAULT_ESCALATE_AFTER_S = 600.0     # held pings deliver after 10 minutes
 DEFAULT_TICK_S = 15.0
 RECENT_HANDLED_S = 90.0             # dedupe window after send/resolve
@@ -75,6 +82,7 @@ class PresenceNotify:
         run_escalator: bool = True,
         web_active_window_s: float = DEFAULT_WEB_ACTIVE_WINDOW_S,
         idle_active_s: float = DEFAULT_IDLE_ACTIVE_S,
+        recent_focus_s: float = DEFAULT_RECENT_FOCUS_S,
         escalate_after_s: float = DEFAULT_ESCALATE_AFTER_S,
         tick_s: float = DEFAULT_TICK_S,
     ):
@@ -82,11 +90,12 @@ class PresenceNotify:
         self._now = now
         self._web_active_window_s = float(web_active_window_s)
         self._idle_active_s = float(idle_active_s)
+        self._recent_focus_s = float(recent_focus_s)
         self._escalate_after_s = float(escalate_after_s)
         self._tick_s = float(tick_s)
         self._run_escalator = bool(run_escalator)
         self._lock = threading.Lock()
-        self._web: dict[str, dict] = {}       # client_id -> {focused, seen}
+        self._web: dict[str, dict] = {}       # client_id -> {focused, focused_at, seen}
         self._pending: dict[str, dict] = {}   # key -> held/sending record
         self._handled: dict[str, float] = {}  # key -> when it was handled
         self._ticker: threading.Thread | None = None
@@ -95,12 +104,21 @@ class PresenceNotify:
 
     def note_web(self, client_id: str, focused: bool) -> None:
         """Record a web-UI heartbeat. One id per browser tab; the focused
-        flag is the tab's visibilityState && document.hasFocus() snapshot."""
+        flag is the tab's visibilityState && document.hasFocus() snapshot.
+
+        focused_at is the last moment this tab was known to have focus: now
+        when it reports focused, and also now when it reports losing focus
+        (the blur heartbeat marks the end of a focused spell)."""
         cid = str(client_id or "").strip()[:64]
         if not cid:
             return
+        now = self._now()
         with self._lock:
-            self._web[cid] = {"focused": bool(focused), "seen": self._now()}
+            prev = self._web.get(cid)
+            focused_at = prev.get("focused_at") if prev else None
+            if focused or (prev and prev["focused"]):
+                focused_at = now
+            self._web[cid] = {"focused": bool(focused), "focused_at": focused_at, "seen": now}
             self._gc_web_locked()
 
     def drop_web(self, client_id: str) -> None:
@@ -122,7 +140,9 @@ class PresenceNotify:
         now = self._now()
         with self._lock:
             fresh = [rec for rec in self._web.values() if now - rec["seen"] <= self._web_active_window_s]
+            focus_times = [rec["focused_at"] for rec in self._web.values() if rec.get("focused_at") is not None]
         focused_fresh = any(rec["focused"] for rec in fresh)
+        last_focus_age = (now - max(focus_times)) if focus_times else None
         try:
             idle = self._idle_seconds()
         except Exception:
@@ -131,6 +151,10 @@ class PresenceNotify:
             active, reason = True, "web-focused"
         elif idle is not None and idle <= self._idle_active_s:
             active, reason = True, "input-recent"
+        elif last_focus_age is not None and last_focus_age <= self._recent_focus_s:
+            # Switched to another app (IDE, terminal) on whatever device they
+            # use Accuretta from: the host may be idle, but they are around.
+            active, reason = True, "web-recent"
         elif idle is not None:
             active, reason = False, "input-idle"
         elif fresh:
@@ -143,6 +167,7 @@ class PresenceNotify:
             "idle_seconds": idle,
             "web_clients": len(fresh),
             "web_focused_fresh": focused_fresh,
+            "last_focus_age": last_focus_age,
         }
 
     # ---- external notification routing -----------------------------------
@@ -187,8 +212,9 @@ class PresenceNotify:
             except Exception:
                 delivered = False
             if delivered:
-                self._handled[key] = now
-                self._trim_handled_locked()
+                with self._lock:
+                    self._handled[key] = now
+                    self._trim_handled_locked()
                 return "sent"
             # Delivery failed: fall through to hold so the escalator retries
             # instead of silently dropping the notification.
@@ -250,7 +276,9 @@ class PresenceNotify:
 
     def tick(self) -> None:
         """One escalator pass: drop resolved items, deliver when the user
-        looks absent, deliver past the deadline otherwise."""
+        looks absent, deliver past the deadline otherwise (a still-unanswered
+        item is worth one ping even to a present user, and the deadline caps
+        what a stuck "active" signal can cost)."""
         now = self._now()
         # One presence decision per pass — state cannot change meaningfully
         # within a tick, and presence() must not run while the record lock is

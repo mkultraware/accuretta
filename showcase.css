@@ -1,22 +1,26 @@
 /* ============================================================
    SHOWCASE — structural layer (palette lives in colors_and_type.css).
-   A mid-tone theme: cool steel ground, ink type, dark slabs.
-   - FRAME    the sidebar, top row and chat share one steel plane.
-              Hairline rules divide it: one down the sidebar's edge,
-              one under the top row that carries on under the profile
-              row, and rules between the sidebar's sections.
-   - SLABS    what you act on or have selected is a slate slab with
-              pale type and superellipse corners: the composer, your
-              messages, the open session, the open tab. Code and the
-              welcome plate are ink. Surfaces go darker than the
-              ground here, never lighter.
-   - SIGNAL   one green, used only as a fill: the send key, a switch
-              that is on, selected text, the mark on what is live.
-   - FIELD    an empty session is a poster: an ink plate carrying a
-              live ASCII field (showcase-field.js) that keeps going
-              past the plate's edge over the sidebar and top row, then
-              the composer and two short lists. It all arrives in
-              sequence, and the field dissolves when a chat starts.
+   A mid-tone theme on sunlit clay, drawn in both directions from
+   its ground: warm ink for type, white light for structure.
+   - LIGHT    the frame is drawn in white hairlines instead of
+              dark borders. They are brightest where the sidebar's
+              edge meets the rule under the top row, and fade with
+              distance from that point.
+   - GLASS    whatever you touch, and whatever floats, is a sheet
+              of pale glass with a second hairline set just inside
+              its edge: the prompt box, the plate on an empty
+              session, menus, windows. Smaller things you have
+              chosen or said (the open session, the open tab, your
+              messages) are chips of the same glass.
+   - INK      code is an ink slab, and the keys that act (send, a
+              switch that is on) are ink. There is no accent colour.
+   - SCENE    an empty session is a poster. From two of its
+              corners, lines of light run out to the window's edge,
+              over the sidebar and the top row, with points of light
+              leaving along them, and the name is set in lettering
+              as wide as the window behind the glass. It draws
+              itself in, and when a chat starts the lines pull back
+              and the lettering fades (showcase-field.js).
    Loaded last and scoped through #app, like opal.css.
    ============================================================ */
 
@@ -25,9 +29,9 @@
   to   { opacity: 1; transform: translateY(0); }
 }
 
-@keyframes sc-plate {
-  from { opacity: 0; transform: scale(0.972); }
-  to   { opacity: 1; transform: scale(1); }
+@keyframes sc-appear {
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 
 @keyframes sc-settle {
@@ -35,19 +39,34 @@
   to   { opacity: 1; transform: translateY(0); }
 }
 
+@keyframes sc-out-left  { from { transform: translateX(100%); }  to { transform: translateX(-100%); } }
+@keyframes sc-out-right { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+@keyframes sc-out-up    { from { transform: translateY(100%); }  to { transform: translateY(-100%); } }
+@keyframes sc-out-down  { from { transform: translateY(-100%); } to { transform: translateY(100%); } }
+
+@keyframes sc-ghost {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to   { opacity: 0; transform: translateY(-10px) scale(0.985); }
+}
+
 [data-theme="showcase"] body {
   background: var(--bg);
 }
 
-/* The field's canvas sits inside the app, above its panels and below
-   anything that floats over the app (menus, windows). */
+/* The scene sits inside the app, behind its panels. */
 [data-theme="showcase"] #app {
   isolation: isolate;
   background: transparent;
 }
 
 [data-theme="showcase"] ::selection {
-  background: var(--sc-signal);
+  background: var(--sc-ink);
+  color: var(--sc-pale);
+  -webkit-text-fill-color: var(--sc-pale);
+}
+
+[data-theme="showcase"] :is(pre, .code-card, .terminal, .backend-log-pre) ::selection {
+  background: #FFFFFF;
   color: var(--sc-ink);
   -webkit-text-fill-color: var(--sc-ink);
 }
@@ -71,35 +90,24 @@
   text-transform: uppercase;
 }
 
-/* The palette inside a slate slab. Everything drawn from the theme's tokens
-   (type, hairlines, tints, hover fills) follows, and the signal green can be
-   used for type here because it reads on a dark surface. */
-[data-theme="showcase"] #app :is(.composer-wrap > .composer, .bubble.user, .chatrow.wb-row.active, .wb-tab.active) {
-  --fg:        #EEF1F4;
-  --fg-muted:  #D0D5DA;
-  --fg-subtle: #B0B7BE;
-  --fg-faint:  #9199A1;
-  --fg-invert: #0B0F13;
-  --bg:        #4E565F;
-  --bg-raised: #5B636C;
-  --bg-sunken: #454C54;
-  --bg-inset:  #646C75;
-  --border:        #68707A;
-  --border-strong: #7A828C;
-  --border-subtle: #596069;
-  --accent:        #2CF07A;
-  --accent-hover:  #6AF5A2;
-  --accent-subtle: rgba(44, 240, 122, 0.16);
-  --accent-fg:     #0B0F13;
-  --success: #8DEBB3;
-  --warning: #F3CB97;
-  --danger:  #FFB1A1;
-  --info:    #B9C6FF;
+/* The palette on a sheet of glass. Type keeps the theme's ink; fills and
+   hairlines drawn from the tokens are re-based on the sheet's own tone, so
+   they stay visible on the paler surface. */
+[data-theme="showcase"] #app :is(.composer-wrap > .composer, .bubble.user) {
+  --bg:        var(--sc-sheet);
+  --bg-raised: color-mix(in srgb, var(--sc-sheet), #FFFFFF 46%);
+  --bg-sunken: color-mix(in srgb, var(--sc-sheet), var(--sc-ink) 8%);
+  --bg-inset:  color-mix(in srgb, var(--sc-sheet), #FFFFFF 24%);
+  --border:        color-mix(in srgb, var(--sc-sheet), var(--sc-ink) 20%);
+  --border-strong: color-mix(in srgb, var(--sc-sheet), var(--sc-ink) 34%);
+  --border-subtle: color-mix(in srgb, var(--sc-sheet), var(--sc-ink) 11%);
   color: var(--fg);
 }
 
-/* ...and inside an ink slab. */
-[data-theme="showcase"] #app :is(.code-card, pre, .terminal, .backend-log-pre, .wv-head) {
+/* ...and inside an ink slab. Code blocks only: the short notes and outputs
+   inside a tool card are also <pre>, and those stay on the card in the
+   card's own colours. */
+[data-theme="showcase"] #app :is(.code-card, pre:not(.tcard-pre, .tcard-note), .terminal, .backend-log-pre, .term-tab-pane) {
   --fg:        #EEF1F4;
   --fg-muted:  #B7BDC3;
   --fg-subtle: #8B929A;
@@ -112,9 +120,9 @@
   --border:        #2A2E33;
   --border-strong: #3B4046;
   --border-subtle: #1A1D21;
-  --accent:        #2CF07A;
-  --accent-hover:  #6AF5A2;
-  --accent-subtle: rgba(44, 240, 122, 0.16);
+  --accent:        #FFE2D2;
+  --accent-hover:  #FFFFFF;
+  --accent-subtle: rgba(255, 226, 210, 0.16);
   --accent-fg:     #0B0D10;
   --success: #6FDC9C;
   --warning: #F0B46A;
@@ -125,14 +133,17 @@
 }
 
 /* ============================================================
-   FRAME
+   LIGHT — the frame
    ============================================================ */
 @media (min-width: 601px) {
+  /* The sidebar's edge: brightest level with the rule under the top row. */
   [data-theme="showcase"] #app > .sidebar {
     height: 100%;
     margin: 0;
     border: 0;
-    border-right: 1px solid var(--sc-rule);
+    border-right: 1px solid var(--sc-line);
+    border-image: linear-gradient(to bottom, var(--sc-line) 0, var(--sc-line-hot) 48px, var(--sc-line) 260px,
+      var(--sc-line-dim) 70%, rgba(255, 255, 255, 0.08) 100%) 1;
     border-radius: 0;
     box-shadow: none;
   }
@@ -142,47 +153,54 @@
     background: transparent;
   }
 
+  /* The rule under the top row: brightest where it leaves the sidebar. */
   [data-theme="showcase"] #app .topbar {
     margin: 0;
     padding: 0 12px 0 8px;
     border: 0;
-    border-bottom: 1px solid var(--sc-rule);
+    border-bottom: 1px solid var(--sc-line);
+    border-image: linear-gradient(to right, var(--sc-line-hot) 0, var(--sc-line) 280px, var(--sc-line-dim) 72%,
+      rgba(255, 255, 255, 0.08) 100%) 1;
     border-radius: 0;
     box-shadow: none;
   }
 
-  /* The profile row is as tall as the top row, so the rule under the top
-     row carries straight on across the sidebar. */
+  /* The profile row is as tall as the top row, so the same rule carries on
+     across the sidebar, fading away from the meeting point. */
   [data-theme="showcase"] #app:not(.sidebar-collapsed) > .sidebar .brand {
     box-sizing: border-box;
     height: 48px;
     padding: 0 8px 0 10px;
-    border-bottom: 1px solid var(--sc-rule);
+    border-bottom: 1px solid var(--sc-line);
+    border-image: linear-gradient(to left, var(--sc-line-hot) 0, var(--sc-line) 55%, var(--sc-line-dim) 100%) 1;
   }
 
-  /* Rules between the sidebar's sections: menu, list, foot, today. */
+  /* Rules between the sidebar's sections start at its edge and thin out. */
   [data-theme="showcase"] #app:not(.sidebar-collapsed) > #sidebar.sb-v2 .workspace-nav {
     margin-bottom: 10px;
     padding-top: 10px;
-    border-bottom: 1px solid var(--sc-rule);
+    border-bottom: 1px solid var(--sc-line-dim);
+    border-image: linear-gradient(to left, var(--sc-line) 0, var(--sc-line-dim) 60%, rgba(255, 255, 255, 0.06) 100%) 1;
   }
 
   [data-theme="showcase"] #app:not(.sidebar-collapsed) > #sidebar.sb-v2 .sb-bottom {
     padding: 10px 10px 0;
-    border-top: 1px solid var(--sc-rule);
+    border-top: 1px solid var(--sc-line-dim);
+    border-image: linear-gradient(to left, var(--sc-line) 0, var(--sc-line-dim) 60%, rgba(255, 255, 255, 0.06) 100%) 1;
   }
 
   [data-theme="showcase"] #app:not(.sidebar-collapsed) > #sidebar.sb-v2 .sb-usage {
     width: auto;
     margin: 8px -10px 0;
     padding: 12px 14px 12px 20px;
-    border-top: 1px solid var(--sc-rule);
+    border-top: 1px solid var(--sc-line-dim);
+    border-image: linear-gradient(to left, var(--sc-line) 0, var(--sc-line-dim) 60%, rgba(255, 255, 255, 0.06) 100%) 1;
     border-radius: 0;
     background: transparent;
   }
 
   [data-theme="showcase"] #app:not(.sidebar-collapsed) > #sidebar.sb-v2 .sb-usage:hover {
-    background: color-mix(in srgb, var(--fg) 6%, transparent);
+    background: rgba(255, 255, 255, 0.1);
   }
 }
 
@@ -200,7 +218,7 @@
 
 [data-theme="showcase"] #wb-statusbar {
   background: var(--bg);
-  border-top: 1px solid var(--sc-rule);
+  border-top: 1px solid var(--sc-line-dim);
   font-family: var(--font-mono);
   font-size: 10px;
   letter-spacing: 0.03em;
@@ -209,8 +227,8 @@
 /* ---- sidebar ---- */
 [data-theme="showcase"] #sidebar.sb-v2 {
   --sb-radius: 11px;
-  --sb-hover: color-mix(in srgb, var(--fg) 7%, transparent);
-  --sb-selected: var(--sc-slate);
+  --sb-hover: rgba(255, 255, 255, 0.12);
+  --sb-selected: var(--sc-glass-hi);
 }
 
 [data-theme="showcase"] #app .sb-profile {
@@ -221,7 +239,7 @@
   width: 28px;
   height: 28px;
   border-radius: 9px;
-  background: var(--sc-slate);
+  background: var(--sc-ink);
   color: var(--sc-pale);
   font: 500 13px/1 var(--font-sans);
 }
@@ -231,13 +249,13 @@
 }
 
 [data-theme="showcase"] #sidebar.sb-v2 #btn-search-sessions {
-  background: var(--bg-sunken);
+  background: rgba(74, 28, 8, 0.13);
   color: var(--fg-subtle);
 }
 
 [data-theme="showcase"] #app kbd {
   border: 0;
-  background: color-mix(in srgb, var(--fg) 9%, transparent);
+  background: rgba(255, 255, 255, 0.26);
   color: var(--fg-muted);
   font: 400 10px/1.2 var(--font-mono);
   letter-spacing: 0.04em;
@@ -251,17 +269,17 @@
   color: var(--fg-subtle);
 }
 
-/* Two-cell switches: a sunken track, the chosen cell a slate slab. */
+/* Two-cell switches: a sunken track, the chosen cell lit. */
 [data-theme="showcase"] #app :is(.sb-views, .sb-theme) {
   padding: 3px;
   border-radius: 13px;
-  background: var(--bg-sunken);
+  background: rgba(74, 28, 8, 0.13);
 }
 
 [data-theme="showcase"] #app :is(.sb-views, .sb-theme) button {
   border-radius: 10px;
   box-shadow: none;
-  transition: background-color 160ms ease, color 160ms ease;
+  transition: background-color 160ms ease, color 160ms ease, box-shadow 160ms ease;
 }
 
 [data-theme="showcase"] #app .sb-views button {
@@ -274,8 +292,9 @@
 
 [data-theme="showcase"] #app .sb-views button.active,
 [data-theme="showcase"] #app .sb-theme .sb-theme-name {
-  background: var(--sc-slate);
-  color: var(--sc-pale);
+  background: var(--sc-glass-hi);
+  box-shadow: inset 0 0 0 1px var(--sc-line);
+  color: var(--fg);
 }
 
 [data-theme="showcase"] #app .sb-theme .sb-theme-name {
@@ -285,18 +304,19 @@
 }
 
 [data-theme="showcase"] #app .sb-theme-swatch {
-  background: var(--sc-signal);
+  background: var(--sc-ink);
   box-shadow: none;
 }
 
+/* The open session is lit: pale glass with a hairline of light. */
 [data-theme="showcase"] #app .chatrow.wb-row {
   border: 0;
-  transition: background-color 140ms ease;
+  transition: background-color 140ms ease, box-shadow 140ms ease;
 }
 
 [data-theme="showcase"] #app > .sidebar .chatrow.wb-row.active {
-  background: var(--bg);
-  box-shadow: none;
+  background: var(--sc-glass-hi);
+  box-shadow: inset 0 0 0 1px var(--sc-line);
 }
 
 [data-theme="showcase"] #app > .sidebar .chatrow.wb-row.active .t {
@@ -316,17 +336,21 @@
 [data-theme="showcase"] #app .sb-usage-btn {
   border: 0;
   border-radius: 9px;
-  background: var(--sc-slate);
-  box-shadow: none;
-  color: var(--sc-pale);
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--sc-line);
+  color: var(--fg);
   font: 400 10px/1 var(--font-mono);
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
 
+[data-theme="showcase"] #app .sb-usage-btn:hover {
+  background: var(--sc-glass);
+}
+
 [data-theme="showcase"] #chatlist .wb-group-body,
 [data-theme="showcase"] #sidebar .sb-files-tree {
-  border-left-color: var(--sc-rule);
+  border-left-color: var(--sc-line-dim);
 }
 
 /* ---- top row ---- */
@@ -337,14 +361,16 @@
 [data-theme="showcase"] #app .wb-tab {
   border-radius: 11px;
   color: var(--fg-muted);
+  transition: background-color 140ms ease, box-shadow 140ms ease;
 }
 
 [data-theme="showcase"] #app .wb-tab:hover {
-  background: color-mix(in srgb, var(--fg) 7%, transparent);
+  background: rgba(255, 255, 255, 0.12);
 }
 
 [data-theme="showcase"] #app .wb-tab.active {
-  background: var(--bg);
+  background: var(--sc-glass-hi);
+  box-shadow: inset 0 0 0 1px var(--sc-line);
   color: var(--fg);
 }
 
@@ -353,19 +379,30 @@
 }
 
 /* ============================================================
-   SLABS
+   SHEETS — what floats
    ============================================================ */
-/* ---- messages: yours on the right, on slate ---- */
+/* Menus and windows sit outside the app. A second hairline of light runs
+   just inside the edge of each. */
+[data-theme="showcase"] :is(.settings-window, .modal, .wb-menu, .project-menu) {
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  outline: 1px solid rgba(255, 255, 255, 0.4);
+  outline-offset: -5px;
+}
+
+/* ============================================================
+   GLASS AND INK — the conversation
+   ============================================================ */
+/* ---- messages: yours on the right, on a chip of glass ---- */
 [data-theme="showcase"] #app .bubble.user {
   border: 0 !important;
   border-radius: 20px;
-  background: var(--bg) !important;
-  box-shadow: none !important;
+  background: var(--sc-glass-hi) !important;
+  box-shadow: inset 0 0 0 1px var(--sc-line) !important;
   color: var(--fg) !important;
 }
 
 [data-theme="showcase"] #app .bubble.user:hover {
-  box-shadow: none !important;
+  box-shadow: inset 0 0 0 1px var(--sc-line-hot) !important;
 }
 
 [data-theme="showcase"] #app .bubble.user :is(p, li, strong, em, span, a) {
@@ -374,7 +411,7 @@
 }
 
 [data-theme="showcase"] #app .bubble.user :not(pre) > code {
-  background: color-mix(in srgb, var(--fg) 12%, transparent) !important;
+  background: rgba(74, 28, 8, 0.12) !important;
   color: var(--fg) !important;
   -webkit-text-fill-color: var(--fg) !important;
 }
@@ -382,7 +419,7 @@
 [data-theme="showcase"] #app .avatar.user {
   border: 0;
   border-radius: 9px;
-  background: var(--sc-slate);
+  background: var(--sc-ink);
   color: var(--sc-pale);
 }
 
@@ -402,29 +439,84 @@
 }
 
 [data-theme="showcase"] #app .bubble.agent :not(pre) > code {
-  background: color-mix(in srgb, var(--fg) 9%, transparent);
+  background: rgba(255, 255, 255, 0.32);
   color: var(--fg);
 }
 
-/* Links in a reply: ink, underlined in the signal green. */
+/* Links in a reply: ink, underlined in light. */
 [data-theme="showcase"] #app .bubble.agent a:not(.chat-link-card) {
   color: var(--fg);
   text-decoration: underline;
-  text-decoration-color: var(--sc-signal);
+  text-decoration-color: var(--sc-line-hot);
   text-decoration-thickness: 2px;
   text-underline-offset: 3px;
 }
 
+/* Rules and tables inside a reply are drawn in light too. */
+[data-theme="showcase"] #app .bubble.agent :is(hr, table, th, td) {
+  border-color: var(--sc-line);
+}
+
+[data-theme="showcase"] #app .bubble.agent :is(h1, h2, h3) {
+  border-color: var(--sc-line);
+}
+
+[data-theme="showcase"] #app .bubble.agent .md-table-wrapper {
+  border: 1px solid var(--sc-line);
+  border-radius: 14px;
+  corner-shape: squircle;
+  background: transparent;
+  box-shadow: none;
+}
+
+[data-theme="showcase"] #app .bubble.agent tr:last-child > td {
+  border-bottom: 0;
+}
+
+[data-theme="showcase"] #app .bubble.agent th {
+  background: transparent;
+  font: 400 10px/1.4 var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-subtle);
+}
+
+[data-theme="showcase"] #app .bubble.agent blockquote {
+  border-left: 2px solid var(--sc-line-hot);
+  background: transparent;
+  color: var(--fg-muted);
+}
+
 /* ---- code: ink slabs ---- */
-[data-theme="showcase"] #app :is(.code-card, pre, .terminal, .backend-log-pre) {
+[data-theme="showcase"] #app :is(.code-card, pre:not(.tcard-pre, .tcard-note), .terminal, .backend-log-pre) {
   border: 0;
   border-radius: 18px;
   background-color: var(--bg);
   box-shadow: none;
 }
 
-[data-theme="showcase"] :is(.tok-keyword, .hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-literal, .hljs-name, .hljs-type, .hljs-section) { color: #7DF5AC; }
-[data-theme="showcase"] :is(.tok-string, .hljs-string, .hljs-addition, .hljs-symbol, .hljs-bullet, .hljs-regexp) { color: #FFB38A; }
+/* The terminal panel is ink from edge to edge, like any terminal, and its
+   text sits straight on it: no slab of its own around each block of output. */
+[data-theme="showcase"] #app .term-tab-pane {
+  background: var(--bg);
+}
+
+[data-theme="showcase"] #app .term-tab-pane :is(pre, .term-pre, .backend-log-pre) {
+  border-radius: 0;
+  background: transparent;
+}
+
+[data-theme="showcase"] #app .term-tab-pane .backend-status {
+  background: var(--bg);
+}
+
+[data-theme="showcase"] #app .term-tab-pane :is(.term-err, .bl-err) { color: #FF8166; }
+[data-theme="showcase"] #app .term-tab-pane .bl-warn { color: #F0B46A; }
+[data-theme="showcase"] #app .term-tab-pane .bl-ok { color: #6FDC9C; }
+[data-theme="showcase"] #app .term-tab-pane .bl-key { color: #9DB0FF; }
+
+[data-theme="showcase"] :is(.tok-keyword, .hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-literal, .hljs-name, .hljs-type, .hljs-section) { color: #FFC2A3; }
+[data-theme="showcase"] :is(.tok-string, .hljs-string, .hljs-addition, .hljs-symbol, .hljs-bullet, .hljs-regexp) { color: #C8E6B0; }
 [data-theme="showcase"] :is(.tok-number, .hljs-number) { color: #FF8FBF; }
 [data-theme="showcase"] :is(.tok-fn, .hljs-title, .hljs-title.function_, .hljs-title.class_) { color: #F2F4EF; }
 [data-theme="showcase"] :is(.tok-comment, .hljs-comment, .hljs-quote) { color: #6B727A; font-style: italic; }
@@ -432,10 +524,11 @@
 [data-theme="showcase"] :is(.tok-var, .hljs-variable, .hljs-template-variable, .tok-decorator) { color: #D3D8DD; }
 [data-theme="showcase"] :is(.tok-punct) { color: #8B929A; }
 
-/* ---- composer: a slate slab ---- */
-/* The hint in the empty box is set explicitly so it stays readable on slate. */
+/* ---- composer: a sheet of glass ---- */
+/* Same box, same shape. Its edge and the second hairline are drawn with a
+   shadow and an outline, so neither adds to its size. */
 :root[data-theme="showcase"] body #app .composer-wrap > .composer #composer-input::placeholder {
-  color: #B9C0C7;
+  color: var(--fg-subtle);
   opacity: 1;
 }
 
@@ -444,15 +537,21 @@
 :root[data-theme="showcase"] #app .composer-wrap > .composer {
   border: 0 !important;
   border-radius: 26px !important;
-  background: var(--bg) !important;
-  box-shadow: 0 0 0 0 transparent !important;
-  color-scheme: dark;
-  transition: box-shadow 180ms ease !important;
+  outline: 1px solid rgba(255, 255, 255, 0.38);
+  outline-offset: -7px;
+  background: var(--sc-glass-hi) !important;
+  -webkit-backdrop-filter: blur(9px);
+  backdrop-filter: blur(9px);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.66), 0 30px 54px -42px var(--sc-shade) !important;
+  color-scheme: light;
+  transition: box-shadow 180ms ease, background-color 180ms ease !important;
 }
 
+/* In use, the sheet is lit: brighter glass, a full line of light at its edge. */
 :root[data-theme="showcase"] body.wb-composer #app .composer-wrap > .composer:focus-within,
 :root[data-theme="showcase"] #app .composer-wrap > .composer:focus-within {
-  box-shadow: 0 0 0 2px var(--sc-ink) !important;
+  background: rgba(255, 255, 255, 0.44) !important;
+  box-shadow: inset 0 0 0 1px #FFFFFF, 0 30px 54px -42px var(--sc-shade) !important;
 }
 
 /* The line over the box (project, machine, context) is a caption on the
@@ -477,23 +576,23 @@
   text-transform: uppercase;
 }
 
-/* Send is the one lit key: signal green, ink arrow. */
+/* Send is the one ink key on the glass. */
 [data-theme="showcase"] #app #btn-send:not(.queue-mode) {
-  color: var(--sc-ink) !important;
+  color: var(--sc-pale) !important;
   box-shadow: none !important;
 }
 
 [data-theme="showcase"] #app #btn-send:not(.queue-mode):hover {
-  filter: brightness(1.08);
+  filter: brightness(1.5);
 }
 
-/* A switch that is on is green, with an ink knob. */
+/* A switch that is on is ink, with a pale knob. */
 [data-theme="showcase"] .sw.on {
-  background: var(--sc-signal);
+  background: var(--sc-ink);
 }
 
 [data-theme="showcase"] .sw.on::after {
-  background: var(--sc-ink);
+  background: var(--sc-pale);
 }
 
 /* The card waiting on your decision sits inside crop marks. */
@@ -520,11 +619,207 @@
 }
 
 /* ============================================================
-   FIELD — the empty session
+   SCENE — the empty session
    ============================================================ */
-/* The ASCII field replaces the dot field here. */
+/* The scene replaces the dot field here. */
 [data-theme="showcase"] #app .dot-field {
   display: none;
+}
+
+/* One layer behind the app's panels (which are transparent in this theme),
+   so nothing in it ever covers what you read. showcase-field.js builds it,
+   measures the page and sets --xl --xr --yt --yb (the poster's edges),
+   --ph (the plate's height) and --vx --vy (where the frame's two lines
+   meet). */
+[data-theme="showcase"] #showcase-scene {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+  contain: strict;
+}
+
+/* The point the frame is lit from. */
+[data-theme="showcase"] #showcase-scene .sc-vertex {
+  position: absolute;
+  left: calc(var(--vx, -99px) - 3px);
+  top: calc(var(--vy, -99px) - 3px);
+  width: 5px;
+  height: 5px;
+  background: #FFFFFF;
+}
+
+/* ---- the lettering ---- */
+/* The script leans this wrapper a few pixels away from the pointer. */
+[data-theme="showcase"] #showcase-scene .sc-drift {
+  position: absolute;
+  inset: 0;
+  will-change: transform;
+}
+
+[data-theme="showcase"] #showcase-scene .sc-word {
+  position: absolute;
+  left: calc((var(--xl, 40vw) + var(--xr, 60vw)) / 2);
+  top: calc(var(--yt, 30vh) + var(--ph, 300px) / 2);
+  transform: translate(-50%, -50%) scale(1.03);
+  font: 700 clamp(200px, 25.5vw, 620px)/0.74 var(--font-sans);
+  letter-spacing: -0.055em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: rgba(112, 40, 10, 0.125);
+  opacity: 0;
+  transition: opacity 420ms ease, transform 900ms cubic-bezier(0.2, 0.7, 0.1, 1);
+  will-change: transform, opacity;
+}
+
+[data-theme="showcase"] #showcase-scene.is-on .sc-word {
+  transform: translate(-50%, -50%) scale(1);
+  opacity: 1;
+  transition: opacity 1100ms 120ms ease, transform 1400ms cubic-bezier(0.2, 0.7, 0.1, 1);
+}
+
+/* ---- the rays: two corners of the poster, carried on to the window's edge ---- */
+/* From the poster's top left corner one line runs left across the sidebar and
+   one runs up across the top row; from its bottom right corner one runs right
+   and one runs down. Each is brightest at its corner and thins out with
+   distance, and is drawn out from the corner when the scene arrives. */
+[data-theme="showcase"] #showcase-scene .sc-ray {
+  position: absolute;
+  overflow: hidden;
+  transition: transform 460ms cubic-bezier(0.6, 0, 0.8, 0.3);
+}
+
+[data-theme="showcase"] #showcase-scene .sc-ray::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.7);
+}
+
+[data-theme="showcase"] #showcase-scene .sc-ray.is-h { height: 1px; transform: scaleX(0); }
+[data-theme="showcase"] #showcase-scene .sc-ray.is-v { width: 1px; transform: scaleY(0); }
+
+[data-theme="showcase"] #showcase-scene .sc-ray.is-h.is-tl {
+  left: 0;
+  top: var(--yt);
+  width: var(--xl);
+  transform-origin: 100% 50%;
+  -webkit-mask-image: linear-gradient(to left, #000 0, rgba(0, 0, 0, 0.6) 150px, rgba(0, 0, 0, 0.2) 100%);
+  mask-image: linear-gradient(to left, #000 0, rgba(0, 0, 0, 0.6) 150px, rgba(0, 0, 0, 0.2) 100%);
+}
+
+[data-theme="showcase"] #showcase-scene .sc-ray.is-v.is-tl {
+  left: var(--xl);
+  top: 0;
+  height: var(--yt);
+  transform-origin: 50% 100%;
+  -webkit-mask-image: linear-gradient(to top, #000 0, rgba(0, 0, 0, 0.45) 100%);
+  mask-image: linear-gradient(to top, #000 0, rgba(0, 0, 0, 0.45) 100%);
+}
+
+[data-theme="showcase"] #showcase-scene .sc-ray.is-h.is-br {
+  left: var(--xr);
+  right: 0;
+  top: var(--yb);
+  transform-origin: 0 50%;
+  -webkit-mask-image: linear-gradient(to right, #000 0, rgba(0, 0, 0, 0.6) 110px, rgba(0, 0, 0, 0.25) 100%);
+  mask-image: linear-gradient(to right, #000 0, rgba(0, 0, 0, 0.6) 110px, rgba(0, 0, 0, 0.25) 100%);
+}
+
+[data-theme="showcase"] #showcase-scene .sc-ray.is-v.is-br {
+  left: var(--xr);
+  top: var(--yb);
+  bottom: 0;
+  transform-origin: 50% 0;
+  -webkit-mask-image: linear-gradient(to bottom, #000 0, rgba(0, 0, 0, 0.6) 110px, rgba(0, 0, 0, 0.2) 100%);
+  mask-image: linear-gradient(to bottom, #000 0, rgba(0, 0, 0, 0.6) 110px, rgba(0, 0, 0, 0.2) 100%);
+}
+
+[data-theme="showcase"] #showcase-scene.is-on .sc-ray {
+  transform: none;
+  transition: transform 1150ms cubic-bezier(0.16, 0.8, 0.2, 1);
+}
+
+[data-theme="showcase"] #showcase-scene.is-on .sc-ray.is-tl { transition-delay: 140ms; }
+[data-theme="showcase"] #showcase-scene.is-on .sc-ray.is-br { transition-delay: 380ms; }
+
+/* A point of light leaves each corner along its line, trailing a tail. The
+   strip is as long as the line and carries the streak at its leading end, so
+   moving it by its own length takes the streak from the corner to the edge. */
+[data-theme="showcase"] #showcase-scene .sc-ray > i {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 300ms ease;
+}
+
+[data-theme="showcase"] #showcase-scene.is-on .sc-ray > i {
+  opacity: 1;
+  transition: opacity 600ms 1300ms ease;
+}
+
+[data-theme="showcase"] #showcase-scene .sc-ray.is-h.is-tl > i {
+  background: linear-gradient(to left, rgba(255, 255, 255, 0), #FFFFFF 94%) left / 150px 100% no-repeat;
+  animation: sc-out-left 8s linear infinite;
+}
+
+[data-theme="showcase"] #showcase-scene .sc-ray.is-v.is-tl > i {
+  background: linear-gradient(to top, rgba(255, 255, 255, 0), #FFFFFF 94%) top / 100% 70px no-repeat;
+  animation: sc-out-up 6.5s -2.5s linear infinite;
+}
+
+[data-theme="showcase"] #showcase-scene .sc-ray.is-h.is-br > i {
+  background: linear-gradient(to right, rgba(255, 255, 255, 0), #FFFFFF 94%) right / 110px 100% no-repeat;
+  animation: sc-out-right 7s -4s linear infinite;
+}
+
+[data-theme="showcase"] #showcase-scene .sc-ray.is-v.is-br > i {
+  background: linear-gradient(to bottom, rgba(255, 255, 255, 0), #FFFFFF 94%) bottom / 100% 130px no-repeat;
+  animation: sc-out-down 9s -1s linear infinite;
+}
+
+/* The two corners. */
+[data-theme="showcase"] #showcase-scene .sc-node {
+  position: absolute;
+  width: 5px;
+  height: 5px;
+  margin: -2px 0 0 -2px;
+  background: #FFFFFF;
+  opacity: 0;
+  transform: scale(0);
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+
+[data-theme="showcase"] #showcase-scene .sc-node.is-tl { left: var(--xl); top: var(--yt); }
+[data-theme="showcase"] #showcase-scene .sc-node.is-br { left: var(--xr); top: var(--yb); }
+
+[data-theme="showcase"] #showcase-scene.is-on .sc-node {
+  opacity: 1;
+  transform: scale(1);
+  transition: opacity 260ms ease, transform 420ms cubic-bezier(0.2, 1.4, 0.4, 1);
+}
+
+[data-theme="showcase"] #showcase-scene.is-on .sc-node.is-tl { transition-delay: 60ms; }
+[data-theme="showcase"] #showcase-scene.is-on .sc-node.is-br { transition-delay: 300ms; }
+
+/* A chat has started: the plate has left the page, so a copy of its glass
+   stands in for a moment and lifts away. */
+[data-theme="showcase"] #showcase-scene .sc-ghost {
+  position: absolute;
+  left: var(--xl);
+  top: var(--yt);
+  width: calc(var(--xr) - var(--xl));
+  height: var(--ph, 0px);
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 26px;
+  corner-shape: squircle;
+  background: var(--sc-glass);
+  opacity: 0;
+}
+
+[data-theme="showcase"] #showcase-scene.is-leaving .sc-ghost {
+  animation: sc-ghost 420ms cubic-bezier(0.4, 0, 0.7, 0.2) both;
 }
 
 @media (min-width: 601px) {
@@ -559,17 +854,49 @@
     align-items: stretch;
   }
 
-  /* The plate: an ink slab. showcase-field.js draws the characters on it. */
+  /* The plate: a sheet of pale glass. The lettering behind it shows
+     through, softened. */
   [data-theme="showcase"] #app .chat.is-welcome .wv-head {
+    position: relative;
     box-sizing: border-box;
     height: clamp(170px, 35vh, 340px);
-    padding: 26px 30px 26px;
+    padding: 30px 34px 30px;
     align-items: flex-start;
     justify-content: space-between;
     gap: 0;
+    border: 1px solid rgba(255, 255, 255, 0.62);
     border-radius: 26px;
-    background: var(--bg);
-    animation: sc-plate 700ms cubic-bezier(0.2, 0.7, 0.1, 1) backwards;
+    background: var(--sc-glass);
+    -webkit-backdrop-filter: blur(9px);
+    backdrop-filter: blur(9px);
+    box-shadow: 0 36px 60px -44px var(--sc-shade);
+    animation: sc-appear 900ms ease backwards;
+  }
+
+  /* The second hairline, just inside the edge. */
+  [data-theme="showcase"] #app .chat.is-welcome .wv-head::after {
+    content: "";
+    position: absolute;
+    inset: 7px;
+    border: 1px solid rgba(255, 255, 255, 0.36);
+    border-radius: 19px;
+    corner-shape: squircle;
+    pointer-events: none;
+  }
+
+  /* What the sheet is, and when: set by showcase-field.js. */
+  [data-theme="showcase"] #app .chat.is-welcome .wv-head::before {
+    content: var(--sc-stamp, "New session");
+    position: absolute;
+    right: 34px;
+    bottom: 32px;
+    white-space: pre;
+    text-align: right;
+    font: 400 10px/1.7 var(--font-mono);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--fg-subtle);
+    animation: sc-appear 700ms 500ms ease backwards;
   }
 
   [data-theme="showcase"] #app .chat.is-welcome .wv-a {
@@ -579,27 +906,28 @@
 
   [data-theme="showcase"] #app .chat.is-welcome .wv-title {
     max-width: 15ch;
-    color: var(--fg);
-    font-size: clamp(30px, 3.4vw, 46px);
+    color: var(--fg-subtle);
+    font-size: clamp(30px, 3.5vw, 50px);
     font-weight: 400;
     line-height: 1.02;
     letter-spacing: -0.045em;
     text-align: left;
     text-wrap: balance;
-    animation: sc-rise 620ms 160ms cubic-bezier(0.2, 0.7, 0.1, 1) backwards;
+    animation: sc-rise 720ms 220ms cubic-bezier(0.2, 0.7, 0.1, 1) backwards;
   }
 
-  /* The rest of the poster arrives after the plate, a beat apart. */
+  /* The prompt box only fades in here, so the lines drawn from its edges
+     land where it stands. */
   [data-theme="showcase"] #app .chat.is-welcome .composer-wrap {
-    animation: sc-rise 560ms 120ms cubic-bezier(0.2, 0.7, 0.1, 1) backwards;
+    animation: sc-appear 700ms 160ms ease backwards;
   }
 
   [data-theme="showcase"] #app .chat.is-welcome .wv-below .wv-col {
-    animation: sc-rise 520ms 240ms cubic-bezier(0.2, 0.7, 0.1, 1) backwards;
+    animation: sc-rise 520ms 420ms cubic-bezier(0.2, 0.7, 0.1, 1) backwards;
   }
 
   [data-theme="showcase"] #app .chat.is-welcome .wv-below .wv-col + .wv-col {
-    animation-delay: 310ms;
+    animation-delay: 500ms;
   }
 
   /* A chat has started: the composer settles into its place at the foot. */
@@ -608,13 +936,14 @@
   }
 }
 
-/* The mark is printed pale on the plate. */
+/* The mark is printed in ink on the glass. */
 [data-theme="showcase"] #app .wv-a circle {
   fill: var(--fg) !important;
 }
 
-[data-theme="showcase"] #app .wv-project {
-  color: var(--accent);
+/* The heading is set in two tones: the question quiet, its subject in ink. */
+[data-theme="showcase"] #app .wv-title .wv-project {
+  color: var(--fg);
 }
 
 [data-theme="showcase"] #app .wv-label {
@@ -626,14 +955,34 @@
   transition: background-color 140ms ease;
 }
 
+[data-theme="showcase"] #app .wv-row:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
 [data-theme="showcase"] #app .wv-row-m {
   font: 400 10px/1 var(--font-mono);
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 
+@media (max-width: 600px) {
+  [data-theme="showcase"] #showcase-scene {
+    display: none;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  [data-theme="showcase"] #app :is(.wv-head, .wv-title, .composer-wrap, .wv-col) {
+  [data-theme="showcase"] #app :is(.wv-head, .wv-title, .composer-wrap, .wv-col),
+  [data-theme="showcase"] #app .wv-head::before {
     animation: none !important;
+  }
+
+  [data-theme="showcase"] #showcase-scene :is(.sc-word, .sc-ray, .sc-node) {
+    transition: none !important;
+  }
+
+  [data-theme="showcase"] #showcase-scene .sc-ray > i,
+  [data-theme="showcase"] #showcase-scene .sc-ghost {
+    display: none;
   }
 }

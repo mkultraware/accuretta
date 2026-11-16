@@ -35,7 +35,7 @@
 <link rel="stylesheet" href="/ui-pass.css?v=15">
 <link rel="stylesheet" href="/workbench.css?v=46">
 <link rel="stylesheet" href="/opal.css?v=3">
-<link rel="stylesheet" href="/showcase.css?v=2">
+<link rel="stylesheet" href="/showcase.css?v=3">
 <link rel="stylesheet" href="/assets/vendor/web/icons.css">
 <script src="/assets/vendor/html2canvas/dist/html2canvas.min.js" defer></script>
 <script src="/assets/vendor/jszip/dist/jszip.min.js" defer></script>
@@ -68,7 +68,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v1.0.7</span>
+        <span class="v" id="brand-v">v1.0.8</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -375,6 +375,8 @@
                 <button class="chip" id="quick-recon-target" title="Authorized target reconnaissance using scoped DNS, TLS, HTTP and port checks."><i class="ph ph-crosshair"></i>Target Recon</button>
                 <button class="chip" id="quick-frontend-secrets" title="Authorized read-only audit of frontend JavaScript, lazy chunks, and source maps for exposed credentials."><i class="ph ph-file-js"></i>Frontend Secrets</button>
                 <button class="chip" id="quick-gain-access" title="Authorized red-team assessment. Chains reconnaissance, validation and non-destructive exploitation, then captures evidence and reports."><i class="ph ph-shield-chevron"></i>Red Team</button>
+                <button class="chip" id="quick-access-control" title="Authorized access-control check. Replays requests as two test accounts and signed out to find pages or data one account can reach but should not. Beta: new, and so far only tried against a practice site."><i class="ph ph-user-switch"></i>Access Control<span class="beta-badge">beta</span></button>
+                <button class="chip" id="quick-bug-bounty" title="Authorized bug bounty hunt. Paste the program page and Accuretta fills in its scope and rules, then tests only what the program allows and proves each bug with the smallest proof it accepts."><i class="ph ph-bug"></i>Bug Bounty<span class="beta-badge">beta</span></button>
                 <div class="overflow-section-label">Blue team</div>
                 <button class="chip" id="quick-health-check" title="Read-only host triage: logon/service/scheduled-task event log review (last 24h) plus a persistence sweep, then a summary of anything worth a look. Nothing is changed."><i class="ph ph-shield-check"></i>Health check (read-only)</button>
                 <button class="chip" id="quick-persistence-hunt" title="Read-only sweep of startup keys, startup folders, scheduled tasks, services and WMI event subscriptions — flags anything hiding to survive a reboot. Nothing is changed."><i class="ph ph-shield-warning"></i>Persistence hunt (read-only)</button>
@@ -852,13 +854,27 @@
         <div id="recon-disclaimer-text"><strong>Authorized testing only.</strong> Test only systems you own or have explicit written permission to test. Unauthorized scanning may be illegal where you are. You alone are responsible for how these tools are used and for the consequences.</div>
       </div>
 
+      <div class="recon-program" data-recon-bounty-only>
+        <label class="recon-label" for="recon-program-text">Program</label>
+        <textarea id="recon-program-text" class="recon-input" rows="5" placeholder="Paste the whole program page here (scope, rules, everything), or drop a .md or .txt file on this box" autocomplete="off" spellcheck="false"></textarea>
+        <div class="recon-program-actions">
+          <button type="button" class="btn" id="recon-program-read" disabled>Fill in the form</button>
+          <span class="recon-program-status" id="recon-program-status"></span>
+        </div>
+        <p class="recon-field-hint">The loaded model reads the program and fills in the fields below. Hosts are only kept if the program names them. Check every field before you run.</p>
+        <div id="recon-program-flags" class="recon-notice hidden">
+          <i class="ph ph-warning"></i>
+          <div><strong>Check these before running</strong><ul id="recon-program-flag-list"></ul></div>
+        </div>
+      </div>
+
       <label class="recon-label" id="recon-target-label" for="recon-target-input">Target domain or host</label>
       <input type="text" id="recon-target-input" class="recon-input" placeholder="example.com" autocomplete="off" spellcheck="false">
 
       <label class="recon-check" data-recon-active-only>
         <input type="checkbox" id="recon-auth-check">
         <span class="custom-checkbox"></span>
-        <span>I own this target or have written authorization to test it.</span>
+        <span id="recon-auth-text">I own this target or have written authorization to test it.</span>
       </label>
 
       <div class="recon-secret-options" data-recon-secret-only>
@@ -873,6 +889,17 @@
           <span>Include uncertain candidates in a separate section.</span>
         </label>
       </div>
+
+      <label class="recon-label" for="recon-account-a" data-recon-access-only>Account A sign-in</label>
+      <textarea id="recon-account-a" class="recon-input" data-recon-access-only rows="2" maxlength="8192" placeholder="Cookie: session=… or Authorization: Bearer … — one header per line" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+
+      <label class="recon-label" for="recon-account-b" data-recon-access-only>Account B sign-in</label>
+      <textarea id="recon-account-b" class="recon-input" data-recon-access-only rows="2" maxlength="8192" placeholder="Cookie: session=… or Authorization: Bearer … — one header per line" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+      <p class="recon-field-hint" data-recon-access-only>Sign in to the target as two different test accounts and paste each one's Cookie or Authorization header from your browser's network tab. Accuretta attaches them to requests itself: the model only refers to "account A" and "account B", and both sign-ins are deleted when the engagement ends.</p>
+
+      <label class="recon-label" for="recon-owned-urls" data-recon-access-only>Pages only account A should see <span class="recon-opt">optional</span></label>
+      <textarea id="recon-owned-urls" class="recon-input" data-recon-access-only rows="2" maxlength="4096" placeholder="https://example.com/orders/1042 — one URL per line" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+      <p class="recon-field-hint" data-recon-access-only>Known starting points, such as one of account A's orders, invoices or profile pages. Leave blank to let the run find them.</p>
 
       <label class="recon-label" data-recon-active-only>Scope <span class="recon-opt">optional</span></label>
       <input type="text" id="recon-scope-in" class="recon-input" data-recon-active-only placeholder="in scope: hosts / IPs / CIDRs, comma-separated" autocomplete="off" spellcheck="false">
@@ -904,14 +931,14 @@
         <span>Allow destructive methods (DELETE and destructive-looking endpoints).</span>
       </label>
 
-      <label class="recon-label" data-recon-suite-only>Objective <span class="recon-opt">optional</span></label>
-      <div class="recon-chips" id="recon-objective-chips" data-recon-active-only data-recon-suite-only>
+      <label class="recon-label" data-recon-suite-only data-recon-no-access data-recon-no-bounty>Objective <span class="recon-opt">optional</span></label>
+      <div class="recon-chips" id="recon-objective-chips" data-recon-active-only data-recon-suite-only data-recon-no-access data-recon-no-bounty>
         <button type="button" class="recon-chip" data-val="Map the attack surface and report findings.">Recon only</button>
         <button type="button" class="recon-chip" data-val="Assess and verify exploitable risk.">Full assessment</button>
         <button type="button" class="recon-chip" data-val="Test a specific vulnerability class.">Specific vuln</button>
         <button type="button" class="recon-chip" data-val="Prove a data-access / exfil path.">Prove data access</button>
       </div>
-      <input type="text" id="recon-objective-text" class="recon-input" data-recon-suite-only placeholder="what does &quot;done&quot; look like?" autocomplete="off">
+      <input type="text" id="recon-objective-text" class="recon-input" data-recon-suite-only data-recon-no-access data-recon-no-bounty placeholder="what does &quot;done&quot; look like?" autocomplete="off">
 
       <label class="recon-label" data-recon-active-only data-recon-suite-only>Constraints <span class="recon-opt">optional</span></label>
       <div class="recon-chips" id="recon-constraint-chips" data-recon-active-only data-recon-suite-only>
@@ -931,9 +958,9 @@
       </label>
       <p class="recon-field-hint">Logs (evidence receipts, captured responses, screenshots and the request ledger) are better for remembering what happened when you write the report later, and the model may use them to check its own findings and cite proof. Unticked, they still exist while the engagement runs, then are deleted when it ends. Generated reports are kept either way.</p>
 
-      <label class="recon-label">Additional notes to agent <span class="recon-opt">optional</span></label>
+      <label class="recon-label" id="recon-notes-label">Additional notes to agent <span class="recon-opt">optional</span></label>
       <textarea id="recon-notes-text" class="recon-input" rows="3" placeholder="Anything the fields above don't capture: endpoints to prioritize, test credentials you're providing, rules of engagement, out-of-band details…" autocomplete="off" spellcheck="false"></textarea>
-      <p class="recon-field-hint">Free text, sent to the model along with the engagement scope.</p>
+      <p class="recon-field-hint" id="recon-notes-hint">Free text, sent to the model along with the engagement scope.</p>
 
       <div id="recon-blank-notice" class="recon-notice hidden" data-recon-active-only data-recon-suite-only>
         <i class="ph ph-info"></i>
@@ -1112,7 +1139,7 @@
             </details>
             <details class="faq-item">
               <summary><span>What are Playbooks?</span><i class="ph ph-plus"></i></summary>
-              <div><p>Ready-made guided jobs in the composer's <strong>+</strong> menu: a network scan of this machine, red-team jobs (Passive OSINT, Target Recon, Frontend Secrets, Red Team) and read-only blue-team checks (Health check, Persistence hunt). Red-team playbooks need Red team tools turned on in Settings, and each engagement passes an authorization gate with a target and scope that the tools then enforce. Use them only on systems you own or are authorized to test.</p></div>
+              <div><p>Ready-made guided jobs in the composer's <strong>+</strong> menu: a network scan of this machine, red-team jobs (Passive OSINT, Target Recon, Frontend Secrets, Red Team, Access Control) and read-only blue-team checks (Health check, Persistence hunt). Red-team playbooks need Red team tools turned on in Settings, and each engagement passes an authorization gate with a target and scope that the tools then enforce. Use them only on systems you own or are authorized to test.</p></div>
             </details>
             <details class="faq-item">
               <summary><span>What does Security Overview do?</span><i class="ph ph-plus"></i></summary>
@@ -2049,7 +2076,7 @@
 <script src="/dropdown-menus.js?v=1"></script>
 <script src="/agent-orb.js?v=5"></script>
 <script src="/theme-flowlines.js?v=2" defer></script>
-<script src="/showcase-field.js?v=1" defer></script>
+<script src="/showcase-field.js?v=2" defer></script>
 <script src="/dot-matrix.js?v=6"></script>
 <script src="/sound-cues.js?v=1"></script>
 <script src="/app.js?v=2026111002"></script>

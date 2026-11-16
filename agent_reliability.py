@@ -221,7 +221,10 @@ class EvidenceStore:
         record = {
             "id": receipt_id, "chat_id": chat_id, "mission_id": mission_id,
             "call_id": call_id or uuid.uuid4().hex, "tool": tool, "target": target,
-            "identity": str(args.get("session") or ("explicit credentials" if any(credentials.values()) else "anonymous")),
+            # request_identity is set by the bridge when it attached a stored test
+            # account itself, so it is what was actually sent, not a model label.
+            "identity": str(result.get("request_identity") or args.get("session")
+                            or ("explicit credentials" if any(credentials.values()) else "anonymous")),
             "identity_fingerprint": (result.get("request_identity_fingerprint")
                                      or digest([args.get("session"), identity_fingerprint(credentials)])),
             "request_sha256": digest(args), "method": request_context(tool, args, result)["method"],

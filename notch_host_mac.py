@@ -112,6 +112,7 @@ class IslandLogic:
     SHOW_GRACE_S = 6.0            # how long a notification keeps it up
     FIRST_SHOW_S = 6.0            # one confirmation when the overlay starts
     COLLAPSE_HIDE_S = 0.62        # the page's spring settles before it hides
+    COLLAPSE_FORCE_S = 0.6        # then hide even if a running command keeps it busy
     LEAVE_SLIDE_S = 0.34          # slide up into the bezel, then hide
     # Cards the owner dismisses deliberately (or the page folds on its own
     # countdown): never tucked away by the idle timer.
@@ -268,10 +269,19 @@ class IslandLogic:
             self.ui.post({"type": "outside-click"})
 
         # the hotkey's collapse, then the slide-out
-        if self.hide_at and self.island_state in ("idle", "off") and now >= self.hide_at:
-            reason, self.hide_at = self.hide_reason, 0.0
-            self.sticky = False
-            self.hide(reason, now)
+        # While a command runs, its progress puts the island straight back into
+        # "work" and idle never comes, so past a short grace it hides whatever
+        # the state, unless a new approval or prompt now needs the owner.
+        if self.hide_at and now >= self.hide_at:
+            settled = self.island_state in ("idle", "off")
+            if settled or now >= self.hide_at + self.COLLAPSE_FORCE_S:
+                if (not settled and self.hide_reason == "approval handled"
+                        and self.island_state in self.QUIET_HOLD_STATES):
+                    self.hide_at = 0.0
+                else:
+                    reason, self.hide_at = self.hide_reason, 0.0
+                    self.sticky = False
+                    self.hide(reason, now)
         if self.leaving and now >= self.leave_started + self.LEAVE_SLIDE_S:
             self.finish_hide()
 
