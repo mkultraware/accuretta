@@ -219,6 +219,8 @@
 .wb-sb-bar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 3px; transition: width .3s; }
 .wb-sb-bar i[data-level="warn"] { background: var(--warning); }
 .wb-sb-bar i[data-level="crit"] { background: var(--danger); }
+[data-sb="gputemp"][data-level="warn"], [data-sb="gputemp"][data-level="warn"] .ph { color: var(--warning); }
+[data-sb="gputemp"][data-level="crit"], [data-sb="gputemp"][data-level="crit"] .ph { color: var(--danger); }
 .wb-sb-state.on { color: var(--accent); }
 .wb-sb-state.on .ph { color: var(--accent); }
 .wb-sb-led {
@@ -1730,7 +1732,7 @@ body.wb-composer #toolbar-overflow-menu :is(#btn-attach-image, #btn-attach-file)
   gap: 8px;
   margin-top: 10px;
   padding-top: 10px;
-  border-top: 1px solid var(--border-muted);
+  border-top: 1px solid var(--border-subtle);
 }
 @media (min-width: 601px) {
   #app > .sidebar {
@@ -2253,6 +2255,7 @@ body.wb-composer #app .perms-option .perms-check { margin-top: 3px; font-size: 1
 .wb-mp-radio { flex: 0 0 auto; box-sizing: border-box; width: 15px; height: 15px; border: 1px solid var(--border-strong); border-radius: 50%; }
 .wb-mp-row.loaded .wb-mp-radio { border: 4.5px solid var(--accent); }
 .wb-mp-draft { flex: 0 0 auto; font-size: 11px; color: var(--accent); }
+.wb-mp-old { flex: 0 0 auto; font-size: 12px; color: var(--warning); }
 .wb-mp-versions { display: flex; flex-direction: column; gap: 1px; margin: 1px 0 4px 18px; padding-left: 8px; border-left: 1px solid var(--border-subtle); }
 .wb-mp-ver, .wb-mp-item {
   display: flex; align-items: center; gap: 9px; width: 100%; padding: 0 10px 0 8px; border: 0; border-radius: 8px;

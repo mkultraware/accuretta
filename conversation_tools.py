@@ -86,9 +86,11 @@ def search_conversations(chats, query, limit=30):
     for chat_id in order:
         chat = records[chat_id]
         messages = chat.get("messages", [])
+        # Same rule as the chat view's isRenderedMessage: a reply cut short by
+        # a mid-answer update is internal but shown.
         visible = [i for i, m in enumerate(messages)
                    if (m.get("role") in {"user", "assistant"} or m.get("_note"))
-                   and not m.get("_internal")]
+                   and (not m.get("_internal") or m.get("_steer_partial"))]
         hits = 0
         for index, message in enumerate(messages):
             if message.get("role") not in {"user", "assistant", "tool"} or message.get("invisible"):

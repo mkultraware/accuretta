@@ -560,6 +560,15 @@
     lastRow.after(divider);
   }
 
+  // The chat record also stores intermediate assistant turns and tool results
+  // for the bridge's replay; only these render. A reply that a mid-answer update
+  // cut short (_steer_partial) is internal for the bridge but shown, since the
+  // user watched it being written.
+  function isRenderedMessage(m) {
+    return !!m && (m.role === "user" || m.role === "assistant"
+      || (m.role === "system" && m._note)) && (!m._internal || !!m._steer_partial);
+  }
+
   // Visible-message index of the fold boundary for a raw chat record.
   // summary_through points into the raw message list (internal assistants and
   // tool results included), but only visible user/assistant messages render, so
@@ -572,7 +581,7 @@
     let idx = 0;
     for (let i = 0; i < Math.min(through, chat.messages.length); i++) {
       const m = chat.messages[i];
-      if ((m.role === "user" || m.role === "assistant") && !m._internal) idx++;
+      if ((m.role === "user" || m.role === "assistant") && isRenderedMessage(m)) idx++;
     }
     return { idx, stats: mark };
   }
@@ -2040,6 +2049,9 @@
       case "list_windows":   return `Listing open windows…`;
       case "desktop_snapshot": return `Inspecting the active window…`;
       case "desktop_click":  return `Clicking on screen…`;
+      case "desktop_drag":   return `Dragging on screen…`;
+      case "desktop_open_url": return `Opening a page in the browser…`;
+      case "view_image":     return `Looking at an image…`;
       case "desktop_type_text": return `Typing on screen…`;
       case "desktop_press_keys": return `Pressing keys…`;
       case "desktop_invoke": return `Activating a control…`;
@@ -3208,6 +3220,31 @@
     return out.join("\n");
   }
 
+  // A list line: indent, marker ("-", "*", "+" or "3."), text.
+  const _MD_LIST_ITEM = /^(\s*)([-*+]|\d+\.)\s+(.*)$/;
+  // Nested <ul>/<ol> from [{indent, ordered, num, text}]. Deeper indentation
+  // nests under the item above; a numbered list keeps its first number, so a
+  // list the model split with a paragraph goes on 3, 4… instead of restarting.
+  function _mdListHtml(items) {
+    let i = 0;
+    const build = (indent) => {
+      const ordered = items[i].ordered;
+      const start = ordered && items[i].num > 1 ? ` start="${items[i].num}"` : "";
+      let html = ordered ? `<ol class="md-list"${start}>` : '<ul class="md-list">';
+      while (i < items.length && items[i].indent >= indent) {
+        if (items[i].indent === indent && items[i].ordered !== ordered) break;
+        const item = items[i++];
+        let li = `<li>${item.text}`;
+        while (i < items.length && items[i].indent > item.indent) li += build(items[i].indent);
+        html += li + "</li>";
+      }
+      return html + (ordered ? "</ol>" : "</ul>");
+    };
+    let out = "";
+    while (i < items.length) out += build(items[i].indent);
+    return out;
+  }
+
   // ---------- markdown-lite for chat bubbles ----------
   // Preserves code fences, ignores tool_call tags (rendered as tool cards separately).
   function renderMarkdown(text, opts = {}) {
@@ -3346,24 +3383,36 @@
         i2++;
         continue;
       }
-      // unordered list
-      if (/^\s*[-*]\s+/.test(ln)) {
-        const items = [];
-        while (i2 < lines.length && /^\s*[-*]\s+/.test(lines[i2])) {
-          items.push(lines[i2].replace(/^\s*[-*]\s+/, ""));
+      // blockquote ("> " arrives escaped)
+      if (/^\s*&gt;\s?/.test(ln)) {
+        const quoted = [];
+        while (i2 < lines.length && /^\s*&gt;\s?/.test(lines[i2])) {
+          quoted.push(lines[i2].replace(/^\s*&gt;\s?/, ""));
           i2++;
         }
-        blocks.push("<ul class=\"md-list\">" + items.map(t => `<li>${t}</li>`).join("") + "</ul>");
+        blocks.push(`<blockquote class="md-quote">${quoted.join("<br>")}</blockquote>`);
         continue;
       }
-      // ordered list
-      if (/^\s*\d+\.\s+/.test(ln)) {
+      // lists, bulleted or numbered, nested by indentation
+      if (_MD_LIST_ITEM.test(ln)) {
         const items = [];
-        while (i2 < lines.length && /^\s*\d+\.\s+/.test(lines[i2])) {
-          items.push(lines[i2].replace(/^\s*\d+\.\s+/, ""));
-          i2++;
+        while (i2 < lines.length) {
+          const m = _MD_LIST_ITEM.exec(lines[i2]);
+          if (m) {
+            items.push({ indent: m[1].replace(/\t/g, "    ").length, ordered: /\d/.test(m[2]),
+              num: parseInt(m[2], 10), text: m[3] });
+            i2++;
+            continue;
+          }
+          // an indented line right under an item continues that item
+          if (items.length && /^\s{2,}\S/.test(lines[i2])) {
+            items[items.length - 1].text += "<br>" + lines[i2].trim();
+            i2++;
+            continue;
+          }
+          break;
         }
-        blocks.push("<ol class=\"md-list\">" + items.map(t => `<li>${t}</li>`).join("") + "</ol>");
+        blocks.push(_mdListHtml(items));
         continue;
       }
       // accumulate paragraph lines until blank
@@ -3372,8 +3421,8 @@
              !/^\s*\|.*\|\s*$/.test(lines[i2]) &&
              !/^#{1,6}\s+/.test(lines[i2]) &&
              !/^\s*(---|\*\*\*|___)\s*$/.test(lines[i2]) &&
-             !/^\s*[-*]\s+/.test(lines[i2]) &&
-             !/^\s*\d+\.\s+/.test(lines[i2])) {
+             !/^\s*&gt;\s?/.test(lines[i2]) &&
+             !_MD_LIST_ITEM.test(lines[i2])) {
         para.push(lines[i2]);
         i2++;
       }
@@ -3782,19 +3831,38 @@
     const modelPath = s.model_path || "";
     const tier = Number(s.vram_tier_gb || 0) || 0;
     if (!modelPath || !tier) return;  // nothing to tune for
-    const curCtx = Number(s.num_ctx || 0) || 0;
+    // Wait for the model to finish loading. Mid-load, free VRAM and the running
+    // instance's share are read at different moments, so the tuner saw a full
+    // card and moved every expert layer to RAM (2026-11-21, Inkling at 256k).
+    let ready = false;
+    for (let i = 0; i < 80 && !ready; i++) {
+      try { ready = !!(await api("/api/workbench/status"))?.llama_up; } catch {}
+      if (!ready) await new Promise(res => setTimeout(res, 3000));
+    }
+    if (!ready) return;  // never came up: nothing measured to heal against
+    const cur = state.settings || s;
+    const curCtx = Number(cur.num_ctx || 0) || 0;
     let r;
     try {
       r = await api("/api/llama/auto-tune", {
         method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ model_path: modelPath, vram_gb: tier, min_ctx: curCtx }),
+        body: JSON.stringify({ model_path: modelPath, vram_gb: tier, min_ctx: curCtx, background: true }),
       });
     } catch (e) {
       throw e;  // bubbled to caller's .catch
     }
+    const sug = r?.suggested || {};
+    // A background re-tune only heals upward. A plan llama.cpp says won't load,
+    // or one that moves more of the model off the GPU than the setup that just
+    // booted, comes from a bad measurement, not a better fit: leave it.
+    if (sug.does_not_fit) return;
+    const curMoe = Number(cur.n_cpu_moe || 0) || 0;
+    const curGpu = Number(cur.num_gpu || 99) || 99;
+    if (Number(sug.n_cpu_moe || 0) > curMoe) return;
+    if (sug.num_gpu != null && Number(sug.num_gpu) < Math.min(curGpu, 99)) return;
     // The tuner enforces grow-only (min_ctx above), so apply the returned (ctx,
     // offload) combo as-is.
-    const update = await applyAutoTune(r?.suggested);
+    const update = await applyAutoTune(sug);
     if (!update) return;  // already tuned, nothing to do
     // If llama-server is running, restart it so the tuned flags apply now;
     // otherwise the next /api/models/load picks them up.
@@ -3852,12 +3920,20 @@
   function saveSettings(update) {
     const run = async () => {
       const prevModel = state.settings.model;
-      const saved = await api("/api/settings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(update),
-      });
-      if (!saved || saved.error) throw new Error(saved?.error || "Settings could not be saved");
+      // Tagged so the global unhandledrejection handler can tell the user when
+      // a caller (most one-click toggles) doesn't handle the failure itself.
+      const fail = (message) => Object.assign(new Error(message), { settingsSave: true });
+      let saved;
+      try {
+        saved = await api("/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(update),
+        });
+      } catch (error) {
+        throw fail(`the app didn't answer (${error.message || error})`);
+      }
+      if (!saved || saved.error) throw fail(saved?.error || "Settings could not be saved");
       state.settings = saved;
       // model changed mid-stream → abort so next send uses fresh model cleanly
       if (update.model && update.model !== prevModel && state.streaming) {
@@ -3997,7 +4073,11 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: "new session", origin }),
-    });
+    }).catch(() => null);
+    if (!c || !c.id) {
+      toast(`Couldn't start a new session: ${(c && c.error) || "the app didn't answer"}`, "err", 4000);
+      return;
+    }
     await loadChats();
     await selectChat(c.id);
     const ta = $("#composer-input");
@@ -4548,15 +4628,8 @@
       }
     }
     
-    // Only render visible bubbles. The chat record also stores intermediate
-    // assistant turns and tool results for the bridge's replay; the renderer
-    // skips them.
-    state.messages = chat
-      ? (chat.messages || []).filter(
-          m => (m.role === "user" || m.role === "assistant"
-                || (m.role === "system" && m._note)) && !m._internal
-        )
-      : [];
+    // Only render visible bubbles (isRenderedMessage).
+    state.messages = chat ? (chat.messages || []).filter(isRenderedMessage) : [];
     state.messageWindowStart = Math.max(
       0, state.messages.length - state.messageWindowSize);
     if (chat) {
@@ -8031,6 +8104,12 @@
       row._appliedUpdates ||= new Set();
       if (!row._appliedUpdates.has(evt.id)) {
         row._appliedUpdates.add(evt.id);
+        // The reply this update cut short stays on screen above it, as it will
+        // after a reload; the live bubble below then carries on from it.
+        if (evt.kept_partial) {
+          row.before(renderBubble({ role: "assistant", content: evt.kept_partial, _internal: true,
+            _steer_partial: true, t: Date.now() / 1000 }));
+        }
         const update = renderBubble({ role: "user", content: evt.text, images: evt.images || [], _steering_id: evt.id, t: Date.now() / 1000 });
         row.before(update);
       }
@@ -13205,10 +13284,7 @@
       const c = await api(`/api/chats/${encodeURIComponent(chatId)}`);
       if (state.chatId !== chatId) return;
       state.chats.chats[chatId] = c;
-      state.messages = (c.messages || []).filter(
-        m => (m.role === "user" || m.role === "assistant"
-              || (m.role === "system" && m._note)) && !m._internal
-      );
+      state.messages = (c.messages || []).filter(isRenderedMessage);
       renderMessages();
     } catch (err) { console.warn("chat rebuild failed", err); }
   }
@@ -15439,6 +15515,8 @@
     const hint = $("#set-mmproj-hint");
     const mode = modeSel?.value || "off";
     if (input) input.disabled = mode !== "manual";
+    const device = $("#set-mmproj-device");
+    if (device) device.disabled = mode === "off";
     if (!hint) return;
     if (mode === "off") {
       hint.textContent = state.visionCapable
@@ -15483,9 +15561,20 @@
     sel.value = match ? path : "";
   }
 
+  // The strategy a draft file runs as: maya's helper is DSpark; a draft GGUF
+  // says what it is in its architecture. "" when it can't be told.
+  function specDraftKind(path) {
+    const data = state._specDrafts || {};
+    if (data.engine === "maya") return "dspark";
+    const want = path || data.paired || "";
+    const d = (data.drafts || []).find(x => x.path === want);
+    const arch = String(d?.architecture || "").toLowerCase();
+    return arch.includes("dspark") ? "dspark" : arch.includes("dflash") ? "dflash" : "";
+  }
+
   function renderSpecDraftStatus(data) {
-    if ((state.settings?.spec_draft_mode || "auto") === "off") {
-      setSpecDraftStatus("", "decoder unloaded — auto-pairing disabled, VRAM back to context");
+    if ((state.settings?.spec_draft_mode || "auto") === "off" && !specStrategyWantsDraft()) {
+      setSpecDraftStatus("", "decoder unloaded — choose a draft below to turn it back on");
       return;
     }
     if (!specStrategyWantsDraft()) { setSpecDraftStatus("", ""); return; }
@@ -15571,6 +15660,7 @@
         option.textContent = `${chosen.split(/[\\/]/).pop()} — manual`;
         sel.appendChild(option);
       }
+      state._specDrafts = data;
       syncSpecDraftSelection();
       renderSpecDraftStatus(data);
     } catch (error) {
@@ -15598,11 +15688,13 @@
       const loaded = state.loadedModel || s.model_path || "";
       if (!list.length) {
         const msg = state.modelsError || "pick a models folder above";
-        modelSel.innerHTML = `<option value="">(${msg})</option>`;
+        modelSel.innerHTML = `<option value="">(${esc(msg)})</option>`;
       } else {
         for (const m of list) {
           const o = document.createElement("option");
-          o.value = m.path; o.textContent = m.name + (m.size_gb ? `  (${m.size_gb} GB)` : "");
+          o.value = m.path; o.textContent = m.name + (m.size_gb ? `  (${m.size_gb} GB)` : "")
+            + (m.needs_maya ? "  · needs the Maya engine"
+              : m.llama_supported === false ? "  · needs a newer llama.cpp" : "");
           if (m.path === loaded || m.loaded) o.selected = true;
           modelSel.appendChild(o);
         }
@@ -15640,6 +15732,8 @@
     if (mmMode) mmMode.value = normalizedMmprojMode(s);
     const mmInp = $("#set-mmproj");
     if (mmInp) mmInp.value = s.mmproj_path || "";
+    const mmDev = $("#set-mmproj-device");
+    if (mmDev) mmDev.value = s.mmproj_device === "gpu" ? "gpu" : "cpu";
     syncMmprojModeUi();
 
     fill("#set-ctx", s.num_ctx);
@@ -15778,7 +15872,7 @@
     "spec_draft_n_max", "moe_cache_mib",
     // mmproj_path changes how the server is launched (--mmproj <path>) so it
     // also requires a relaunch to take effect.
-    "mmproj_mode", "mmproj_auto", "mmproj_path",
+    "mmproj_mode", "mmproj_auto", "mmproj_path", "mmproj_device",
   ];
   // Drawer controls that feed load-time keys, and every payload key each one
   // owns. Save only sends (and only reloads for) the ones touched since the
@@ -15807,6 +15901,7 @@
     "set-extra-args": ["llama_extra_args"],
     "set-mmproj-mode": ["mmproj_mode", "mmproj_auto", "mmproj_path"],
     "set-mmproj": ["mmproj_mode", "mmproj_auto", "mmproj_path"],
+    "set-mmproj-device": ["mmproj_device"],
   });
   const LOAD_CONTROL_SWITCHES = new Set(["sw-flash", "sw-nowarmup", "sw-metrics"]);
   const touchedLoadControls = new Set();
@@ -15874,6 +15969,7 @@
       mmproj_mode: mmprojMode,
       mmproj_auto: mmprojMode === "auto",
       mmproj_path: mmprojMode === "manual" ? ($("#set-mmproj")?.value || "").trim() : "",
+      mmproj_device: $("#set-mmproj-device")?.value === "gpu" ? "gpu" : "cpu",
       vram_tier_gb: Math.max(0, Number($("#set-vram-tier")?.value || 0)),
       autotune_kv_cache: $("#set-autotune-kv")?.value || "auto",
       autotune_kv_cache_v: $("#set-autotune-kv-v")?.value || "",
@@ -16049,7 +16145,8 @@
   async function stepTheme(step = 1) {
     const next = nextTheme(document.documentElement.dataset.theme || state.settings.theme || "light", step);
     applyTheme(next);
-    await saveSettings({ theme: next });
+    try { await saveSettings({ theme: next }); }
+    catch (error) { toast(`Theme changed here, but it couldn't be saved: ${error.message || error}`, "warn", 3500); }
   }
   // applyTheme takes a theme string from THEME_CYCLE; a boolean from older
   // callers is coerced (true -> "dark", false -> "light").
@@ -16242,30 +16339,91 @@
     return `<span class="bl-line">${safe}</span>`;
   }
 
+  // A command can stream thousands of lines a second (a search that hits binary
+  // files, a big log). Writing each line on its own, then reading the pane's
+  // height, forced a layout per line, and the console never shrank, so every
+  // line cost more than the last and the chat froze for seconds. Lines are now
+  // queued and written once per frame, and the console keeps only its newest
+  // TERM_KEEP_CHARS characters.
+  const TERM_KEEP_CHARS = 200000;
+  let _termQueue = [];
+  let _termQueuedChars = 0;
+  let _termDropped = 0;
+  let _termFlushPending = false;
   function appendTerminalText(text, isError) {
+    const s = String(text ?? "");
+    _termQueue.push([s, !!isError]);
+    _termQueuedChars += s.length;
+    // A burst bigger than the console keeps would be trimmed right away: drop
+    // its oldest lines before they reach the page.
+    while (_termQueue.length > 1 && _termQueuedChars - _termQueue[0][0].length > TERM_KEEP_CHARS) {
+      _termQueuedChars -= _termQueue.shift()[0].length;
+      _termDropped++;
+    }
+    if (_termFlushPending) return;
+    _termFlushPending = true;
+    // requestAnimationFrame stalls while the window is hidden; the timer keeps
+    // output flowing then.
+    requestAnimationFrame(flushTerminalText);
+    setTimeout(flushTerminalText, 120);
+  }
+
+  function flushTerminalText() {
+    if (!_termFlushPending) return;
+    _termFlushPending = false;
+    const items = _termQueue;
+    const dropped = _termDropped;
+    _termQueue = [];
+    _termQueuedChars = 0;
+    _termDropped = 0;
     const consolePre = document.getElementById("term-console-pre");
-    if (!consolePre) return;
-    const codeEl = consolePre.querySelector("code");
-    if (!codeEl) return;
-    
+    const codeEl = consolePre?.querySelector("code");
+    if (!codeEl || !items.length) return;
     const cursor = consolePre.querySelector(".term-cursor");
     const pane = consolePre.closest('.term-tab-pane');
     // Follow the latest output only when the user is already at the bottom (or
     // the pane was hidden) — if they've scrolled up to read history, leave them.
     const stick = !pane || pane.classList.contains("hidden")
       || (pane.scrollHeight - pane.scrollTop - pane.clientHeight < 60);
-
-    let safeText = esc(text);
-    if (isError) {
-      safeText = `<span class="term-err">${safeText}</span>`;
-    }
-    if (cursor) {
-      cursor.insertAdjacentHTML("beforebegin", safeText);
-    } else {
-      codeEl.insertAdjacentHTML("beforeend", safeText);
-    }
+    let html = "";
+    for (const [t, err] of items) html += err ? `<span class="term-err">${esc(t)}</span>` : esc(t);
+    const box = cursor?.parentNode || codeEl;
+    if (cursor) cursor.insertAdjacentHTML("beforebegin", html);
+    else codeEl.insertAdjacentHTML("beforeend", html);
+    trimTerminal(box, cursor, dropped > 0);
     activateTerminalTab("terminal");
     if (pane && stick) pane.scrollTop = pane.scrollHeight;
+  }
+
+  // Drop the oldest output so the console holds about TERM_KEEP_CHARS, and say
+  // at its top that earlier output is not shown.
+  function trimTerminal(box, cursor, dropped) {
+    let total = box.textContent.length;
+    const over = total > TERM_KEEP_CHARS * 1.25;
+    if (!over && !dropped) return;
+    let mark = box.querySelector(":scope > .term-trimmed");
+    if (over) {
+      let node = box.firstChild;
+      while (node && total > TERM_KEEP_CHARS) {
+        const next = node.nextSibling;
+        if (node !== mark && node !== cursor && !(cursor && node.contains?.(cursor))) {
+          const len = node.textContent.length;
+          if (node.nodeType === Node.TEXT_NODE && total - len < TERM_KEEP_CHARS) {
+            node.textContent = node.textContent.slice(total - TERM_KEEP_CHARS);   // keep its newest part
+            break;
+          }
+          total -= len;
+          node.remove();
+        }
+        node = next;
+      }
+    }
+    if (!mark) {
+      mark = document.createElement("span");
+      mark.className = "term-err term-trimmed";
+      mark.textContent = "[earlier output not shown]\n";
+      box.insertBefore(mark, box.firstChild);
+    }
   }
 
   function appendSandboxText(text, isError = false, activate = false) {
@@ -16318,7 +16476,7 @@
       <span class="status-dot">·</span>
       <div class="status-item"><i class="ph ph-database"></i><span data-s="ctx-limit"></span></div>
       <span class="status-dot">·</span>
-      <div class="status-item status-ctx" data-s="ctx"><i class="ph ph-gauge"></i><span data-s="ctx-pct"></span></div>
+      <div class="status-item status-ctx" data-s="ctx" role="button" tabindex="0" aria-label="Context usage: details and Compact"><i class="ph ph-gauge"></i><span data-s="ctx-pct"></span></div>
       <span class="status-dot">·</span>
       <div class="status-item"><i class="ph ph-lightning"></i><span data-s="speed"></span></div>
       <span class="status-dot">·</span>
@@ -16559,9 +16717,18 @@
     footEl.innerHTML = `<span>${data.used.toLocaleString()} of ${cap.toLocaleString()} used · ${free.toLocaleString()} free</span>`
       + `<span>${data.live ? "live" : "estimate"}</span>`;
   }
+  // The card opens from the ring above the box, or, on phones where that strip
+  // is hidden, from the context item in the status line under the title bar.
+  let _ctxPopoverAnchor = null;
+  function ctxPopoverAnchor() {
+    const shown = el => !!el && el.getBoundingClientRect().width > 0;
+    if (shown(_ctxPopoverAnchor)) return _ctxPopoverAnchor;
+    const gauge = document.getElementById("ctx-gauge");
+    return shown(gauge) ? gauge : document.querySelector(".status-ctx");
+  }
   function positionCtxPopover() {
     if (!_ctxPopoverEl) return;
-    const anchor = document.getElementById("ctx-gauge");
+    const anchor = ctxPopoverAnchor();
     if (!anchor) return;
     const r = anchor.getBoundingClientRect();
     const pw = _ctxPopoverEl.offsetWidth || 300;
@@ -16575,11 +16742,15 @@
     _ctxPopoverEl.style.left = left + "px";
     _ctxPopoverEl.style.top = top + "px";
   }
-  function showCtxPopover() {
+  function showCtxPopover(anchor) {
+    if (anchor) _ctxPopoverAnchor = anchor;
     const el = ensureCtxPopover();
     if (_ctxPopoverHideTimer) { clearTimeout(_ctxPopoverHideTimer); _ctxPopoverHideTimer = null; }
     renderCtxBreakdown();
     el.removeAttribute("hidden");
+    // Place it before the next paint: an unplaced card can land under the
+    // finger mid-tap, and the rest of the tap then reads as a tap outside it.
+    positionCtxPopover();
     requestAnimationFrame(() => {
       el.classList.add("visible");
       positionCtxPopover();
@@ -16601,7 +16772,7 @@
     const g = ev.target && ev.target.closest && ev.target.closest("#ctx-gauge");
     if (!g) return;
     if (g.contains(ev.relatedTarget)) return;
-    showCtxPopover();
+    showCtxPopover(g);
   });
   document.addEventListener("mouseout", (ev) => {
     const g = ev.target && ev.target.closest && ev.target.closest("#ctx-gauge");
@@ -16613,11 +16784,12 @@
   // Click and keyboard focus open the same card, so touch (remote over
   // Tailscale) and keyboard users can reach the Compact button too.
   document.addEventListener("click", (ev) => {
-    if (ev.target && ev.target.closest && ev.target.closest("#ctx-gauge")) { showCtxPopover(); return; }
+    const anchor = ev.target && ev.target.closest && ev.target.closest("#ctx-gauge, .status-ctx");
+    if (anchor) { showCtxPopover(anchor); return; }
     if (_ctxPopoverEl && !_ctxPopoverEl.hasAttribute("hidden") && !_ctxPopoverEl.contains(ev.target)) scheduleHideCtxPopover();
   });
   document.addEventListener("focusin", (ev) => {
-    if (ev.target && ev.target.id === "ctx-gauge") showCtxPopover();
+    if (ev.target && (ev.target.id === "ctx-gauge" || ev.target.classList?.contains("status-ctx"))) showCtxPopover(ev.target);
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && _ctxPopoverEl && !_ctxPopoverEl.hasAttribute("hidden")) scheduleHideCtxPopover();
@@ -18185,6 +18357,20 @@
   // restored values into the settings form. Returns true on success.
   async function loadModelByPath(modelPath, opts = {}) {
     if (!modelPath) return false;
+    // Warn instead of trying: a llama.cpp without this architecture can only
+    // fail, and the attempt would first stop the running model.
+    const entry = (state.modelsList || []).find(m => m.path === modelPath);
+    if (entry && entry.llama_supported === false) {
+      const name = entry.display_name || modelPath.split(/[\\/]/).pop().replace(/\.gguf$/i, "");
+      if (entry.needs_maya) {
+        toast(`${name} is made for the Maya engine, which isn't installed. llama.cpp can't run `
+          + `this file correctly. Install Maya, or pick a llama.cpp copy of the model.`, "warn", 9000, "model-load");
+        return false;
+      }
+      toast(`${name} needs a newer llama.cpp: your build doesn't support its architecture `
+        + `(${entry.architecture}). Update llama.cpp, then pick it again.`, "warn", 9000, "model-load");
+      return false;
+    }
     const hint = opts.hint || null;
     const prev = hint?.textContent;
     if (hint) hint.textContent = "loading model into llama-server...";
@@ -18276,6 +18462,15 @@
     const pair = state.draftPairs && state.draftPairs[m.path];
     return pair ? `<i class="ph-fill ph-lightning wb-mp-draft" title="DFlash draft paired: ${esc(pair.draft)}" aria-hidden="true"></i>` : "";
   }
+  // The installed llama.cpp doesn't know this model's architecture (from
+  // /api/models: llama_supported === false), so loading it can only fail.
+  const wbTooOldText = (m) => m.needs_maya
+    ? "Needs the Maya engine: this file is made for it, and llama.cpp can't run it correctly"
+    : `Needs a newer llama.cpp: this build doesn't support ${m.architecture || "its architecture"}`;
+  function wbTooOldBadge(m) {
+    return m.llama_supported === false
+      ? `<i class="ph ph-warning-circle wb-mp-old" title="${esc(wbTooOldText(m))}" role="img" aria-label="${esc(wbTooOldText(m))}"></i>` : "";
+  }
   function wbModelGroupHtml(g, isLoaded) {
     const multi = g.files.length > 1;
     const single = g.files[0];
@@ -18284,7 +18479,7 @@
       + `<button type="button" class="wb-mp-pick" role="option" aria-selected="${isLoaded}"`
       + (multi ? ` data-mp-versions aria-expanded="${open}" title="${esc(g.name)}: ${g.files.length} files"`
         : ` data-mp-path="${esc(single.path)}" title="${esc(single.name)}"`)
-      + `><span class="wb-mp-name">${esc(g.name)}</span>${multi ? "" : wbDraftBadge(single)}</button>`
+      + `><span class="wb-mp-name">${esc(g.name)}</span>${multi ? "" : wbDraftBadge(single) + wbTooOldBadge(single)}</button>`
       + (multi
         ? `<button type="button" class="wb-mp-chip" data-mp-versions aria-expanded="${open}">${g.files.length} versions<i class="ph ph-caret-${open ? "down" : "right"}" aria-hidden="true"></i></button>`
         : `<span class="wb-mp-meta">${esc(wbBitsLabel(single))}</span>`)
@@ -18295,7 +18490,7 @@
           const on = wbFileLoaded(m);
           const tag = [...(m.quant_tags || []), m.quant || ""].filter(Boolean).join(" ");
           return `<button type="button" class="wb-mp-ver${on ? " loaded" : ""}" data-mp-path="${esc(m.path)}" role="option" aria-selected="${on}" title="${esc(m.name)}">`
-            + `${wbBars(m.bits)}<span class="wb-mp-ver-name">${esc(wbBitsLabel(m))}</span>${wbDraftBadge(m)}`
+            + `${wbBars(m.bits)}<span class="wb-mp-ver-name">${esc(wbBitsLabel(m))}</span>${wbDraftBadge(m)}${wbTooOldBadge(m)}`
             + `<span class="wb-mp-tag">${esc(tag)}</span><i class="ph ph-check wb-mp-check" aria-hidden="true"></i></button>`;
         }).join("") + `</div>`;
     }
@@ -18875,6 +19070,15 @@
         menu.classList.remove("open");
       }
     });
+    // Esc closes the menu. Capture phase + preventDefault, so the composer's
+    // "Esc stops the running turn" never fires for the same key press.
+    document.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape" || !menu.classList.contains("open")) return;
+      e.preventDefault();
+      menu.classList.remove("open");
+      if (btn.hasAttribute("aria-expanded")) btn.setAttribute("aria-expanded", "false");
+      btn.focus({ preventScroll: true });
+    }, true);
     window.addEventListener("resize", () => {
       if (menu.classList.contains("open")) positionMenu();
     });
@@ -18891,6 +19095,15 @@
     const wrap = document.querySelector(".toolbar-overflow-wrap");
     if (!tools || !menu || !wrap) return;
     const mobile = isMobile();
+    // Phones drop the strip above the box (CSS); its folder chip moves into the
+    // box's bottom row after Access, and context stays in the status line.
+    const projectChip = document.getElementById("project-chip");
+    const projectStrip = document.querySelector(".composer-projects");
+    const permsControl = document.getElementById("composer-perms-control");
+    if (projectChip && projectStrip && permsControl) {
+      if (mobile && projectChip.parentNode !== tools) permsControl.after(projectChip);
+      else if (!mobile && projectChip.parentNode !== projectStrip) projectStrip.prepend(projectChip);
+    }
     if (mobile) {
       let toolsLabel = menu.querySelector('.overflow-section-label[data-section="tools"]');
       if (!toolsLabel) {
@@ -19021,6 +19234,18 @@
       anchor = null;
       if (tip) tip.classList.remove("is-visible");
     };
+    // A tap makes the browser fake hovers (also later, when the page changes
+    // under the finger), which pop tooltips that then stay up on a phone. While
+    // the last pointer was a finger or pen, hovers show nothing; moving a real
+    // mouse (a touch laptop) brings tooltips back.
+    let touchPointer = false;
+    document.addEventListener("pointerdown", (e) => {
+      touchPointer = e.pointerType !== "mouse";
+      if (touchPointer) hide();
+    }, { passive: true, capture: true });
+    document.addEventListener("pointermove", (e) => {
+      if (e.pointerType === "mouse") touchPointer = false;
+    }, { passive: true, capture: true });
     document.addEventListener("mouseover", (e) => {
       const el = e.target && e.target.closest ? e.target.closest("[data-tip], [title]") : null;
       if (!el || el === anchor) return;
@@ -19029,7 +19254,7 @@
         el.removeAttribute("title");
         if (!el.hasAttribute("aria-label")) el.setAttribute("aria-label", el.dataset.tip);
       }
-      if (!el.dataset.tip) return;
+      if (!el.dataset.tip || touchPointer) return;
       if (timer) clearTimeout(timer);
       anchor = el;
       timer = setTimeout(show, 400);
@@ -19065,6 +19290,9 @@
     });
     window.addEventListener("unhandledrejection", (e) => {
       const r = e.reason;
+      if (r && r.settingsSave) {
+        toast(`That setting wasn't saved: ${r.message}`, "err", 4500, "settings-save");
+      }
       _sendClientError("UnhandledRejection",
         String((r && (r.message || r)) || "rejection").slice(0, 500),
         "interface", String((r && r.stack) || "").slice(0, 2000));
@@ -19588,6 +19816,15 @@
     $("#set-spec-draft-select")?.addEventListener("change", (e) => {
       const input = $("#set-spec-draft-model");
       if (input) input.value = e.currentTarget.value || "";
+      // Choosing a draft means "use it": with speculative decoding off (or a
+      // draft-less kind), the pick alone saved nothing and nothing reloaded.
+      const strat = $("#set-spec-strategy");
+      const picked = e.currentTarget.value || state._specDrafts?.paired || "";
+      const kind = picked ? specDraftKind(picked) : "";
+      if (strat && kind && !specStrategyWantsDraft() && [...strat.options].some(o => o.value === kind)) {
+        strat.value = kind;
+        markLoadControlTouched("set-spec-strategy");
+      }
       refreshSpecDrafts();
     });
     $("#set-spec-draft-model")?.addEventListener("input", () => {
@@ -19763,6 +20000,11 @@
         await loadModelByPath(m, { hint: $("#set-model-hint") });
       } finally {
         sel.disabled = false;
+      }
+      // A model this llama.cpp can't run was never tried: show the loaded one again.
+      if ((state.modelsList || []).some(x => x.path === m && x.llama_supported === false)) {
+        const back = state.loadedModel || state.settings?.model_path || "";
+        if ([...sel.options].some(o => o.value === back)) sel.value = back;
       }
     });
     $("#btn-sysctx-rescan").addEventListener("click", rescanSystemContext);
@@ -21900,6 +22142,17 @@
       const v = s.vram || {};
       const vram = bar.querySelector("[data-sb=vram]");
       if (vram) { vram.hidden = !(v.total_gb > 0); vram.querySelector("span").textContent = `VRAM ${v.used_gb} / ${v.total_gb} GB`; vram.title = v.name || "GPU memory"; }
+      const temp = bar.querySelector("[data-sb=gputemp]");
+      if (temp) {
+        // Only cards that report a sensor (nvidia-smi); hidden everywhere else.
+        const t = v.temp_c == null ? NaN : Number(v.temp_c);
+        temp.hidden = !(v.total_gb > 0 && Number.isFinite(t));
+        if (!temp.hidden) {
+          temp.querySelector("span").textContent = `${Math.round(t)}°C`;
+          temp.dataset.level = t >= 90 ? "crit" : t >= 83 ? "warn" : "";
+          temp.title = `${v.name || "GPU"} temperature`;
+        }
+      }
       const backend = bar.querySelector("[data-sb=backend]");
       if (backend) {
         backend.dataset.up = s.llama_up ? "1" : "0";
@@ -23260,6 +23513,7 @@
         <span class="wb-sb-item" title="Context window in use">ctx <span class="wb-sb-bar"><i data-sb="ctxbar"></i></span><span data-sb="ctx"></span></span>
         <span class="wb-sb-item"><i class="ph ph-lightning" aria-hidden="true"></i><span data-sb="speed"></span></span>
         <span class="wb-sb-item" data-sb="vram" hidden><i class="ph ph-graphics-card" aria-hidden="true"></i><span></span></span>
+        <span class="wb-sb-item" data-sb="gputemp" hidden><i class="ph ph-thermometer-simple" aria-hidden="true"></i><span></span></span>
         <span class="wb-sb-item wb-sb-state" data-sb="state"><i class="ph ph-pulse" aria-hidden="true"></i><span>idle</span></span>
         <span class="grow"></span>
         <span class="wb-sb-item" data-sb="backend"><span class="wb-sb-led"></span><span>llama-server</span></span>

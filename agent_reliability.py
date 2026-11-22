@@ -245,9 +245,25 @@ class EvidenceStore:
         return {k: v for k, v in record.items() if k != "result"}
 
     def read(self, chat_id, mission_id, receipt_id):
+        # Small models quote a receipt ID shortened, quoted or upper-cased. A
+        # unique prefix of at least 8 hex digits still names one record; the
+        # integrity checks below run on the record it resolves to.
+        if isinstance(receipt_id, str):
+            receipt_id = receipt_id.strip().strip("'\"`").lower()
+            if re.fullmatch(r"[0-9a-f]{8,31}", receipt_id):
+                found = sorted(p.stem for p in self.folder(chat_id, mission_id).glob(receipt_id + "*.json"))
+                if len(found) > 1:
+                    raise ValueError(f"Evidence ID {receipt_id} matches {len(found)} records; "
+                                     "use the full 32-character ID")
+                if found:
+                    receipt_id = found[0]
         if not isinstance(receipt_id, str) or not re.fullmatch(r"[0-9a-f]{32}", receipt_id):
-            raise ValueError("Invalid evidence ID")
-        record = json.loads((self.folder(chat_id, mission_id) / (receipt_id + ".json")).read_text(encoding="utf-8"))
+            raise ValueError("Invalid evidence ID: use the 32-character id from a result's evidence_receipt")
+        path = self.folder(chat_id, mission_id) / (receipt_id + ".json")
+        if not path.is_file():
+            raise FileNotFoundError(f"No evidence {receipt_id} in this engagement; security_coverage "
+                                    "without evidence_id lists the recorded ones")
+        record = json.loads(path.read_text(encoding="utf-8"))
         if (record.get("record_sha256") and record["record_sha256"] != digest({k: v for k, v in record.items() if k != "record_sha256"})):
             raise ValueError("Evidence metadata integrity check failed")
         if (record["chat_id"] != chat_id or record["mission_id"] != mission_id

@@ -91,6 +91,15 @@ Download one GGUF model from Hugging Face. A `Q4_K_M` quant of a 7B to 35B model
 
 The wizard detects the GPU, finds models, offers an appropriate llama.cpp build, and tunes the selected model before starting it. Sessions, settings, workspace pointers, memories, model profiles, and preview versions are stored under `data/`.
 
+### Updating
+
+Accuretta tells you when a new release is out. Close it first, then:
+
+- **If you cloned it:** run `git pull` in the Accuretta folder.
+- **If you downloaded a zip:** unpack the new version into a new folder and copy your own files across from the old one: the `data` folder, plus `skills`, `bridge_mcp_config.json` and `email_plugin\email_config.json` if you have them.
+
+Your chats, settings and model setups carry over. Run `pip install -r requirements.txt` again when a release says it added packages.
+
 ### Preferences and memory
 
 In Settings, standing preferences stay in every chat's instructions. Searchable facts stay on disk and the model can retrieve them with `search_memories` when you ask about past information. Search uses local words and phrases, so different wording may require another search. Retrieval requires a mode with tools enabled.
@@ -281,6 +290,12 @@ Each GGUF keeps its own saved configuration. A failed launch can fall back to a 
 Speculative-decoding and vision-projector choices are also remembered per model. Projector mode is explicit: `off` guarantees a text-only launch, `automatic` looks for a matching nearby mmproj, and `manual` uses the selected file path. The Settings picker can select a projector without typing its path.
 
 Bigger context costs memory and prompt-processing time. The tuner aims for a configuration that fits the detected hardware; it cannot make an oversized model fast.
+
+### The Maya engine for Inkling 2 Mini (NVIDIA)
+
+Unsloth's looped Inkling 2 Mini GGUF runs on [maya-ik2](https://github.com/alesha-pro/maya-inkling-mini), a CUDA engine made for that model, instead of llama-server. On an RTX 4090 it writes about 150 tokens a second and reads about 3,800, against roughly 55 and 400 on llama.cpp. Build it by following its README, in a folder named `maya-inkling-mini` in your home folder (or point `ACCURETTA_MAYA_DIR` at it). Accuretta needs its `serve/server.py`, the built `maya-ik2` binary and the checkout's own `.venv`.
+
+Accuretta then picks the engine by itself for that file, makes the tokenizer once, finds the CUDA runtime and sizes the context to the free VRAM. Put Thinking Machines' drafter (`mtp.safetensors`) beside the model and choose it in the speculative-decoding draft picker to speed up code and edits; it is used only while at least 128k of context still fits beside it. Without the engine installed, the model list marks that file "needs the Maya engine" and Accuretta does not try to load it with llama.cpp.
 
 ## Troubleshooting
 

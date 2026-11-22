@@ -68,7 +68,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v1.0.8</span>
+        <span class="v" id="brand-v">v1.0.9</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -820,7 +820,7 @@
   <div class="modal-head">
     <i class="ph ph-power"></i>
     <h3>Shutdown Accuretta</h3>
-    <button class="iconbtn" id="btn-close-shutdown"><i class="ph ph-x"></i></button>
+    <button class="iconbtn" id="btn-close-shutdown" aria-label="Close"><i class="ph ph-x"></i></button>
   </div>
   <div class="modal-body" style="text-align: center; padding-top: 1rem;">
     <p style="margin-bottom: 2rem;">Save session summary before closing?</p>
@@ -829,7 +829,7 @@
       <div class="apple-loader">
         <div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div>
       </div>
-      <p style="margin-top: 1rem; color: var(--text-muted); font-size: 0.9em;">Summarizing session...</p>
+      <p style="margin-top: 1rem; color: var(--fg-muted); font-size: 0.9em;">Summarizing session...</p>
     </div>
 
     <div id="shutdown-actions" style="display: flex; gap: 1rem; justify-content: center;">
@@ -845,7 +845,7 @@
   <div class="modal-head">
     <i class="ph ph-crosshair" id="recon-modal-icon"></i>
     <h3>Target Recon</h3>
-    <button class="iconbtn" id="btn-close-recon"><i class="ph ph-x"></i></button>
+    <button class="iconbtn" id="btn-close-recon" aria-label="Close"><i class="ph ph-x"></i></button>
   </div>
   <div class="modal-body">
     <div id="recon-panel">
@@ -1214,7 +1214,7 @@
     <i class="ph ph-git-branch"></i>
     <h3>GitHub Activity</h3>
     <span class="gh-activity-login" id="gh-activity-login"></span>
-    <button class="iconbtn" id="btn-close-github-activity"><i class="ph ph-x"></i></button>
+    <button class="iconbtn" id="btn-close-github-activity" aria-label="Close"><i class="ph ph-x"></i></button>
   </div>
   <div class="modal-body gh-activity-body" id="gh-activity-body"></div>
 </aside>
@@ -1287,6 +1287,14 @@
         <button class="btn sm" id="btn-mmproj-clear" title="Set projector mode to off"><i class="ph ph-x"></i></button>
       </div>
       <span class="hint" id="set-mmproj-hint">off guarantees that no projector is loaded. changing this requires a model relaunch.</span>
+    </div>
+    <div class="form-row">
+      <label>Projector device <i class="ph ph-info" title="Where the vision projector runs. CPU leaves its ~1 GB of VRAM to context; each image then takes several seconds more to read. GPU reads images in about a second, for cards or multi-GPU setups with VRAM to spare."></i></label>
+      <select id="set-mmproj-device">
+        <option value="cpu">cpu · more room for context, slower images</option>
+        <option value="gpu">gpu · fast images, uses about 1 GB of VRAM</option>
+      </select>
+      <span class="hint">changing this requires a model relaunch.</span>
     </div>
 
     <div class="form-row">
@@ -1960,7 +1968,7 @@
     <div class="form-row">
       <label>App allowlist — one per line (exe name or absolute path)</label>
       <textarea id="set-desktop-allowlist" rows="5" placeholder="notepad&#10;chrome&#10;C:\Program Files\Electronic Arts\EA Desktop\EA Desktop\EADesktop.exe" style="font-family:ui-monospace,Consolas,monospace;font-size:12px;"></textarea>
-      <span class="hint">matches any exe/path that contains a line from this list (case-insensitive). leave empty to block all launches. restart not required.</span>
+      <span class="hint">these open without asking (Hard mode still asks). anything else asks first, as starting it from a command would. matches any exe/path that contains a line from this list (case-insensitive). restart not required.</span>
     </div>
     <div class="form-row inline">
       <label>Max actions per minute</label>
@@ -2224,7 +2232,7 @@
             scannerIcon.className = 'ph ph-check-circle success-icon';
             scannerIcon.classList.remove('spin');
             scannerTitle.textContent = 'System Ready: llama-server detected';
-            scannerDesc.innerHTML = 'We\'ve automatically detected a working <code>llama-server.exe</code> on your computer.<br><strong>Build Mode:</strong> ' + sysinfo.gpu_name;
+            scannerDesc.innerHTML = 'We\'ve automatically detected a working <code>llama-server.exe</code> on your computer.<br><strong>Build Mode:</strong> ' + escSbx(sysinfo.gpu_name);
           } else {
             // No llama-server detected - show one-click installer card
             llamaSel.innerHTML = '<option value="">No local llama-server configured</option>';
@@ -2235,7 +2243,7 @@
             scannerTitle.textContent = 'Action Required: Missing llama-server';
             
             scannerDesc.innerHTML = 'We couldn\'t locate a local <code>llama-server.exe</code>. To run models locally, you need Llama.cpp.<br>' +
-              '<div style="margin-top: 8px;"><strong>Detected Hardware:</strong> <span class="setup-wizard-badge success">' + sysinfo.gpu_name + '</span></div>' +
+              '<div style="margin-top: 8px;"><strong>Detected Hardware:</strong> <span class="setup-wizard-badge success">' + escSbx(sysinfo.gpu_name) + '</span></div>' +
               '<button class="btn-installer-download" id="btn-setup-download" style="margin-top: 12px;">' +
                 '<i class="ph ph-download-simple"></i> Install Recommended ' + sysinfo.recommended_build + ' Build (1-Click)' +
               '</button>';
@@ -2278,7 +2286,7 @@
           scannerCard.className = 'setup-scanner-card downloading';
           scannerIcon.className = 'ph ph-spinner-gap pulse-icon spin';
           scannerTitle.textContent = 'Installing llama-server…';
-          scannerDesc.innerHTML = 'Fetching official pre-compiled package for <code>' + sysinfo.gpu_name + '</code>. Please wait.' +
+          scannerDesc.innerHTML = 'Fetching official pre-compiled package for <code>' + escSbx(sysinfo.gpu_name) + '</code>. Please wait.' +
             '<div class="setup-download-container" id="download-progress-container">' +
               '<div class="setup-download-bar">' +
                 '<div class="setup-download-fill" id="download-progress-fill" style="width: 0%;"></div>' +
@@ -2337,7 +2345,7 @@
             scannerCard.className = 'setup-scanner-card';
             scannerIcon.className = 'ph ph-warning-circle';
             scannerTitle.textContent = 'Installation Failed';
-            scannerDesc.innerHTML = 'An error occurred during installation: <code style="color: var(--danger);">' + status.error_msg + '</code><br>' +
+            scannerDesc.innerHTML = 'An error occurred during installation: <code style="color: var(--danger);">' + escSbx(status.error_msg || 'unknown error') + '</code><br>' +
               '<button class="btn-installer-download" id="btn-setup-download" style="margin-top: 12px;">' +
                 '<i class="ph ph-arrow-counter-clockwise"></i> Try Again' +
               '</button>';
