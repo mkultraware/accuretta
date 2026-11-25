@@ -19,23 +19,26 @@ def main():
     failed = []
 
     if shutil.which("node"):
-        for js in sorted(ROOT.glob("*.js")):
+        js_files = sorted([*ROOT.glob("*.js"), *(ROOT / "web").rglob("*.js")])
+        for js in js_files:
             r = subprocess.run(["node", "--check", str(js)], capture_output=True, text=True)
             if r.returncode:
-                failed.append(f"JS   {js.name}: {r.stderr.strip()}")
-        print(f"JS syntax:  {len(list(ROOT.glob('*.js')))} files checked")
+                failed.append(f"JS   {js.relative_to(ROOT).as_posix()}: {r.stderr.strip()}")
+        print(f"JS syntax:  {len(js_files)} files checked")
 
         checker = ROOT / "css-syntax-check.cjs"
-        for css in sorted(ROOT.glob("*.css")):
-            r = subprocess.run(["node", str(checker), css.name], input=css.read_bytes(),
+        css_files = sorted([*ROOT.glob("*.css"), *(ROOT / "web").rglob("*.css")])
+        for css in css_files:
+            rel = css.relative_to(ROOT).as_posix()
+            r = subprocess.run(["node", str(checker), rel], input=css.read_bytes(),
                                capture_output=True, cwd=ROOT)
             try:
                 ok = json.loads(r.stdout or b"{}").get("check_status") == "passed"
             except ValueError:
                 ok = False
             if not ok:
-                failed.append(f"CSS  {css.name}: {(r.stdout or r.stderr).decode(errors='replace').strip()}")
-        print(f"CSS syntax: {len(list(ROOT.glob('*.css')))} files checked")
+                failed.append(f"CSS  {rel}: {(r.stdout or r.stderr).decode(errors='replace').strip()}")
+        print(f"CSS syntax: {len(css_files)} files checked")
     else:
         print("JS/CSS syntax: skipped (Node.js isn't installed)")
 

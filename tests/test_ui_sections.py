@@ -12,13 +12,14 @@ import bridge
 from accuretta.server.http_handler import STATIC_WHITELIST, UI_SECTION_FILES
 
 ROOT = bridge.ROOT
-FILES = sorted(p.name for p in ROOT.glob("ui-*.js"))
+FILES = sorted(f"web/ui/{p.name}" for p in (ROOT / "web" / "ui").glob("ui-*.js"))
 INDEX = (ROOT / "index.html").read_text(encoding="utf-8")
-APP = (ROOT / "app.js").read_text(encoding="utf-8")
+APP = (ROOT / "web" / "js" / "app.js").read_text(encoding="utf-8")
 
 
 def _slug(name):
-    return name[len("ui-"):-len(".js")]
+    base = name.rsplit("/", 1)[-1]
+    return base[len("ui-"):-len(".js")]
 
 
 class UiSectionWiringTests(unittest.TestCase):
@@ -28,7 +29,7 @@ class UiSectionWiringTests(unittest.TestCase):
             self.assertIn(name, STATIC_WHITELIST)
 
     def test_every_file_loads_before_app_js(self):
-        app_tag = re.search(r'<script src="/app\.js\?v=[^"]*"></script>', INDEX)
+        app_tag = re.search(r'<script src="/web/js/app\.js\?v=[^"]*"></script>', INDEX)
         self.assertIsNotNone(app_tag)
         for name in FILES:
             with self.subTest(file=name):

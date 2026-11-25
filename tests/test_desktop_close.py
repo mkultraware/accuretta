@@ -106,7 +106,7 @@ class WiringTests(unittest.TestCase):
 
     def test_page_answers_and_hides_the_power_button(self):
         app = frontend_source()
-        css = (bridge.ROOT / "workbench.css").read_text(encoding="utf-8")
+        css = (bridge.ROOT / "web" / "css" / "workbench.css").read_text(encoding="utf-8")
         self.assertIn("window.accurettaRequestQuit = () => { openShutdown(); return true; };", app)
         self.assertIn('window.addEventListener("pywebviewready", markDesktopApp);', app)
         self.assertIn("body.in-desktop-app #btn-shutdown-side { display: none; }", css)

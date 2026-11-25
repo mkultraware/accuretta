@@ -189,7 +189,7 @@ class HTTPTests(unittest.TestCase):
     def test_untrusted_reads_and_vendor_assets(self):
         self.assertEqual(self.request('GET', '/api/chats', headers={'Origin': 'null'})[0], 403)
         self.assertEqual(self.request('GET', '/api/chats', headers={'Sec-Fetch-Site': 'cross-site'})[0], 403)
-        self.assertEqual(self.request('GET', '/preview-runtime.js', headers={'Origin': 'null'})[0], 200)
+        self.assertEqual(self.request('GET', '/web/js/preview-runtime.js', headers={'Origin': 'null'})[0], 200)
         self.assertEqual(self.request('GET', '/assets/vendor/html2canvas/dist/html2canvas.min.js', headers={'Origin': 'null'})[0], 200)
         self.assertEqual(self.request('GET', '/assets/vendor/../../bridge.py')[0], 404)
 
@@ -199,7 +199,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn('sandbox allow-scripts', headers['Content-Security-Policy'])
         self.assertNotIn('allow-same-origin', headers['Content-Security-Policy'])
-        self.assertIn(b'<HEAD lang="en"><script src="/preview-runtime.js">', body)
+        self.assertIn(b'<HEAD lang="en"><script src="/web/js/preview-runtime.js">', body)
 
     def test_singleton_refuses_second_bind_without_startup(self):
         with bridge_patch('PORT', self.port), bridge_patch('_main_owned') as start:

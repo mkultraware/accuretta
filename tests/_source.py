@@ -21,8 +21,8 @@ def app_source() -> str:
 
 
 def frontend_files() -> list[Path]:
-    """app.js and every section split out of it (ui-*.js)."""
-    return [ROOT / "app.js", *sorted(ROOT.glob("ui-*.js"))]
+    """app.js and every section split out of it (web/ui/ui-*.js)."""
+    return [ROOT / "web" / "js" / "app.js", *sorted((ROOT / "web" / "ui").glob("ui-*.js"))]
 
 
 def frontend_source() -> str:

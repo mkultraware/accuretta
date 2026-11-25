@@ -181,7 +181,7 @@ class ShimContractTests(unittest.TestCase):
         self.assertIn("window.__notchHost", js)
 
     def test_wire_uses_exactly_that_surface(self):
-        wire = (Path(mac.ROOT) / "notch-wire.js").read_text(encoding="utf-8")
+        wire = (Path(mac.ROOT) / "web" / "js" / "notch-wire.js").read_text(encoding="utf-8")
         self.assertIn("window.chrome.webview.postMessage", wire)
         self.assertIn('window.chrome.webview.addEventListener("message"', wire)
 

@@ -67,9 +67,10 @@ class DeadWelcomeFieldTests(unittest.TestCase):
     def test_retired_welcome_field_styles_are_gone(self):
         # Nothing creates .welcome-blobs any more; its styles were dead weight.
         dead = re.compile(r"\.(?:welcome-blobs|wb-blob|wb-pillar|wb-soften|wb-noise)\b|--wb-(?:a|b|c|strength)\b")
-        sections = tuple(p.name for p in sorted(bridge.ROOT.glob("ui-*.js")))
-        for name in ("app.css", "ui-pass.css", "workspace-shell.css", "colors_and_type.css",
-                     "opal.css", "workbench.css", "appearance.js", "app.js", "index.html") + sections:
+        sections = tuple(f"web/ui/{p.name}" for p in sorted((bridge.ROOT / "web" / "ui").glob("ui-*.js")))
+        for name in ("web/css/app.css", "web/css/ui-pass.css", "web/css/workspace-shell.css",
+                     "web/css/colors_and_type.css", "web/css/opal.css", "web/css/workbench.css",
+                     "web/js/appearance.js", "web/js/app.js", "index.html") + sections:
             with self.subTest(file=name):
                 self.assertIsNone(dead.search((bridge.ROOT / name).read_text(encoding="utf-8")))
 

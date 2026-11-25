@@ -7,10 +7,10 @@ The folder and its files on disk are not touched.
 import re
 import unittest
 
-from _source import frontend_files
+from _source import ROOT, frontend_files
 
 FILES = {p.name: p.read_text(encoding="utf-8") for p in frontend_files()}
-CSS = (frontend_files()[0].parent / "workbench.css").read_text(encoding="utf-8")
+CSS = (ROOT / "web" / "css" / "workbench.css").read_text(encoding="utf-8")
 
 
 def _function(name):

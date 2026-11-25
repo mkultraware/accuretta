@@ -45,7 +45,7 @@ class NotchServeTests(unittest.TestCase):
         self.assertIn('name="accuretta-request-token"', text)
         self.assertIn(bridge._REQUEST_TOKEN, text)
         self.assertIn("background: transparent !important", text)
-        self.assertIn('<script src="/notch-wire.js"></script></body>', text)
+        self.assertIn('<script src="/web/js/notch-wire.js"></script></body>', text)
         self.assertIn('id="island"', text)
         self.assertIn("no-store", headers.get("Cache-Control", ""))
 
@@ -53,26 +53,26 @@ class NotchServeTests(unittest.TestCase):
         status, _, body = self._get("/accuretta-notch.html")
         self.assertEqual(status, 200)
         self.assertEqual(body, (bridge.ROOT / "accuretta-notch.html").read_bytes())
-        status, _, body = self._get("/notch-wire.js")
+        status, _, body = self._get("/web/js/notch-wire.js")
         self.assertEqual(status, 200)
-        self.assertEqual(body, (bridge.ROOT / "notch-wire.js").read_bytes())
+        self.assertEqual(body, (bridge.ROOT / "web" / "js" / "notch-wire.js").read_bytes())
 
     def test_wire_script_is_not_the_demo(self):
-        _, _, body = self._get("/notch-wire.js")
+        _, _, body = self._get("/web/js/notch-wire.js")
         text = body.decode("utf-8", "replace")
         # wired mode must be forced before any notch call
         self.assertIn("notch.config.demo = false", text)
         self.assertIn("notch.config.mockLoadMs = 0", text)
 
     def test_markdown_renderer_is_served(self):
-        status, _, body = self._get("/notch-markdown.js")
+        status, _, body = self._get("/web/js/notch-markdown.js")
         self.assertEqual(status, 200)
-        self.assertEqual(body, (bridge.ROOT / "notch-markdown.js").read_bytes())
+        self.assertEqual(body, (bridge.ROOT / "web" / "js" / "notch-markdown.js").read_bytes())
 
     def test_main_window_sounds_are_the_notch_sounds(self):
         # sound-cues.js carries the notch's Sound engine for the main window;
         # the cue table and the synth must match the notch's own copy.
-        status, _, body = self._get("/sound-cues.js")
+        status, _, body = self._get("/web/js/sound-cues.js")
         self.assertEqual(status, 200)
         cues = body.decode("utf-8").replace("\r\n", "\n")
         notch = (bridge.ROOT / "accuretta-notch.html").read_text(encoding="utf-8").replace("\r\n", "\n")
@@ -94,12 +94,12 @@ class NotchServeTests(unittest.TestCase):
     def test_page_loads_renderer_before_wiring(self):
         _, _, body = self._get("/notch")
         text = body.decode("utf-8", "replace")
-        self.assertLess(text.index("/notch-markdown.js"), text.index("/notch-wire.js"))
+        self.assertLess(text.index("/web/js/notch-markdown.js"), text.index("/web/js/notch-wire.js"))
 
     def test_host_messages_use_the_webview_channel(self):
         # Host -> page messages arrive on window.chrome.webview in WebView2;
         # a plain window listener never sees them.
-        _, _, body = self._get("/notch-wire.js")
+        _, _, body = self._get("/web/js/notch-wire.js")
         text = body.decode("utf-8", "replace")
         self.assertIn("window.chrome.webview.addEventListener", text)
         self.assertIn('"collapse"', text)
@@ -116,7 +116,7 @@ class NotchServeTests(unittest.TestCase):
 
     def test_approval_keys_follow_the_settings(self):
         _, _, page = self._get("/notch")
-        _, _, wire = self._get("/notch-wire.js")
+        _, _, wire = self._get("/web/js/notch-wire.js")
         page, wire = page.decode("utf-8", "replace"), wire.decode("utf-8", "replace")
         self.assertIn("setApprovalKeys", page)
         self.assertNotIn("'Allow <kbd>Y</kbd>'", page, "the approve key must not be hard-coded")
@@ -147,7 +147,7 @@ class NotchReplyContractTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.wire = (bridge.ROOT / "notch-wire.js").read_text(encoding="utf-8")
+        cls.wire = (bridge.ROOT / "web" / "js" / "notch-wire.js").read_text(encoding="utf-8")
         cls.html = (bridge.ROOT / "accuretta-notch.html").read_text(encoding="utf-8")
 
     def test_finish_reports_a_turn_that_produced_nothing(self):
@@ -432,7 +432,7 @@ class NotchSessionDiscoverabilityTests(unittest.TestCase):
         self.assertIn("loadChats()", focus_seg)
 
     def test_notch_turn_declares_its_surface(self):
-        wire = (bridge.ROOT / "notch-wire.js").read_text(encoding="utf-8")
+        wire = (bridge.ROOT / "web" / "js" / "notch-wire.js").read_text(encoding="utf-8")
         self.assertIn('surface: "notch"', wire)
 
     def test_open_in_main_app_targets_the_desktop_window(self):
@@ -484,7 +484,7 @@ class NotchChatBindingTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.wire = (bridge.ROOT / "notch-wire.js").read_text(encoding="utf-8")
+        cls.wire = (bridge.ROOT / "web" / "js" / "notch-wire.js").read_text(encoding="utf-8")
 
     def _chat_start_handler(self):
         seg = self.wire[self.wire.index('case "chat_start": {'):]

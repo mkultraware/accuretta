@@ -165,7 +165,7 @@ class SidebarContractTests(unittest.TestCase):
         self.assertIn('data-view="sessions"', side)
         self.assertIn('data-view="files"', side)
         self.assertIn('filesView.id = "sb-files-view";', side)
-        css = (bridge.ROOT / "workbench.css").read_text(encoding="utf-8")
+        css = (bridge.ROOT / "web" / "css" / "workbench.css").read_text(encoding="utf-8")
         self.assertIn('#sidebar.sb-v2[data-view="files"] #chatlist,', css)
         self.assertIn('#sidebar.sb-v2:not([data-view="files"]) #sb-files-view { display: none; }', css)
         # the Files view lists every project folder, with or without sessions
@@ -189,7 +189,7 @@ class SidebarContractTests(unittest.TestCase):
 
 class ActivityHeatmapTests(unittest.TestCase):
     def test_the_year_fits_and_a_narrow_panel_opens_on_today(self):
-        css = (bridge.ROOT / "ui-refresh.css").read_text(encoding="utf-8")
+        css = (bridge.ROOT / "web" / "css" / "ui-refresh.css").read_text(encoding="utf-8")
         self.assertIn("min-width: calc(var(--weeks, 53) * 11px + 34px);", css)
         self.assertNotIn("min-width: 700px", css)
         wire = APP[APP.index("function wireUsageHeatmap(data)"):]
@@ -197,7 +197,7 @@ class ActivityHeatmapTests(unittest.TestCase):
 
     def test_rows_and_columns_share_one_gap(self):
         # the Mon/Wed/Fri labels must not stretch the rows apart
-        css = (bridge.ROOT / "ui-refresh.css").read_text(encoding="utf-8")
+        css = (bridge.ROOT / "web" / "css" / "ui-refresh.css").read_text(encoding="utf-8")
         weekdays = css[css.index(".usage-weekdays {"):]
         self.assertIn("contain: size;", weekdays[:weekdays.index("}")])
         self.assertIn("grid-template-rows: repeat(7, auto); gap: 3px;", css)
@@ -209,7 +209,7 @@ class SettingsFadeTests(unittest.TestCase):
         nav = nav[:nav.index("\n  }\n")]
         # after the page list exists, so both sides get it
         self.assertTrue(nav.rstrip().endswith("initSettingsFades();"))
-        css = (bridge.ROOT / "workbench.css").read_text(encoding="utf-8")
+        css = (bridge.ROOT / "web" / "css" / "workbench.css").read_text(encoding="utf-8")
         self.assertIn("#settings-drawer .settings-fade.fade-bottom { --fade-bottom: 44px; }", css)
 
 

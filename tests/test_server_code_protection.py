@@ -30,7 +30,7 @@ class WhatCountsAsServerCode(unittest.TestCase):
 
     def test_other_files_do_not(self):
         root = Path(bridge.ROOT)
-        for p in (root / "app.js", root / "README.md", root / "tests" / "check.py",
+        for p in (root / "web" / "js" / "app.js", root / "README.md", root / "tests" / "check.py",
                   root / "accuretta_extra.py", Path(tempfile.gettempdir()) / "accuretta" / "x.py", ""):
             self.assertFalse(bridge.is_bridge_self_path(str(p)), p)
 

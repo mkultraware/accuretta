@@ -15,14 +15,15 @@ from _source import app_source, frontend_files, frontend_source
 
 ROOT = Path(__file__).resolve().parent.parent
 APP_JS = frontend_source()
-APP_CSS = (ROOT / "app.css").read_text(encoding="utf-8")
+APP_CSS = (ROOT / "web" / "css" / "app.css").read_text(encoding="utf-8")
 INDEX = (ROOT / "index.html").read_text(encoding="utf-8")
 
 # Stylesheets the main window loads, plus the page itself.
-_MAIN_STYLE_SOURCES = ["app.css", "workbench.css", "ui-pass.css", "ui-refresh.css",
-                       "colors_and_type.css", "showcase.css", "opal.css", "research-ui.css",
-                       "workspace-shell.css", "index.html", "app.js",
-                       *(p.name for p in sorted(ROOT.glob("ui-*.js")))]
+_MAIN_STYLE_SOURCES = ["web/css/app.css", "web/css/workbench.css", "web/css/ui-pass.css",
+                       "web/css/ui-refresh.css", "web/css/colors_and_type.css",
+                       "web/css/showcase.css", "web/css/opal.css", "web/css/research-ui.css",
+                       "web/css/workspace-shell.css", "index.html", "web/js/app.js",
+                       *(f"web/ui/{p.name}" for p in sorted((ROOT / "web" / "ui").glob("ui-*.js")))]
 # Set at runtime by a script with a helper the scan can't see.
 _RUNTIME_TOKENS = {"--xl", "--xr", "--yt", "--yb"}
 
@@ -32,7 +33,7 @@ class UndefinedCssTokenTests(unittest.TestCase):
         """var(--x) with no fallback and no definition drops the whole rule; the
         session search's selected row and the close-dialog spinner went blank."""
         defined, used = set(), {}
-        for name in _MAIN_STYLE_SOURCES + [p.name for p in ROOT.glob("*.js")]:
+        for name in _MAIN_STYLE_SOURCES + [f"web/js/{p.name}" for p in (ROOT / "web" / "js").glob("*.js")]:
             text = (ROOT / name).read_text(encoding="utf-8", errors="replace")
             defined |= set(re.findall(r"(--[\w-]+)\s*:", text))
             defined |= set(re.findall(r"setProperty\(\s*['\"`](--[\w-]+)", text))

@@ -345,105 +345,108 @@ MIME = {
 }
 
 
-# app.js sections that live in their own file (ui-<name>.js). Each is served like
-# app.js (whitelisted, never cached) and has a <script> tag before app.js in
+# app.js sections that live in their own file (web/ui/ui-<name>.js). Each is served
+# like app.js (whitelisted, never cached) and has a <script> tag before app.js in
 # index.html; tests/test_ui_sections.py checks that the three agree.
 UI_SECTION_FILES = frozenset({
-    "ui-terminal-jump.js",
-    "ui-mcp-quick-look.js",
-    "ui-sidebar.js",
-    "ui-composer-controls.js",
-    "ui-explorer-tools.js",
-    "ui-status-bar.js",
-    "ui-composer-context.js",
-    "ui-wb-git.js",
-    "ui-wb-viewer.js",
-    "ui-file-index.js",
-    "ui-file-refs.js",
-    "ui-replies.js",
-    "ui-sidebar-groups.js",
-    "ui-session-tabs.js",
-    "ui-wb-actions.js",
-    "ui-shortcuts.js",
-    "ui-small-formatters.js",
-    "ui-workbench.js",
-    "ui-mention-menu.js",
-    "ui-event-wiring.js",
-    "ui-mobile-tabs.js",
-    "ui-model-menu.js",
-    "ui-mobile-preview.js",
-    "ui-usage-stats.js",
-    "ui-savings-card.js",
-    "ui-savings-widget.js",
-    "ui-shell-tab.js",
-    "ui-draft-picker.js",
-    "ui-cmd-history.js",
-    "ui-sandbox.js",
-    "ui-file-tree.js",
-    "ui-preview-tools.js",
-    "ui-console-forwarder.js",
-    "ui-multi-file.js",
-    "ui-versions.js",
-    "ui-security-overview.js",
-    "ui-task-progress.js",
-    "ui-change-rollup.js",
-    "ui-streaming-fade.js",
-    "ui-finish-batch.js",
-    "ui-reveal-pacing.js",
-    "ui-paint-pipeline.js",
-    "ui-osint-card.js",
-    "ui-recon-exploit.js",
-    "ui-exposure-rail.js",
-    "ui-assessment-progress.js",
-    "ui-send-stream.js",
-    "ui-attachments.js",
-    "ui-desktop-kill-switch.js",
-    "ui-chat.js",
-    "ui-data-loading.js",
-    "ui-bootstrap.js",
-    "ui-hover-popover.js",
-    "ui-autolinker.js",
-    "ui-markdown.js",
-    "ui-stream-helpers.js",
-    "ui-email-cards.js",
-    "ui-diff-render.js",
-    "ui-highlighter.js",
-    "ui-tool-card.js",
-    "ui-tool-labels.js",
-    "ui-tool-icons.js",
-    "ui-presence.js",
-    "ui-render-helpers.js",
-    "ui-llama-update.js",
-    "ui-maya-install.js",
-    "ui-effort-stream.js",
-    "ui-ctx-breakdown.js",
-    "ui-live-events.js",
-    "ui-notifications.js",
-    "ui-utilities.js",
-    "ui-state.js",
-    "ui-viewport-presets.js",
-    "ui-mcp-servers.js",
-    "ui-backend-log.js",
-    "ui-memories-panel.js",
-    "ui-vram-tune.js",
-    "ui-settings.js",
-    "ui-file-actions.js",
-    "ui-github-activity.js",
-    "ui-command-palette.js",
-    "ui-cost-widget-init.js",
-    "ui-turn-changes.js",
+    "web/ui/ui-terminal-jump.js",
+    "web/ui/ui-mcp-quick-look.js",
+    "web/ui/ui-sidebar.js",
+    "web/ui/ui-composer-controls.js",
+    "web/ui/ui-explorer-tools.js",
+    "web/ui/ui-status-bar.js",
+    "web/ui/ui-composer-context.js",
+    "web/ui/ui-wb-git.js",
+    "web/ui/ui-wb-viewer.js",
+    "web/ui/ui-file-index.js",
+    "web/ui/ui-file-refs.js",
+    "web/ui/ui-replies.js",
+    "web/ui/ui-sidebar-groups.js",
+    "web/ui/ui-session-tabs.js",
+    "web/ui/ui-wb-actions.js",
+    "web/ui/ui-shortcuts.js",
+    "web/ui/ui-small-formatters.js",
+    "web/ui/ui-workbench.js",
+    "web/ui/ui-mention-menu.js",
+    "web/ui/ui-event-wiring.js",
+    "web/ui/ui-mobile-tabs.js",
+    "web/ui/ui-model-menu.js",
+    "web/ui/ui-mobile-preview.js",
+    "web/ui/ui-usage-stats.js",
+    "web/ui/ui-savings-card.js",
+    "web/ui/ui-savings-widget.js",
+    "web/ui/ui-shell-tab.js",
+    "web/ui/ui-draft-picker.js",
+    "web/ui/ui-cmd-history.js",
+    "web/ui/ui-sandbox.js",
+    "web/ui/ui-file-tree.js",
+    "web/ui/ui-preview-tools.js",
+    "web/ui/ui-console-forwarder.js",
+    "web/ui/ui-multi-file.js",
+    "web/ui/ui-versions.js",
+    "web/ui/ui-security-overview.js",
+    "web/ui/ui-task-progress.js",
+    "web/ui/ui-change-rollup.js",
+    "web/ui/ui-streaming-fade.js",
+    "web/ui/ui-finish-batch.js",
+    "web/ui/ui-reveal-pacing.js",
+    "web/ui/ui-paint-pipeline.js",
+    "web/ui/ui-osint-card.js",
+    "web/ui/ui-recon-exploit.js",
+    "web/ui/ui-exposure-rail.js",
+    "web/ui/ui-assessment-progress.js",
+    "web/ui/ui-send-stream.js",
+    "web/ui/ui-attachments.js",
+    "web/ui/ui-desktop-kill-switch.js",
+    "web/ui/ui-chat.js",
+    "web/ui/ui-data-loading.js",
+    "web/ui/ui-bootstrap.js",
+    "web/ui/ui-hover-popover.js",
+    "web/ui/ui-autolinker.js",
+    "web/ui/ui-markdown.js",
+    "web/ui/ui-stream-helpers.js",
+    "web/ui/ui-email-cards.js",
+    "web/ui/ui-diff-render.js",
+    "web/ui/ui-highlighter.js",
+    "web/ui/ui-tool-card.js",
+    "web/ui/ui-tool-labels.js",
+    "web/ui/ui-tool-icons.js",
+    "web/ui/ui-presence.js",
+    "web/ui/ui-render-helpers.js",
+    "web/ui/ui-llama-update.js",
+    "web/ui/ui-maya-install.js",
+    "web/ui/ui-effort-stream.js",
+    "web/ui/ui-ctx-breakdown.js",
+    "web/ui/ui-live-events.js",
+    "web/ui/ui-notifications.js",
+    "web/ui/ui-utilities.js",
+    "web/ui/ui-state.js",
+    "web/ui/ui-viewport-presets.js",
+    "web/ui/ui-mcp-servers.js",
+    "web/ui/ui-backend-log.js",
+    "web/ui/ui-memories-panel.js",
+    "web/ui/ui-vram-tune.js",
+    "web/ui/ui-settings.js",
+    "web/ui/ui-file-actions.js",
+    "web/ui/ui-github-activity.js",
+    "web/ui/ui-command-palette.js",
+    "web/ui/ui-cost-widget-init.js",
+    "web/ui/ui-turn-changes.js",
 })
 
 
 STATIC_WHITELIST = {
     *UI_SECTION_FILES,
-    "bridge-client.js", "preview-runtime.js",
-    "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css", "glyph-field.js",
-    "research-ui.js", "research-ui.css", "dropdown-menus.js",
-    "security-scan-field.js", "rt-visuals.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css",
-    "dot-matrix.js", "workbench.css", "opal.css", "showcase.css", "showcase-field.js", "sound-cues.js",
+    "web/js/bridge-client.js", "web/js/preview-runtime.js",
+    "index.html", "web/js/app.js", "web/js/appearance.js", "web/css/app.css",
+    "web/css/workspace-shell.css", "web/css/colors_and_type.css", "web/js/glyph-field.js",
+    "web/js/research-ui.js", "web/css/research-ui.css", "web/js/dropdown-menus.js",
+    "web/js/security-scan-field.js", "web/js/rt-visuals.js", "web/js/agent-orb.js",
+    "web/css/ui-refresh.css", "web/css/ui-pass.css",
+    "web/js/dot-matrix.js", "web/css/workbench.css", "web/css/opal.css",
+    "web/css/showcase.css", "web/js/showcase-field.js", "web/js/sound-cues.js",
     # notch overlay: the island UI (served unchanged) + its bridge wiring
-    "accuretta-notch.html", "notch-wire.js", "notch-markdown.js",
+    "accuretta-notch.html", "web/js/notch-wire.js", "web/js/notch-markdown.js",
     # brand assets — see index.html <link rel="..."> tags
     "assets/brand/logo-mark-dark.png", "assets/brand/logo-mark-light.png",
     "assets/icons/favicon.png", "assets/icons/favicon-32.png",
@@ -554,7 +557,7 @@ class Handler(BaseHTTPRequestHandler):
             path.startswith("/api/versions/") and len(path.split("/")) == 5)
         origin = self.headers.get("Origin")
         fetch_site = self.headers.get("Sec-Fetch-Site", "")
-        if self.command == "GET" and (preview or path.startswith("/assets/vendor/") or path == "/preview-runtime.js"):
+        if self.command == "GET" and (preview or path.startswith("/assets/vendor/") or path == "/web/js/preview-runtime.js"):
             return True
         if fetch_site in {"cross-site", "same-site"}:
             return False
@@ -606,7 +609,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/") and ("text/html" in ctype or "image/svg+xml" in ctype or "application/xhtml+xml" in ctype):
             headers["Content-Security-Policy"] = _PREVIEW_SANDBOX
             if "text/html" in ctype and self.headers.get("Sec-Fetch-Dest") in {"iframe", "document"}:
-                runtime = b'<script src="/preview-runtime.js"></script>'
+                runtime = b'<script src="/web/js/preview-runtime.js"></script>'
                 if re.search(br"<head\b[^>]*>", data, re.I):
                     data = re.sub(br"<head\b[^>]*>", lambda match: match[0] + runtime, data, count=1, flags=re.I)
                 else:
@@ -755,14 +758,17 @@ class Handler(BaseHTTPRequestHandler):
         if name == "index.html":
             source_etag += _REQUEST_TOKEN
         live_ui_asset = name in UI_SECTION_FILES or name in {
-            "index.html", "app.js", "appearance.js", "app.css", "workspace-shell.css", "colors_and_type.css",
-            "research-ui.js", "research-ui.css", "dropdown-menus.js",
-            "glyph-field.js", "security-scan-field.js", "rt-visuals.js", "agent-orb.js", "ui-refresh.css", "ui-pass.css",
-            "dot-matrix.js", "workbench.css", "opal.css", "showcase.css", "showcase-field.js", "sound-cues.js",
-            "accuretta-notch.html", "notch-wire.js", "notch-markdown.js",
+            "index.html", "web/js/app.js", "web/js/appearance.js", "web/css/app.css",
+            "web/css/workspace-shell.css", "web/css/colors_and_type.css",
+            "web/js/research-ui.js", "web/css/research-ui.css", "web/js/dropdown-menus.js",
+            "web/js/glyph-field.js", "web/js/security-scan-field.js", "web/js/rt-visuals.js",
+            "web/js/agent-orb.js", "web/css/ui-refresh.css", "web/css/ui-pass.css",
+            "web/js/dot-matrix.js", "web/css/workbench.css", "web/css/opal.css",
+            "web/css/showcase.css", "web/js/showcase-field.js", "web/js/sound-cues.js",
+            "accuretta-notch.html", "web/js/notch-wire.js", "web/js/notch-markdown.js",
             # The request-token wrapper: a stale cached copy can't recover a
             # page from a bridge restart.
-            "bridge-client.js",
+            "web/js/bridge-client.js",
         }
         cache_control = ("no-cache, must-revalidate" if live_ui_asset
                          else ("public, max-age=31536000, immutable" if versioned
@@ -770,7 +776,7 @@ class Handler(BaseHTTPRequestHandler):
         data = full.read_bytes()
         if name == "index.html":
             bootstrap = (f'<meta name="accuretta-request-token" content="{_REQUEST_TOKEN}">'
-                         '<script src="/bridge-client.js"></script>')
+                         '<script src="/web/js/bridge-client.js"></script>')
             data = data.replace(b"<head>", b"<head>" + bootstrap.encode("ascii"), 1)
         ctype = MIME.get(full.suffix, "application/octet-stream")
         accepts_gzip = "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
@@ -812,8 +818,8 @@ class Handler(BaseHTTPRequestHandler):
             f'<meta name="accuretta-request-token" content="{_REQUEST_TOKEN}">'
             "<style>html, body { background: transparent !important; }</style>"
         ).encode("utf-8")
-        tail_inject = (b'<script src="/notch-markdown.js"></script>'
-                       b'<script src="/notch-wire.js"></script>')
+        tail_inject = (b'<script src="/web/js/notch-markdown.js"></script>'
+                       b'<script src="/web/js/notch-wire.js"></script>')
         if b"<head>" in data:
             data = data.replace(b"<head>", b"<head>" + head_inject, 1)
         if b"</body>" in data:

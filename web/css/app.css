@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* ============================================================
    Accuretta app — layout + components on top of the design system.
-   Imports: /colors_and_type.css
+   Imports: /web/css/colors_and_type.css
    ============================================================ */
-@import url("/colors_and_type.css?v=15");
+@import url("/web/css/colors_and_type.css?v=15");
 
 * {
   box-sizing: border-box;

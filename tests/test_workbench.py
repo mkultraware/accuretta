@@ -14,7 +14,7 @@ from _patching import bridge_patch
 from _source import frontend_source
 
 APP = frontend_source()
-CSS = (bridge.ROOT / "workbench.css").read_text(encoding="utf-8")
+CSS = (bridge.ROOT / "web" / "css" / "workbench.css").read_text(encoding="utf-8")
 HTML = (bridge.ROOT / "index.html").read_text(encoding="utf-8")
 
 
@@ -169,13 +169,13 @@ class WorkbenchEndpointTests(unittest.TestCase):
 
 class WorkbenchContractTests(unittest.TestCase):
     def test_stylesheet_is_linked_and_served(self):
-        self.assertIn('href="/workbench.css', HTML)
-        self.assertIn("workbench.css", bridge.STATIC_WHITELIST)
+        self.assertIn('href="/web/css/workbench.css', HTML)
+        self.assertIn("web/css/workbench.css", bridge.STATIC_WHITELIST)
 
     def test_desktop_chat_stays_in_the_stretch_row(self):
         # Hiding #status-line on desktop used to drop the chat into the
         # auto-sized row, leaving an empty band under the composer.
-        css = (bridge.ROOT / "app.css").read_text(encoding="utf-8")
+        css = (bridge.ROOT / "web" / "css" / "app.css").read_text(encoding="utf-8")
         block = css[css.index("#status-line { display: none; }"):]
         block = block[:block.index("\n}\n")]
         self.assertIn("#app > .center > .chat { grid-row: 3; }", block)

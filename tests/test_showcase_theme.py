@@ -10,12 +10,12 @@ from _source import frontend_source
 
 ROOT = bridge.ROOT
 APP = frontend_source()
-CSS = (ROOT / "showcase.css").read_text(encoding="utf-8")
-FIELD = (ROOT / "showcase-field.js").read_text(encoding="utf-8")
+CSS = (ROOT / "web" / "css" / "showcase.css").read_text(encoding="utf-8")
+FIELD = (ROOT / "web" / "js" / "showcase-field.js").read_text(encoding="utf-8")
 
 
 def _palette():
-    css = (ROOT / "colors_and_type.css").read_text(encoding="utf-8")
+    css = (ROOT / "web" / "css" / "colors_and_type.css").read_text(encoding="utf-8")
     block = css[css.index('[data-theme="showcase"] {'):]
     return block[:block.index("}")]
 
@@ -41,14 +41,14 @@ class ShowcaseRegistrationTests(unittest.TestCase):
         self.assertIn('"showcase"', light[:light.index("}")])
 
     def test_stylesheet_and_scene_script_are_served(self):
-        self.assertIn("showcase.css", bridge.STATIC_WHITELIST)
-        self.assertIn("showcase-field.js", bridge.STATIC_WHITELIST)
+        self.assertIn("web/css/showcase.css", bridge.STATIC_WHITELIST)
+        self.assertIn("web/js/showcase-field.js", bridge.STATIC_WHITELIST)
         html = (ROOT / "index.html").read_text(encoding="utf-8")
-        self.assertIn('href="/showcase.css', html)
-        self.assertIn('src="/showcase-field.js', html)
+        self.assertIn('href="/web/css/showcase.css', html)
+        self.assertIn('src="/web/js/showcase-field.js', html)
 
     def test_it_is_not_treated_as_a_dark_theme(self):
-        for name in ("app.css", "workspace-shell.css", "ui-pass.css"):
+        for name in ("web/css/app.css", "web/css/workspace-shell.css", "web/css/ui-pass.css"):
             with self.subTest(file=name):
                 for line in (ROOT / name).read_text(encoding="utf-8").splitlines():
                     if '[data-theme="dark"]' in line:

@@ -15,12 +15,9 @@ Run it directly during development (no console window):
 Package it into a single windowed .exe (no console) with PyInstaller:
     pip install pywebview pyinstaller
     pyinstaller --noconfirm --windowed --name Accuretta ^
-        --add-data "index.html;." --add-data "app.js;." --add-data "ui-*.js;." --add-data "app.css;." ^
-        --add-data "bridge-client.js;." --add-data "preview-runtime.js;." --add-data "appearance.js;." ^
-        --add-data "glyph-field.js;." --add-data "dot-matrix.js;." --add-data "security-scan-field.js;." --add-data "rt-visuals.js;." ^
-        --add-data "agent-orb.js;." --add-data "ui-refresh.css;." --add-data "ghidra_worker.py;." ^
-        --add-data "assets;assets" ^
-        --add-data "colors_and_type.css;." --add-data "manifest.webmanifest;." ^
+        --add-data "index.html;." --add-data "accuretta-notch.html;." ^
+        --add-data "web;web" --add-data "assets;assets" ^
+        --add-data "ghidra_worker.py;." --add-data "manifest.webmanifest;." ^
         --icon assets/icons/accuretta.ico accuretta_app.py
 
 Note: the bridge serves its static files relative to its own directory. When
@@ -146,7 +143,7 @@ def _splash_palette(theme: str) -> dict:
     Falls back to the light default if the file or a token can't be read."""
     pal = {"bg": "#FAFAFB", "fg": "#09090B", "muted": "#52525B", "accent": "#0066FF"}
     try:
-        css = (bridge.ROOT / "colors_and_type.css").read_text(encoding="utf-8")
+        css = (bridge.ROOT / "web" / "css" / "colors_and_type.css").read_text(encoding="utf-8")
         css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)  # strip comments so [^{}] is safe
         blocks = re.findall(r"([^{}]+)\{([^{}]*)\}", css)
 
@@ -227,7 +224,7 @@ def _glyph_field_js() -> str:
     origin, so it can't <script src> the bridge. '' if the file is missing
     (the splash falls back to the dot-matrix A)."""
     try:
-        return (bridge.ROOT / "glyph-field.js").read_text(encoding="utf-8")
+        return (bridge.ROOT / "web" / "js" / "glyph-field.js").read_text(encoding="utf-8")
     except Exception:
         return ""
 
@@ -237,7 +234,7 @@ def _dot_matrix_js() -> str:
     does (one source for its geometry). '' if missing: the splash falls back
     to the PNG mark."""
     try:
-        return (bridge.ROOT / "dot-matrix.js").read_text(encoding="utf-8")
+        return (bridge.ROOT / "web" / "js" / "dot-matrix.js").read_text(encoding="utf-8")
     except Exception:
         return ""
 

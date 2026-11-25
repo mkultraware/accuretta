@@ -38,7 +38,7 @@ window.Acc.sections["console-forwarder"] = ({ state }) => {
 
   function injectConsoleForwarder(html) {
     if (!html) return html;
-    const runtime = `<script src="/preview-runtime.js"><\/script>`;
+    const runtime = `<script src="/web/js/preview-runtime.js"><\/script>`;
     const injected = runtime + CONSOLE_FORWARDER;
     if (/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i, m => m + injected);
     if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, m => m + "<head>" + injected + "</head>");
