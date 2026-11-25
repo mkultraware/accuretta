@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 // The notch's sound cues, for the main window too: one set of sounds across
 // Accuretta. A copy of the Sound engine in accuretta-notch.html (that page
 // stays byte-identical to its approved UI, so it keeps its own);

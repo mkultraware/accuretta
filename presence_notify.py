@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """User presence and external-notification routing, shared by approval DMs
 and future security alerts.
 

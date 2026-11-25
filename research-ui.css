@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 html[data-theme] :is(.effort-popover, .mode-popover, .model-pill-menu, .toolbar-overflow-menu, .preview-overflow-menu, .mobile-menu, .mention-menu, .unified-select-menu) {
   padding: 11px 12px 10px;
   border: 1px solid var(--border);

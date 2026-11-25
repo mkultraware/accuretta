@@ -1,0 +1,9 @@
+# Python packages bundled into the Windows installer. Keep this list small:
+# heavy optional packs (playwright, androguard, yara-python, capstone, ...) stay
+# out and are installed by users who need them.
+pillow>=10.0.0        # images, screenshots
+pywebview>=5.0        # the desktop window (WebView2)
+pyautogui>=0.9.54     # desktop screenshots, mouse and keyboard
+pygetwindow>=0.0.9    # window targeting
+uiautomation>=2.0.20  # Windows accessibility tree (CPU-only desktop control)
+psutil>=5.9           # process details for the approval rules

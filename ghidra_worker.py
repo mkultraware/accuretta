@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Ghidra analysis in its own process, for bridge.tool_ghidra_analyze.
 
 Ghidra used to run inside the bridge through pyghidra/JPype. A JVM can't be

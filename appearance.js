@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 (() => {
   "use strict";
   const valid = value => typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value);

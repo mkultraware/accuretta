@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Conversation search and safe-boundary delivery of user task updates."""
 
 from collections import OrderedDict

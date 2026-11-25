@@ -1,4 +1,5 @@
 <!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -68,7 +69,7 @@
           </g>
         </svg>
         <span class="brand-title">Accuretta</span>
-        <span class="v" id="brand-v">v1.0.9</span>
+        <span class="v" id="brand-v">v2.0.0</span>
         <span class="grow"></span>
         <button class="iconbtn" id="btn-toggle-sidebar" title="Collapse sidebar"><i class="ph ph-sidebar-simple"></i></button>
       </div>
@@ -710,7 +711,7 @@
             <label class="security-filter"><input type="checkbox" id="security-show-whitelisted"><span>Show whitelisted</span></label>
           </header>
           <div class="security-alert-list" id="security-alert-list">
-            <div class="security-empty"><i class="ph ph-radar"></i><strong>No scan data yet</strong><span>Run a scan to inspect the current machine state.</span></div>
+            <div class="security-empty"><i class="ph ph-scan"></i><strong>No scan data yet</strong><span>Run a scan to inspect the current machine state.</span></div>
           </div>
         </section>
 
@@ -1022,6 +1023,7 @@
           <div>
             <h2>Your model.<br>Your machine.</h2>
             <p>Short, honest answers about local models, approvals, memory and tools, including the parts that can still bite.</p>
+            <p class="faq-source">Accuretta is free software under the GNU AGPL-3.0. Source code: <a href="https://github.com/mkultraware/accuretta" target="_blank" rel="noopener noreferrer">github.com/mkultraware/accuretta</a>. Modified versions must offer their own source code to their users.</p>
           </div>
           <label class="faq-search">
             <i class="ph ph-magnifying-glass" aria-hidden="true"></i>
@@ -1266,6 +1268,22 @@
         <button class="btn sm" id="btn-refresh-models" title="Re-scan models folder"><i class="ph ph-arrow-clockwise"></i></button>
       </div>
       <span class="hint" id="set-model-hint">selecting a model loads it into llama-server.</span>
+    </div>
+    <div class="form-row" id="llama-update-row">
+      <label>llama.cpp <i class="ph ph-info" title="The llama.cpp build that runs your models. Updating downloads the newest official release for your graphics card, tests it, and restarts your model on it. If your model doesn't start on it, your current build comes back."></i></label>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <span id="llama-build" style="flex:1;font-family:ui-monospace,Consolas,monospace;font-size:12px;">…</span>
+        <button class="btn sm" id="btn-llama-update" title="Look for a newer official llama.cpp build"><i class="ph ph-arrow-circle-up"></i><span>Check for update</span></button>
+      </div>
+      <span class="hint" id="llama-update-hint" role="status" aria-live="polite"></span>
+    </div>
+    <div class="form-row" id="maya-install-row" hidden>
+      <label>Maya engine <i class="ph ph-info" title="Maya runs Inkling 2 Mini about 2.5 times faster than llama.cpp. It needs an NVIDIA RTX 30-series card or newer with about 20 GB of graphics memory. Installing downloads a ready-made copy, checks it and sets it up."></i></label>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <span id="maya-state" style="flex:1;font-family:ui-monospace,Consolas,monospace;font-size:12px;">…</span>
+        <button class="btn sm" id="btn-maya-install" title="Install or update the Maya engine"><i class="ph ph-download-simple"></i><span>Install</span></button>
+      </div>
+      <span class="hint" id="maya-install-hint" role="status" aria-live="polite"></span>
     </div>
     <div class="form-row">
       <label>Vision model <i class="ph ph-info" title="Fallback OCR/describe model. Used only when the chat model has no vision projector loaded."></i></label>
@@ -2083,11 +2101,93 @@
 <script src="/research-ui.js?v=2"></script>
 <script src="/dropdown-menus.js?v=1"></script>
 <script src="/agent-orb.js?v=5"></script>
-<script src="/theme-flowlines.js?v=2" defer></script>
 <script src="/showcase-field.js?v=2" defer></script>
 <script src="/dot-matrix.js?v=6"></script>
 <script src="/sound-cues.js?v=1"></script>
-<script src="/app.js?v=2026111002"></script>
+<script src="/ui-terminal-jump.js?v=1"></script>
+<script src="/ui-mcp-quick-look.js?v=1"></script>
+<script src="/ui-sidebar.js?v=1"></script>
+<script src="/ui-composer-controls.js?v=1"></script>
+<script src="/ui-explorer-tools.js?v=1"></script>
+<script src="/ui-status-bar.js?v=1"></script>
+<script src="/ui-composer-context.js?v=1"></script>
+<script src="/ui-wb-git.js?v=1"></script>
+<script src="/ui-wb-viewer.js?v=1"></script>
+<script src="/ui-file-index.js?v=1"></script>
+<script src="/ui-file-refs.js?v=1"></script>
+<script src="/ui-replies.js?v=1"></script>
+<script src="/ui-sidebar-groups.js?v=1"></script>
+<script src="/ui-session-tabs.js?v=1"></script>
+<script src="/ui-wb-actions.js?v=1"></script>
+<script src="/ui-shortcuts.js?v=1"></script>
+<script src="/ui-small-formatters.js?v=1"></script>
+<script src="/ui-workbench.js?v=1"></script>
+<script src="/ui-mention-menu.js?v=1"></script>
+<script src="/ui-event-wiring.js?v=1"></script>
+<script src="/ui-mobile-tabs.js?v=1"></script>
+<script src="/ui-model-menu.js?v=1"></script>
+<script src="/ui-mobile-preview.js?v=1"></script>
+<script src="/ui-usage-stats.js?v=1"></script>
+<script src="/ui-savings-card.js?v=1"></script>
+<script src="/ui-savings-widget.js?v=1"></script>
+<script src="/ui-shell-tab.js?v=1"></script>
+<script src="/ui-draft-picker.js?v=1"></script>
+<script src="/ui-cmd-history.js?v=1"></script>
+<script src="/ui-sandbox.js?v=1"></script>
+<script src="/ui-file-tree.js?v=1"></script>
+<script src="/ui-preview-tools.js?v=1"></script>
+<script src="/ui-console-forwarder.js?v=1"></script>
+<script src="/ui-multi-file.js?v=1"></script>
+<script src="/ui-versions.js?v=1"></script>
+<script src="/ui-security-overview.js?v=1"></script>
+<script src="/ui-task-progress.js?v=1"></script>
+<script src="/ui-change-rollup.js?v=1"></script>
+<script src="/ui-streaming-fade.js?v=1"></script>
+<script src="/ui-finish-batch.js?v=1"></script>
+<script src="/ui-reveal-pacing.js?v=1"></script>
+<script src="/ui-paint-pipeline.js?v=1"></script>
+<script src="/ui-osint-card.js?v=1"></script>
+<script src="/ui-recon-exploit.js?v=1"></script>
+<script src="/ui-exposure-rail.js?v=1"></script>
+<script src="/ui-assessment-progress.js?v=1"></script>
+<script src="/ui-send-stream.js?v=1"></script>
+<script src="/ui-attachments.js?v=1"></script>
+<script src="/ui-desktop-kill-switch.js?v=1"></script>
+<script src="/ui-chat.js?v=1"></script>
+<script src="/ui-data-loading.js?v=1"></script>
+<script src="/ui-bootstrap.js?v=1"></script>
+<script src="/ui-hover-popover.js?v=1"></script>
+<script src="/ui-autolinker.js?v=1"></script>
+<script src="/ui-markdown.js?v=1"></script>
+<script src="/ui-stream-helpers.js?v=1"></script>
+<script src="/ui-email-cards.js?v=1"></script>
+<script src="/ui-diff-render.js?v=1"></script>
+<script src="/ui-highlighter.js?v=1"></script>
+<script src="/ui-tool-card.js?v=1"></script>
+<script src="/ui-tool-labels.js?v=1"></script>
+<script src="/ui-tool-icons.js?v=1"></script>
+<script src="/ui-presence.js?v=1"></script>
+<script src="/ui-render-helpers.js?v=1"></script>
+<script src="/ui-llama-update.js?v=1"></script>
+<script src="/ui-maya-install.js?v=1"></script>
+<script src="/ui-effort-stream.js?v=1"></script>
+<script src="/ui-ctx-breakdown.js?v=1"></script>
+<script src="/ui-live-events.js?v=1"></script>
+<script src="/ui-notifications.js?v=1"></script>
+<script src="/ui-utilities.js?v=1"></script>
+<script src="/ui-state.js?v=1"></script>
+<script src="/ui-viewport-presets.js?v=1"></script>
+<script src="/ui-mcp-servers.js?v=1"></script>
+<script src="/ui-backend-log.js?v=1"></script>
+<script src="/ui-memories-panel.js?v=1"></script>
+<script src="/ui-vram-tune.js?v=1"></script>
+<script src="/ui-settings.js?v=1"></script>
+<script src="/ui-file-actions.js?v=1"></script>
+<script src="/ui-github-activity.js?v=1"></script>
+<script src="/ui-command-palette.js?v=1"></script>
+<script src="/ui-cost-widget-init.js?v=1"></script>
+<script src="/ui-turn-changes.js?v=1"></script>
+<script src="/app.js?v=2026112481"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {

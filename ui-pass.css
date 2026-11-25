@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* ============================================================
    ACCURETTA — UI pass (2026 audit fixes)
    Diff review workspace · IA consolidation · settings nav/search
@@ -918,25 +919,14 @@
 /* ============================================================
    ATELIER — theme-specific presentation
    The token block (colors_and_type.css) recolors everything;
-   this section only does what tokens can't: the flow-line field
-   on the blank chat, serif display tuning, and the editorial
-   scrim that keeps the welcome legible over the lines.
+   this section only does what tokens can't: serif display
+   tuning and the editorial scrim on the welcome screen.
    ============================================================ */
 
-/* --- flow-line field ------------------------------------------ */
+/* --- welcome screen ------------------------------------------- */
 [data-theme="atelier"] .welcome-screen {
   position: relative;
   overflow: hidden;
-}
-
-[data-theme="atelier"] .flow-lines-canvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  display: block;
-  pointer-events: none;
-  z-index: 0;
 }
 
 /* Soft vignette so lines never compete with the wordmark. */

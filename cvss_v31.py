@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """CVSS v3.1 base scoring and CWE normalization for finding records.
 
 Server-side on purpose: a local model can judge qualitative impact, but it

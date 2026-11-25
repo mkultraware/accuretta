@@ -37,92 +37,20 @@
   {
     "file": "web/src/bold/style.css",
     "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "c8a32df67f8bd57f70c6371e15ec232df25ddeba3eb9060d7aaa68101a6ce240"
-  },
-  {
-    "file": "web/src/duotone/style.css",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "fc6d37f7f0f7ffdcdf714c54181fdd27911969e4737d3151b972d4b806e5ae5d"
+    "sha256": "0dc1ebf1550e67f9c2dc048e0c02a9d0e3d21579eefffdb25a6f64ab2c388c3c",
+    "note": "@font-face trimmed to the woff2 file (the other weights and formats were removed)"
   },
   {
     "file": "web/src/fill/style.css",
     "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "555980683a582c1910a954648b4ae38f58d76e797f02bfdc2c5e817901e6d4fc"
-  },
-  {
-    "file": "web/src/light/style.css",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "f2e59699faaeee27da9edb86dd18f5ed3bd5113db3e4e388fdd23afcaf308865"
+    "sha256": "f6429ccc3ae40d7d7c6018f7ade208525dcd4aa67d795790db39ece4a92fa692",
+    "note": "@font-face trimmed to the woff2 file (the other weights and formats were removed)"
   },
   {
     "file": "web/src/regular/style.css",
     "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "873761b8711147dc516b6102936e9ad005f3a3015349efcde1a496f0326f1051"
-  },
-  {
-    "file": "web/src/thin/style.css",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "41e0eae512457cbef8f0106108fbfb995952c24b3e600dca38516990b441c2af"
-  },
-  {
-    "file": "web/src/bold/Phosphor-Bold.ttf",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "10a0a1cb4f8156a420f9f84cf34c4e9871e58ed2ddea1f6a8079ad07243a7fb2"
-  },
-  {
-    "file": "web/src/duotone/Phosphor-Duotone.ttf",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "80e6f0d6fa8ce96a9933f48aaabddc592c5d2b52caf8f010a7e54a17c74084bf"
-  },
-  {
-    "file": "web/src/fill/Phosphor-Fill.ttf",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "a53f5d2630cab5e3b7536ecb9d69d71519a2190298c22b1f8d770dd37bc2940a"
-  },
-  {
-    "file": "web/src/light/Phosphor-Light.ttf",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "a10ef7a0631da04626fca2eab921d14b391749fddfa3465749368f21b28fd46c"
-  },
-  {
-    "file": "web/src/thin/Phosphor-Thin.ttf",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "f40473506b4ab4fcfd2b5c32fb235f9e22def891e58e01da866e1e18974e79f2"
-  },
-  {
-    "file": "web/src/regular/Phosphor.ttf",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "06b91e022b7ee899a63efced879392a74f0bacbda54e4467e9f663220d173a10"
-  },
-  {
-    "file": "web/src/bold/Phosphor-Bold.woff",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "de4dcc9d18cf33363c19d2c924c9d9d51e210978bd3e6ec508aec71670b3db06"
-  },
-  {
-    "file": "web/src/duotone/Phosphor-Duotone.woff",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "fca99cff3f3ec82cec7e5ec9973e229deb8efec7432485b9a339bfa97b6d7b75"
-  },
-  {
-    "file": "web/src/fill/Phosphor-Fill.woff",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "5dea68e9198122686ec2788f81e345cd50c2ee9980f6c907d742f91cad481d48"
-  },
-  {
-    "file": "web/src/light/Phosphor-Light.woff",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "6d34d73a01305a3260b1e85e89c65bc0170274c5874b8995a01b79c863a7a1c1"
-  },
-  {
-    "file": "web/src/thin/Phosphor-Thin.woff",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "a68d54a19a82cf5a64f3bd21a8f50f429b2def0b6db582418af8535e1f2679b3"
-  },
-  {
-    "file": "web/src/regular/Phosphor.woff",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "396c5eae7f2dfb4d1f5432edd87109eda2f92a451b2167e43a26165b82770f75"
+    "sha256": "983e1c569506da3936a924de7002f733e992c9cfbdb3ec40ff60573a63fc1eb4",
+    "note": "@font-face trimmed to the woff2 file (the other weights and formats were removed)"
   },
   {
     "file": "web/src/bold/Phosphor-Bold.woff2",
@@ -130,24 +58,9 @@
     "sha256": "2153b52cea9e06fc0cc8496048be485b381a0f8bf130adea5a9756fc8f100b87"
   },
   {
-    "file": "web/src/duotone/Phosphor-Duotone.woff2",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "93d163cd4b1f07736d34bfef80803646ab0322efa947a98e3973a1450e3d20cc"
-  },
-  {
     "file": "web/src/fill/Phosphor-Fill.woff2",
     "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
     "sha256": "660bd6045c0e0d9756cddb8ba2ece3aad855df7d4a170ef23f7b1c0bf511c430"
-  },
-  {
-    "file": "web/src/light/Phosphor-Light.woff2",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "9c45e81688520e967e2dd93d702eed59d25a3a97d8cc82932b1d17267a279887"
-  },
-  {
-    "file": "web/src/thin/Phosphor-Thin.woff2",
-    "source": "https://registry.npmjs.org/@phosphor-icons/web/-/web-2.1.1.tgz",
-    "sha256": "79f36354836fb87863c7d140e3333446c1d1ec9748a207a09798912d8a3c64d5"
   },
   {
     "file": "web/src/regular/Phosphor.woff2",
@@ -554,5 +467,10 @@
     "file": "lobe-icons/yi.svg",
     "source": "https://registry.npmjs.org/@lobehub/icons-static-svg/-/icons-static-svg-1.95.1.tgz",
     "sha256": "c1975458cc94ee44306336215fdf64b1a25f60d7b3f4c01aee5a720eddea0e0a"
+  },
+  {
+    "file": "lobe-icons/thinkingmachines.svg",
+    "source": "drawn for Accuretta after https://thinkingmachines.ai/images/favicon-32x32.png (lobe-icons has no Thinking Machines icon)",
+    "sha256": "c9c5b21ac9f2d4b1276f291868e1ebd2adebc0382b25c22ab04909a3e576f452"
   }
 ]

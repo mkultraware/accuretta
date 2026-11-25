@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* ============================================================
    ACCURETTA — Colors & Type
    Pastel candy palette · Mono-forward · Off-white / Off-black
@@ -444,8 +445,7 @@
    A studio-dark theme: near-black umber room, editorial serif
    display (Newsreader), quiet grotesk UI (Schibsted Grotesk),
    drafting-room mono (Fragment Mono). Its own font bundle lives
-   at assets/vendor/fonts/atelier/. The blank "New session" chat
-   carries a slow flow-line field (theme-flowlines.js).
+   at assets/vendor/fonts/atelier/.
    ============================================================ */
 [data-theme="atelier"] {
   --bg:        #121009;

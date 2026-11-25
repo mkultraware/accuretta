@@ -8,6 +8,13 @@
 data/*
 !data/.gitkeep
 
+# llama.cpp builds the setup wizard or "Update llama.cpp" downloaded, and the
+# Maya engine "Install Maya" set up
+/bin/
+# the Maya package builder's work and output (tools/maya-package/build.ps1)
+tools/maya-package/build/
+tools/maya-package/dist/
+
 # python
 __pycache__/
 *.py[cod]
@@ -90,10 +97,20 @@ github_stats.db
 promo_video/
 AUDIT_AND_ROADMAP.md
 
-# internal test suite and test rigs, not shipped to users
-tests/
+# The test suite is public; these parts of tests/ stay private: old file
+# snapshots (they hold personal paths), screenshots, dev scripts and notes.
+tests/baseline/
+tests/dev-checks/
+tests/*.png
+tests/VERIFICATION.md
+# Local test rigs and benchmark runs, never shipped
 bench/
 
 # launch videos and pages: large or one-off, kept local
 assets/social/*.mp4
 assets/social/v*-launch.html
+
+# Windows installer build output
+tools/installer/build/
+tools/installer/dist/
+tools/installer/cache/

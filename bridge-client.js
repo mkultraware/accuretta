@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 (() => {
   "use strict";
   const tokenMeta = () => document.querySelector('meta[name="accuretta-request-token"]');

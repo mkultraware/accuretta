@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Read email over IMAP from the account in email_config.json.
 
 Usage:

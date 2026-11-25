@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Local preferences and searchable notes, with no automatic eviction."""
 
 import json

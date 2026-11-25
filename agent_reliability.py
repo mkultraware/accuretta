@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Evidence provenance and factual guidance for the agent loop."""
 
 import hashlib

@@ -1,0 +1,16 @@
+Accuretta
+Copyright (C) 2026 mkultraware (https://github.com/mkultraware)
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License, version 3 only, as
+published by the Free Software Foundation. See the LICENSE file.
+
+A separate commercial license is available for anyone who can't or won't
+accept the AGPL's terms. See COMMERCIAL-LICENSE.md.
+
+Accuretta versions up to and including 1.0.9 were released under the PolyForm
+Noncommercial License 1.0.0. Those releases keep that license. Versions after
+1.0.9 are released under AGPL-3.0-only.
+
+Third-party components bundled with Accuretta keep their own licenses. See
+THIRD_PARTY_NOTICES.md.

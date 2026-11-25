@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Sub-agents for models trained on Sage-A1.5's spawn_subagent orchestration.
 
 The main model hands over self-contained tasks; each one runs as an isolated

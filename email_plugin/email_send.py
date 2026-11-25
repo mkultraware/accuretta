@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Send an email over SMTP from the account in email_config.json.
 
 Usage:

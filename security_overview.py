@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Local, read-only security overview service.
 
 The service owns persistence, deterministic triage, whitelisting, bounded

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """
 Accuretta Notch host for macOS — the island (served at /notch) in a
 borderless, transparent, always-on-top panel at the top of the screen.
@@ -46,8 +47,12 @@ PORT = int(os.environ.get("ACCURETTA_PORT", "8787"))
 LOOPBACK = ".".join(("127", "0", "0", "1"))
 BASE = f"http://{LOOPBACK}:{PORT}"
 PAGE_URL = f"{BASE}/notch"
-LOG_FILE = ROOT / "data" / "notch_host.log"
-LOCK_FILE = ROOT / "data" / "notch_host_mac.lock"
+# Same data folder as the bridge: ACCURETTA_DATA_DIR, else the user folder
+# (ACCURETTA_HOME, set by installer builds), else data/ next to the code.
+_DATA = Path(os.environ.get("ACCURETTA_DATA_DIR")
+             or Path(os.environ.get("ACCURETTA_HOME") or ROOT) / "data")
+LOG_FILE = _DATA / "notch_host.log"
+LOCK_FILE = _DATA / "notch_host_mac.lock"
 
 WIDTH_PT = 720              # 640 pt expanded island + room for its shadow
 HEIGHT_PT = 560

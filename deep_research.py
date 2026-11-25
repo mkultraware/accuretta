@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Durable research notebooks with citations tied to retrieved source text."""
 
 import copy

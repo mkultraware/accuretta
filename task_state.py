@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Revision-aware file recovery, independent of the model and integrations."""
 
 from __future__ import annotations

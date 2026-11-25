@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Local-only error log. No prompts, commands, paths beyond basenames, or tool output."""
 
 import json

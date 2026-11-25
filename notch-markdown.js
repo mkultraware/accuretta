@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Minimal, safe markdown renderer for the notch reply area.
  *
  * The approved widget appends streamed reply text as plain spans, so the

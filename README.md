@@ -8,9 +8,11 @@
 
 # Accuretta
 
-**Run a GGUF model. Give it files, terminals, previews, and guardrails.**
+**The best agent for your own GPU.**
 
-[![License: personal use only](https://img.shields.io/badge/license-personal%20use%20only-B5544A.svg)](LICENSE)
+Run a local model with real tools, long tasks and safe autonomy, tuned to the hardware you own.
+
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-B5544A.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Powered by llama.cpp](https://img.shields.io/badge/backend-llama.cpp-orange.svg)](https://github.com/ggml-org/llama.cpp)
 [![Local inference](https://img.shields.io/badge/inference-local-brightgreen.svg)](#privacy)
@@ -21,7 +23,14 @@
   <img src="assets/docs/interface-aperture.png" alt="Accuretta using the Aperture theme, with sessions and workspace files on the left, local model status and chat in the center, and preview plus terminal tools on the right." width="1100" />
 </p>
 
-Accuretta is a desktop workspace for local models running through [llama.cpp](https://github.com/ggml-org/llama.cpp). It puts chat history, file tools, persistent shells, live HTML previews, approvals, remote computers, and security tools in one interface.
+Accuretta is an agent workspace built around a local model on your own GPU. Most agents treat local models as an afterthought. Accuretta is built around them:
+
+- **Tuned to your hardware.** It reads the model file and your GPU, picks context size, GPU offload and KV cache settings, and checks the real speed at load time.
+- **Faster engines where they exist.** Inkling 2 Mini runs on the Maya engine at about 150 tokens a second writing and 3,800 reading on an RTX 4090, against about 55 and 400 on llama.cpp.
+- **Long tasks on small contexts.** Old history is folded into compact notes, task state is kept by the app, and `/goal` runs keep going for hours.
+- **Autonomy that stops for the right things.** In a replay of 1,192 real agent actions, it asked about 1 in 100. Turning off Windows Defender, deleting backups or sending your keys off the PC are stopped in every mode.
+
+Files, terminals, live previews, computer use, a browser that acts, remote computers and security tools all sit in one interface.
 
 The model weights, prompts, history, settings, and workspace live on the computer running the bridge. There is no hosted model account, frontend build step, npm dependency tree, or Electron shell. The core is static HTML, CSS, JavaScript, and one Python bridge you can inspect yourself.
 
@@ -32,13 +41,14 @@ The model weights, prompts, history, settings, and workspace live on the compute
 | Local model runtime | Finds GGUF files, launches llama-server, switches models, watches for crashes, and restores the last working configuration. |
 | Hardware-aware tuning | Reads GGUF metadata and chooses context size, GPU offload, KV cache types, batching, and supported speculative decoding options. |
 | Agent workspace | Reads and edits files, maps projects, finds symbols and references, checks syntax, runs tests, and works with Git. |
-| Live building | Renders HTML beside the chat, saves preview versions, exposes the source, and keeps the terminal and agent log visible. |
 | Long tasks | Compacts old conversation history, preserves structured task state, tracks unfinished verification, and can recover an interrupted turn. |
-| Notch overlay (beta) | Shows what the agent is doing and handles approvals and prompts from a small always-on-top Windows island. |
+| Safe autonomy | Asks only about actions that can't be undone and that you didn't ask for. Hard stops for disabling security, destroying backups and leaking secrets apply in every mode. |
+| Live building | Renders HTML beside the chat, saves preview versions, exposes the source, and keeps the terminal and agent log visible. |
 | Remote work | Serves the UI over Tailscale HTTPS and can run commands or transfer files to an allowlisted Mac over SSH. |
+| Notch overlay (beta) | Shows what the agent is doing and handles approvals and prompts from a small always-on-top Windows island. |
+| Extensions | Loads MCP servers from a standard JSON config and supports a Discord owner bridge with reaction approvals. |
 | Security work | Provides an authorization-gated recon, validation, exploitation, evidence, and reporting flow for targets you are allowed to test. |
 | Local analysis | Inspects Windows events, network connections, PCAPs, APKs, native binaries, firmware, archives, and YARA matches. |
-| Extensions | Loads MCP servers from a standard JSON config and supports a Discord owner bridge with reaction approvals. |
 
 None of those rows means “the model can do anything.” Tool availability depends on the operating system, installed optional packages, the selected model, and the permissions you grant. Accuretta reports missing capabilities instead of handing the model a tool that is guaranteed to fail.
 
@@ -52,53 +62,45 @@ Local models still have limits. A small quantized model will not match the best 
 
 ## Setup
 
-You need Python 3.10 or newer and one GGUF model. Accuretta can download a matching llama.cpp build during first-run setup.
+### Windows installer (recommended)
 
-### 1. Install Python
+Download `Accuretta-Setup-<version>.exe` from [GitHub Releases](https://github.com/mkultraware/accuretta/releases) and run it. The installer bundles its own Python and desktop dependencies (no admin rights or separate Python install needed). Your chats, settings, and downloaded engines stay in `%LOCALAPPDATA%\Accuretta`, separate from the app files.
 
-Download Python from [python.org](https://www.python.org/downloads/). On Windows, enable **Add Python to PATH** in the installer.
+Download one GGUF model from Hugging Face (a `Q4_K_M` quant of a 7B to 35B model is a practical first choice) and launch Accuretta from the Start Menu. The first-run wizard detects your GPU, downloads the matching `llama.cpp` build, and points at your models folder.
 
-```
-python --version
-```
+### From source (Windows, macOS, Linux)
 
-### 2. Get Accuretta
+You need Python 3.10 or newer and one GGUF model. Accuretta can download a matching llama.cpp build during first-run setup on Windows.
 
-Download or clone this repository into a folder, for example `C:\accuretta`.
+1. **Install Python:** download Python from [python.org](https://www.python.org/downloads/). On Windows, enable **Add Python to PATH** in the installer (`python --version`).
+2. **Get Accuretta:** download or clone this repository into a folder, for example `C:\accuretta`.
+3. **Install the optional packages:**
+   ```
+   pip install -r requirements.txt
+   ```
+   The core bridge uses Python's standard library. The packages in `requirements.txt` add image handling, desktop input, document parsing, code parsers, security analysis, and the Discord bridge. Missing packages remove the affected tools from the model's tool list.
+4. **Add a model:** download one GGUF model from Hugging Face and put it anywhere on disk, such as `D:\MODELS\`.
+5. **Start Accuretta:**
+   - **Windows:** double-click `start.bat`. It prepares the desktop-window dependency, clears a stale Accuretta port, and opens the app without a leftover console.
+   - **Browser mode on any OS:** run `python bridge.py`, then open the printed address. The default is `http://localhost:8787`.
 
-### 3. Install the optional packages
-
-```
-pip install -r requirements.txt
-```
-
-The core bridge uses Python's standard library. The packages in `requirements.txt` add image handling, desktop input, document parsing, code parsers, security analysis, and the Discord bridge. Missing packages remove the affected tools from the model's tool list.
-
-### 4. Add a model
-
-Download one GGUF model from Hugging Face. A `Q4_K_M` quant of a 7B to 35B model is a practical first choice. Put it anywhere on disk, such as `D:\MODELS\`.
-
-### 5. Start Accuretta
-
-- **Windows:** double-click `start.bat`. It prepares the desktop-window dependency, clears a stale Accuretta port, and opens the app without a leftover console.
-- **Browser mode on any OS:** run `python bridge.py`, then open the printed address. The default is `http://localhost:8787`.
-
-### 6. Finish the setup wizard
+### Finish the setup wizard
 
 <p align="center">
   <img src="assets/docs/setup-wizard.png" alt="The Accuretta setup wizard scanning system hardware, offering a llama.cpp download matched to the detected GPU, and listing detected GGUF models." width="820" />
 </p>
 
-The wizard detects the GPU, finds models, offers an appropriate llama.cpp build, and tunes the selected model before starting it. Sessions, settings, workspace pointers, memories, model profiles, and preview versions are stored under `data/`.
+The wizard detects the GPU, finds models, offers an appropriate llama.cpp build, and tunes the selected model before starting it. Sessions, settings, workspace pointers, memories, model profiles, and preview versions are stored under `data/` (or `%LOCALAPPDATA%\Accuretta\data\` for installer builds).
 
 ### Updating
 
-Accuretta tells you when a new release is out. Close it first, then:
+Accuretta notifies you when a new release is out:
 
-- **If you cloned it:** run `git pull` in the Accuretta folder.
-- **If you downloaded a zip:** unpack the new version into a new folder and copy your own files across from the old one: the `data` folder, plus `skills`, `bridge_mcp_config.json` and `email_plugin\email_config.json` if you have them.
-
-Your chats, settings and model setups carry over. Run `pip install -r requirements.txt` again when a release says it added packages.
+- **Windows installer:** close Accuretta and run the new `Accuretta-Setup-<version>.exe`. It replaces only the app and bundled Python; your chats, settings, and downloaded engines in `%LOCALAPPDATA%\Accuretta` stay intact.
+- **Git clone:** close Accuretta and run `git pull` (and `pip install -r requirements.txt` when a release adds packages).
+- **Source zip:** unpack the new version into a new folder and copy your own files across from the old one: the `data` folder, plus `skills`, `bridge_mcp_config.json` and `email_plugin\email_config.json` if you have them.
+- **llama.cpp (Windows):** open **Settings → Model → llama.cpp** (or click **Update llama.cpp** on the warning when a model needs a newer build). Accuretta downloads the newest official release for your GPU backend, tests it, switches, and automatically rolls back if your model fails to start.
+- **Maya engine (Windows, eligible NVIDIA GPUs):** open **Settings → Model → Maya engine** to install or update the ready-made package with one click.
 
 ### Preferences and memory
 
@@ -138,9 +140,29 @@ Accuretta also records verification debt. A file edit adds the path to the task'
 
 ## Approvals and audit records
 
-Reads can run without stopping the conversation. In Soft mode, normal workspace writes, non-destructive Windows or WSL commands, project tests, persistent host-session input, and routine MCP actions can also continue automatically. Medium mode only trusts normal workspace writes. Hard mode asks for every action. Deletions, mutating Git actions, program launches, desktop input, protected or remote changes, and execution following recent web content keep stricter gates regardless of the convenience mode.
+Reads can run without stopping the conversation. Soft mode judges what an action does, not how the command is spelled, and asks only for what can't be undone and that you didn't ask for. These run without asking:
+- workspace writes, and deletes inside a project (text files go into the turn's undo first)
+- local Git: add, commit, branch, checkout, stash, merge
+- starting or stopping programs Accuretta started itself, or ones built in the workspace
+- read-only system checks such as `schtasks /query` or `netsh … show`
+- project tests and routine MCP actions
 
-Tests are kept in a private ignored folder for development and release checks. They are not part of the public product checkout. The bridge still reports when a changed file has only had a syntax check, and only a recognised whole-project test run clears that verification warning.
+When your own message asks for an action ("push it", "kill the server", "delete the old-builds folder"), that counts as your OK. A question about it doesn't, and neither does text pasted from somewhere else. Pushing, throwing away uncommitted work, deleting outside the workspace or a whole project, stopping other programs and changing system settings still ask. An approval covers the same kind of action for the rest of the turn. Stopping programs, launching and pushing can be allowed for the rest of the chat.
+
+Some actions are stopped in every mode, /goal included. Turning off Windows Defender or the firewall, clearing event logs, and adding startup tasks, services or admin accounts get a press-and-hold card. Deleting backups (shadow copies, recovery), sending private keys or saved passwords off the PC, and killing Accuretta's own process are refused. Under /goal, a question nobody answers within 90 seconds is skipped: the run carries on and lists the skipped action in its final report. Medium mode only trusts normal workspace writes. Hard mode asks for every action. Protected or remote changes and execution following recent web content keep stricter gates in every mode.
+
+Every approval decision is logged to `data/approval_log.jsonl`, without the command text: what kind of action, why it asked, and whether you approved. That shows which questions are worth keeping.
+
+The bridge reports when a changed file has only had a syntax check, and only a recognised whole-project test run clears that verification warning.
+
+### Running the tests
+
+```
+pip install pytest
+python tests/check.py
+```
+
+It checks JavaScript and CSS syntax (skipped without Node.js) and runs the test suite. Every test runs in a throwaway data folder, so your own chats and settings are never touched. Tests that need something you haven't installed, such as Pillow, skip instead of failing.
 
 Approved actions write a bounded record to `data/action_audit.jsonl`. It stores the tool, target, time, outcome, authorization identity, and hashes of the arguments and result. It does not copy prompts, commands, typed text, or tool output into the audit file.
 
@@ -293,9 +315,12 @@ Bigger context costs memory and prompt-processing time. The tuner aims for a con
 
 ### The Maya engine for Inkling 2 Mini (NVIDIA)
 
-Unsloth's looped Inkling 2 Mini GGUF runs on [maya-ik2](https://github.com/alesha-pro/maya-inkling-mini), a CUDA engine made for that model, instead of llama-server. On an RTX 4090 it writes about 150 tokens a second and reads about 3,800, against roughly 55 and 400 on llama.cpp. Build it by following its README, in a folder named `maya-inkling-mini` in your home folder (or point `ACCURETTA_MAYA_DIR` at it). Accuretta needs its `serve/server.py`, the built `maya-ik2` binary and the checkout's own `.venv`.
+Unsloth's looped Inkling 2 Mini GGUF runs on [maya-ik2](https://github.com/alesha-pro/maya-inkling-mini), a CUDA engine made for that model, instead of llama-server. On an RTX 4090 it writes about 150 tokens a second and reads about 3,800, against roughly 55 and 400 on llama.cpp.
 
-Accuretta then picks the engine by itself for that file, makes the tokenizer once, finds the CUDA runtime and sizes the context to the free VRAM. Put Thinking Machines' drafter (`mtp.safetensors`) beside the model and choose it in the speculative-decoding draft picker to speed up code and edits; it is used only while at least 128k of context still fits beside it. Without the engine installed, the model list marks that file "needs the Maya engine" and Accuretta does not try to load it with llama.cpp.
+- **One-click install (Windows):** on PCs with an NVIDIA RTX 30/40/50-series GPU (at least 20 GB VRAM and driver 580+), open **Settings → Model → Maya engine** and click **Install** — or pick a Maya Inkling file and click **Install Maya** on the warning. Accuretta downloads the ready-made package from Accuretta's GitHub releases, verifies every file's checksum, tests the engine, and loads the model automatically.
+- **Building from source (Linux or custom builds):** follow Maya's README in a folder named `maya-inkling-mini` in your home folder (or point `ACCURETTA_MAYA_DIR` at it). Accuretta needs its `serve/server.py`, the built `maya-ik2` binary and the checkout's own `.venv`. A self-built checkout takes precedence over the ready-made package.
+
+Accuretta picks the engine automatically for that file, builds the tokenizer once, finds the CUDA runtime and sizes the context to the free VRAM. Put Thinking Machines' drafter (`mtp.safetensors`) beside the model and choose it in the speculative-decoding draft picker to speed up code and edits; it is used only while at least 128k of context still fits beside it. Without the engine installed, the model list marks that file "needs the Maya engine" and Accuretta does not try to load it with llama.cpp.
 
 ## Troubleshooting
 
@@ -359,10 +384,14 @@ accuretta/
 
 ## Status
 
-Personal project. I work on it when I feel like it. Pull requests are welcome, but I'm not building a roadmap or chasing stars. If you fork it and make it your own, that's the point.
+Built and maintained by one person. Pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Free for personal use. Run it, poke at it, build on it for yourself. It's not for commercial use though: if you want it in or for a business, or shipped as part of something you sell, ask me first. And please don't pretend you wrote the parts you didn't.
+Accuretta is free software under the [GNU AGPL-3.0](LICENSE) (version 3 only). You can use it, change it and share it, also at work. If you share a modified version, or let others use one over a network, you also share its source code under the same license.
 
-Formally, it's under the [PolyForm Noncommercial License 1.0.0](LICENSE), a real drafted license that permits any noncommercial use and blocks commercial use.
+If you want to build it into a closed product, or run a modified version as a service without sharing your changes, see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+
+Contributions are accepted under the [Contributor License Agreement](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md). Bundled third-party parts keep their own licenses: see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Versions up to and including 1.0.9 were released under the PolyForm Noncommercial License 1.0.0 and keep that license.

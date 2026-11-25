@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """
 Accuretta Notch host — a transparent, always-on-top, click-through overlay
 window that renders accuretta-notch.html on top of the desktop.
@@ -41,8 +42,12 @@ PORT = int(os.environ.get("ACCURETTA_PORT", "8787"))
 LOOPBACK = ".".join(("127", "0", "0", "1"))
 BASE = f"http://{LOOPBACK}:{PORT}"
 PAGE_URL = f"{BASE}/notch"
-USER_DATA = ROOT / "data" / "notch-webview2"
-LOG_FILE = ROOT / "data" / "notch_host.log"
+# Same data folder as the bridge: ACCURETTA_DATA_DIR, else the user folder
+# (ACCURETTA_HOME, set by installer builds), else data/ next to the code.
+_DATA = Path(os.environ.get("ACCURETTA_DATA_DIR")
+             or Path(os.environ.get("ACCURETTA_HOME") or ROOT) / "data")
+USER_DATA = _DATA / "notch-webview2"
+LOG_FILE = _DATA / "notch_host.log"
 
 WIDTH_DIP = 720             # 640 DIP expanded island + room for its shadow
 HEIGHT_DIP = 560

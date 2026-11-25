@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Red-team instruments: small dot-matrix canvases that live inside the
    engagement cards without changing their size.
      tape(canvas)        frontend audit: the site's JavaScript streams past a

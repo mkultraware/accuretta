@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Session-level offline policy for bridge networking."""
 
 import ipaddress

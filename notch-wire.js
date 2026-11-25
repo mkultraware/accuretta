@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Accuretta Notch — bridge wiring.
  *
  * Served alongside accuretta-notch.html and appended to the page at serve

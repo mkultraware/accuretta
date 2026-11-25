@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Shared config handling for email_send.py and email_read.py.
 
 Everything personal (account, servers, password, signature, contacts, writing
@@ -19,8 +20,11 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-# Settings > Email in Accuretta writes this file. ACCURETTA_EMAIL_CONFIG moves it.
-CFG = Path(os.environ.get("ACCURETTA_EMAIL_CONFIG") or HERE / "email_config.json")
+# Settings > Email in Accuretta writes this file. ACCURETTA_EMAIL_CONFIG moves it;
+# an installer build keeps it in the user folder (ACCURETTA_HOME) instead.
+_HOME = os.environ.get("ACCURETTA_HOME")
+CFG = Path(os.environ.get("ACCURETTA_EMAIL_CONFIG")
+           or (Path(_HOME) / "email_plugin" / "email_config.json" if _HOME else HERE / "email_config.json"))
 EXAMPLE = "email_config.example.json"
 
 

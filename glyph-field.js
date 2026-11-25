@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Accuretta splash — the split A drawn in monospace glyphs over a dot field.
    One canvas covers the window. The A (shape from dot-matrix.js, AccDots.inA)
    is a grid of characters, dense in its body and lighter at its edges, which

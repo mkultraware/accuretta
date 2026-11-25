@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Workbench chrome: session tabs, bottom status bar, capability chips,
    two-line session rows, reply headers, file references, explorer and
    viewer polish. Colors come only from theme tokens so every theme carries
@@ -465,7 +466,6 @@
 .bubble code.wb-fref {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
   cursor: pointer;
   vertical-align: baseline;
   transition: border-color .15s, color .15s;
@@ -476,7 +476,8 @@
   outline: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
   outline-offset: 0;
 }
-.bubble code.wb-fref .ph { font-size: 12px; }
+/* Space only between the icon and label, never between inline text chunks. */
+.bubble code.wb-fref .ph { font-size: 12px; margin-right: 4px; }
 
 /* file-type colors: tree icons, palette rows, file references, viewer crumbs */
 :is(.tree-icon, .wb-fref .ph, .wb-crumbs .ph, .palette-item .ph)[data-kind="html"], .palette-item .ph.wb-kind-html { color: #e8784b; }
@@ -2775,6 +2776,13 @@ button.sb-section-empty:hover { background: color-mix(in srgb, var(--fg) 5%, tra
 #sidebar.sb-v2 .sb-group-files { position: absolute; top: 5px; right: 14px; width: 24px; height: 24px; opacity: 0; }
 #sidebar.sb-v2 .wb-group-head:hover ~ .sb-group-files,
 #sidebar.sb-v2 .sb-group-files:is(:hover, :focus-visible) { opacity: 1; }
+/* Removes the project and its sessions (files stay on disk); beside the files
+   button, shown with it. While either shows, the name stops short of both. */
+#sidebar.sb-v2 .sb-group-remove { position: absolute; top: 5px; right: 40px; width: 24px; height: 24px; opacity: 0; }
+#sidebar.sb-v2 .wb-group:has(> .wb-group-head:hover, > .sb-group-files:is(:hover, :focus-visible), > .sb-group-remove:is(:hover, :focus-visible))
+  > :is(.sb-group-files, .sb-group-remove) { opacity: 1; }
+#sidebar.sb-v2 #chatlist .wb-group:has(> .wb-group-head:hover, > .sb-group-files:is(:hover, :focus-visible), > .sb-group-remove:is(:hover, :focus-visible))
+  > .wb-group-head { padding-right: 62px; }
 
 /* Sessions / Files: two views of the list, never mixed. */
 .sb-views {
@@ -3006,3 +3014,17 @@ body.wb-composer #app .chat-scroll {
 }
 #project-chip.just-followed { animation: project-chip-followed 1.6s ease-out; }
 @media (prefers-reduced-motion: reduce) { #project-chip.just-followed { animation: none; } }
+
+/* Pictures the agent showed (show_image), under its reply. Click opens full size. */
+.shown-images { display: flex; flex-direction: column; gap: 10px; margin: 10px 0 2px; max-width: min(720px, 100%); }
+.shown-image {
+  margin: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 12px;
+  background: color-mix(in srgb, var(--fg) 2.5%, var(--bg));
+}
+.shown-image figcaption {
+  display: flex; align-items: center; gap: 8px; min-width: 0; padding: 8px 12px;
+  border-bottom: 1px solid var(--border); color: var(--fg-muted); font: 400 12.5px/1.3 var(--font-sans);
+}
+.shown-image figcaption span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shown-image-view { display: block; width: 100%; padding: 0; border: 0; background: none; cursor: zoom-in; }
+.shown-image-view img { display: block; width: 100%; height: auto; max-height: 60vh; object-fit: contain; }
